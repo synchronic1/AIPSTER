@@ -12,4 +12,12 @@ The offline scaffold has tested selection, probability, budget, and event contro
 
 [View the editable SVG](assets/IRB-DGM-JEV-component-flow.svg)
 
+## Model and LoRA drill-down
+
+The proposed runtime keeps base weights resident and selects compatible, versioned LoRA adapters through a serial, request-safe switching sequence. This is not a claim of verified concurrent multi-LoRA serving; the Medina example is historical and has not been reverified.
+
+![Proposed model and LoRA runtime: immutable resident base, versioned compatible adapters, serial switching, cache and request isolation, independent evaluation, and rollback.](assets/AIPSTER-model-LoRA-drilldown.png)
+
+[View the editable model/LoRA SVG](assets/AIPSTER-model-LoRA-drilldown.svg)
+
 Conceptual design and offline scaffold work predate this public documentation repository. Publication dates do not establish when that earlier work occurred.
