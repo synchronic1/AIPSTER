@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="2460" viewBox="0 0 2200 2460" role="img" aria-labelledby="title desc">
+<title id="title">AIPSTER — model and LoRA drill-down</title><desc id="desc">Proposed architecture: DGM freezes a run specification, Dendrite places a whole workload on one Ganglion runtime, and a base-specific gate permits serial adapter switching on immutable base weights. The runtime drains requests, isolates caches and binds adapter epochs to receipts. An independent evaluator supplies development admission evidence; promotion and human release remain separate. Historical Medina adapter examples are not reverified.</desc>
+<defs><marker id="blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L12 6 L0 12Z" fill="#30618C"/></marker><marker id="green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L12 6 L0 12Z" fill="#26794D"/></marker><marker id="purple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L12 6 L0 12Z" fill="#70529B"/></marker></defs>
+<rect width="2200" height="2460" fill="white"/><g font-family="DejaVu Sans, sans-serif" fill="#24364B">
+<text x="70" y="74" font-size="48" font-weight="700" fill="#24364B">AIPSTER — model and LoRA drill-down</text>
+<text x="70" y="120" font-size="25" font-weight="700" fill="#30618C">PROPOSED CONTROL FLOW  •  Historical Medina example, not a live integration</text>
+<rect x="70" y="165" width="1350" height="200" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="95" y="208" font-size="29" font-weight="700" fill="#30618C">01  DGM experiment controller — freeze the RunSpec</text>
+<text x="95" y="249" font-size="25" font-weight="400" fill="#24364B">Base model hash • tokenizer / template • engine version • adapter hash / scale</text>
+<text x="95" y="284" font-size="25" font-weight="400" fill="#24364B">Seed • context / cache policy • budget • trial identity</text>
+<text x="95" y="319" font-size="25" font-weight="400" fill="#24364B">Weights stay frozen within each trial; candidate versions are prepared offline.</text>
+<rect x="1480" y="165" width="650" height="200" rx="16" fill="#F1ECF8" stroke="#70529B" stroke-width="2"/>
+<text x="1505" y="208" font-size="27" font-weight="700" fill="#70529B">IRB artifact / refinement facade</text>
+<text x="1505" y="249" font-size="23" font-weight="400" fill="#24364B">Supplies versioned artifacts and refinements.</text>
+<text x="1505" y="284" font-size="23" font-weight="400" fill="#24364B">Not the model loader or dispatcher.</text>
+<text x="1505" y="319" font-size="23" font-weight="400" fill="#24364B">No new training is authorized by this figure.</text>
+<path d="M745 365 V410" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="70" y="410" width="1350" height="110" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="95" y="453" font-size="29" font-weight="700" fill="#30618C">02  Dendrite — whole-workload routing</text>
+<text x="95" y="494" font-size="25" font-weight="400" fill="#24364B">Choose an eligible Ganglion per-machine runtime; no tensor splitting.</text>
+<text x="1480" y="444" font-size="22" font-weight="700" fill="#24364B">LEGEND</text>
+<text x="1480" y="482" font-size="23" font-weight="400" fill="#30618C">Blue: execution / runtime</text>
+<text x="1480" y="516" font-size="23" font-weight="400" fill="#70529B">Purple: optional / artifact context</text>
+<text x="1480" y="550" font-size="23" font-weight="400" fill="#26794D">Green: evaluation evidence / release boundary</text>
+<rect x="70" y="580" width="2060" height="1275" rx="22" fill="#F6F9FC" stroke="#90A5B9" stroke-width="2"/>
+<path d="M745 520 V580" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="100" y="627" font-size="29" font-weight="700" fill="#30618C">03  ONE GANGLION RUNTIME  ·  SERIAL SWITCHING, NOT CONCURRENT MULTI-LoRA</text>
+<rect x="100" y="665" width="610" height="200" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="125" y="708" font-size="29" font-weight="700" fill="#30618C">Resident base model</text>
+<text x="125" y="749" font-size="23" font-weight="400" fill="#24364B">Immutable base weights + tokenizer / template</text>
+<text x="125" y="784" font-size="23" font-weight="400" fill="#24364B">Pinned base hash and engine version</text>
+<text x="125" y="819" font-size="23" font-weight="400" fill="#24364B">Base is never rewritten by adapter selection.</text>
+<rect x="750" y="665" width="650" height="200" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="775" y="708" font-size="29" font-weight="700" fill="#30618C">Versioned adapter registry</text>
+<text x="775" y="749" font-size="23" font-weight="400" fill="#24364B">Hash / version • parent base identity</text>
+<text x="775" y="784" font-size="23" font-weight="400" fill="#24364B">Architecture / shapes • allowed rank / format</text>
+<text x="775" y="819" font-size="23" font-weight="400" fill="#24364B">Validation status • scale • optional preload</text>
+<path d="M405 865 V905 H720 V935" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M1075 865 V905 H780 V935" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="100" y="935" width="1300" height="155" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="125" y="978" font-size="29" font-weight="700" fill="#30618C">Base-specific compatibility gate</text>
+<text x="125" y="1019" font-size="25" font-weight="400" fill="#24364B">Reject wrong base family, tensor shapes, rank, format or unvalidated versions.</text>
+<text x="125" y="1054" font-size="25" font-weight="400" fill="#24364B">Verify the actual engine / provider supports adapter loading and safe switching.</text>
+<path d="M1350 1090 V1146 H300 V1160" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="100" y="1132" font-size="24" font-weight="700" fill="#30618C">SAFE SWITCH TRANSACTION  ·  one controller-owned sequence</text>
+<rect x="100" y="1160" width="400" height="145" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="125" y="1203" font-size="25" font-weight="700" fill="#30618C">1  Pause admissions</text>
+<text x="125" y="1244" font-size="21" font-weight="400" fill="#24364B">Stop new requests before</text>
+<text x="125" y="1279" font-size="21" font-weight="400" fill="#24364B">changing the active adapter.</text>
+<rect x="550" y="1160" width="400" height="145" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="575" y="1203" font-size="25" font-weight="700" fill="#30618C">2  Drain requests</text>
+<text x="575" y="1244" font-size="22" font-weight="400" fill="#24364B">Wait for in-flight work</text>
+<text x="575" y="1279" font-size="22" font-weight="400" fill="#24364B">to finish before switching.</text>
+<rect x="1000" y="1160" width="400" height="145" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1025" y="1203" font-size="25" font-weight="700" fill="#30618C">3  Load / select</text>
+<text x="1025" y="1244" font-size="22" font-weight="400" fill="#24364B">Validate, load or select</text>
+<text x="1025" y="1279" font-size="22" font-weight="400" fill="#24364B">the permitted adapter.</text>
+<path d="M500 1230 H550" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M950 1230 H1000" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M1200 1305 V1335 H300 V1365" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="100" y="1365" width="400" height="145" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="125" y="1408" font-size="25" font-weight="700" fill="#30618C">4  Isolate cache</text>
+<text x="125" y="1449" font-size="22" font-weight="400" fill="#24364B">Invalidate or isolate adapter-</text>
+<text x="125" y="1484" font-size="22" font-weight="400" fill="#24364B">dependent KV / prefix cache.</text>
+<rect x="550" y="1365" width="400" height="145" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="575" y="1408" font-size="25" font-weight="700" fill="#30618C">5  Bind identity</text>
+<text x="575" y="1449" font-size="22" font-weight="400" fill="#24364B">Pin base + adapter + epoch</text>
+<text x="575" y="1484" font-size="22" font-weight="400" fill="#24364B">to each request and receipt.</text>
+<rect x="1000" y="1365" width="400" height="145" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1025" y="1408" font-size="25" font-weight="700" fill="#30618C">6  Resume</text>
+<text x="1025" y="1449" font-size="22" font-weight="400" fill="#24364B">Admit work only after</text>
+<text x="1025" y="1484" font-size="22" font-weight="400" fill="#24364B">a successful state transition.</text>
+<path d="M500 1435 H550" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M950 1435 H1000" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M1200 1510 V1540 H750 V1570" fill="none" stroke="#30618C" stroke-width="3" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="100" y="1570" width="1300" height="240" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="125" y="1613" font-size="27" font-weight="700" fill="#30618C">Active request state — Base-only  /  Adapter A  /  Adapter B</text>
+<text x="125" y="1654" font-size="23" font-weight="400" fill="#24364B">W_effective = W_base + scale · (B · A)     [A, B here are low-rank matrices]</text>
+<text x="125" y="1689" font-size="23" font-weight="400" fill="#24364B">Base-only uses no adapter delta. Each transition creates a new epoch / generation ID.</text>
+<text x="125" y="1724" font-size="23" font-weight="400" fill="#24364B">Failure: restore a known-good adapter or base-only state; otherwise quarantine.</text>
+<text x="125" y="1759" font-size="23" font-weight="400" fill="#24364B">Preloaded adapters are possible; fast disk loading or production availability is not promised.</text>
+<rect x="1460" y="665" width="640" height="575" rx="16" fill="#F1ECF8" stroke="#70529B" stroke-width="2"/>
+<text x="1485" y="708" font-size="26" font-weight="700" fill="#70529B">HISTORICAL MEDINA EXAMPLE</text>
+<text x="1485" y="749" font-size="24" font-weight="400" fill="#24364B">Reported base: Qwen3-14B Q4_K_M</text>
+<text x="1485" y="784" font-size="24" font-weight="400" fill="#24364B"></text>
+<text x="1485" y="819" font-size="24" font-weight="400" fill="#24364B">Reported compatible in the May 5 gist:</text>
+<text x="1485" y="854" font-size="24" font-weight="400" fill="#24364B">• tool-calling</text>
+<text x="1485" y="889" font-size="24" font-weight="400" fill="#24364B">• defensive</text>
+<text x="1485" y="924" font-size="24" font-weight="400" fill="#24364B">• offensive</text>
+<text x="1485" y="959" font-size="24" font-weight="400" fill="#24364B"></text>
+<text x="1485" y="994" font-size="24" font-weight="400" fill="#24364B">Reject calibration_rank32 for this base:</text>
+<text x="1485" y="1029" font-size="24" font-weight="400" fill="#24364B">it is Qwen2.5-specific, not Qwen3.</text>
+<text x="1485" y="1064" font-size="24" font-weight="400" fill="#24364B"></text>
+<text x="1485" y="1099" font-size="24" font-weight="400" fill="#24364B">“Offensive” is a historical adapter label,</text>
+<text x="1485" y="1134" font-size="24" font-weight="400" fill="#24364B">not attack instructions.</text>
+<text x="1485" y="1169" font-size="24" font-weight="400" fill="#24364B">Historical report; not reverified.</text>
+<rect x="1460" y="1290" width="640" height="250" rx="16" fill="#F1ECF8" stroke="#70529B" stroke-width="2"/>
+<text x="1485" y="1333" font-size="27" font-weight="700" fill="#70529B">Capability is a deployment gate</text>
+<text x="1485" y="1374" font-size="23" font-weight="400" fill="#24364B">Not every engine or provider can hot-swap.</text>
+<text x="1485" y="1409" font-size="23" font-weight="400" fill="#24364B">Do not infer concurrent multi-LoRA support.</text>
+<text x="1485" y="1444" font-size="23" font-weight="400" fill="#24364B">Verify this integration before enabling it.</text>
+<text x="1485" y="1479" font-size="23" font-weight="400" fill="#24364B">Incompatible adapters never reach execution.</text>
+<text x="1485" y="1514" font-size="23" font-weight="400" fill="#24364B">No global switch under unrelated requests.</text>
+<rect x="1460" y="1560" width="640" height="250" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1485" y="1603" font-size="27" font-weight="700" fill="#30618C">Request / receipt identity</text>
+<text x="1485" y="1644" font-size="23" font-weight="400" fill="#24364B">RunSpec + request ID + epoch / generation</text>
+<text x="1485" y="1679" font-size="23" font-weight="400" fill="#24364B">Base hash + adapter hash / scale + engine</text>
+<text x="1485" y="1714" font-size="23" font-weight="400" fill="#24364B">Outputs + resource use + transition outcome</text>
+<text x="1485" y="1749" font-size="23" font-weight="400" fill="#24364B">Signed or hash-bound receipts are proposed;</text>
+<text x="1485" y="1784" font-size="23" font-weight="400" fill="#24364B">their trusted boundary is external.</text>
+<path d="M750 1810 V1905" fill="none" stroke="#26794D" stroke-width="3" stroke-linejoin="round" marker-end="url(#green)"/>
+<rect x="70" y="1905" width="1350" height="250" rx="16" fill="#EAF4ED" stroke="#26794D" stroke-width="2"/>
+<text x="95" y="1948" font-size="29" font-weight="700" fill="#26794D">04  Independent development evaluator</text>
+<text x="95" y="1989" font-size="25" font-weight="400" fill="#24364B">Receives outputs + identity-bound receipts; it is not the execution authority.</text>
+<text x="95" y="2024" font-size="25" font-weight="400" fill="#24364B">Checks held-out quality, identity and base → A → B → base restoration.</text>
+<text x="95" y="2059" font-size="25" font-weight="400" fill="#24364B">Tests stale-cache / cross-request isolation, resource cost and rollback.</text>
+<text x="95" y="2094" font-size="25" font-weight="400" fill="#24364B">A / B above are named adapter states, not concurrent request mixtures.</text>
+<path d="M1420 2030 H1480" fill="none" stroke="#26794D" stroke-width="3" stroke-linejoin="round" marker-end="url(#green)"/>
+<rect x="1480" y="1905" width="650" height="250" rx="16" fill="#EAF4ED" stroke="#26794D" stroke-width="2"/>
+<text x="1505" y="1948" font-size="26" font-weight="700" fill="#26794D">DEVELOPMENT archive admission</text>
+<text x="1505" y="1989" font-size="24" font-weight="400" fill="#24364B">Evaluation evidence goes to the controller</text>
+<text x="1505" y="2024" font-size="24" font-weight="400" fill="#24364B">for development admission decisions only.</text>
+<text x="1505" y="2059" font-size="24" font-weight="400" fill="#24364B">Admission does not approve release.</text>
+<text x="1505" y="2094" font-size="24" font-weight="400" fill="#24364B">No evaluation-driven execution authority.</text>
+<rect x="70" y="2210" width="2060" height="125" rx="16" fill="#F2F8F3" stroke="#26794D" stroke-width="2"/>
+<text x="95" y="2253" font-size="28" font-weight="700" fill="#26794D">SEPARATE RELEASE BOUNDARY — preserved, not connected as search feedback</text>
+<text x="95" y="2294" font-size="25" font-weight="400" fill="#24364B">After search: freeze finalists → separate held-out promotion → frozen final audit → human release approval.</text>
+<text x="70" y="2380" font-size="23" font-weight="400" fill="#24364B">Source: https://gist.github.com/synchronic1/22ad2e229fe760f0ccd5313f53adea59</text>
+<text x="70" y="2420" font-size="22" font-weight="400" fill="#24364B">Diagram date: 2026-10-26  •  Historical report not reverified  •  Additional figure; original IRB / DGM diagram unchanged</text>
+</g></svg>
