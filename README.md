@@ -8,6 +8,8 @@ The offline scaffold has tested selection, probability, budget, and event contro
 
 **Proposed architecture**
 
-The proposed IRB / DGM / JEV architecture graphic will be added separately.
+![Proposed IRB/DGM architecture: bounded search, independent evaluation, optional JEV advice, and separate promotion gates.](assets/IRB-DGM-JEV-component-flow.png)
+
+[View the editable SVG](assets/IRB-DGM-JEV-component-flow.svg)
 
 Conceptual design and offline scaffold work predate this public documentation repository. Publication dates do not establish when that earlier work occurred.

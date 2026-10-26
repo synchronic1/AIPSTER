@@ -1,0 +1,141 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1690" viewBox="0 0 2000 1690" role="img" aria-labelledby="title desc"><title id="title">Proposed IRB / DGM recursive improvement architecture and JEV advisory role</title><desc id="desc">A new trusted experiment controller selects parents from an exploration archive, supervises bounded sandboxed coding trials and admits candidates using independent development receipts. JEV only recommends choices. Dendrite and Ganglion place and run whole models. After search ends, frozen finalists undergo separate promotion, a single frozen final audit and human approved reversible deployment. No sealed evaluation feedback returns to search.</desc><defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L10 5 L0 10Z" fill="#466078"/></marker><marker id="advice" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L10 5 L0 10Z" fill="#70529B"/></marker></defs><g font-family="DejaVu Sans, Arial, sans-serif"><rect width="2000" height="1690" fill="#FFFFFF"/>
+<text x="50" y="62" font-size="42" font-weight="700" fill="#24364B" text-anchor="start" id="label-10">IRB / DGM: bounded recursive improvement</text>
+<text x="50" y="104" font-size="23" font-weight="700" fill="#30618C" text-anchor="start" id="label-11">PROPOSED ARCHITECTURE • Research design, not a deployed integration</text>
+<rect x="730" y="145" width="540" height="112" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="752" y="183" font-size="23.77622216460692" font-weight="700" fill="#24364B" text-anchor="start" id="label-13">Human objective + campaign budget</text>
+<text x="752" y="221" font-size="22.955887439081906" font-weight="400" fill="#24364B" text-anchor="start" id="label-14">Freeze policy, models, limits and stop rules</text>
+<text x="1020" y="305" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-15">authorizes bounded search</text>
+<rect x="40" y="335" width="1920" height="435" rx="22" fill="#F5F8FC" stroke="#90A5B9" stroke-width="2"/>
+<text x="65" y="369" font-size="22" font-weight="700" fill="#30618C" text-anchor="start" id="label-17">01  SEARCH CONTROL + ADVISORY SCORING</text>
+<path d="M1000 257 V405" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="75" y="405" width="470" height="163" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="97" y="443" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-20">DGM exploration archive</text>
+<text x="97" y="481" font-size="21.40761982793937" font-weight="400" fill="#24364B" text-anchor="start" id="label-21">Executable, provenance-linked lineages</text>
+<text x="97" y="512" font-size="21.60827015851137" font-weight="400" fill="#24364B" text-anchor="start" id="label-22">Viable stepping stones may lose locally</text>
+<text x="97" y="543" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-23">Archive admission ≠ release</text>
+<rect x="75" y="625" width="470" height="105" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="97" y="663" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-25">Parent selection</text>
+<text x="97" y="701" font-size="21.255957425172028" font-weight="400" fill="#24364B" text-anchor="start" id="label-26">Recorded policy + RNG; eligible parents</text>
+<rect x="730" y="405" width="540" height="325" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="752" y="443" font-size="25.065872991769673" font-weight="700" fill="#24364B" text-anchor="start" id="label-28">NEW trusted experiment controller</text>
+<text x="752" y="481" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-29">Validate immutable RunSpec + policy</text>
+<text x="752" y="512" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-30">Reserve budget; enforce caps / stop</text>
+<text x="752" y="543" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-31">Check deterministic eligibility gates</text>
+<text x="752" y="574" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-32">Launch, cancel and confirm termination</text>
+<text x="752" y="605" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-33">Accept trusted development receipts</text>
+<text x="752" y="636" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-34">Admit archive members; record decisions</text>
+<text x="752" y="667" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-35">Fixed fallback + exploration floor</text>
+<rect x="1480" y="405" width="440" height="210" rx="16" fill="#F1ECFA" stroke="#70529B" stroke-width="2"/>
+<text x="1502" y="443" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-37">JEV-style decision model</text>
+<text x="1502" y="481" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-38">OPTIONAL • advisory only</text>
+<text x="1502" y="512" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-39">First: parent–hypothesis ranking</text>
+<text x="1502" y="543" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-40">Predict utility / cost / uncertainty</text>
+<text x="1502" y="574" font-size="21.95442732853753" font-weight="400" fill="#24364B" text-anchor="start" id="label-41">May abstain; no execution authority</text>
+<rect x="1480" y="625" width="440" height="105" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1502" y="663" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-43">Trusted attempt ledger</text>
+<text x="1502" y="701" font-size="18.954638571846647" font-weight="400" fill="#24364B" text-anchor="start" id="label-44">All attempts: outcomes, cost, provenance</text>
+<path d="M545 476 H625 V440 H730" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="561" y="421" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-46">dev evidence</text>
+<path d="M310 568 V625" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M545 678 H583 Q595 658 607 678 H730" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="560" y="661" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-49">parent choice</text>
+<path d="M730 710 H595 V604 H420 V568" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="432" y="590" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-51">gate-passing admission</text>
+<path d="M1270 451 H1480" fill="none" stroke="#70529B" stroke-width="3" stroke-linejoin="round" marker-end="url(#advice)" stroke-dasharray="9 7"/>
+<text x="1290" y="427" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-53">dev snapshot</text>
+<text x="1290" y="478" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-54">choices + budget</text>
+<path d="M1480 546 H1270" fill="none" stroke="#70529B" stroke-width="3" stroke-linejoin="round" marker-end="url(#advice)" stroke-dasharray="9 7"/>
+<text x="1290" y="531" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-56">ranking / abstain</text>
+<path d="M1270 678 H1480" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1290" y="661" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-58">append receipts</text>
+<text x="50" y="820" font-size="22" font-weight="700" fill="#30618C" text-anchor="start" id="label-59">02  BOUNDED DEVELOPMENT TRIALS • KARPATHY-STYLE LOCAL LOOP</text>
+<rect x="440" y="890" width="570" height="390" rx="22" fill="#FFFCF5" stroke="#B58A3C" stroke-width="2"/>
+<text x="465" y="926" font-size="21" font-weight="700" fill="#8E671F" text-anchor="start" id="label-61">DISPOSABLE CANDIDATE SANDBOX</text>
+<rect x="470" y="955" width="510" height="195" rx="16" fill="#FFF5DE" stroke="#9E772D" stroke-width="2"/>
+<text x="492" y="993" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-63">Replaceable coding runner</text>
+<text x="492" y="1031" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-64">Pi / custom • pinned baseline</text>
+<text x="492" y="1062" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-65">Hypothesis → allowlisted patch → test</text>
+<text x="492" y="1093" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-66">Propose local keep / discard</text>
+<text x="492" y="1124" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-67">Controller-enforced trial / keep rules</text>
+<text x="465" y="1180" font-size="21" font-weight="500" fill="#24364B" text-anchor="start" id="label-68">Candidate outputs are untrusted evidence.</text>
+<text x="465" y="1213" font-size="21" font-weight="500" fill="#24364B" text-anchor="start" id="label-69">No admin APIs, raw keys or sealed data.</text>
+<text x="465" y="1246" font-size="21" font-weight="500" fill="#24364B" text-anchor="start" id="label-70">Generated code cannot modify the controller.</text>
+<rect x="65" y="955" width="330" height="165" rx="16" fill="#FFFFFF" stroke="#8092A5" stroke-width="2"/>
+<text x="87" y="993" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-72">IRB reuse facade</text>
+<text x="87" y="1031" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-73">Refinement / artifacts</text>
+<text x="87" y="1062" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-74">Selective reuse only</text>
+<text x="87" y="1093" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-75">Not controller or coder</text>
+<rect x="65" y="1150" width="330" height="130" rx="16" fill="#F1ECFA" stroke="#70529B" stroke-width="2"/>
+<text x="87" y="1188" font-size="25.88826633302508" font-weight="700" fill="#24364B" text-anchor="start" id="label-77">Optional HeurChain</text>
+<text x="87" y="1226" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-78">Development-only recall</text>
+<text x="87" y="1257" font-size="21.82662795520531" font-weight="400" fill="#24364B" text-anchor="start" id="label-79">No sealed evaluation data</text>
+<path d="M395 1025 H470" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="406" y="1006" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-81">I/O</text>
+<path d="M395 1210 H425 V1100 H470" fill="none" stroke="#70529B" stroke-width="3" stroke-linejoin="round" marker-end="url(#advice)" stroke-dasharray="9 7"/>
+<path d="M1000 730 V850 H945 V955" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="620" y="865" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-84">RunSpec + bounded trial loop</text>
+<rect x="1080" y="1005" width="420" height="205" rx="16" fill="#E9F3EE" stroke="#337654" stroke-width="2"/>
+<text x="1102" y="1043" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-86">Development evaluator</text>
+<text x="1102" y="1081" font-size="21.57280947926411" font-weight="400" fill="#24364B" text-anchor="start" id="label-87">Independent of candidate sandbox</text>
+<text x="1102" y="1112" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-88">Frozen development protocol</text>
+<text x="1102" y="1143" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-89">Trusted, hash-bound receipt</text>
+<text x="1102" y="1174" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-90">Matched tasks / resources</text>
+<path d="M980 1052 H1080" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="991" y="1028" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-92">artifact</text>
+<path d="M1290 1005 V805 H1140 V730" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1310" y="832" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-94">trusted receipt</text>
+<rect x="1570" y="865" width="390" height="415" rx="22" fill="#F5F8FC" stroke="#90A5B9" stroke-width="2"/>
+<text x="1585" y="902" font-size="18" font-weight="700" fill="#30618C" text-anchor="start" id="label-96">BROKERED MODEL EXECUTION</text>
+<rect x="1590" y="925" width="350" height="91" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1612" y="963" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-98">Dendrite</text>
+<text x="1612" y="1001" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-99">Whole-model placement</text>
+<rect x="1590" y="1045" width="350" height="91" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1612" y="1083" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-101">Ganglion</text>
+<text x="1612" y="1121" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-102">Per-machine runtime</text>
+<rect x="1590" y="1165" width="350" height="91" rx="16" fill="#EAF2FA" stroke="#30618C" stroke-width="2"/>
+<text x="1612" y="1203" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-104">Model workers</text>
+<text x="1612" y="1241" font-size="22.960138648180244" font-weight="400" fill="#24364B" text-anchor="start" id="label-105">Complete model instances</text>
+<path d="M1765 1016 V1045" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1765 1136 V1165" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1225 730 V785 H1910 V925" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1470" y="765" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-109">authorized route / resource lease</text>
+<path d="M1278 915 Q1290 895 1302 915" fill="none" stroke="#FFFFFF" stroke-width="9" stroke-linecap="round"/><path d="M980 980 H1030 V915 H1278 Q1290 895 1302 915 H1550 V980 H1590" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1320" y="871" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-112"><tspan x="1320" y="871">scoped inference </tspan><tspan x="1320" y="898">requests / responses</tspan></text>
+<text x="1080" y="1258" font-size="19" font-weight="400" fill="#24364B" text-anchor="start" id="label-115">Evaluator traffic uses separately authorized routes.</text>
+<rect x="40" y="1345" width="1920" height="255" rx="22" fill="#F2F7F3" stroke="#87A592" stroke-width="2"/>
+<text x="65" y="1382" font-size="22" font-weight="700" fill="#337654" text-anchor="start" id="label-117">03  POST-SEARCH PROMOTION • SEPARATE EVALUATION AUTHORITY</text>
+<path d="M75 500 H30 V1485 H75" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="65" y="1330" font-size="20" font-weight="500" fill="#24364B" text-anchor="start" id="label-119">Only after search stops + campaign integrity passes</text>
+<rect x="75" y="1420" width="320" height="130" rx="16" fill="#E9F3EE" stroke="#337654" stroke-width="2"/>
+<text x="97" y="1458" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-121">Freeze finalists</text>
+<text x="97" y="1496" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-122">Prespecified slate</text>
+<text x="97" y="1527" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-123">Development-selected</text>
+<rect x="455" y="1420" width="350" height="130" rx="16" fill="#E9F3EE" stroke="#337654" stroke-width="2"/>
+<text x="477" y="1458" font-size="25.15606936416185" font-weight="700" fill="#24364B" text-anchor="start" id="label-125">Promotion evaluation</text>
+<text x="477" y="1496" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-126">Separate held-out suite</text>
+<text x="477" y="1527" font-size="22.56334218303862" font-weight="400" fill="#24364B" text-anchor="start" id="label-127">Select gate-passing winner</text>
+<rect x="865" y="1420" width="315" height="130" rx="16" fill="#E9F3EE" stroke="#337654" stroke-width="2"/>
+<text x="887" y="1458" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-129">Freeze winner</text>
+<text x="887" y="1496" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-130">One final audit</text>
+<text x="887" y="1527" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-131">Sealed, one-time check</text>
+<rect x="1240" y="1420" width="310" height="130" rx="16" fill="#E9F3EE" stroke="#337654" stroke-width="2"/>
+<text x="1262" y="1458" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-133">Human approval</text>
+<text x="1262" y="1496" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-134">Review evidence</text>
+<text x="1262" y="1527" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-135">Or no improvement</text>
+<rect x="1610" y="1420" width="310" height="130" rx="16" fill="#E9F3EE" stroke="#337654" stroke-width="2"/>
+<text x="1632" y="1458" font-size="26" font-weight="700" fill="#24364B" text-anchor="start" id="label-137">Reversible deploy</text>
+<text x="1632" y="1496" font-size="23" font-weight="400" fill="#24364B" text-anchor="start" id="label-138">Canary + rollback</text>
+<text x="1632" y="1527" font-size="22.371843217917952" font-weight="400" fill="#24364B" text-anchor="start" id="label-139">Separate release action</text>
+<path d="M395 1485 H455" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M805 1485 H865" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1180 1485 H1240" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M1550 1485 H1610" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="65" y="1580" font-size="22" font-weight="700" fill="#337654" text-anchor="start" id="label-144">NO promotion or final-audit feedback returns to the same search campaign.</text>
+<path d="M65 1630 H130" fill="none" stroke="#466078" stroke-width="3" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="145" y="1637" font-size="21" font-weight="400" fill="#24364B" text-anchor="start" id="label-146">Execution / data flow</text>
+<path d="M470 1630 H535" fill="none" stroke="#70529B" stroke-width="3" stroke-linejoin="round" marker-end="url(#advice)" stroke-dasharray="9 7"/>
+<text x="550" y="1637" font-size="21" font-weight="400" fill="#24364B" text-anchor="start" id="label-148">Advisory recommendation / recall</text>
+<text x="1080" y="1637" font-size="21" font-weight="700" fill="#24364B" text-anchor="start" id="label-149">Hard gates remain outside the learned scorer.</text>
+<text x="65" y="1670" font-size="18" font-weight="400" fill="#566C80" text-anchor="start" id="label-150">Scope: frozen-weight agent / runtime research • whole-model distribution, not tensor or pipeline splitting • 26 Oct 2026</text>
+</g></svg>
