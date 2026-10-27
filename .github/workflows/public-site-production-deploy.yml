@@ -1,18 +1,23 @@
-# DRAFT - requires independent review before any production use.
-# Fail-closed by construction: the `production` environment and the
-# CLOUDFLARE_API_TOKEN secret must both exist or this job cannot run.
-# Deploys only website/dist/ (built from the allowlisted public/ source).
+# The release owner dispatches only after independent review and merge.
+# This explicit revision gate complements protected main/environment approvals;
+# it does not replace those repository settings or prove a review occurred.
 name: Public site production deploy
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: Full merged main commit approved for this release
+        required: true
+        type: string
 permissions:
   contents: read
+  checks: read
 concurrency:
   group: public-site-production
   cancel-in-progress: false
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     name: Build and deploy dist to production
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -32,7 +37,14 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run build
+      - name: Require the reviewed current main revision and successful CI
+        run: node scripts/release-preflight.mjs
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          GH_TOKEN: ${{ github.token }}
       - run: npx wrangler deploy --config wrangler.jsonc
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           WRANGLER_SEND_METRICS: 'false'
+      - name: Verify live assets, release revision and anonymous access protection
+        run: npm run verify:live
