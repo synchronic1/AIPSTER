@@ -7,6 +7,7 @@ import { createAuth, isInvited, oauthConfigured, sessionUser } from './lib/auth.
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
+import { handleFabric } from './fabric/router.mjs';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -427,6 +428,11 @@ async function handleApi(request, env, url) {
     return json(200, page);
   }
 
+  // ---- federation control plane (F1; flag-gated, default off) ----
+  if (path === '/v1/fabric/mcp' || path.startsWith('/v1/fabric/')) {
+    return handleFabric({ request, env, url, actor, db, json, needSession, needCsrf, needAuthz, needNotDemo });
+  }
+
   return json(404, { error: 'Unknown API route.', code: 'NOT_FOUND' });
 }
 
@@ -480,7 +486,7 @@ export default {
         }
         return serveApp(request, env, url.pathname);
       }
-      if (url.pathname.startsWith('/api/')) {
+      if (url.pathname.startsWith('/api/') || url.pathname === '/v1/fabric/mcp' || url.pathname.startsWith('/v1/fabric/')) {
         try {
           return await handleApi(request, env, url);
         } catch (error) {
