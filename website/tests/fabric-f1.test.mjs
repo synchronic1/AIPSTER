@@ -177,8 +177,11 @@ test('F1: acceptance proves token + node ownership + node secret; single use', a
   const okAcc = await readJson(await t.call('/v1/fabric/invitations/accept', { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { token, nodeId: regB.json.id, nodeKey: regB.json.nodeSecret } }));
   assert.equal(okAcc.status, 201);
   assert.equal(okAcc.json.state, 'active');
+  // Re-acceptance with the same valid proofs converges on the one
+  // connection (crash recovery) instead of burning the invitation.
   const again = await readJson(await t.call('/v1/fabric/invitations/accept', { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { token, nodeId: regB.json.id, nodeKey: regB.json.nodeSecret } }));
-  assert.equal(again.status, 409);
+  assert.equal(again.status, 200);
+  assert.equal(again.json.id, okAcc.json.id);
   // Acceptance alone grants zero access: discovery shows nothing new for bob.
   const disc = await readJson(await t.call('/v1/fabric/discovery', { headers: S(t, t.bob) }));
   assert.equal(disc.json.total, 0);

@@ -56,12 +56,25 @@ async function mutate(ctx, fn) {
     replay = await S.checkIdempotency(db, factor, request.method, url.pathname, request.headers.get('Idempotency-Key'), await digestJson(body === undefined ? null : body));
   } catch (e) { return sendErr(ctx, e); }
   if (replay) return ctx.json(replay.status, { ...replay.body, replayed: true });
+  const key = request.headers.get('Idempotency-Key');
   let out;
   try {
     out = await fn(factor, body || {});
-  } catch (e) { return sendErr(ctx, e); }
+  } catch (e) {
+    // Terminal (4xx) failures finalize the record so the same key replays
+    // the same failure instead of wedging on IDEMPOTENCY_PENDING; unknown
+    // (5xx) outcomes release the key for a fresh reconciling retry.
+    const status = Number(e && e.status) || 500;
+    if (status < 500) {
+      const failure = { error: (e && e.message) || 'Request failed.', code: (e && e.code) || 'INTERNAL' };
+      try { await S.storeIdempotency(db, factor, key, status, failure); } catch { /* fall through to error */ }
+      return ctx.json(status, failure);
+    }
+    try { await S.releaseIdempotency(db, factor, key); } catch { /* fall through to error */ }
+    return sendErr(ctx, e);
+  }
   try {
-    await S.storeIdempotency(db, factor, request.headers.get('Idempotency-Key'), out.status, out.body);
+    await S.storeIdempotency(db, factor, key, out.status, out.body);
   } catch (e) { return sendErr(ctx, e); }
   return send(ctx, out);
 }
@@ -334,9 +347,20 @@ export async function handleMcp(ctx) {
     const ipath = `/v1/fabric/mcp:${tool}`;
     const replay = await S.checkIdempotency(db, f, 'POST', ipath, key, await digestJson(params));
     if (replay) return ctx.json(replay.status, { ok: true, tool, result: replay.body, replayed: true });
-    const out = await spec.run(db, f, params);
-    await S.storeIdempotency(db, f, key, out.status, out.body);
-    return ctx.json(out.status, { ok: true, tool, result: out.body });
+    try {
+      const out = await spec.run(db, f, params);
+      await S.storeIdempotency(db, f, key, out.status, out.body);
+      return ctx.json(out.status, { ok: true, tool, result: out.body });
+    } catch (e) {
+      const status = Number(e && e.status) || 500;
+      if (status < 500) {
+        const failure = { error: (e && e.message) || 'Request failed.', code: (e && e.code) || 'INTERNAL' };
+        try { await S.storeIdempotency(db, f, key, status, failure); } catch { /* fall through */ }
+        return ctx.json(status, failure);
+      }
+      try { await S.releaseIdempotency(db, f, key); } catch { /* fall through */ }
+      return sendErr(ctx, e);
+    }
   } catch (e) {
     return sendErr(ctx, e);
   }

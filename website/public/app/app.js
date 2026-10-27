@@ -161,7 +161,7 @@ async function loadFederation() {
   const on = $('fab-on'), off = $('fab-off');
   try {
     const nodes = await api('/v1/fabric/nodes');
-    on.hidden = false; off.hidden = true;
+    on.hidden = false; off.hidden = true; $('fab-error').hidden = true;
     fabNodes.length = 0;
     for (const n of nodes.items) fabNodes.push(n);
     $('fab-node-list').innerHTML = nodes.items.length ? nodes.items.map((n) =>
@@ -194,7 +194,7 @@ async function loadFederation() {
       api('/v1/fabric/grants?scope=outgoing'), api('/v1/fabric/grants?scope=incoming'), api('/v1/fabric/denies')
     ]);
     const grantCard = (g, mine) => `<div class="card"><p>${esc(g.id)} <span class="muted">${esc(g.status)} · v${g.version} · expires ${esc(g.expiry)}</span></p>
-      <p class="muted">${(g.snapshot || []).length} resource(s) · models ${(g.models || []).join(', ')}</p>
+      <p class="muted">${(g.snapshot || []).length} resource(s) · models ${(g.models || []).map(esc).join(', ')}</p>
       ${mine && g.status === 'enforced' ? `<button type="button" data-fab-pause="${esc(g.id)}" data-v="${g.version}">Pause</button> <button type="button" class="danger" data-fab-revoke="${esc(g.id)}" data-v="${g.version}">Revoke</button>` : ''}
       ${mine && g.status === 'paused' ? `<button type="button" data-fab-grant-resume="${esc(g.id)}" data-v="${g.version}">Resume…</button>` : ''}</div>`;
     $('fab-grant-out').innerHTML = gout.items.length ? gout.items.map((g) => grantCard(g, true)).join('') : '<div class="card">No outgoing grants.</div>';
@@ -205,7 +205,17 @@ async function loadFederation() {
     wireFabButtons();
   } catch (e) {
     if (isStale(e)) return;
-    on.hidden = true; off.hidden = false;
+    // Only the flag-off 404 means "not enabled". Any other failure
+    // (auth, server, network) keeps that copy hidden and reports the
+    // actionable error instead.
+    if (e && e.message && e.message.includes('(NOT_FOUND)')) {
+      on.hidden = true; off.hidden = false; $('fab-error').hidden = true;
+    } else {
+      on.hidden = true; off.hidden = true;
+      const box = $('fab-error');
+      box.textContent = 'Federation unavailable: ' + (e && e.message ? e.message : 'request failed.');
+      box.hidden = false;
+    }
   }
 }
 
@@ -249,6 +259,7 @@ function resetState() {
   $('fab-commit-box').hidden = true; $('fab-commit-text').textContent = ''; $('fab-commit-digest').textContent = '';
   fabPreview = null; fabNodes.length = 0;
   $('fab-on').hidden = true; $('fab-off').hidden = true;
+  $('fab-error').textContent = ''; $('fab-error').hidden = true;
   $('whoami').textContent = '';
   $('settings-email').textContent = ''; $('settings-via').textContent = '…';
   for (const id of ['res-name', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'grant-user', 'key-name', 'key-expires', 'settings-name', 'demo-username', 'demo-password']) $(id).value = '';
