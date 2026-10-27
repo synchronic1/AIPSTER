@@ -1,0 +1,15 @@
+{
+  "name": "aipster-public-website",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test scripts/check.test.mjs",
+    "build": "node scripts/build.mjs",
+    "bundle": "node scripts/dry-run.mjs",
+    "verify:live": "node scripts/verify-live.mjs"
+  },
+  "devDependencies": { "wrangler": "4.153.0" }
+}

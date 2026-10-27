@@ -1,0 +1,11 @@
+import {spawn} from 'node:child_process';
+import {mkdir} from 'node:fs/promises';
+import {resolve} from 'node:path';
+const root=resolve(import.meta.dirname,'..');
+await mkdir(resolve(root,'.verification'),{recursive:true});
+const env={...process.env,CI:'true',WRANGLER_SEND_METRICS:'false',WRANGLER_LOG_SANITIZE:'true',WRANGLER_LOG_PATH:resolve(root,'.verification/wrangler.log'),CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV:'false'};
+delete env.CLOUDFLARE_API_TOKEN;delete env.CLOUDFLARE_API_KEY;delete env.CLOUDFLARE_EMAIL;
+const cli=resolve(root,'node_modules/wrangler/bin/wrangler.js');
+const processHandle=spawn(process.execPath,[cli,'deploy','--dry-run','--config','wrangler.jsonc','--outdir','.verification/bundle'],{cwd:root,env,stdio:'inherit',windowsHide:true});
+processHandle.on('error',()=>{process.exitCode=1;});
+processHandle.on('exit',code=>{process.exitCode=code??1;});

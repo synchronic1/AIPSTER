@@ -1,0 +1,7 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "aipster-public-site",
+  "compatibility_date": "2026-10-26",
+  "send_metrics": false,
+  "assets": { "directory": "./dist", "not_found_handling": "404-page" }
+}
