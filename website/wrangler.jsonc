@@ -15,9 +15,8 @@
     {
       "binding": "DB",
       "database_name": "aipster-app",
-      // Placeholder: replace with the real id from `wrangler d1 create aipster-app`
-      // (see docs/cloudflare-integration-plan.md). Local dev does not use it.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // Provisioned D1 database; runtime binding is applied by the reviewed release.
+      "database_id": "b91be793-704a-4eae-8b8f-7f4c8b78e4fc",
       "migrations_dir": "migrations"
     }
   ]
