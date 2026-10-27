@@ -3,6 +3,21 @@
   "name": "aipster-public-site",
   "compatibility_date": "2026-10-26",
   "send_metrics": false,
+  "main": "src/worker.js",
+  "compatibility_flags": ["nodejs_als"],
   "preview_urls": false,
-  "assets": { "directory": "./dist", "not_found_handling": "404-page" }
+  // Public, non-secret: the canonical origin better-auth uses for callbacks
+  // and trusted origins. Secrets (BETTER_AUTH_SECRET, GITHUB_*) are set via
+  // `wrangler secret put` by the rollout owner, never here.
+  "vars": { "BETTER_AUTH_URL": "https://aipster.net" },
+  "assets": { "directory": "./dist", "not_found_handling": "404-page", "run_worker_first": true, "binding": "ASSETS" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aipster-app",
+      // Provisioned D1 database; runtime binding is applied by the reviewed release.
+      "database_id": "b91be793-704a-4eae-8b8f-7f4c8b78e4fc",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

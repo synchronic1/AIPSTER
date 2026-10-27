@@ -1,0 +1,96 @@
+/* Built with Meta Muse. */
+// D1 access helpers + row mapping. API shapes mirror the local backend so the
+// control-panel UI ports without contract changes (except identity: Better
+// Auth user {id, name, email} replaces local {id, username, displayName}).
+export const nowIso = () => new Date().toISOString();
+
+export function rid(prefix) {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return prefix + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export async function all(db, sql, ...params) {
+  const res = await db.prepare(sql).bind(...params).all();
+  return res.results || [];
+}
+
+export async function first(db, sql, ...params) {
+  return db.prepare(sql).bind(...params).first();
+}
+
+export async function run(db, sql, ...params) {
+  return db.prepare(sql).bind(...params).run();
+}
+
+export async function pageQuery(db, { select, from, params = [], order, limit, offset }) {
+  const totalRow = await first(db, `SELECT COUNT(*) AS n ${from}`, ...params);
+  const total = Number(totalRow ? totalRow.n : 0);
+  const items = await all(db, `${select} ${from} ${order} LIMIT ? OFFSET ?`, ...params, limit, offset);
+  return { items, total, limit, offset };
+}
+
+const asJson = (text, fallback) => {
+  try { const v = JSON.parse(text || ''); return v ?? fallback; } catch { return fallback; }
+};
+
+export function cardFor(r, ownerName) {
+  const status = !r.configured ? 'unconfigured' : !r.authenticated ? 'unauthenticated' : !r.online ? 'offline' : !r.usable ? 'unusable' : 'ready';
+  return {
+    id: r.id, name: r.name, kind: r.kind, origin: r.origin,
+    owner: { id: r.owner_id, name: ownerName },
+    compute: { cpu: r.cpu, gpu: r.gpu }, capabilities: asJson(r.capabilities_json, []),
+    state: { configured: !!r.configured, authenticated: !!r.authenticated, online: !!r.online, usable: !!r.usable, status },
+    heartbeatAt: r.heartbeat_at || null, limits: asJson(r.limits_json, {}), scope: r.scope,
+    verification: asJson(r.verification_json, {}),
+    credits: r.credits_json ? asJson(r.credits_json, null) : null, // informational only
+    createdAt: r.created_at
+  };
+}
+
+export function mapGrant(g) {
+  return {
+    id: g.id, resourceId: g.resource_id, ownerId: g.owner_id, granteeId: g.grantee_id,
+    quotas: { maxJobs: g.max_jobs, maxTokens: g.max_tokens },
+    usedJobs: g.used_jobs, usedTokens: g.used_tokens,
+    inferenceOnly: !!g.inference_only, createdAt: g.created_at, revokedAt: g.revoked_at || null
+  };
+}
+
+export function mapKey(k) {
+  const { verifier, salt, ...rest } = {
+    id: k.id, ownerId: k.owner_id, name: k.name, scope: k.scope,
+    verifier: k.verifier, salt: k.salt, prefix: k.prefix,
+    expiresAt: k.expires_at || null, metadata: k.metadata || '',
+    createdAt: k.created_at, lastUsedAt: k.last_used_at || null, revokedAt: k.revoked_at || null
+  };
+  return rest;
+}
+
+export function mapJob(j) {
+  return {
+    id: j.id, ownerId: j.owner_id, resourceId: j.resource_id, grantId: j.grant_id || null,
+    adapter: j.adapter, model: j.model, status: j.status,
+    tokensIn: j.tokens_in, tokensOut: j.tokens_out, costSource: j.cost_source,
+    createdAt: j.created_at, updatedAt: j.updated_at
+  };
+}
+
+export function mapUsage(u) {
+  return {
+    id: u.id, ownerId: u.owner_id, kind: u.kind, requests: u.requests,
+    tokensIn: u.tokens_in, tokensOut: u.tokens_out,
+    modelCostUsd: u.model_cost_usd === null || u.model_cost_usd === undefined ? null : Number(u.model_cost_usd),
+    executionCostUsd: u.execution_cost_usd === null || u.execution_cost_usd === undefined ? null : Number(u.execution_cost_usd),
+    costSource: u.cost_source, at: u.at
+  };
+}
+
+export function auditRow(actorId, action, target, detail = '') {
+  return { id: rid('a_'), at: nowIso(), actorId: actorId || null, action, target, detail: String(detail).slice(0, 300) };
+}
+
+export async function audit(db, actorId, action, target, detail = '') {
+  const a = auditRow(actorId, action, target, detail);
+  await run(db, 'INSERT INTO audit (id, at, actor_id, action, target, detail) VALUES (?, ?, ?, ?, ?, ?)',
+    a.id, a.at, a.actorId, a.action, a.target, a.detail);
+}
