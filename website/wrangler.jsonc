@@ -3,6 +3,18 @@
   "name": "aipster-public-site",
   "compatibility_date": "2026-10-26",
   "send_metrics": false,
+  "main": "src/worker.js",
+  "compatibility_flags": ["nodejs_als"],
   "preview_urls": false,
-  "assets": { "directory": "./dist", "not_found_handling": "404-page" }
+  "assets": { "directory": "./dist", "not_found_handling": "404-page", "run_worker_first": true, "binding": "ASSETS" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aipster-app",
+      // Placeholder: replace with the real id from `wrangler d1 create aipster-app`
+      // (see docs/cloudflare-integration-plan.md). Local dev does not use it.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

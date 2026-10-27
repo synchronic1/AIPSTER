@@ -4,7 +4,7 @@ import {resolve,relative} from 'node:path';
 import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 
-export const publicFiles=['404.html','_headers','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','favicon.svg','index.html','release.json','styles.css'].sort();
+export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','favicon.svg','index.html','release.json','styles.css'].sort();
 export const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function files(root,dir=root){const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink(),'Symlinks are outside the public upload policy');const path=resolve(dir,entry.name);if(entry.isDirectory())result.push(...await files(root,path));else{assert(entry.isFile(),'Unexpected asset type');result.push(relative(root,path).replaceAll('\\','/'));}}return result.sort();}
 
@@ -15,7 +15,12 @@ export async function checkPublic(root){
     if(/\.(?:html|css|svg|json)$/.test(path)){
       const text=bytes.toString('utf8');
       assert(!/127\.0\.0\.1|localhost|4327|resource[-_. ]ledger|C:\\Users|(?:BEGIN (?:RSA |EC )?PRIVATE KEY)|(?:gh[pousr]_[\w]{20,})|(?:sk-[\w]{20,})/i.test(text),'Private content or credential-shaped material is forbidden');
-      assert(!/<(?:script|form|iframe|object|embed|foreignObject)\b|\son[a-z]+\s*=|javascript:|@import\b/i.test(text),'Active or embedded content is outside the static site policy');
+      let scan = text;
+      if (path.startsWith('app/')) {
+        assert(!/\saction\s*=|\smethod\s*=/i.test(text), 'App forms must be JS-handled (no action/method attributes)');
+        scan = text.split('<script src="/app/app.js"></script>').join('').replace(/<form\b[^>]*>/gi, '');
+      }
+      assert(!/<(?:script|form|iframe|object|embed|foreignObject)\b|\son[a-z]+\s*=|javascript:|@import\b/i.test(scan),'Active or embedded content is outside the static site policy');
       if(path.endsWith('.svg'))assert(!/(?:href|src)\s*=\s*["'](?:https?:|\/\/|data:)/i.test(text),'SVG assets must not fetch remote content');
     }
   }
@@ -23,10 +28,10 @@ export async function checkPublic(root){
   const ids=new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m=>m[1]));
   for(const ref of [...html.matchAll(/(?:href|src)="([^"]+)"/g)].map(m=>m[1])){
     if(ref.startsWith('#'))assert(ids.has(ref.slice(1)),`Broken anchor: ${ref}`);
-    else if(ref.startsWith('/'))assert(ref==='/'||publicFiles.includes(ref.slice(1)),`Unapproved or missing asset: ${ref}`);
+    else if(ref.startsWith('/'))assert(ref==='/'||ref==='/app/'||publicFiles.includes(ref.slice(1)),`Unapproved or missing asset: ${ref}`);
     else assert(ref.startsWith('https://github.com/synchronic1/AIPSTER'),`External destination requires review: ${ref}`);
   }
-  assert(!/(?:href|src)="\/(?:login|app|api)(?:[\/"?])/i.test(html),'Prepared auth must not be advertised as deployed');
+  assert(!/(?:href|src)="\/(?:login|api)(?:[\/"?])/i.test(html),'Raw login/API paths must not be advertised on the landing page');
   assert(html.includes('User login is not enabled on this public site.'));
   assert(html.includes('In development'));
   assert((await readFile(resolve(root,'_headers'),'utf8')).includes('no-transform'));

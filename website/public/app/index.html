@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- Built with Meta Muse. -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIPSTER control panel</title>
+<link rel="stylesheet" href="/app/styles.css">
+<link rel="icon" href="/app/icon.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="wordmark" aria-label="AIPSTER">AIPSTER</span><span class="tag">control panel</span></div>
+  <div id="sessionbar" class="sessionbar" hidden>
+    <span id="whoami"></span>
+    <button id="logout" type="button">Sign out</button>
+  </div>
+</header>
+<main id="main">
+  <section id="view-login" class="card" aria-labelledby="login-h">
+    <h1 id="login-h">Sign in</h1>
+    <p class="muted">GitHub sign-in for invited testers. No passwords are accepted here.</p>
+    <p id="login-error" class="error" role="alert" hidden></p>
+    <button id="github-login" type="button">Sign in with GitHub</button>
+  </section>
+
+  <div id="view-app" hidden>
+    <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+      <button role="tab" data-tab="compute" aria-selected="false">My Compute</button>
+      <button role="tab" data-tab="shared" aria-selected="false">Shared With Me</button>
+      <button role="tab" data-tab="sharing" aria-selected="false">Sharing</button>
+      <button role="tab" data-tab="keys" aria-selected="false">API Keys</button>
+      <button role="tab" data-tab="usage" aria-selected="false">Usage</button>
+      <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
+    </nav>
+    <section id="tab-overview" role="tabpanel"><h1>Overview</h1><div id="ov-cards" class="grid"></div><div id="ov-note"></div></section>
+    <section id="tab-compute" role="tabpanel" hidden>
+      <h1>My Compute</h1>
+      <form id="resource-form" class="card">
+        <h2>Register resource</h2>
+        <p class="muted">Declared resources start unverified: configured, but not authenticated, online, or usable.</p>
+        <label>Name <input id="res-name" required maxlength="80"></label>
+        <label>Kind <select id="res-kind"><option value="local">local</option><option value="cluster">cluster</option><option value="provider">provider</option></select></label>
+        <label>Origin <input id="res-origin" maxlength="80" placeholder="e.g. home lab"></label>
+        <label>CPU <input id="res-cpu" maxlength="80" placeholder="e.g. 16-core x86"></label>
+        <label>GPU <input id="res-gpu" maxlength="80" placeholder="e.g. none recorded"></label>
+        <label>Capabilities (comma separated) <input id="res-caps" maxlength="300" placeholder="e.g. text, vision"></label>
+        <p id="resource-error" class="error" role="alert" hidden></p>
+        <button type="submit">Register</button>
+      </form>
+      <div id="compute-list" class="grid"></div>
+    </section>
+    <section id="tab-shared" role="tabpanel" hidden><h1>Shared With Me</h1><div id="shared-list" class="grid"></div></section>
+    <section id="tab-sharing" role="tabpanel" hidden>
+      <h1>Sharing</h1>
+      <p class="muted">Inference-only grants with bounded quotas. <strong>Policy:</strong> grants never convey admin rights. <strong>Enforcement:</strong> server checks ownership, grant validity, and quotas before every dispatch.</p>
+      <form id="grant-form" class="card">
+        <h2>New grant</h2>
+        <label>Resource <select id="grant-resource"></select></label>
+        <label>Grantee email <input id="grant-user" type="email" required maxlength="254" placeholder="teammate@example.com"></label>
+        <label>Max jobs <input id="grant-jobs" type="number" min="1" max="10000" value="50" required></label>
+        <label>Max tokens <input id="grant-tokens" type="number" min="100" max="10000000" value="50000" required></label>
+        <p id="grant-error" class="error" role="alert" hidden></p>
+        <button type="submit">Create grant</button>
+      </form>
+      <h2>Outgoing grants</h2><div id="grant-list" class="grid"></div>
+    </section>
+    <section id="tab-keys" role="tabpanel" hidden>
+      <h1>API Keys</h1>
+      <p class="muted">Secrets are shown <strong>once</strong> at creation. Only non-reversible verifiers are stored. Keys work for inventory/usage reads and (with inference scope) future jobs &mdash; never for sharing, key, or settings management. These are AIPSTER keys, not provider keys.</p>
+      <form id="key-form" class="card">
+        <h2>New key</h2>
+        <label>Name <input id="key-name" required maxlength="80"></label>
+        <label>Scope <select id="key-scope"><option value="read">read</option><option value="inference">inference</option></select></label>
+        <label>Expires <input id="key-expires" type="date"></label>
+        <p id="key-error" class="error" role="alert" hidden></p>
+        <button type="submit">Create key</button>
+      </form>
+      <div id="key-reveal" class="card reveal" hidden>
+        <h2>Copy this secret now</h2>
+        <code id="key-secret"></code>
+        <p class="muted">It cannot be shown again. It is not stored in the browser.</p>
+        <button id="key-dismiss" type="button">Done</button>
+      </div>
+      <h2>Your keys</h2><div id="key-list" class="grid"></div>
+    </section>
+    <section id="tab-usage" role="tabpanel" hidden><h1>Usage</h1><div id="usage-totals"></div><div id="usage-list" class="grid"></div></section>
+    <section id="tab-settings" role="tabpanel" hidden>
+      <h1>Settings</h1>
+      <form id="settings-form" class="card">
+        <label>Display name <input id="settings-name" required maxlength="80"></label>
+        <p class="muted">Signed in as <span id="settings-email"></span> (via GitHub).</p>
+        <p id="settings-error" class="error" role="alert" hidden></p>
+        <button type="submit">Save</button>
+      </form>
+      <h2>Recent activity</h2><div id="audit-list" class="grid"></div>
+    </section>
+  </div>
+  <div id="banner" class="banner" role="status" hidden></div>
+</main>
+<script src="/app/app.js"></script>
+</body>
+</html>
