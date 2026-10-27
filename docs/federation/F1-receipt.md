@@ -1,6 +1,6 @@
 # F1 stage receipt
 
-- SHA: `<filled at commit>` (branch
+- SHA: `e17c90d069e7698491164e75193971f3c045b34b` (branch
   `muse/federation-control-plane`, base F0 `4abdb81`; PR #3 branch untouched).
 - Files: `website/migrations/0005_fabric.sql`,
   `website/src/fabric/store.mjs` (new, 32 exports),
