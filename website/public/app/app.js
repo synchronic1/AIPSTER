@@ -1,7 +1,8 @@
 /* Built with Meta Muse. */
 // Control-panel client. Session cookie is httpOnly; sign-in is GitHub OAuth
-// (no passwords). Mutations carry a custom CSRF header (never a secret).
-// API secrets are shown once and never persisted.
+// for invited testers or the seeded demo username/password (same sessions).
+// Mutations carry a custom CSRF header (never a secret). API secrets are
+// shown once and never persisted.
 'use strict';
 let me = null;
 
@@ -44,7 +45,9 @@ async function loadOverview() {
     el.innerHTML = `<div class="card"><h2>My resources</h2><p>${inv.total} total · ${ready} ready</p></div>
       <div class="card"><h2>Shared with me</h2><p>${shared.total} active grant(s)</p></div>
       <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>`;
-    $('ov-note').innerHTML = '<p class="muted">No demo data: only resources you register appear here. Inference dispatch is disabled.</p>';
+    $('ov-note').innerHTML = me && me.demo
+      ? '<p class="muted">DEMO DATA: simulated fixtures for exploration. Grants and live actions are disabled. Inference dispatch is disabled.</p>'
+      : '<p class="muted">No demo data: only resources you register appear here. Inference dispatch is disabled.</p>';
   } catch (e) { state(el, 'error', e.message); }
 }
 
@@ -119,7 +122,8 @@ async function loadSettings() {
   try {
     const s = await api('/api/settings');
     $('settings-name').value = s.displayName || '';
-    $('settings-email').textContent = s.email || '';
+    $('settings-email').textContent = s.username ? s.username + ' (demo username sign-in)' : (s.email || '');
+    $('settings-via').textContent = s.demo ? 'demo username sign-in' : 'GitHub';
     const a = await api('/api/audit?limit=20');
     $('audit-list').innerHTML = a.items.map((x) => `<div class="card"><p>${esc(x.action)} → ${esc(x.target)}</p><p class="muted">${esc(x.at)}</p></div>`).join('') || '<div class="card">No activity yet.</div>';
   } catch (e) { banner(e.message); }
@@ -143,8 +147,26 @@ $('github-login').addEventListener('click', async () => {
   } catch (ex) { err.textContent = ex.message; err.hidden = false; }
 });
 
+$('demo-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('demo-error'); err.hidden = true;
+  const password = $('demo-password').value;
+  $('demo-password').value = '';
+  try {
+    await api('/api/auth/sign-in/username', { method: 'POST', body: JSON.stringify({ username: $('demo-username').value.trim(), password }) });
+    const data = await api('/api/auth/get-session');
+    if (!data || !data.user) throw new Error('Demo sign-in did not establish a session.');
+    me = data.user; showApp();
+  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+});
+
 $('logout').addEventListener('click', async () => {
-  try { await api('/api/auth/sign-out', { method: 'POST' }); } catch { /* session already gone */ }
+  // A failed sign-out must never present as completed: only transition on
+  // success, and say so on failure (review finding, fixed).
+  try {
+    // Empty JSON body: the auth endpoint requires a JSON content type.
+    await api('/api/auth/sign-out', { method: 'POST', body: '{}' });
+  } catch (ex) { banner('Sign-out failed: ' + ex.message); return; }
   me = null;
   $('view-app').hidden = true; $('view-login').hidden = false; $('sessionbar').hidden = true;
 });
@@ -195,7 +217,12 @@ $('settings-form').addEventListener('submit', async (e) => {
 
 function showApp() {
   $('view-login').hidden = true; $('view-app').hidden = false; $('sessionbar').hidden = false;
-  $('whoami').textContent = me.name + ' (' + me.email + ')';
+  $('whoami').textContent = me.name + ' (' + (me.username || me.email) + ')';
+  const demo = !!(me && me.demo);
+  $('demo-banner').hidden = !demo;
+  $('grant-form').hidden = demo;
+  $('demo-grants-note').hidden = !demo;
+  $('demo-keys-note').hidden = !demo;
   loadOverview();
 }
 

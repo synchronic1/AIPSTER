@@ -19,12 +19,21 @@
 <main id="main">
   <section id="view-login" class="card" aria-labelledby="login-h">
     <h1 id="login-h">Sign in</h1>
-    <p class="muted">GitHub sign-in for invited testers. No passwords are accepted here.</p>
+    <p class="muted">GitHub sign-in for invited testers.</p>
     <p id="login-error" class="error" role="alert" hidden></p>
     <button id="github-login" type="button">Sign in with GitHub</button>
+    <h2>Demo sign-in</h2>
+    <p class="muted">Explore the panel with the seeded demo account: isolated demo workspace, simulated data, restricted actions.</p>
+    <form id="demo-form">
+      <label>Username <input id="demo-username" autocomplete="username" required maxlength="30"></label>
+      <label>Password <input id="demo-password" type="password" autocomplete="current-password" required></label>
+      <p id="demo-error" class="error" role="alert" hidden></p>
+      <button type="submit">Sign in as demo</button>
+    </form>
   </section>
 
   <div id="view-app" hidden>
+    <div id="demo-banner" class="card demo" role="status" hidden>Demo workspace: simulated data, clearly labeled. Grants, invitations, and live actions are disabled for this account.</div>
     <nav class="tabs" role="tablist" aria-label="Dashboard sections">
       <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
       <button role="tab" data-tab="compute" aria-selected="false">My Compute</button>
@@ -55,6 +64,7 @@
     <section id="tab-sharing" role="tabpanel" hidden>
       <h1>Sharing</h1>
       <p class="muted">Inference-only grants with bounded quotas. <strong>Policy:</strong> grants never convey admin rights. <strong>Enforcement:</strong> server checks ownership, grant validity, and quotas before every dispatch.</p>
+      <p id="demo-grants-note" class="muted" hidden>The demo account cannot create grants.</p>
       <form id="grant-form" class="card">
         <h2>New grant</h2>
         <label>Resource <select id="grant-resource"></select></label>
@@ -69,6 +79,7 @@
     <section id="tab-keys" role="tabpanel" hidden>
       <h1>API Keys</h1>
       <p class="muted">Secrets are shown <strong>once</strong> at creation. Only non-reversible verifiers are stored. Keys work for inventory/usage reads and (with inference scope) future jobs &mdash; never for sharing, key, or settings management. These are AIPSTER keys, not provider keys.</p>
+      <p id="demo-keys-note" class="muted" hidden>Sandbox credentials only: demo keys start with aip_demo_ and can never touch real resources.</p>
       <form id="key-form" class="card">
         <h2>New key</h2>
         <label>Name <input id="key-name" required maxlength="80"></label>
@@ -90,7 +101,7 @@
       <h1>Settings</h1>
       <form id="settings-form" class="card">
         <label>Display name <input id="settings-name" required maxlength="80"></label>
-        <p class="muted">Signed in as <span id="settings-email"></span> (via GitHub).</p>
+        <p class="muted">Signed in as <span id="settings-email"></span> (<span id="settings-via">…</span>).</p>
         <p id="settings-error" class="error" role="alert" hidden></p>
         <button type="submit">Save</button>
       </form>

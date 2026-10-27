@@ -10,24 +10,34 @@ wiring awaits the account actions in “Exact next actions”.
 
 - Repo `synchronic1/AIPSTER`, default branch `main` at `1b91dc1` (“Keep production
   Worker preview URLs disabled (#2)”, 2026-10-27). PR #1 merged as `ee1a1a0`.
-  Branches: `main`, `codex/production-disable-preview-urls`,
-  `codex/public-site-source-checks`. No open PRs (before this work).
-- Live site serves public release `2026-10-26.7`, `auth_deployed: false`; the
-  Sign in link points at `#progress` and the page states login is not enabled.
-- Static deploy recovered: `CLOUDFLARE_API_TOKEN` secret exists (set 2026-10-27)
-  and a `production` environment exists. `main` has NO branch protection; no
+  Draft PR #3 (`muse/control-panel-cloudflare-auth`, from `origin/main`
+  `1b91dc1`) carries this work; Codex `codex/pr3-independent-review-20261027`
+  exists only in the isolated local review worktree (tooling commit `fc677ba`
+  cherry-picked into PR #3 as `e6a4557`).
+- Live site serves public release `2026-10-26.8`, `auth_deployed: false`; the
+  landing Sign in links to `/app/` (404 until this branch deploys) and the
+  progress section states login is not yet enabled. Independent fresh checks
+  (Codex, 2026-10-27): apex + workers.dev serve `deployment.json` at `1b91dc1`,
+  landing 200, `/app` 404, `/api/health` 404 — login/panel/inference not live.
+- Rollout ownership: Muse implements on the PR branch; Goose is the sole
+  merge/provision/deploy owner (acknowledgment still pending per Codex handoff
+  manifest `a4d5dc1`, `docs/pr3-rollout-review.json` in the review worktree —
+  secret NAMES only, no values). Observed rollback target: Worker version
+  `650bb690-8eb2-43e0-8ddb-09509848b887` (re-verify availability before use).
+- Static deploy recovered: `CLOUDFLARE_API_TOKEN` secret exists and a
+  `production` environment exists. `main` has NO branch protection; no
   required checks/reviewers are enforced. Copilot review gate is blocked
   (quota insufficient) — do not claim it ran.
 - Control panel checkout: `Aipster/aipster-local/` (unversioned local directory,
   NOT in git). Node 24, zero dependencies, JSON-file DB, scrypt passwords,
   in-memory sessions, deterministic fake adapter + EIF 501 stub. Screens:
   Overview, My Compute, Shared With Me, Sharing, API Keys, Usage, Settings.
-- No Better Auth / Workers / D1 auth slice exists anywhere found (workspace-wide
-  search plus likely checkouts; zero matches). No OAuth app, no D1 database, no
-  owner policy exists or is approved. The private `resource-dashboard` remains an
-  operator inventory and is not used as the customer backend.
-- Integration branch: `muse/control-panel-cloudflare-auth` (from `origin/main`
-  `1b91dc1`). Working tree carries only this task's files.
+- Provisioning evidence (Codex, read-only): Cloudflare dashboard lists 4 D1
+  databases, none named `aipster-app`; existing token gets 401 on D1 listing
+  (Workers reads succeed). Personal GitHub OAuth Apps lists only HeurChain —
+  no AIPSTER app. No OAuth app, no D1 database, no approved identity names
+  exist yet. The private `resource-dashboard` remains an operator inventory
+  and is not used as the customer backend.
 
 ## 2. Target architecture
 
@@ -35,7 +45,9 @@ One apex Worker (`aipster-public-site`) keeps serving the static landing page
 byte-for-byte (including progress/changelog/journal sections). Worker code runs
 first and routes:
 
-- `/api/auth/*` → Better Auth handler (GitHub OAuth, D1 sessions).
+- `/api/auth/*` → Better Auth handler (GitHub OAuth for invited testers +
+  seeded demo username/password via the maintained `username` plugin, D1
+  sessions, database-backed throttling).
 - `/api/*` (other) → control-panel JSON API, always JSON (errors never fall
   through to the static 404 page).
 - `/app`, `/app/*` → control-panel UI from static assets (login view when
@@ -64,24 +76,58 @@ bundles, or this document.
 
 ## 4. Migrations (reviewed, versioned, additive)
 
-`website/migrations/0001_better_auth.sql`: Better Auth core tables
-(`user`, `session`, `account`, `verification` + indexes), DDL verified by
-running real Better Auth 1.7.14 session flows against it in tests.
-`website/migrations/0002_app.sql`: `resources`, `grants`, `key_verifiers`,
-`jobs`, `usage`, `audit`, `allowlist` (adapted from the local `schema.sql`;
-password columns dropped — Better Auth owns identity; `owner_id` references
-`user.id`).
+- `0001_better_auth.sql`: Better Auth core tables (`user`, `session`,
+  `account`, `verification` + indexes), DDL verified by running real Better
+  Auth 1.7.14 session flows against it in tests.
+- `0002_app.sql`: `resources`, `grants`, `key_verifiers`, `jobs`, `usage`,
+  `audit`, `allowlist` (adapted from the local `schema.sql`; no password
+  columns in app tables — Better Auth owns identity; `owner_id` references
+  `user.id`).
+- `0003_demo_auth.sql`: `username`/`displayUsername` plugin columns, `demo`
+  workspace flag, `rateLimit` table for database-backed throttling.
+- `0004_disable_flag.sql`: `disabled` account flag for membership revocation.
 
-Apply: `wrangler d1 migrations apply aipster-app --remote` (production),
-`--local` for development. Existing databases: none exist; nothing to preserve.
+Apply in order: `wrangler d1 migrations apply aipster-app --remote`
+(production), `--local` for development. 0001/0002 are re-runnable
+(`IF NOT EXISTS`); 0003/0004 apply once via the D1 migration journal
+(SQLite has no `ADD COLUMN IF NOT EXISTS`). Existing databases: per §1,
+none named `aipster-app` exists; do not reuse or mutate unrelated ones.
 
 ## 5. Policy decisions (confirm where marked)
 
-- **Invited test users (ASSUMED — needs confirmation):** signup beyond
-  `allowlist.verified_email` is rejected in `databaseHooks.user.create.before`.
-  Public signup policy is NOT established; do not treat the allowlist as a
-  general production owner policy. Seed invited emails per environment with
-  `wrangler d1 execute` (documented command, never committed data).
+- **Invited test users (ASSUMED — needs confirmation):** signup beyond the
+  `allowlist` is rejected in `databaseHooks.user.create.before`, which now
+  also requires a provider-verified email (`emailVerified === true` from the
+  GitHub verified-emails adapter). Public signup policy is NOT established;
+  do not treat the allowlist as a general production owner policy. Seed
+  invited emails per environment with `wrangler d1 execute` (documented
+  command, never committed data). Two approved identity names are still
+  pending from Peter — do not invent or seed them.
+- **Demo username/password (APPROVED scope change):** one seeded `demo`
+  identity signs in via the maintained Better Auth `username` plugin +
+  credential account (scrypt via the library, never plaintext, never a
+  parallel session system). `user.demo = 1` marks the isolated demo
+  workspace: synthetic fixtures only, grants/invitations refused server-side
+  (`403 DEMO_RESTRICTED`), minted API keys forced to the `aip_demo_` prefix
+  with sandbox metadata, dispatch disabled like everyone else. Public
+  registration stays closed (`disableSignUp`, verified by test). Provision
+  with `D1_PASSWORD='<generated-20+>' node scripts/setup-demo.mjs --db
+  aipster-app [--remote]` (idempotent; hashes before touching SQL; password
+  travels a private channel only, never source/logs). Rotate by re-running
+  with a new password; disable by deleting the credential account row and
+  setting `demo = 0` (see script header). Throttled: 10 username/email
+  sign-in attempts per rolling 60 s (plus Better Auth's 3/10 s sign-in
+  default), generic failures, no account-existence oracle (tested).
+- **Membership revocation (explicit disable path):** removing an email from
+  the allowlist blocks future signups only. To revoke a live user the
+  rollout owner runs: `UPDATE "user" SET disabled = 1 WHERE …;`
+  `UPDATE key_verifiers SET revoked_at = … WHERE owner_id = …;`
+  `DELETE FROM allowlist WHERE email = …;`. `disabled = 1` blocks new
+  sessions (session-create hook, `403 ACCOUNT_DISABLED`) and deadens
+  existing sessions + API keys for all API calls (tested).
+- **Provider tokens:** OAuth access/refresh/ID tokens are stripped by
+  account create/update hooks before persistence — identity + sessions
+  only (tested).
 - **Inference dispatch DISABLED:** `POST /api/jobs` returns `501
   INFERENCE_DISABLED`. No paid inference, training, model swaps, billing, or
   Stripe in this task. No fake adapter runs in production; no fixtures are
@@ -101,51 +147,74 @@ Apply: `wrangler d1 migrations apply aipster-app --remote` (production),
   their own CSRF/state/PKCE handling).
 - **Tenant isolation:** every resource/grant/key/job/usage/audit row carries
   `owner_id = user.id`; all reads/writes filter by the session user or an
-  active grant. API keys (`aip_live_…`) are read/inference-scoped, salted
-  SHA-256 verifiers, one-time reveal, revocable; never upstream keys.
-- **Static checker evolution:** allowlist grows 14 → 18 (`app/*` UI files);
-  same-origin `/app/app.js` is permitted ONLY in `app/*.html`; the landing
-  page and 404 stay script-free (covered by a negative test). Landing Sign in
-  now targets `/app/` (explicitly permitted in the checker).
+  active grant. API keys (`aip_live_…`, `aip_demo_…` for the demo tenant) are
+  read/inference-scoped, salted SHA-256 verifiers, one-time reveal,
+  revocable; never upstream keys.
+- **Static checker evolution (Codex-owned tooling, cherry-picked):** parsed
+  HTML/URL checks with exact approved destinations, shipped-JS privacy scan,
+  form-handler scan; landing + 404 stay script-free. Landing Sign in targets
+  `/app/`.
+- **Request limits:** app JSON bodies stream with a 64 KiB wire-byte cap
+  (tested with multibyte payloads); declared over-cap `/api/auth/*` bodies
+  are rejected before the auth library. `/api/health` is schema-aware:
+  `ready` requires the full table set, booleans only, no secret metrics.
 
 ## 6. CI/CD and gate status
 
-Existing `Public site checks` workflow still runs check/test/build/bundle; `npm
-test` now also runs the integration suite. Prior gaps: deployment credentials —
-FIXED (R6/R7 exist); review gates — UNFIXED (no branch protection, Copilot
-blocked); post-deploy verification — UNFIXED (`verify:live` exists but is not
-wired into any gate). Do not enable automatic production deployment until at
-minimum: branch protection with required checks is on, and a post-deploy
-`/health` + `/release.json` verification step runs after deploy.
+`Public site checks` runs check/test/build/bundle. The production deploy
+workflow is now explicit-`workflow_dispatch` on a reviewed merged SHA with a
+release preflight + wired anonymous live verifier (Codex tooling, `e6a4557`).
+Prior gaps: deployment credentials — EXISTS (R6/R7, reuse); review gates —
+STILL UNPROTECTED (`main` and `production` have no protection rules; Copilot
+blocked by quota — do not claim it ran); post-deploy verification — WIRED
+(anonymous verifier runs after deploy; live-auth validation stays a separate
+manual checklist, §8 step 7). Do not merge/deploy until branch protection +
+required checks + `production` reviewers are on and the final head is
+re-reviewed.
 
-## 7. Test plan (all committed under `website/tests/`)
+## 7. Test plan (all committed under `website/`)
 
-Migrations apply cleanly; login callback shape (redirect + state, no network);
-session get/logout round-trip; unauthenticated 401s; cross-user 404s on
-resources/grants/keys/usage; grant create/revoke + quota boundaries; key
-mint/one-time reveal/verify/scope/expiry/revoke; allowlist accept/reject;
-missing secrets fail closed (500 `CONFIG`, no leak); API errors stay JSON
-(asset fallback never swallows them); static gates green; `wrangler dev`
-local-D1 smoke incl. `/app` UI and desktop/mobile viewports. Live GitHub
-handshake with two identities stays PENDING (needs R3–R5); mocked flows are
-not presented as OAuth evidence.
+`npm test` (108 green on the final head): migrations incl. 0003/0004; real
+session round-trips; unauthenticated 401s; cross-user 404s; grants/quotas;
+key lifecycle incl. `aip_demo_` sandbox prefix; allowlist + verified-email
+gate (unit + stubbed-GitHub OAuth callback matrix, Codex-adopted probes);
+byte-cap streaming incl. multibyte; token stripping; disable path (sessions
++ keys + new sign-ins); schema-aware health; demo sign-in/logout/isolation/
+restrictions/throttling; EIF truthfulness guards (`501 INFERENCE_DISABLED`,
+no outbound inference calls); 44 checker + verifier/preflight suites.
+`wrangler dev --local` smoke incl. `/app` UI desktop/mobile. Live GitHub
+handshake with two approved identities stays PENDING (needs R3–R5 + names);
+stubbed flows are not presented as OAuth evidence.
 
-## 8. Exact next actions (smallest concrete order)
+## 8. Exact next actions (Goose-owned rollout; cf. Codex manifest `a4d5dc1`)
 
-1. `wrangler d1 create aipster-app` → put `database_id` in `wrangler.jsonc`;
-   `wrangler d1 migrations apply aipster-app --remote`.
-2. Create GitHub OAuth app (callback + scopes from R3); `openssl rand -base64 32`
-   for the app secret; set `BETTER_AUTH_SECRET`, `GITHUB_CLIENT_ID`,
-   `GITHUB_CLIENT_SECRET` via `wrangler secret put` (production) and local
-   `.dev.vars` (gitignored).
-3. Seed invited emails: `wrangler d1 execute aipster-app --remote --command
-   "INSERT INTO allowlist (email, added_at) VALUES ('…', …)"`.
-4. Turn on branch protection (required checks + 1 review) and `production`
-   environment reviewers; merge this branch; re-run the deploy workflow.
-5. Live verify: Sign in → GitHub authorization → `/app` panel → permitted API
-   call → logout → denied; repeat with a second identity; record release id.
-6. Rollback at any point: `wrangler rollback` (Worker + assets), D1 additive
-   migrations need no down action for a code rollback; rotate secrets if
+1. Goose acknowledges sole rollout ownership on PR #3.
+2. Re-review the exact final head (demo boundaries, migrations 0001–0004,
+   tooling `e6a4557`); require CI green; turn on branch protection
+   (required checks + review) and `production` environment reviewers.
+3. `wrangler d1 create aipster-app` → replace the zero `database_id` in
+   `wrangler.jsonc` (reviewed config commit); `wrangler d1 migrations apply
+   aipster-app --remote`. Needs Cloudflare account D1 Edit (existing token
+   401s on D1 listing).
+4. Create GitHub OAuth app `AIPSTER` (callback + scopes from R3);
+   `openssl rand -base64 32` for the app secret; set `BETTER_AUTH_SECRET`,
+   `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` via `wrangler secret put`
+   (production) and local `.dev.vars` (gitignored). `BETTER_AUTH_URL` is
+   already `https://aipster.net` in committed `vars` (non-secret).
+5. Seed ONLY approved identities: invited emails via `wrangler d1 execute`;
+   demo account via `scripts/setup-demo.mjs --remote` with a privately
+   delivered generated password (never committed/logged).
+6. Merge the reviewed head; dispatch the production workflow with
+   `reviewed_sha` = full merged SHA; run the wired anonymous verifier and
+   correlate `deployment.json`, CI run, merged commit, Cloudflare version.
+7. Live verify with the two approved identities: GitHub sign-in → `/app`
+   panel → permitted API call → logout → denied; demo username sign-in →
+   isolated workspace → restrictions hold; cross-tenant checks; record
+   release id.
+8. Rollback at any point: `npx wrangler rollback 650bb690-8eb2-43e0-8ddb-
+   09509848b887 --name aipster-public-site` (re-verify target first).
+   Preserve D1 data/migrations/identities/secrets — never drop tables or
+   restore over newer user data for a code rollback. Rotate secrets if
    exposure is suspected.
 
 ## 9. Open confirmations
@@ -153,3 +222,44 @@ not presented as OAuth evidence.
 - Invited-email policy vs another signup rule.
 - D1 database name `aipster-app` acceptable.
 - Custom domain stays apex-only (no `app.` subdomain, no DNS change).
+- Two approved identity names (pending from Peter).
+- Hermes incident summary: sanitized log references unavailable — treated as
+  reported evidence only; no incident reproduction claimed.
+
+## 10. Bounded EIF end-to-end check (PLANNED — blocked, no live endpoint)
+
+Preconditions (all outstanding): Codex supplies a verified, authorized live
+endpoint + agent token custody design; Peter authorizes the check. Until
+then `/api/jobs` stays `501 INFERENCE_DISABLED` (guarded by tests).
+
+Contract source (read-only): EIF restoration worktree at `67a3ce0` (docs) /
+`7395b50` (code), `docs/restoration/HANDOFF.md`. Stable interface: agent
+`Bearer` token; `GET /v1/resources` eligible capacity; `GET /v1/models`
+roster; `POST /v1/tasks` → 202 (`capability`, exactly one of
+`prompt`/`messages`, `max_tokens` 1..4096, `allow_simulated=false` for real
+inference, optional `idempotency_key` 8..128 ASCII); `GET /v1/tasks/{id}`
+poll (`running` → `succeeded`/`failed`/`expired`; inspect `status`, not just
+HTTP 200); result envelope ≤1 MiB with correlated IDs, `simulated` flag,
+`usage`; gateway deadline 180 s; no queue (409 when no idle runtime).
+
+Planned check (single bounded run): authenticated submit with a fresh
+idempotency key → ownership isolation (second identity cannot read the task)
+→ poll to a terminal state → error/truncation handling → record provenance
+(request/node/runtime/model IDs, `simulated:false`, elapsed, usage) →
+re-submit same key returns the same task (no duplicate work). Abort on any
+non-`false` `simulated` flag or missing correlation. No fallback, download,
+restart, or shared-token-across-users design.
+
+## 11. Independent-review disposition (PR #3)
+
+| # | Finding | Disposition |
+|---|---------|-------------|
+| 1 | Invitation gate admits `emailVerified:false` | FIXED: `checkInvitation` requires allowlist + verified email; unit + stubbed-callback matrix green |
+| 2 | Provider tokens persisted in plaintext | FIXED: account create/update hooks strip OAuth tokens; credential passwords untouched; hook-level tests |
+| 3 | Verifier unwired + expects `/app` 404 | FIXED by Codex tooling `e6a4557` (wired anonymous verifier + preflight + explicit-dispatch workflow) |
+| 4 | Static-checker bypasses | FIXED by Codex tooling `e6a4557` (44 parse5 checker tests); this branch's checker edits reverted in favor of it |
+| 5 | Char-count instead of byte cap | FIXED: streaming byte reads + cancel; multibyte + oversized probes green; auth precheck added |
+| 6 | No disable/membership-revocation path | FIXED: migration 0004 `disabled` flag; new sessions refused, existing sessions + keys deadened; tests |
+| 7 | `/api/health` ignores schema; `secretLen` leak | FIXED: schema-aware `ready`, booleans only |
+| 8 | Failed sign-out presented as completed | FIXED: client transitions only on success, banners failures |
+| — | Demo username/password scope change | IMPLEMENTED per §5 (username plugin, sandbox, throttling, closed signup); fresh review required |

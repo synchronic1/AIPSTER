@@ -4,6 +4,7 @@
 // appear in list/detail/logs. Production prefix aip_live_ differs from the
 // local demo prefix so demo keys are never valid here.
 export const KEY_PREFIX = 'aip_live_';
+export const DEMO_KEY_PREFIX = 'aip_demo_';
 
 function bytesToHex(bytes) {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -20,13 +21,13 @@ export async function sha256Hex(text) {
   return bytesToHex(new Uint8Array(digest));
 }
 
-export function mintKey() {
+export function mintKey(prefix = KEY_PREFIX) {
   const idBytes = crypto.getRandomValues(new Uint8Array(8));
   const secretBytes = crypto.getRandomValues(new Uint8Array(32));
   const id = 'k_' + bytesToHex(idBytes);
   const secret = bytesToBase64Url(secretBytes);
   const short = secret.slice(0, 6);
-  return { id, secret: `${KEY_PREFIX}${id}_${secret}`, short };
+  return { id, secret: `${prefix}${id}_${secret}`, short };
 }
 
 export function verifierFor(secret, salt) {
@@ -40,11 +41,13 @@ export function publicKey(row) {
 }
 
 export function splitPresented(presented) {
-  if (typeof presented !== 'string' || !presented.startsWith(KEY_PREFIX)) return null;
-  const rest = presented.slice(KEY_PREFIX.length);
-  const m = /^(k_[0-9a-f]{16})_(.+)$/.exec(rest);
+  if (typeof presented !== 'string') return null;
+  const prefix = presented.startsWith(KEY_PREFIX) ? KEY_PREFIX
+    : presented.startsWith(DEMO_KEY_PREFIX) ? DEMO_KEY_PREFIX : null;
+  if (!prefix) return null;
+  const m = /^(k_[0-9a-f]{16})_(.+)$/.exec(presented.slice(prefix.length));
   if (!m) return null;
-  return { id: m[1], secret: presented };
+  return { id: m[1], secret: presented, demo: prefix === DEMO_KEY_PREFIX };
 }
 
 // Constant-time string compare (no timingSafeEqual in Workers).

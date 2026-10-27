@@ -5,10 +5,10 @@
 // everything else -> ASSETS (landing page preserved byte-for-byte).
 import { createAuth, isInvited, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
-import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX } from './lib/keys.js';
+import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
 const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
@@ -42,8 +42,13 @@ function sameOrigin(request) {
 
 async function actorFrom(request, env, auth) {
   // Session cookie wins when valid; otherwise a Bearer [REDACTED] API key. Never mixed.
+  // Disabled accounts authorize nothing: existing sessions and keys go dead for
+  // API calls immediately (new sessions are blocked by the session-create hook).
   const found = await sessionUser(auth, request);
-  if (found) return { kind: 'session', user: found.user };
+  if (found) {
+    if (Number(found.user && found.user.disabled) === 1) return { kind: 'none' };
+    return { kind: 'session', user: found.user };
+  }
   const header = request.headers.get('Authorization') || '';
   const m = /^Bearer\s+(\S+)$/.exec(header);
   if (m) {
@@ -54,8 +59,8 @@ async function actorFrom(request, env, auth) {
         const expect = await verifierFor(parts.secret, row.salt);
         if (timingSafeEqualStr(expect, row.verifier)) {
           if (row.expires_at && Date.parse(row.expires_at) < Date.now()) return { kind: 'expired' };
-          const user = await first(env.DB, 'SELECT id, name, email FROM "user" WHERE id = ?', row.owner_id);
-          if (user) {
+          const user = await first(env.DB, 'SELECT id, name, email, username, demo, disabled FROM "user" WHERE id = ?', row.owner_id);
+          if (user && Number(user.disabled) !== 1) {
             await run(env.DB, 'UPDATE key_verifiers SET last_used_at = ? WHERE id = ?', nowIso(), row.id);
             return { kind: 'key', user, key: row };
           }
@@ -85,8 +90,26 @@ async function handleApi(request, env, url) {
   const path = url.pathname;
   const method = request.method;
   if (path === '/api/health' && method === 'GET') {
-    const detail = { db: !!env.DB, secret: (env.BETTER_AUTH_SECRET || '').length >= 32, secretLen: (env.BETTER_AUTH_SECRET || '').length, url: !!env.BETTER_AUTH_URL, oauth: oauthConfigured(env) };
-    return json(200, { ok: true, app: 'aipster-app', version: VERSION, auth_configured: detail.db && detail.secret && detail.url, detail });
+    // Readiness probes the schema: a bound but unmigrated DB is not ready.
+    // Booleans only; no lengths, names, or error strings leave this endpoint.
+    const hasDb = !!env.DB;
+    const secretOk = (env.BETTER_AUTH_SECRET || '').length >= 32;
+    const urlOk = !!env.BETTER_AUTH_URL;
+    let schemaOk = false;
+    if (hasDb) {
+      try {
+        const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
+        const names = new Set(rows.map((r) => r.name));
+        schemaOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit']
+          .every((n) => names.has(n));
+      } catch { schemaOk = false; }
+    }
+    const authConfigured = hasDb && secretOk && urlOk;
+    return json(200, {
+      ok: true, app: 'aipster-app', version: VERSION,
+      auth_configured: authConfigured, ready: authConfigured && schemaOk,
+      detail: { db: hasDb, secret: secretOk, url: urlOk, schema: schemaOk, oauth: oauthConfigured(env) }
+    });
   }
   let auth;
   try {
@@ -97,7 +120,18 @@ async function handleApi(request, env, url) {
   if (path === '/api/auth/sign-in/social' || path === '/api/auth/callback/github') {
     if (!oauthConfigured(env)) return json(503, { error: 'GitHub sign-in is not configured.', code: 'OAUTH_UNCONFIGURED' });
   }
-  if (path.startsWith('/api/auth/')) return auth.handler(request);
+  if (path.startsWith('/api/auth/')) {
+    // Defense in depth: better-auth parses these JSON bodies itself, so the
+    // byte cap from readJson cannot apply. Reject declared over-cap uploads
+    // before they reach the auth library.
+    if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS') {
+      const declared = Number(request.headers.get('content-length'));
+      if (Number.isFinite(declared) && declared > 64 * 1024) {
+        return json(413, { error: 'Body too large.', code: 'BODY_TOO_LARGE' });
+      }
+    }
+    return auth.handler(request);
+  }
 
   const actor = await actorFrom(request, env, auth);
   const needSession = () => {
@@ -123,6 +157,12 @@ async function handleApi(request, env, url) {
   const deny = (r) => r;
   const db = env.DB;
   const me = () => actor.user.id;
+  // Demo workspace: user.demo = 1 marks the seeded demo tenant. Same sessions,
+  // CSRF, and authorization as every user, plus sandbox restrictions below.
+  const isDemo = () => !!actor.user && Number(actor.user.demo) === 1;
+  const needNotDemo = () => isDemo()
+    ? json(403, { error: 'The demo account cannot perform this action.', code: 'DEMO_RESTRICTED' })
+    : null;
 
   // ---- inventory ----
   if (path === '/api/inventory' && method === 'GET') {
@@ -185,7 +225,7 @@ async function handleApi(request, env, url) {
     return json(200, { ...page, items: page.items.map(mapGrantLite) });
   }
   if (path === '/api/grants' && method === 'POST') {
-    const d = needSession() || needCsrf(); if (d) return deny(d);
+    const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
     const body = await readJson(request);
     const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resourceId);
     if (!resource || resource.owner_id !== me()) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
@@ -235,12 +275,13 @@ async function handleApi(request, env, url) {
       if (!Number.isFinite(t) || t <= Date.now()) return json(400, { error: 'expiresAt must be a future timestamp.', code: 'BAD_EXPIRY' });
       expiresAt = new Date(t).toISOString();
     }
-    const metadata = body.metadata !== undefined ? String(body.metadata).slice(0, 500) : '';
-    const { id, secret, short } = mintKey();
+    const metadata = isDemo() ? 'sandbox: demo-only credential' : (body.metadata !== undefined ? String(body.metadata).slice(0, 500) : '');
+    const keyPrefix = isDemo() ? DEMO_KEY_PREFIX : KEY_PREFIX;
+    const { id, secret, short } = mintKey(keyPrefix);
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
     await run(db, 'INSERT INTO key_verifiers (id, owner_id, name, scope, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)',
-      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), KEY_PREFIX + id + '_' + short, expiresAt, metadata, nowIso());
+      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso());
     await audit(db, me(), 'key.create', id, body.scope);
     const row = await first(db, 'SELECT * FROM key_verifiers WHERE id = ?', id);
     return json(201, { ...publicKey(mapKeyRow(row)), secret, oneTime: 'This secret is shown once. It cannot be recovered.' });
@@ -298,7 +339,7 @@ async function handleApi(request, env, url) {
   // ---- settings (session only) ----
   if (path === '/api/settings' && method === 'GET') {
     const d = needSession(); if (d) return deny(d);
-    return json(200, { displayName: actor.user.name || '', email: actor.user.email || '' });
+    return json(200, { displayName: actor.user.name || '', email: actor.user.email || '', username: actor.user.username || null, demo: isDemo() });
   }
   if (path === '/api/settings' && method === 'PATCH') {
     const d = needSession() || needCsrf(); if (d) return deny(d);
@@ -345,6 +386,7 @@ async function serveApp(request, env, pathname) {
   if (!res.ok) return new Response('Not found', { status: 404, headers: { ...baseHeaders(), 'Content-Type': 'text/plain' } });
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(baseHeaders())) headers.set(k, v);
+  headers.set('Cache-Control', 'no-store, no-transform');
   headers.set('Content-Security-Policy', APP_CSP);
   return new Response(res.body, { status: res.status, headers });
 }

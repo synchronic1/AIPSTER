@@ -18,8 +18,15 @@ test('migrations create the auth and app tables', () => {
   assert.ok(cols('allowlist').includes('email'), 'allowlist.email');
 });
 
-test('migrations are idempotent', () => {
+test('migrations are idempotent where SQLite allows', () => {
   const sqlite = new DatabaseSync(':memory:');
   applyMigrations(sqlite);
-  applyMigrations(sqlite); // must not throw
+  // 0001/0002 are re-runnable (IF NOT EXISTS). 0003's ALTER TABLE is
+  // once-only by SQLite design; D1's migration journal enforces that, so the
+  // test re-applies only the idempotent files and verifies 0003's effects.
+  applyMigrations(sqlite, ['0001_better_auth.sql', '0002_app.sql']); // must not throw
+  const cols = sqlite.prepare('SELECT * FROM pragma_table_info(?)').all('user').map((c) => c.name);
+  for (const c of ['username', 'displayUsername', 'demo']) assert.ok(cols.includes(c), `user.${c}`);
+  const tables = sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
+  assert.ok(tables.includes('rateLimit'), 'rateLimit table');
 });

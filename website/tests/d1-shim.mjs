@@ -39,8 +39,10 @@ export function createD1Shim(sqlite) {
   };
 }
 
-export function applyMigrations(sqlite) {
-  for (const name of ['0001_better_auth.sql', '0002_app.sql']) {
+export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql'];
+
+export function applyMigrations(sqlite, names = MIGRATION_FILES) {
+  for (const name of names) {
     sqlite.exec(readFileSync(path.join(ROOT, 'migrations', name), 'utf8'));
   }
 }
@@ -56,7 +58,8 @@ export function sessionCookieHeader(token, secret) {
 
 export async function createTestEnv(overrides = {}) {
   const sqlite = new DatabaseSync(':memory:');
-  applyMigrations(sqlite);
+  const skipMigrations = !!overrides.skipMigrations;
+  if (!skipMigrations) applyMigrations(sqlite);
   const DB = createD1Shim(sqlite);
   const now = new Date().toISOString();
   const future = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
@@ -69,8 +72,8 @@ export async function createTestEnv(overrides = {}) {
       .bind('s_' + token.slice(0, 8), future, token, now, now, null, 'test', id).run();
     return { id, name, email, token };
   };
-  const alice = await seed('alice@example.com', 'Alice', 'u_alice');
-  const bob = await seed('bob@example.com', 'Bob', 'u_bob');
+  const alice = skipMigrations ? null : await seed('alice@example.com', 'Alice', 'u_alice');
+  const bob = skipMigrations ? null : await seed('bob@example.com', 'Bob', 'u_bob');
   const assetsHits = [];
   const ASSETS = {
     async fetch(input) {

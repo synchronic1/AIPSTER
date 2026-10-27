@@ -9,8 +9,41 @@ export function httpError(status, message, code) {
 }
 
 export async function readJson(request, maxBytes = MAX_BODY_BYTES) {
-  const text = await request.text();
-  if (text.length > maxBytes) throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
+  // Enforce the limit in wire bytes, not UTF-16 code units: read the body as
+  // a byte stream and stop as soon as the cap is exceeded. A pre-read
+  // request.text() would let a multi-byte-heavy UTF-8 payload (e.g. CJK,
+  // ~3 bytes per char) several times over the cap pass a char-count check.
+  const declared = request && request.headers ? Number(request.headers.get('content-length')) : NaN;
+  if (Number.isFinite(declared) && declared > maxBytes) throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
+  let text;
+  const body = request ? request.body : null;
+  if (body && typeof body.getReader === 'function') {
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const step = await reader.read();
+        if (step.done) break;
+        const n = step.value ? (step.value.byteLength || step.value.length || 0) : 0;
+        total += n;
+        if (total > maxBytes) {
+          try { await reader.cancel(); } catch { /* best effort */ }
+          throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
+        }
+        chunks.push(step.value);
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* best effort */ }
+    }
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += (c.byteLength || c.length || 0); }
+    text = new TextDecoder().decode(merged);
+  } else {
+    text = await request.text();
+    if (new TextEncoder().encode(text).byteLength > maxBytes) throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
+  }
   return parseJson(text);
 }
 
