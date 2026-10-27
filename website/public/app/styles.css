@@ -1,10 +1,12 @@
 /* Built with Meta Muse. */
-:root { --bg:#0e1116; --panel:#171c24; --line:#2a3140; --ink:#e8ecf4; --muted:#9aa4b5; --accent:#7fd4c1; --warn:#e0a458; --bad:#e06c75; --ok:#98c379; }
+:root { --bg:#0e1116; --panel:#171c24; --line:#2a3140; --ink:#e8ecf4; --muted:#9aa4b5; --copper:#F2B887; --forest:#24634d; --accent:var(--copper); --warn:#e0a458; --bad:#e06c75; --ok:#98c379; }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,Segoe UI,Roboto,sans-serif; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .topbar { display:flex; justify-content:space-between; align-items:center; padding:.75rem 1rem; border-bottom:1px solid var(--line); background:var(--panel); }
-.wordmark { font-weight:800; letter-spacing:.12em; }
-.wordmark::after { content:""; display:inline-block; width:.5em; height:.5em; margin-left:.3em; border-radius:50%; background:var(--accent); }
+.brand { display:flex; align-items:center; }
+a.wordmark { display:inline-block; line-height:0; }
+.wordmark-logo { display:block; height:30px; width:auto; }
 .tag { margin-left:.6rem; font-size:.75rem; color:var(--muted); border:1px solid var(--line); border-radius:1rem; padding:.1rem .6rem; }
 main { max-width:1000px; margin:0 auto; padding:1rem; }
 .card { background:var(--panel); border:1px solid var(--line); border-radius:.6rem; padding:1rem; margin-bottom:1rem; }
