@@ -280,7 +280,7 @@ async function handleApi(request, env, url) {
     const items = [];
     for (const g of page.items) {
       const r = await first(db, 'SELECT name FROM resources WHERE id = ?', g.resource_id);
-      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'server-enforced', policyNote: 'Inference-only; bounded quotas checked before every dispatch.' });
+      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'recorded', policyNote: 'Inference-only grant recorded by the owner; quotas are checked when dispatch is enabled. Dispatch is currently disabled.' });
     }
     return json(200, { ...page, items });
   }
@@ -398,8 +398,10 @@ async function handleApi(request, env, url) {
       requests: t.requests + r.requests,
       tokensIn: t.tokensIn + r.tokensIn,
       tokensOut: t.tokensOut + r.tokensOut,
-      modelCostUsd: r.costSource === 'demo-estimate' ? t.modelCostUsd : null,
-      executionCostUsd: r.costSource === 'demo-estimate' ? t.executionCostUsd : null
+      // Unknown is not zero: costs sum only when every row carries a real
+      // number; any unmeasured row makes the total unknown (null).
+      modelCostUsd: t.modelCostUsd === null || r.modelCostUsd === null || r.modelCostUsd === undefined ? null : t.modelCostUsd + r.modelCostUsd,
+      executionCostUsd: t.executionCostUsd === null || r.executionCostUsd === null || r.executionCostUsd === undefined ? null : t.executionCostUsd + r.executionCostUsd
     }), { requests: 0, tokensIn: 0, tokensOut: 0, modelCostUsd: 0, executionCostUsd: 0 });
     return json(200, { items: rows, total: page.total, limit: page.limit, offset: page.offset, totals, note: 'Model cost and execution cost are tracked separately. Unmeasured values stay null (unknown).' });
   }

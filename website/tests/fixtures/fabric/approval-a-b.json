@@ -1,0 +1,12 @@
+{
+  "comment": "F0 fixture: owner approval bound to the preview digest. previewDigest must equal preview-a-b.json expectedDigest; the F0 suite checks the binding.",
+  "approval": {
+    "id": "appr_1",
+    "previewDigest": "49e0a3a8521ad0629a84f93b0a9d3758fd8cf3316f095849466bfb0d9ac04aee",
+    "revisionVector": { "connection": 3, "policy": 7, "grant": 0 },
+    "approver": "u_alice",
+    "interactionRef": "human-confirmation-fixture-1",
+    "createdAt": "2026-10-27T18:05:00.000Z",
+    "expiresAt": "2026-10-27T18:15:00.000Z"
+  }
+}
