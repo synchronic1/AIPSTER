@@ -132,9 +132,12 @@ none named `aipster-app` exists; do not reuse or mutate unrelated ones.
   sessions (session-create hook, `403 ACCOUNT_DISABLED`), deadens existing
   sessions + API keys for app APIs, and fences the maintained auth
   endpoints (only sign-out/revoke allowed; `get-session`/mutations 401).
-  Demo users are additionally barred from self-service auth mutations
-  (`update-user`, `change-password`, etc., `403 DEMO_RESTRICTED`); demo
-  credentials stay owner-managed (tested through the actual handler).
+  Demo sessions may use only sign-in (username/email), sign-out, and
+  session reads; every other `/api/auth/*` route (linking, updates,
+  password reset, token/account management) returns `403 DEMO_RESTRICTED`
+  via a closed-by-default allowlist verified against the installed
+  route sources. Demo credentials stay owner-managed (tested through
+  the actual handler).
 - **Grant sandbox boundary:** grants never cross real↔demo in either
   direction. Creation to a demo grantee is refused (`403 DEMO_RESTRICTED`,
   alongside the existing demo-creator refusal); reads treat legacy/stale
@@ -197,7 +200,7 @@ re-reviewed.
 
 ## 7. Test plan (all committed under `website/`)
 
-`npm test` (133 green on the final head): migrations incl. 0003/0004; real
+`npm test` (135 green on the final head): migrations incl. 0003/0004; real
 session round-trips; unauthenticated 401s; cross-user 404s; grants/quotas
 incl. real↔demo boundary both directions; key lifecycle incl. `aip_demo_`
 sandbox prefix; allowlist + verified-email gate (unit + stubbed-GitHub
@@ -299,3 +302,5 @@ restart, or shared-token-across-users design.
 | F77-8 | Verifier accepts unready schema | FIXED (minimal ownership-exception edit + fixture update, flagged for re-review): verifier asserts `ready === true`; failure fixtures added |
 | F77-9 | Auth cap depends on declared length | FIXED: auth bodies streamed through the byte cap and forwarded; absent/chunked/flood/lying-length cases tested |
 | F77-10 | Alternate-host auth accepted | FIXED: https canonical-origin guard on `/api/*` + `/app*` (`WRONG_HOST`); public assets unchanged; local http unpinned (tested) |
+| 4B-1 | Demo can initiate OAuth linking (guard named wrong route) | FIXED: demo auth allowlist (sign-in/out/session only) verified against installed route sources; `link-social` + reset paths 403 with no provider URL leak (actual-handler test) |
+| 4B-2 | Tab clicks during logout strand owner state | FIXED: logout sign-out runs unfenced so cleanup never depends on navigation generations; genuine failures still banner and stay signed in (DOM-fixture race test; earlier clearing/late-response cases re-run green) |

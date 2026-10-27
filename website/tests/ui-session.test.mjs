@@ -13,7 +13,7 @@ import { createTestEnv } from './d1-shim.mjs';
 const APP_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public', 'app', 'app.js');
 const DEMO_PASSWORD = 'ui-fixture-password-01';
 
-async function makeUi({ holdKey = false, logoutFails = false, holdError = false } = {}) {
+async function makeUi({ holdKey = false, logoutFails = false, holdError = false, holdLogout = false } = {}) {
   const source = await readFile(APP_JS, 'utf8');
   const t = await createTestEnv();
   const now = new Date().toISOString();
@@ -47,10 +47,17 @@ async function makeUi({ holdKey = false, logoutFails = false, holdError = false 
   let keySeenResolve;
   const keySeen = new Promise((resolve) => { keySeenResolve = resolve; });
   const keyHold = new Promise((resolve, reject) => { releaseKey = resolve; releaseError = reject; });
+  let logoutSeenResolve, releaseLogout;
+  const logoutSeen = new Promise((resolve) => { logoutSeenResolve = resolve; });
+  const logoutHold = new Promise((resolve) => { releaseLogout = resolve; });
   const fetchImpl = async (fetchPath, opts = {}) => {
     if (fetchPath === '/api/auth/sign-out' && logoutFails) return Response.json({ error: 'Synthetic unavailable' }, { status: 503 });
     const res = await t.call(fetchPath, { method: opts.method ?? 'GET', headers: { Cookie: cookie, Origin: 'http://localhost:8787', ...opts.headers }, body: opts.body });
-    if (fetchPath === '/api/auth/sign-out' && res.ok) cookie = '';
+    if (fetchPath === '/api/auth/sign-out' && res.ok) {
+      cookie = '';
+      logoutSeenResolve();
+      if (holdLogout) await logoutHold;
+    }
     if (fetchPath === '/api/auth/sign-in/username' && res.ok) {
       cookie = res.headers.getSetCookie().find((c) => c.startsWith('better-auth.session_token=')).split(';', 1)[0];
     }
@@ -75,6 +82,8 @@ async function makeUi({ holdKey = false, logoutFails = false, holdError = false 
     el, tabs, t,
     secret: () => keySecret,
     keySeen, releaseKey, releaseError,
+    logoutSeen, releaseLogout,
+    clickTab,
     flush,
     createKey: () => el('key-form').listeners.submit({ preventDefault() {} }),
     logout: () => el('logout').listeners.click(),
@@ -150,6 +159,31 @@ test('late owner failures render nothing after the switch', async () => {
   assert.equal(ui.el('key-error').hidden, true, 'stale error suppressed');
   assert.equal(ui.el('key-reveal').hidden, true);
   assert.equal(ui.el('banner').hidden, true, 'no stale banner');
+});
+
+// 4B edge 2: tab clicks during a successful logout cannot strand owner
+// state: the server session is already gone when cleanup runs.
+test('tab navigation during logout cannot strand owner state', async () => {
+  const ui = await makeUi({ holdLogout: true });
+  ui.el('key-name').value = 'Synthetic owner key';
+  ui.el('key-scope').value = 'read';
+  ui.el('key-expires').value = '';
+  await ui.createKey();
+  assert.equal(ui.el('key-reveal').hidden, false, 'positive control: owner reveal visible');
+  const pending = ui.logout();
+  await ui.logoutSeen;
+  await ui.clickTab('compute');
+  ui.releaseLogout();
+  await pending;
+  await ui.clickTab('keys');
+  await ui.flush();
+  const sessions = await ui.t.DB.prepare('SELECT COUNT(*) AS n FROM session WHERE userId = ?').bind(ui.t.alice.id).first();
+  assert.equal(sessions.n, 0, 'server session ended');
+  assert.equal(ui.el('view-login').hidden, false, 'login view shown');
+  assert.equal(ui.el('view-app').hidden, true);
+  assert.equal(ui.el('key-reveal').hidden, true, 'reveal cleared despite tab clicks');
+  assert.equal(ui.el('key-secret').textContent, '');
+  assert.ok(!ui.leaked(), 'no owner secret in DOM');
 });
 
 test('failed logout keeps the session and reports visibly', async () => {

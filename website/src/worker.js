@@ -41,9 +41,13 @@ function sameOrigin(request) {
 }
 
 const AUTH_BODY_MAX = 64 * 1024;
-// Self-service auth mutations the demo tenant may not use: demo identity and
-// credentials are owner-managed (provisioned/rotated via operator scripts).
-const DEMO_BLOCKED_AUTH = new Set(['/api/auth/update-user', '/api/auth/change-password', '/api/auth/change-email', '/api/auth/delete-user', '/api/auth/link-social-account', '/api/auth/unlink-account']);
+// Demo auth surface (allowlist): the only /api/auth/* routes a demo session
+// may use are sign-in (both maintained paths), sign-out, and session reads.
+// Everything else — update-user, change-password, link-social, password
+// reset, token refresh, account management — is owner-managed or unused, so
+// a closed-by-default list keeps future self-service routes from slipping
+// through. Verified against better-auth 1.7.14 route sources.
+const DEMO_ALLOWED_AUTH = new Set(['/api/auth/sign-in/username', '/api/auth/sign-in/email', '/api/auth/sign-out', '/api/auth/get-session']);
 // A disabled account may only end sessions, never read or mutate auth state.
 const DISABLED_ALLOWED_AUTH = new Set(['/api/auth/sign-out', '/api/auth/revoke-session', '/api/auth/revoke-sessions', '/api/auth/revoke-other-sessions']);
 
@@ -188,8 +192,8 @@ async function handleApi(request, env, url) {
       if (disabled && !DISABLED_ALLOWED_AUTH.has(path)) {
         return json(401, { error: 'Sign-in required.', code: 'AUTH_REQUIRED' });
       }
-      if (!disabled && demo && DEMO_BLOCKED_AUTH.has(path)) {
-        return json(403, { error: 'Demo credentials are owner-managed and cannot be changed here.', code: 'DEMO_RESTRICTED' });
+      if (!disabled && demo && !DEMO_ALLOWED_AUTH.has(path)) {
+        return json(403, { error: 'This auth endpoint is not available to the demo account.', code: 'DEMO_RESTRICTED' });
       }
     }
     return auth.handler(forwarded);

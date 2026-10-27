@@ -20,17 +20,23 @@ const loading = (el) => state(el, 'muted', 'Loading…');
 
 async function api(path, opts = {}) {
   const gen = generation;
+  // Auth transitions (logout) run unfenced: their completion must not depend
+  // on tab-navigation generations, or a mid-logout tab click could strand
+  // owner state after the server session already ended.
+  const fenced = !opts.unfenced;
+  const init = { ...opts };
+  delete init.unfenced;
   let res;
   try {
-    res = await fetch(path, { ...opts, headers: { ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...(opts.method && opts.method !== 'GET' && !path.startsWith('/api/auth/') ? { 'X-Aipster-CSRF': '1' } : {}), ...(opts.headers || {}) } });
+    res = await fetch(path, { ...init, headers: { ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...(init.method && init.method !== 'GET' && !path.startsWith('/api/auth/') ? { 'X-Aipster-CSRF': '1' } : {}), ...(init.headers || {}) } });
   } catch (e) {
-    if (gen !== generation) throw staleError();
+    if (fenced && gen !== generation) throw staleError();
     throw e;
   }
-  if (gen !== generation) throw staleError();
+  if (fenced && gen !== generation) throw staleError();
   let data = null;
   try { data = await res.json(); } catch { /* non-JSON */ }
-  if (gen !== generation) throw staleError();
+  if (fenced && gen !== generation) throw staleError();
   if (!res.ok) {
     const code = data && data.code ? ` (${data.code})` : '';
     throw new Error((data && data.error ? data.error : `Request failed: ${res.status}`) + code);
@@ -200,8 +206,10 @@ $('logout').addEventListener('click', async () => {
   // success, and say so on failure (review finding, fixed).
   try {
     // Empty JSON body: the auth endpoint requires a JSON content type.
-    await api('/api/auth/sign-out', { method: 'POST', body: '{}' });
-  } catch (ex) { if (!isStale(ex)) banner('Sign-out failed: ' + ex.message); return; }
+    // Unfenced: tab navigation during logout must not invalidate cleanup.
+    // A genuine failure still banners and stays signed in.
+    await api('/api/auth/sign-out', { method: 'POST', body: '{}', unfenced: true });
+  } catch (ex) { banner('Sign-out failed: ' + ex.message); return; }
   generation++;
   me = null;
   resetState();

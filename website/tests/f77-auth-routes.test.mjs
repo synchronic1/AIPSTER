@@ -35,6 +35,21 @@ test('demo cannot rename itself or change its password', async () => {
   assert.equal(again.status, 200, 'original credentials still work');
 });
 
+// 4B edge 1: demo cannot initiate social linking on the actual maintained
+// route, and unused auth surface stays closed by default.
+test('demo auth surface excludes linking and self-service routes', async () => {
+  const t = await createTestEnv();
+  const cookie = await seedDemo(t);
+  const linked = await readJson(await t.call('/api/auth/link-social', { method: 'POST', headers: cookie, body: { provider: 'github', callbackURL: TEST_URL + '/app/' } }));
+  assert.equal(linked.status, 403);
+  assert.equal(linked.json.code, 'DEMO_RESTRICTED');
+  assert.ok(!linked.text.includes('github.com'), 'no provider URL leaked');
+  const reset = await readJson(await t.call('/api/auth/request-password-reset', { method: 'POST', headers: cookie, body: { email: 'demo@aipster.invalid', redirectTo: '/' } }));
+  assert.equal(reset.status, 403);
+  const session = await readJson(await t.call('/api/auth/get-session', { headers: cookie }));
+  assert.equal(session.status, 200, 'session reads stay allowed');
+});
+
 test('real users keep self-service account updates', async () => {
   const t = await createTestEnv();
   const out = await readJson(await t.call('/api/auth/update-user', { method: 'POST', headers: { ...t.as(t.alice), Origin: TEST_URL }, body: { name: 'Alice Renamed' } }));
