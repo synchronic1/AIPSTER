@@ -113,18 +113,41 @@ none named `aipster-app` exists; do not reuse or mutate unrelated ones.
   registration stays closed (`disableSignUp`, verified by test). Provision
   with `D1_PASSWORD='<generated-20+>' node scripts/setup-demo.mjs --db
   aipster-app [--remote]` (idempotent; hashes before touching SQL; password
-  travels a private channel only, never source/logs). Rotate by re-running
-  with a new password; disable by deleting the credential account row and
-  setting `demo = 0` (see script header). Throttled: 10 username/email
+  travels a private channel only, never source/logs). When D1_PASSWORD is
+  unset the script prompts with hidden input (TTY only); a masked prompt is
+  unit-tested, env delivery stays supported. Rotate by re-running with a new
+  password; disable ONLY via `scripts/disable-user.mjs --user demo
+  --delete-password` (demo classification immutable, sessions/keys revoked).
+  Throttled: 10 username/email
   sign-in attempts per rolling 60 s (plus Better Auth's 3/10 s sign-in
   default), generic failures, no account-existence oracle (tested).
 - **Membership revocation (explicit disable path):** removing an email from
   the allowlist blocks future signups only. To revoke a live user the
-  rollout owner runs: `UPDATE "user" SET disabled = 1 WHERE …;`
-  `UPDATE key_verifiers SET revoked_at = … WHERE owner_id = …;`
-  `DELETE FROM allowlist WHERE email = …;`. `disabled = 1` blocks new
-  sessions (session-create hook, `403 ACCOUNT_DISABLED`) and deadens
-  existing sessions + API keys for all API calls (tested).
+  rollout owner runs `scripts/disable-user.mjs --db aipster-app --user
+  <id-or-email> [--delete-password] [--remote]`, which executes the
+  canonical statements in `scripts/lib/operator-sql.mjs` (also executed
+  verbatim by the regression suite): `disabled = 1`, session rows deleted,
+  API keys revoked, allowlist entry removed, optional password-credential
+  deletion. The demo flag is never modified. `disabled = 1` blocks new
+  sessions (session-create hook, `403 ACCOUNT_DISABLED`), deadens existing
+  sessions + API keys for app APIs, and fences the maintained auth
+  endpoints (only sign-out/revoke allowed; `get-session`/mutations 401).
+  Demo users are additionally barred from self-service auth mutations
+  (`update-user`, `change-password`, etc., `403 DEMO_RESTRICTED`); demo
+  credentials stay owner-managed (tested through the actual handler).
+- **Grant sandbox boundary:** grants never cross real↔demo in either
+  direction. Creation to a demo grantee is refused (`403 DEMO_RESTRICTED`,
+  alongside the existing demo-creator refusal); reads treat legacy/stale
+  cross-boundary rows as absent (resource detail, both grant lists,
+  quota preflight). Grant deletion stays owner-only so legacy rows can be
+  cleaned up (tested both directions, sessions and keys).
+- **Canonical host:** with an https `BETTER_AUTH_URL`, `/api/*` and `/app*`
+  answer only on that origin (`403 WRONG_HOST` elsewhere); public assets
+  are unaffected and local http dev is unpinned (tested).
+- **Readiness contract:** `/api/health` `ready` requires all app tables AND
+  the 0003/0004 columns (`username`, `displayUsername`, `demo`, `disabled`,
+  `rateLimit` fields); the deployment verifier asserts `ready === true`
+  (tested, incl. failure fixtures).
 - **Provider tokens:** OAuth access/refresh/ID tokens are stripped by
   account create/update hooks before persistence — identity + sessions
   only (tested).
@@ -174,14 +197,18 @@ re-reviewed.
 
 ## 7. Test plan (all committed under `website/`)
 
-`npm test` (108 green on the final head): migrations incl. 0003/0004; real
-session round-trips; unauthenticated 401s; cross-user 404s; grants/quotas;
-key lifecycle incl. `aip_demo_` sandbox prefix; allowlist + verified-email
-gate (unit + stubbed-GitHub OAuth callback matrix, Codex-adopted probes);
-byte-cap streaming incl. multibyte; token stripping; disable path (sessions
-+ keys + new sign-ins); schema-aware health; demo sign-in/logout/isolation/
-restrictions/throttling; EIF truthfulness guards (`501 INFERENCE_DISABLED`,
-no outbound inference calls); 44 checker + verifier/preflight suites.
+`npm test` (133 green on the final head): migrations incl. 0003/0004; real
+session round-trips; unauthenticated 401s; cross-user 404s; grants/quotas
+incl. real↔demo boundary both directions; key lifecycle incl. `aip_demo_`
+sandbox prefix; allowlist + verified-email gate (unit + stubbed-GitHub
+OAuth callback matrix, Codex-adopted probes); byte-cap streaming incl.
+multibyte + chunked/flood auth bodies; token stripping; operator disable
+(canonical statements, immutable demo, sessions/keys/sign-ins revoked);
+demo/disabled auth-endpoint fencing through the actual handler; canonical
+host guard; column-aware health + verifier `ready` requirement; exact-client
+DOM-fixture UI session tests (logout clearing, stale fencing, failed logout);
+EIF truthfulness guards (`501 INFERENCE_DISABLED`, no outbound inference
+calls); 44 checker + verifier/preflight suites.
 `wrangler dev --local` smoke incl. `/app` UI desktop/mobile. Live GitHub
 handshake with two approved identities stays PENDING (needs R3–R5 + names);
 stubbed flows are not presented as OAuth evidence.
@@ -263,3 +290,12 @@ restart, or shared-token-across-users design.
 | 7 | `/api/health` ignores schema; `secretLen` leak | FIXED: schema-aware `ready`, booleans only |
 | 8 | Failed sign-out presented as completed | FIXED: client transitions only on success, banners failures |
 | — | Demo username/password scope change | IMPLEMENTED per §5 (username plugin, sandbox, throttling, closed signup); fresh review required |
+| F77-1 | Real→demo grants creatable and readable | FIXED: creation refused both directions; reads treat cross-boundary rows as absent; both-direction session+key tests |
+| F77-2 | Documented demo disable promotes | FIXED: `disable-user.mjs` + canonical statements (demo immutable, sessions deleted, keys revoked, sign-ins blocked); unsafe recipe removed from script header and docs; suite executes the exact statements |
+| F77-3 | Demo can change credentials/username | FIXED: demo barred from self-service auth mutations (`DEMO_RESTRICTED`); rotation owner-operated; real users unaffected (tested) |
+| F77-4 | Disabled sessions mutate auth endpoints | FIXED: disabled fenced off all `/api/auth/*` except sign-out/revoke (401 incl. `get-session`); tested through the actual handler |
+| F77-5/6 | Owner key/data leaks across logout; late responses repopulate demo UI | FIXED: `resetState()` on logout/sign-in + identity-generation fencing of async work and renders; exact-client DOM-fixture tests (success, late-error, failed-logout cases) |
+| F77-7 | Missing 0004 reported ready | FIXED: health requires 0003/0004 columns via portable probes, not just tables |
+| F77-8 | Verifier accepts unready schema | FIXED (minimal ownership-exception edit + fixture update, flagged for re-review): verifier asserts `ready === true`; failure fixtures added |
+| F77-9 | Auth cap depends on declared length | FIXED: auth bodies streamed through the byte cap and forwarded; absent/chunked/flood/lying-length cases tested |
+| F77-10 | Alternate-host auth accepted | FIXED: https canonical-origin guard on `/api/*` + `/app*` (`WRONG_HOST`); public assets unchanged; local http unpinned (tested) |

@@ -8,14 +8,15 @@ export function httpError(status, message, code) {
   return Object.assign(new Error(message), { status, code: code || 'BAD_REQUEST' });
 }
 
-export async function readJson(request, maxBytes = MAX_BODY_BYTES) {
+export async function readBodyBytes(request, maxBytes = MAX_BODY_BYTES) {
   // Enforce the limit in wire bytes, not UTF-16 code units: read the body as
   // a byte stream and stop as soon as the cap is exceeded. A pre-read
   // request.text() would let a multi-byte-heavy UTF-8 payload (e.g. CJK,
   // ~3 bytes per char) several times over the cap pass a char-count check.
+  // The declared Content-Length is only a fast path: chunked uploads and
+  // several clients omit it, so the stream itself is always bounded.
   const declared = request && request.headers ? Number(request.headers.get('content-length')) : NaN;
   if (Number.isFinite(declared) && declared > maxBytes) throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
-  let text;
   const body = request ? request.body : null;
   if (body && typeof body.getReader === 'function') {
     const reader = body.getReader();
@@ -39,12 +40,15 @@ export async function readJson(request, maxBytes = MAX_BODY_BYTES) {
     const merged = new Uint8Array(total);
     let off = 0;
     for (const c of chunks) { merged.set(c, off); off += (c.byteLength || c.length || 0); }
-    text = new TextDecoder().decode(merged);
-  } else {
-    text = await request.text();
-    if (new TextEncoder().encode(text).byteLength > maxBytes) throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
+    return merged;
   }
-  return parseJson(text);
+  const bytes = new TextEncoder().encode(await request.text());
+  if (bytes.byteLength > maxBytes) throw httpError(413, 'Body too large.', 'BODY_TOO_LARGE');
+  return bytes;
+}
+
+export async function readJson(request, maxBytes = MAX_BODY_BYTES) {
+  return parseJson(new TextDecoder().decode(await readBodyBytes(request, maxBytes)));
 }
 
 export function parseJson(text, maxFields = 40) {

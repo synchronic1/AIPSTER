@@ -70,6 +70,7 @@ export async function verifyLive({base = 'https://aipster.net',
   const health = await jsonRequest('/api/health', 200);
   assert.equal(health.ok, true);
   assert.equal(health.auth_configured, true, 'Authentication is not configured');
+  assert.equal(health.ready, true, 'Deployment is not ready: schema/config incomplete');
   const oauthConfigured = health.oauth_configured === true || health.detail?.oauth === true;
   const session = await jsonRequest('/api/auth/get-session', 200);
   assert(session === null || !session.user, 'Anonymous request obtained a user');

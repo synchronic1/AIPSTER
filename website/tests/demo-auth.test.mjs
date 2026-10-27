@@ -153,11 +153,13 @@ test('byte cap counts wire bytes, not characters', async () => {
   assert.equal(parsed.a.length, 100);
 });
 
-test('oversized declared auth bodies are rejected before the library', async () => {
+test('declared over-cap auth bodies take the fast path', async () => {
   const t = await createTestEnv();
   const worker = await import('../src/worker.js?precheck=1');
   const res = await worker.default.fetch(
-    { method: 'POST', url: 'http://localhost:8787/api/auth/sign-in/username', headers: new Headers({ 'content-length': '70000' }) },
+    new Request('http://localhost:8787/api/auth/sign-in/username', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'content-length': '70000' }, body: '{}'
+    }),
     t.env
   );
   const out = await readJson(res);

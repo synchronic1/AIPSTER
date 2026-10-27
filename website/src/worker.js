@@ -6,9 +6,9 @@
 import { createAuth, isInvited, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
-import { readJson, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
+import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
 const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
@@ -38,6 +38,25 @@ function sameOrigin(request) {
   const self = new URL(request.url).origin;
   if (origin) return origin === self;
   try { return new URL(referer).origin === self; } catch { return false; }
+}
+
+const AUTH_BODY_MAX = 64 * 1024;
+// Self-service auth mutations the demo tenant may not use: demo identity and
+// credentials are owner-managed (provisioned/rotated via operator scripts).
+const DEMO_BLOCKED_AUTH = new Set(['/api/auth/update-user', '/api/auth/change-password', '/api/auth/change-email', '/api/auth/delete-user', '/api/auth/link-social-account', '/api/auth/unlink-account']);
+// A disabled account may only end sessions, never read or mutate auth state.
+const DISABLED_ALLOWED_AUTH = new Set(['/api/auth/sign-out', '/api/auth/revoke-session', '/api/auth/revoke-sessions', '/api/auth/revoke-other-sessions']);
+
+function canonicalOrigin(env) {
+  const raw = (env && env.BETTER_AUTH_URL) || '';
+  if (!raw.startsWith('https://')) return null; // http is local-dev only: no host pinning
+  try { return new URL(raw).origin; } catch { return null; }
+}
+
+function wrongHost(env, origin) {
+  const canon = canonicalOrigin(env);
+  if (!canon) return false;
+  return origin !== canon;
 }
 
 async function actorFrom(request, env, auth) {
@@ -76,9 +95,19 @@ async function canUseResource(db, userId, resource) {
   if (resource.owner_id === userId) return { ok: true, grantId: null, grant: null };
   const g = await first(db, 'SELECT * FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', resource.id, userId);
   if (!g) return { ok: false, reason: 'No grant gives you access to this resource.' };
+  if (!(await grantPartiesSameSide(db, g))) return { ok: false, reason: 'No grant gives you access to this resource.' };
   if (g.used_jobs >= g.max_jobs) return { ok: false, reason: 'Grant job quota exhausted.' };
   if (g.used_tokens >= g.max_tokens) return { ok: false, reason: 'Grant token quota exhausted.' };
   return { ok: true, grantId: g.id, grant: g };
+}
+
+async function grantPartiesSameSide(db, grant) {
+  // Grants never cross the demo sandbox boundary in either direction, and
+  // legacy/stale cross-boundary rows authorize nothing.
+  const o = await first(db, 'SELECT demo FROM "user" WHERE id = ?', grant.owner_id);
+  const g = await first(db, 'SELECT demo FROM "user" WHERE id = ?', grant.grantee_id);
+  if (!o || !g) return false;
+  return Number(o.demo || 0) === Number(g.demo || 0);
 }
 
 async function ownerName(db, userId) {
@@ -89,6 +118,12 @@ async function ownerName(db, userId) {
 async function handleApi(request, env, url) {
   const path = url.pathname;
   const method = request.method;
+  // Canonical-host guard: with an https BETTER_AUTH_URL configured, the API
+  // (auth, app, health) answers only on that origin. Public-asset behavior
+  // on other hosts is unchanged; local http dev skips pinning.
+  if (wrongHost(env, url.origin)) {
+    return json(403, { error: 'This host does not serve the API.', code: 'WRONG_HOST' });
+  }
   if (path === '/api/health' && method === 'GET') {
     // Readiness probes the schema: a bound but unmigrated DB is not ready.
     // Booleans only; no lengths, names, or error strings leave this endpoint.
@@ -100,8 +135,18 @@ async function handleApi(request, env, url) {
       try {
         const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
         const names = new Set(rows.map((r) => r.name));
-        schemaOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit']
+        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit']
           .every((n) => names.has(n));
+        // Migration contract: required columns must exist, not just tables.
+        // LIMIT 0 probes fail when any column is missing (e.g. 0003/0004
+        // not applied); portable across SQLite/D1 without pragma calls.
+        let colsOk = false;
+        if (tablesOk) {
+          await all(env.DB, 'SELECT username, displayUsername, demo, disabled FROM "user" LIMIT 0');
+          await all(env.DB, 'SELECT id, "key", count, lastRequest FROM rateLimit LIMIT 0');
+          colsOk = true;
+        }
+        schemaOk = tablesOk && colsOk;
       } catch { schemaOk = false; }
     }
     const authConfigured = hasDb && secretOk && urlOk;
@@ -121,16 +166,33 @@ async function handleApi(request, env, url) {
     if (!oauthConfigured(env)) return json(503, { error: 'GitHub sign-in is not configured.', code: 'OAUTH_UNCONFIGURED' });
   }
   if (path.startsWith('/api/auth/')) {
-    // Defense in depth: better-auth parses these JSON bodies itself, so the
-    // byte cap from readJson cannot apply. Reject declared over-cap uploads
-    // before they reach the auth library.
-    if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'OPTIONS') {
-      const declared = Number(request.headers.get('content-length'));
-      if (Number.isFinite(declared) && declared > 64 * 1024) {
-        return json(413, { error: 'Body too large.', code: 'BODY_TOO_LARGE' });
+    // Every auth request body is streamed through the byte cap first:
+    // better-auth parses bodies itself, and Content-Length is absent on
+    // chunked uploads and unset by several clients, so a header precheck is
+    // not enforcement. Within-cap bodies are buffered and forwarded.
+    let forwarded = request;
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      const bytes = await readBodyBytes(request, AUTH_BODY_MAX);
+      // Preserve bodiless pass-through exactly: attaching an empty body
+      // would trip the library's content-type requirement on bodyless posts.
+      const init = { method, headers: request.headers };
+      if (bytes.byteLength > 0) init.body = bytes;
+      forwarded = new Request(request.url, init);
+    }
+    // Session-aware endpoint guard: the maintained auth routes bypass the app
+    // actor checks, so demo/disabled boundaries are enforced here instead.
+    const found = await sessionUser(auth, request);
+    if (found && found.user) {
+      const demo = Number(found.user.demo) === 1;
+      const disabled = Number(found.user.disabled) === 1;
+      if (disabled && !DISABLED_ALLOWED_AUTH.has(path)) {
+        return json(401, { error: 'Sign-in required.', code: 'AUTH_REQUIRED' });
+      }
+      if (!disabled && demo && DEMO_BLOCKED_AUTH.has(path)) {
+        return json(403, { error: 'Demo credentials are owner-managed and cannot be changed here.', code: 'DEMO_RESTRICTED' });
       }
     }
-    return auth.handler(request);
+    return auth.handler(forwarded);
   }
 
   const actor = await actorFrom(request, env, auth);
@@ -199,8 +261,8 @@ async function handleApi(request, env, url) {
       const r = await first(db, 'SELECT * FROM resources WHERE id = ?', m[1]);
       if (!r) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
       if (r.owner_id !== me()) {
-        const g = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', r.id, me());
-        if (!g) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+        const g = await first(db, 'SELECT * FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', r.id, me());
+        if (!g || !(await grantPartiesSameSide(db, g))) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
       }
       return json(200, cardFor(r, await ownerName(db, r.owner_id)));
     }
@@ -210,7 +272,7 @@ async function handleApi(request, env, url) {
   if (path === '/api/shared-with-me' && method === 'GET') {
     const d = needAuthz('read'); if (d) return deny(d);
     const q = pagination(url);
-    const page = await pageQuery(db, { select: 'SELECT *', from: 'FROM grants WHERE grantee_id = ? AND revoked_at IS NULL', params: [me()], order: 'ORDER BY created_at DESC', ...q });
+    const page = await pageQuery(db, { select: 'SELECT g.*', from: 'FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.grantee_id = ? AND g.revoked_at IS NULL AND o.demo = r.demo', params: [me()], order: 'ORDER BY g.created_at DESC', ...q });
     const items = [];
     for (const g of page.items) {
       const r = await first(db, 'SELECT name FROM resources WHERE id = ?', g.resource_id);
@@ -221,18 +283,20 @@ async function handleApi(request, env, url) {
   if (path === '/api/grants' && method === 'GET') {
     const d = needSession(); if (d) return deny(d);
     const q = pagination(url);
-    const page = await pageQuery(db, { select: 'SELECT *', from: 'FROM grants WHERE owner_id = ?', params: [me()], order: 'ORDER BY created_at DESC', ...q });
+    const page = await pageQuery(db, { select: 'SELECT g.*', from: 'FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.owner_id = ? AND o.demo = r.demo', params: [me()], order: 'ORDER BY g.created_at DESC', ...q });
     return json(200, { ...page, items: page.items.map(mapGrantLite) });
   }
   if (path === '/api/grants' && method === 'POST') {
     const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
     const body = await readJson(request);
+    if (!isId(body.resourceId)) return json(400, { error: 'resourceId is required.', code: 'BAD_RESOURCE' });
     const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resourceId);
     if (!resource || resource.owner_id !== me()) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
     if (!isEmail(body.grantee)) return json(400, { error: 'Grantee must be an invited user email.', code: 'BAD_GRANTEE' });
-    const grantee = await first(db, 'SELECT id, email FROM "user" WHERE email = ?', String(body.grantee).trim().toLowerCase());
+    const grantee = await first(db, 'SELECT id, email, demo FROM "user" WHERE email = ?', String(body.grantee).trim().toLowerCase());
     if (!grantee) return json(404, { error: 'Grantee user not found.', code: 'USER_NOT_FOUND' });
     if (grantee.id === me()) return json(400, { error: 'Cannot share with yourself.', code: 'SELF_SHARE' });
+    if (Number(grantee.demo) === 1) return json(403, { error: 'Grants cannot cross the demo sandbox boundary.', code: 'DEMO_RESTRICTED' });
     const maxJobs = Math.floor(Number(body.maxJobs));
     const maxTokens = Math.floor(Number(body.maxTokens));
     if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 10000) return json(400, { error: 'maxJobs must be 1..10000.', code: 'BAD_QUOTA' });
@@ -395,6 +459,12 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
+      // Canonical-host guard for the app shell (mirrors the /api guard):
+      // alternate hosts (workers.dev, previews) keep serving public assets
+      // but must not become auth entry points.
+      if ((url.pathname === '/app' || url.pathname === '/app/' || url.pathname.startsWith('/app/')) && wrongHost(env, url.origin)) {
+        return new Response('Forbidden host.', { status: 403, headers: { ...baseHeaders(), 'Content-Type': 'text/plain' } });
+      }
       if (url.pathname === '/app' && request.method === 'GET') {
         return Response.redirect(url.origin + '/app/', 302);
       }

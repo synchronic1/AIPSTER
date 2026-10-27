@@ -27,7 +27,7 @@ async function fixture(t, mutate = () => {}) {
         headers['X-Content-Type-Options'] = 'nosniff';
       }
     } else if (path === '/app') { status = 302; headers.Location = '/app/'; }
-    else if (path === '/api/health') body = JSON.stringify({ok: true, auth_configured: true, detail: {oauth: false}});
+    else if (path === '/api/health') body = JSON.stringify({ok: true, auth_configured: true, ready: true, detail: {oauth: false, schema: true}});
     else if (path === '/api/auth/get-session') body = 'null';
     else if (path.startsWith('/api/')) { status = 401; body = '{"code":"AUTH_REQUIRED"}'; }
     else status = 404;

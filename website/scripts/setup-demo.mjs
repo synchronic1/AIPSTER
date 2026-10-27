@@ -10,12 +10,13 @@
 //      before it ever touches SQL; the plaintext is never stored or logged.
 //
 // Idempotent: re-running updates the credential row and demo fixtures.
-// To rotate: re-run with a new D1_PASSWORD.
-// To disable: wrangler d1 execute aipster-app --command \
-//   "UPDATE \"user\" SET demo = 0 WHERE username = 'demo'; \
-//    DELETE FROM account WHERE providerId = 'credential' \
-//    AND userId = (SELECT id FROM \"user\" WHERE username = 'demo');"
+// To rotate: re-run with a new D1_PASSWORD (or answer the hidden prompt).
+// To disable: node scripts/disable-user.mjs --db aipster-app --user demo --delete-password [--remote]
+//   The demo classification is immutable: disabling keeps demo=1 and revokes
+//   sessions/keys/sign-ins. Never "disable" by clearing the demo flag — that
+//   would promote the account to live authority.
 import { hashPassword } from 'better-auth/crypto';
+import { promptPassword } from './lib/prompt-password.mjs';
 import { spawnSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,13 +33,25 @@ function fail(msg) {
   process.exit(1);
 }
 
-const password = process.env.D1_PASSWORD;
-if (!password || password.length < 20) {
-  fail('set D1_PASSWORD to a generated password of at least 20 characters.');
-}
 const args = process.argv.slice(2);
-const dbName = (args[args.indexOf('--db') + 1] || '').trim() || 'aipster-app';
+function flagValue(name, fallback) {
+  const i = args.indexOf(name);
+  if (i < 0 || i + 1 >= args.length || args[i + 1].startsWith('--')) return fallback;
+  return args[i + 1];
+}
+const dbName = (flagValue('--db', '') || '').trim() || 'aipster-app';
 const remote = args.includes('--remote');
+let password = process.env.D1_PASSWORD;
+if (!password) {
+  try {
+    password = await promptPassword('Demo password (min 20 chars, hidden): ');
+  } catch (e) {
+    fail(e.message + ' Or set D1_PASSWORD to a generated password of at least 20 characters.');
+  }
+}
+if (!password || password.length < 20) {
+  fail('use a generated password of at least 20 characters (D1_PASSWORD or the hidden prompt).');
+}
 const now = new Date().toISOString();
 
 const hash = await hashPassword(password);

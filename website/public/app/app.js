@@ -5,6 +5,12 @@
 // shown once and never persisted.
 'use strict';
 let me = null;
+// Identity/navigation generation: bumped on logout, sign-in, and tab switch.
+// In-flight async work from a previous generation is dropped, never rendered,
+// so late owner responses cannot repopulate demo UI (or vice versa).
+let generation = 0;
+const staleError = () => Object.assign(new Error('Stale response.'), { stale: true });
+const isStale = (e) => !!(e && e.stale);
 
 const $ = (id) => document.getElementById(id);
 const banner = (msg) => { const b = $('banner'); b.textContent = msg; b.hidden = false; setTimeout(() => { b.hidden = true; }, 3500); };
@@ -13,9 +19,18 @@ const state = (el, kind, msg) => { el.innerHTML = `<div class="card ${kind}">${e
 const loading = (el) => state(el, 'muted', 'Loading…');
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...(opts.method && opts.method !== 'GET' && !path.startsWith('/api/auth/') ? { 'X-Aipster-CSRF': '1' } : {}), ...(opts.headers || {}) } });
+  const gen = generation;
+  let res;
+  try {
+    res = await fetch(path, { ...opts, headers: { ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...(opts.method && opts.method !== 'GET' && !path.startsWith('/api/auth/') ? { 'X-Aipster-CSRF': '1' } : {}), ...(opts.headers || {}) } });
+  } catch (e) {
+    if (gen !== generation) throw staleError();
+    throw e;
+  }
+  if (gen !== generation) throw staleError();
   let data = null;
   try { data = await res.json(); } catch { /* non-JSON */ }
+  if (gen !== generation) throw staleError();
   if (!res.ok) {
     const code = data && data.code ? ` (${data.code})` : '';
     throw new Error((data && data.error ? data.error : `Request failed: ${res.status}`) + code);
@@ -48,7 +63,7 @@ async function loadOverview() {
     $('ov-note').innerHTML = me && me.demo
       ? '<p class="muted">DEMO DATA: simulated fixtures for exploration. Grants and live actions are disabled. Inference dispatch is disabled.</p>'
       : '<p class="muted">No demo data: only resources you register appear here. Inference dispatch is disabled.</p>';
-  } catch (e) { state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
 async function loadCompute() {
@@ -58,7 +73,7 @@ async function loadCompute() {
     el.innerHTML = inv.items.length ? inv.items.map(resourceCard).join('') : '';
     if (!inv.items.length) state(el, '', 'No resources yet. Register one above.');
     $('grant-resource').innerHTML = inv.items.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
-  } catch (e) { state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
 async function loadShared() {
@@ -70,7 +85,7 @@ async function loadShared() {
        <p>jobs ${g.usedJobs}/${g.quotas.maxJobs} · tokens ${g.usedTokens}/${g.quotas.maxTokens}</p>
        <p class="muted">enforcement: ${esc(g.enforcement)}</p></div>`).join('') : '';
     if (!data.items.length) state(el, '', 'Nothing shared with you yet.');
-  } catch (e) { state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
 async function loadGrants() {
@@ -83,9 +98,9 @@ async function loadGrants() {
     if (!data.items.some((g) => !g.revokedAt)) state(el, '', 'No outgoing grants.');
     el.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       try { await api('/api/grants/' + b.dataset.revoke, { method: 'DELETE' }); banner('Grant revoked.'); loadGrants(); }
-      catch (e) { banner(e.message); }
+      catch (e) { if (isStale(e)) return; banner(e.message); }
     }));
-  } catch (e) { state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
 async function loadKeys() {
@@ -99,9 +114,9 @@ async function loadKeys() {
     if (!data.items.some((k) => !k.revokedAt)) state(el, '', 'No API keys yet.');
     el.querySelectorAll('[data-revkey]').forEach((b) => b.addEventListener('click', async () => {
       try { await api('/api/keys/' + b.dataset.revkey, { method: 'DELETE' }); banner('Key revoked.'); loadKeys(); }
-      catch (e) { banner(e.message); }
+      catch (e) { if (isStale(e)) return; banner(e.message); }
     }));
-  } catch (e) { state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
 async function loadUsage() {
@@ -115,7 +130,7 @@ async function loadUsage() {
       `<div class="card"><p>${esc(u.kind)} · ${u.requests} req · ${u.tokensIn}/${u.tokensOut} tok</p>
        <p class="muted">${esc(u.at)} · source: ${esc(u.costSource)}</p></div>`).join('');
     if (!data.items.length) state(el, '', 'No usage recorded yet.');
-  } catch (e) { state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
 async function loadSettings() {
@@ -126,12 +141,32 @@ async function loadSettings() {
     $('settings-via').textContent = s.demo ? 'demo username sign-in' : 'GitHub';
     const a = await api('/api/audit?limit=20');
     $('audit-list').innerHTML = a.items.map((x) => `<div class="card"><p>${esc(x.action)} → ${esc(x.target)}</p><p class="muted">${esc(x.at)}</p></div>`).join('') || '<div class="card">No activity yet.</div>';
-  } catch (e) { banner(e.message); }
+  } catch (e) { if (isStale(e)) return; banner(e.message); }
 }
 
 const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, keys: loadKeys, usage: loadUsage, settings: loadSettings };
 
+function resetState() {
+  // Clear every identity-scoped pixel and form field. Runs on logout and on
+  // every sign-in before the new identity renders, so a same-document account
+  // switch never shows the previous identity's data (incl. revealed secrets).
+  for (const id of ['ov-cards', 'ov-note', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
+  $('grant-resource').innerHTML = '';
+  $('key-secret').textContent = ''; $('key-reveal').hidden = true;
+  $('whoami').textContent = '';
+  $('settings-email').textContent = ''; $('settings-via').textContent = '…';
+  for (const id of ['res-name', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'grant-user', 'key-name', 'key-expires', 'settings-name', 'demo-username', 'demo-password']) $(id).value = '';
+  $('grant-jobs').value = '50'; $('grant-tokens').value = '50000'; $('key-scope').value = 'read';
+  for (const id of ['login-error', 'demo-error', 'resource-error', 'grant-error', 'key-error', 'settings-error']) { const e = $(id); e.textContent = ''; e.hidden = true; }
+  $('banner').textContent = ''; $('banner').hidden = true;
+  $('demo-banner').hidden = true; $('demo-grants-note').hidden = true; $('demo-keys-note').hidden = true;
+  $('grant-form').hidden = false;
+  document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', b.dataset.tab === 'overview' ? 'true' : 'false'));
+  document.querySelectorAll('[role="tabpanel"]').forEach((p) => { p.hidden = p.id !== 'tab-overview'; });
+}
+
 document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('click', () => {
+  generation++;
   document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', b === btn ? 'true' : 'false'));
   document.querySelectorAll('[role="tabpanel"]').forEach((p) => { p.hidden = p.id !== 'tab-' + btn.dataset.tab; });
   loaders[btn.dataset.tab]();
@@ -144,7 +179,7 @@ $('github-login').addEventListener('click', async () => {
     const url = data && (data.url || data.redirect);
     if (!url) throw new Error('Sign-in did not return a redirect.');
     location.assign(url);
-  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
 $('demo-form').addEventListener('submit', async (e) => {
@@ -157,7 +192,7 @@ $('demo-form').addEventListener('submit', async (e) => {
     const data = await api('/api/auth/get-session');
     if (!data || !data.user) throw new Error('Demo sign-in did not establish a session.');
     me = data.user; showApp();
-  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
 $('logout').addEventListener('click', async () => {
@@ -166,8 +201,10 @@ $('logout').addEventListener('click', async () => {
   try {
     // Empty JSON body: the auth endpoint requires a JSON content type.
     await api('/api/auth/sign-out', { method: 'POST', body: '{}' });
-  } catch (ex) { banner('Sign-out failed: ' + ex.message); return; }
+  } catch (ex) { if (!isStale(ex)) banner('Sign-out failed: ' + ex.message); return; }
+  generation++;
   me = null;
+  resetState();
   $('view-app').hidden = true; $('view-login').hidden = false; $('sessionbar').hidden = true;
 });
 
@@ -179,7 +216,7 @@ $('resource-form').addEventListener('submit', async (e) => {
     await api('/api/inventory', { method: 'POST', body: JSON.stringify({ name: $('res-name').value, kind: $('res-kind').value, origin: $('res-origin').value, cpu: $('res-cpu').value, gpu: $('res-gpu').value, capabilities: caps }) });
     $('res-name').value = ''; $('res-origin').value = ''; $('res-cpu').value = ''; $('res-gpu').value = ''; $('res-caps').value = '';
     banner('Resource registered (unverified).'); loadCompute();
-  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
 $('grant-form').addEventListener('submit', async (e) => {
@@ -188,7 +225,7 @@ $('grant-form').addEventListener('submit', async (e) => {
   try {
     await api('/api/grants', { method: 'POST', body: JSON.stringify({ resourceId: $('grant-resource').value, grantee: $('grant-user').value, maxJobs: Number($('grant-jobs').value), maxTokens: Number($('grant-tokens').value) }) });
     $('grant-user').value = ''; banner('Grant created.'); loadGrants();
-  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
 $('key-form').addEventListener('submit', async (e) => {
@@ -202,7 +239,7 @@ $('key-form').addEventListener('submit', async (e) => {
     $('key-reveal').hidden = false;
     $('key-name').value = ''; $('key-expires').value = '';
     loadKeys();
-  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 $('key-dismiss').addEventListener('click', () => { $('key-secret').textContent = ''; $('key-reveal').hidden = true; });
 
@@ -212,10 +249,12 @@ $('settings-form').addEventListener('submit', async (e) => {
   try {
     const s = await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ displayName: $('settings-name').value }) });
     banner('Saved.'); me.name = s.displayName; $('whoami').textContent = me.name + ' (' + me.email + ')';
-  } catch (ex) { err.textContent = ex.message; err.hidden = false; }
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
 function showApp() {
+  generation++;
+  resetState();
   $('view-login').hidden = true; $('view-app').hidden = false; $('sessionbar').hidden = false;
   $('whoami').textContent = me.name + ' (' + (me.username || me.email) + ')';
   const demo = !!(me && me.demo);
