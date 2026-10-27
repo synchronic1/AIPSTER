@@ -11,18 +11,21 @@
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
-  <header class="site-header wrap">
-    <a class="wordmark" href="/" aria-label="AIPSTER home"><img class="wordmark-logo" src="/assets/aipster-wordmark.svg" alt="" width="164" height="34"><span>In development</span></a>
-    <nav aria-label="Main navigation">
-      <a href="#overview">Vision</a>
-      <a href="#architecture">Research</a>
-      <a href="#model-runtime">Model &amp; LoRA</a>
-      <a class="source-nav" href="https://github.com/synchronic1/AIPSTER">GitHub <span aria-hidden="true">↗</span></a>
-    </nav>
-  </header>
-
   <main id="main">
-    <section class="hero wrap" aria-labelledby="hero-title">
+    <section class="app-card wrap" aria-labelledby="hero-title">
+      <header class="app-topbar">
+      <a class="wordmark" href="/" aria-label="AIPSTER home"><img class="wordmark-logo" src="/assets/aipster-wordmark.svg" alt="" width="164" height="37"><span>In development</span></a>
+      <nav aria-label="Main navigation">
+        <a href="#overview">Vision</a>
+        <a href="#architecture">Research</a>
+        <a href="#model-runtime">Model &amp; LoRA</a>
+        <a class="source-nav" href="https://github.com/synchronic1/AIPSTER">GitHub <span aria-hidden="true">↗</span></a>
+        <a class="sign-in" href="#progress" title="Sign-in runs in the local demo only">Sign in</a>
+      </nav>
+      </header>
+
+      <div class="app-grid">
+
       <div class="hero-copy">
         <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Compute sharing / In development</p>
         <h1 id="hero-title">Now you’re the <em>ISP</em></h1>
@@ -46,6 +49,7 @@
         </ol>
         <p class="card-footnote">Planned capabilities. Secure sharing is not live yet.</p>
       </aside>
+      </div>
     </section>
 
     <section id="overview" class="overview-section" aria-labelledby="overview-title">
@@ -96,21 +100,57 @@
       </div>
     </section>
 
-    <section class="status-section wrap" aria-labelledby="status-title">
-      <div><p class="eyebrow">Current status</p><h2 id="status-title" class="section-title">Early direction.<br>Build and verify next.</h2></div>
-      <div class="status-copy">
+    <section id="progress" class="status-section wrap" aria-labelledby="status-title">
+      <div class="progress-head"><p class="eyebrow">Meta Muse 2026 Global Hackathon</p><h2 id="status-title" class="section-title">Progress updates.</h2>
+
         <p>This public site presents a product direction and published research diagrams. Secure compute sharing, a marketplace and payments are not live.</p>
         <p>A basic sign-in demo is prepared locally for review. User login is not enabled on this public site.</p>
-        <p>The public documentation reports tested selection, probability, budget and event controls in an offline scaffold.</p>
-        <p>Live self-improvement, full JEV integration, runner containment and production deployment of the research system have not been demonstrated. The project makes no claim of frontier results or verified self-improvement gains.</p>
+        <p class="progress-note">The public documentation reports tested selection, probability, budget and event controls in an offline scaffold. Live self-improvement, full JEV integration, runner containment and production deployment of the research system have not been demonstrated. The project makes no claim of frontier results or verified self-improvement gains.</p>
+
         <a class="text-link" href="https://github.com/synchronic1/AIPSTER/tree/25bf2ac61438aab1a9e3fb86efd52aa9001ba6b7">Explore the published documentation <span aria-hidden="true">↗</span></a>
+      </div>
+      <div class="progress-grid">
+        <div class="blog-trace" aria-label="Development blog, newest first">
+          <article class="post">
+            <time datetime="2026-10-26T21:17:47-07:00">26 Oct 2026 · 21:17 PDT</time>
+            <h3>Wordmark selected and drawn.</h3>
+            <p>Six logo comps went up for review this evening, from a one-colour forest set to a monospace terminal treatment. The pick: comp D, the serif editorial — Georgia italic throughout, with PSTER reduced to x-height and slanted at the same angle as the Ai, so its caps sit at the i-body below the dot.</p>
+            <p>It is now drawn as outlined vector SVG in light and on-dark versions, in the existing copper and forest palette, with no font dependency at render time.</p>
+            <figure><img src="/assets/progress-wordmark-d.png" alt="Comp D as reviewed: copper italic Ai with smaller slanted forest PSTER at x-height." loading="lazy"><figcaption>Comp D as reviewed, before outlining.</figcaption></figure>
+          </article>
+          <article class="post">
+            <time datetime="2026-10-26T21:04:44-07:00">26 Oct 2026 · 21:04 PDT</time>
+            <h3>The bottom of the page is now a progress log.</h3>
+            <p>The hero section became the primary application card, carrying the top navigation and the sign-in placement, and the old status block became the timestamped changelog running beside this trace. Every entry carries its time; nothing here claims more than what was verified that day.</p>
+            <p>The changelog keeps the terse record. This trace gets the longer version, with pictures.</p>
+            <figure><img src="/assets/progress-log-20261026.png" alt="The scrolling progress log running in place on the page." loading="lazy"><figcaption>The changelog running in place.</figcaption></figure>
+          </article>
+          <article class="post">
+            <time datetime="2026-10-26T19:57:00-07:00">26 Oct 2026 · 19:57 PDT</time>
+            <h3>Local dashboard scaffold verified.</h3>
+            <p>The signed-in local build — inventory, permissioned sharing, API-key lifecycle and a deterministic fake adapter — passed its six-test suite and a loopback smoke test, then shut down clean. Demo data only; no paid operations, no external calls.</p>
+            <p>It runs on its own port for review and stays out of this public upload entirely.</p>
+          </article>
+        </div>
+        <ol class="changelog" aria-label="Timestamped progress entries, newest first">
+          <li><time datetime="2026-10-26T21:29:03-07:00">26 Oct 2026 · 21:29 PDT</time><div><strong>Hackathon progress section restructured.</strong><span>Meta Muse 2026 header; changelog left, new image-capable blog trace right; two progress photos added.</span></div></li>
+          <li><time datetime="2026-10-26T21:17:47-07:00">26 Oct 2026 · 21:17 PDT</time><div><strong>Serif wordmark drawn and swapped in.</strong><span>Comp D outlined as vector SVG (light + on-dark): Georgia italic throughout, PSTER at exact x-height below the dot.</span></div></li>
+          <li><time datetime="2026-10-26T21:04:44-07:00">26 Oct 2026 · 21:04 PDT</time><div><strong>Site refresh in review.</strong><span>Hero becomes the primary application card with top nav and sign-in placement; the status section becomes this timestamped progress log.</span></div></li>
+          <li><time datetime="2026-10-26T19:57:00-07:00">26 Oct 2026 · 19:57 PDT</time><div><strong>Local dashboard scaffold verified.</strong><span>Six-test suite green, loopback smoke passed, server stopped clean. Demo data only; no paid operations.</span></div></li>
+          <li><time datetime="2026-10-26T19:52:00-07:00">26 Oct 2026 · 19:52 PDT</time><div><strong>Local signed-in scaffold built.</strong><span>Inventory, permissioned sharing, API-key lifecycle and a deterministic fake adapter, for local review.</span></div></li>
+          <li><time datetime="2026-10-26T15:43:42-07:00">26 Oct 2026 · 15:43 PDT</time><div><strong>Public site source proposed (45beace).</strong><span>PR #1 carries the approved website source with isolated, deploy-free checks.</span></div></li>
+          <li><time datetime="2026-10-26T12:48:19-07:00">26 Oct 2026 · 12:48 PDT</time><div><strong>Versioned diagram URL (25bf2ac).</strong><span>Published diagrams referenced by version; original assets retained.</span></div></li>
+          <li><time datetime="2026-10-26T12:44:05-07:00">26 Oct 2026 · 12:44 PDT</time><div><strong>Model &amp; LoRA drill-down (4f8ccab).</strong><span>Serial adapter switching documented; concurrent multi-LoRA serving not claimed.</span></div></li>
+          <li><time datetime="2026-10-26T10:04:12-07:00">26 Oct 2026 · 10:04 PDT</time><div><strong>IRB/DGM graphic added (1c20a87).</strong><span>Verified architecture figure embedded with full-size SVG and PNG.</span></div></li>
+          <li><time datetime="2026-10-26T09:07:35-07:00">26 Oct 2026 · 09:07 PDT</time><div><strong>Research system documented (0bbcf44).</strong><span>Proposed AIPSTER research system written up; live behavior not demonstrated.</span></div></li>
+        </ol>
       </div>
     </section>
   </main>
 
   <footer class="site-footer">
     <div class="wrap footer-grid">
-      <a class="wordmark" href="/" aria-label="AIPSTER home"><img class="wordmark-logo" src="/assets/aipster-wordmark-on-dark.svg" alt="" width="144" height="30"><span>Your AI compute, shared on your terms.</span></a>
+      <a class="wordmark" href="/" aria-label="AIPSTER home"><img class="wordmark-logo" src="/assets/aipster-wordmark-on-dark.svg" alt="" width="144" height="33"><span>Your AI compute, shared on your terms.</span></a>
       <p>Conceptual design and offline scaffold work predate this public documentation repository. Publication dates do not establish when that earlier work occurred.</p>
       <a class="footer-source" href="https://github.com/synchronic1/AIPSTER">Public source on GitHub <span aria-hidden="true">↗</span></a>
     </div>
