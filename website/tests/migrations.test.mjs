@@ -16,6 +16,8 @@ test('migrations create the auth and app tables', () => {
   for (const c of ['id', 'token', 'expiresAt', 'userId']) assert.ok(cols('session').includes(c), `session.${c}`);
   assert.ok(cols('key_verifiers').includes('verifier'), 'key_verifiers.verifier');
   assert.ok(cols('allowlist').includes('email'), 'allowlist.email');
+  assert.ok(names.includes('write_budget'), 'missing table write_budget');
+  for (const c of ['user_id', 'window', 'count']) assert.ok(cols('write_budget').includes(c), `write_budget.${c}`);
 });
 
 test('migrations are idempotent where SQLite allows', () => {

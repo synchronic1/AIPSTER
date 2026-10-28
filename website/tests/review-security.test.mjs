@@ -39,12 +39,14 @@ test('review: tenant cannot update another user through Better Auth', async () =
 
 // Actual Worker -> Better Auth OAuth adapter -> D1 callback. All three GitHub
 // responses are deterministic fixtures; this is not a live GitHub login test.
-for (const [verified, existing] of [[true, false], [false, false], [false, true]]) {
-  test(`review: actual OAuth callback ${verified ? 'accepts verified' : 'rejects unverified'} ${existing ? 'existing' : 'new'} invited email (stub GitHub)`, async context => {
+// Public registration: no invitation. A verified new email registers; anything
+// else fails closed, including a verified email that matches an existing
+// user (no implicit linking on email-text match).
+for (const [verified, existing] of [[true, false], [false, false], [false, true], [true, true]]) {
+  test(`review: actual OAuth callback ${verified ? 'accepts verified' : 'rejects unverified'} ${existing ? 'existing' : 'new'} email (stub GitHub)`, async context => {
     const t = await createTestEnv();
     context.after(() => t.sqlite.close());
     const email = existing ? t.alice.email : 'callback@example.com';
-    if (!existing) await t.DB.prepare('INSERT INTO allowlist(email,added_at) VALUES(?,?)').bind(email, new Date().toISOString()).run();
     const called = [];
     context.mock.method(globalThis, 'fetch', async input => {
       const url = String(input instanceof Request ? input.url : input);
@@ -66,10 +68,16 @@ for (const [verified, existing] of [[true, false], [false, false], [false, true]
       {headers: {Cookie: cookies}});
     assert.equal(called.length, 3, 'Exercise token, profile and verification adapters');
     const row = await t.DB.prepare('SELECT id FROM "user" WHERE email=?').bind(email).first();
-    assert.equal(!!row, verified || existing, 'Only verified invited identity may be created');
+    assert.equal(!!row, verified || existing, 'Only a verified new identity may be created');
     const sessionCookie = callback.headers.getSetCookie().find(value => value.startsWith('better-auth.session_token='));
-    assert.equal(!!sessionCookie, verified, 'Only verified invited identity may obtain a session');
-    if (verified) {
+    const expectSession = verified && !existing;
+    assert.equal(!!sessionCookie, expectSession, 'Only a verified NEW identity may obtain a session');
+    if (verified && existing) {
+      assert.ok(String(callback.headers.get('location') || '').includes('error=account_not_linked'), 'colliding login fails closed, never links');
+      const linked = await t.DB.prepare('SELECT id FROM account WHERE userId = ? AND providerId = ?').bind(t.alice.id, 'github').first();
+      assert.equal(linked, null, 'no silent link row on the existing user');
+    }
+    if (verified && !existing) {
       assert.equal(callback.headers.get('location'), t.env.BETTER_AUTH_URL + '/app/');
       const session = await t.call('/api/auth/get-session', {headers: {Cookie: sessionCookie.split(';')[0]}});
       assert.equal((await session.json()).user.id, row.id);

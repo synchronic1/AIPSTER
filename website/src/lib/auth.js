@@ -1,37 +1,40 @@
 /* Built with Meta Muse. */
 // Better Auth factory for the Cloudflare Worker: GitHub OAuth, D1 sessions,
-// invited-email gate. Verified against better-auth 1.7.14: raw D1Database is a
+// public registration with a provider-verified-email gate. The earlier
+// invited-test-user allowlist policy was an assumption and is rejected:
+// any GitHub user with a provider-verified email may register.
+// Verified against better-auth 1.7.14: raw D1Database is a
 // first-class `database` option, telemetry defaults off (also disabled here),
 // Workers integration mounts at /api/auth/* with the nodejs_als flag.
 import { betterAuth } from 'better-auth';
 import { APIError } from 'better-auth/api';
 import { username } from 'better-auth/plugins/username';
-import { first } from './store.js';
+import { first, run } from './store.js';
 
 export const OAUTH_SCOPES = ['read:user', 'user:email'];
+// Per-user session-creation cap: at most this many sessions minted per
+// rolling UTC hour. Bounds repeat-login D1 writes without touching the
+// mutation budget (a spent budget must never lock a user out of
+// signing in). Sign-out and revocation stay free, so recovery is
+// always available. Counted in a deletion-proof hourly counter (not
+// live session rows: sign-out deletes rows, which would reopen slots).
+export const MAX_SESSIONS_PER_HOUR = 20;
 export const OAUTH_CALLBACK_PATH = '/api/auth/callback/github';
 
 export function configError(message) {
   return Object.assign(new Error(message), { status: 500, code: 'CONFIG' });
 }
 
-export async function isInvited(db, email) {
-  if (typeof email !== 'string') return false;
-  const norm = email.trim().toLowerCase();
-  if (!norm) return false;
-  const row = await first(db, 'SELECT email FROM allowlist WHERE email = ?', norm);
-  return !!row;
-}
-
-// The real OAuth invitation gate (the databaseHooks wrapper below is a thin
-// caller). Requires BOTH allowlist membership AND a provider-verified email:
-// the GitHub provider supplies emailVerified from the verified-emails API.
-export async function checkInvitation(db, user) {
+// The real OAuth signup gate (the databaseHooks wrapper below is a thin
+// caller). Public registration: any signup is allowed, but the email must
+// be provider-verified. emailVerified comes server-side from the GitHub
+// provider's verified-emails API call -- never from a client claim -- and
+// password signup stays closed (disableSignUp), so this hook only ever
+// sees provider-supplied identities. Missing, malformed, or unverified
+// emails are rejected with one code so the login page can explain it.
+export async function requireVerifiedEmail(user) {
   const email = user && user.email;
-  if (!isEmailLike(email) || !(await isInvited(db, email))) {
-    throw new APIError(403, { message: 'This sign-in is not invited.', code: 'NOT_INVITED' });
-  }
-  if (!user || user.emailVerified !== true) {
+  if (!isEmailLike(email) || !user || user.emailVerified !== true) {
     throw new APIError(403, { message: 'A provider-verified email is required.', code: 'NOT_VERIFIED' });
   }
   return true;
@@ -86,6 +89,16 @@ export function createAuth(env) {
       }
     },
     plugins: [username()],
+    account: {
+      // Never link a new OAuth identity to an existing user merely
+      // because the email text matches. Without this, better-auth
+      // implicitly links a verified provider email to the local user
+      // with the same verified email -- an account-takeover vector.
+      // Session-initiated link-social keeps working; only the silent
+      // match path is closed. A colliding login fails closed with
+      // `account_not_linked` instead of joining the wrong account.
+      accountLinking: { disableImplicitLinking: true }
+    },
     rateLimit: {
       enabled: true,
       storage: 'database',
@@ -108,9 +121,9 @@ export function createAuth(env) {
       user: {
         create: {
           before: async (user) => {
-            // Invited-test-user policy (assumed; see docs/cloudflare-integration-plan.md).
-            // Requires allowlist membership AND a provider-verified email.
-            await checkInvitation(env.DB, user);
+            // Public registration: no invitation. Still requires a
+            // provider-verified email, checked server-side.
+            await requireVerifiedEmail(user);
             return { data: user };
           }
         }
@@ -128,6 +141,18 @@ export function createAuth(env) {
               const row = await first(env.DB, 'SELECT disabled FROM "user" WHERE id = ?', session.userId);
               if (row && Number(row.disabled) === 1) {
                 throw new APIError(403, { message: 'This sign-in is disabled.', code: 'ACCOUNT_DISABLED' });
+              }
+              // Rolling hourly cap on session creation (repeat logins),
+              // counted in the write_budget table under an 's:' namespace
+              // so sign-outs and revocations (which delete session rows)
+              // cannot reopen slots. Atomic conditional claim, exactly
+              // like the mutation budget; a lost race mutates nothing.
+              const swindow = 's:' + new Date().toISOString().slice(0, 13);
+              await run(env.DB, 'INSERT OR IGNORE INTO write_budget (user_id, window, count) VALUES (?, ?, 0)', session.userId, swindow);
+              await run(env.DB, "DELETE FROM write_budget WHERE window LIKE 's:%' AND window < ?", 's:' + new Date(Date.now() - 3600 * 1000).toISOString().slice(0, 13));
+              const sclaim = await run(env.DB, 'UPDATE write_budget SET count = count + 1 WHERE user_id = ? AND window = ? AND count < ?', session.userId, swindow, MAX_SESSIONS_PER_HOUR);
+              if (Number(sclaim.meta.changes) !== 1) {
+                throw new APIError(429, { message: 'Too many sign-ins in the last hour. Try again later.', code: 'SESSION_RATE_LIMITED' });
               }
             }
             return { data: session };

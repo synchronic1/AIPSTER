@@ -3,10 +3,11 @@
 // existing static site. Routing: /api/auth/* -> Better Auth, /api/* -> JSON
 // API (errors always JSON, never the static 404 page), /app* -> panel assets,
 // everything else -> ASSETS (landing page preserved byte-for-byte).
-import { createAuth, isInvited, oauthConfigured, sessionUser } from './lib/auth.js';
+import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
+import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from './lib/quotas.js';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -50,6 +51,18 @@ const AUTH_BODY_MAX = 64 * 1024;
 const DEMO_ALLOWED_AUTH = new Set(['/api/auth/sign-in/username', '/api/auth/sign-in/email', '/api/auth/sign-out', '/api/auth/get-session']);
 // A disabled account may only end sessions, never read or mutate auth state.
 const DISABLED_ALLOWED_AUTH = new Set(['/api/auth/sign-out', '/api/auth/revoke-session', '/api/auth/revoke-sessions', '/api/auth/revoke-other-sessions']);
+// Auth mutation budget: these maintained Better Auth routes mutate
+// user/credential/account rows for the CALLER, so an authenticated caller
+// is charged the same hourly write budget as app mutations (the PR11
+// independent review caught update-user bypassing it: 200 + row writes
+// at a spent budget). All six take POST (verified in 1.7.14 sources).
+// Deliberately NOT billed: sign-out, session revocation, and
+// unlink-account (security-reducing; must work at exhaustion — unlink
+// cannot be spammed without re-linking, which IS billed), plus reads,
+// unauthenticated login/registration/recovery flows, and library-managed
+// session upkeep. Verified against better-auth 1.7.14 route sources
+// (dist/api/routes/*.mjs).
+const BUDGETED_AUTH_POST_ROUTES = new Set(['/api/auth/update-user', '/api/auth/change-email', '/api/auth/change-password', '/api/auth/delete-user', '/api/auth/update-session', '/api/auth/link-social']);
 
 function canonicalOrigin(env) {
   const raw = (env && env.BETTER_AUTH_URL) || '';
@@ -84,7 +97,8 @@ async function actorFrom(request, env, auth) {
           if (row.expires_at && Date.parse(row.expires_at) < Date.now()) return { kind: 'expired' };
           const user = await first(env.DB, 'SELECT id, name, email, username, demo, disabled FROM "user" WHERE id = ?', row.owner_id);
           if (user && Number(user.disabled) !== 1) {
-            await run(env.DB, 'UPDATE key_verifiers SET last_used_at = ? WHERE id = ?', nowIso(), row.id);
+            await run(env.DB, 'UPDATE key_verifiers SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)',
+              nowIso(), row.id, new Date(Date.now() - 3600 * 1000).toISOString());
             return { kind: 'key', user, key: row };
           }
         }
@@ -139,7 +153,7 @@ async function handleApi(request, env, url) {
       try {
         const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
         const names = new Set(rows.map((r) => r.name));
-        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit']
+        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit', 'write_budget']
           .every((n) => names.has(n));
         // Migration contract: required columns must exist, not just tables.
         // LIMIT 0 probes fail when any column is missing (e.g. 0003/0004
@@ -195,6 +209,21 @@ async function handleApi(request, env, url) {
       if (!disabled && demo && !DEMO_ALLOWED_AUTH.has(path)) {
         return json(403, { error: 'This auth endpoint is not available to the demo account.', code: 'DEMO_RESTRICTED' });
       }
+      // Authenticated profile/credential mutations consume the hourly
+      // write budget, exactly like app mutations — but only on POST and
+      // only same-origin. Billing bare GETs would let cross-site
+      // top-level navigations (SameSite=Lax carries the cookie) drain the
+      // victim's budget with no mutation; billing cross-origin POSTs
+      // would do the same one claim at a time. Cross-origin POSTs still
+      // fail: better-auth's own origin check (trustedOrigins) rejects
+      // them after we decline to bill. delete-user/callback (a GET) is
+      // deliberately unbilled: fake tokens write nothing, and a valid
+      // single-use token completes at most once per billed delete-user
+      // initiation — billing the completion too would only reopen a
+      // fake-token drain with no accounting benefit.
+      if (!disabled && found.user && method === 'POST' && BUDGETED_AUTH_POST_ROUTES.has(path) && sameOrigin(request)) {
+        await checkWriteBudget(env.DB, found.user.id);
+      }
     }
     return auth.handler(forwarded);
   }
@@ -245,15 +274,19 @@ async function handleApi(request, env, url) {
     if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
+    await checkWriteBudget(db, me());
     const id = rid('r_');
     const now = nowIso();
-    await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?)`,
+    // Atomic cap: the count test is inside the single INSERT statement.
+    const rc = await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?
+      WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
       id, me(), body.name.trim(), kind, origin,
       String(body.cpu || 'unknown').slice(0, 80), String(body.gpu || 'none recorded').slice(0, 80),
       JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : []),
       JSON.stringify(body.limits && typeof body.limits === 'object' ? body.limits : {}),
-      'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now);
+      'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now, me());
+    assertClaimed(rc, 'resource');
     await audit(db, me(), 'resource.register', id, body.name.trim());
     const row = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
     return json(201, cardFor(row, await ownerName(db, me())));
@@ -296,7 +329,7 @@ async function handleApi(request, env, url) {
     if (!isId(body.resourceId)) return json(400, { error: 'resourceId is required.', code: 'BAD_RESOURCE' });
     const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resourceId);
     if (!resource || resource.owner_id !== me()) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
-    if (!isEmail(body.grantee)) return json(400, { error: 'Grantee must be an invited user email.', code: 'BAD_GRANTEE' });
+    if (!isEmail(body.grantee)) return json(400, { error: 'Grantee must be a registered user email.', code: 'BAD_GRANTEE' });
     const grantee = await first(db, 'SELECT id, email, demo FROM "user" WHERE email = ?', String(body.grantee).trim().toLowerCase());
     if (!grantee) return json(404, { error: 'Grantee user not found.', code: 'USER_NOT_FOUND' });
     if (grantee.id === me()) return json(400, { error: 'Cannot share with yourself.', code: 'SELF_SHARE' });
@@ -307,9 +340,12 @@ async function handleApi(request, env, url) {
     if (!Number.isSafeInteger(maxTokens) || maxTokens < 100 || maxTokens > 10000000) return json(400, { error: 'maxTokens must be 100..10000000.', code: 'BAD_QUOTA' });
     const existing = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', resource.id, grantee.id);
     if (existing) return json(409, { error: 'An active grant already exists for this user and resource.', code: 'GRANT_EXISTS' });
+    await checkWriteBudget(db, me());
     const id = rid('g_');
-    await run(db, 'INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL)',
-      id, resource.id, me(), grantee.id, maxJobs, maxTokens, nowIso());
+    const gc = await run(db, `INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at)
+      SELECT ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL WHERE (SELECT COUNT(*) FROM grants WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_GRANTS_PER_USER}`,
+      id, resource.id, me(), grantee.id, maxJobs, maxTokens, nowIso(), me());
+    assertClaimed(gc, 'grant');
     await audit(db, me(), 'grant.create', id, `${resource.id} -> ${grantee.email}`);
     return json(201, mapGrantLite(await first(db, 'SELECT * FROM grants WHERE id = ?', id)));
   }
@@ -319,6 +355,7 @@ async function handleApi(request, env, url) {
       const d = needSession() || needCsrf(); if (d) return deny(d);
       const g = await first(db, 'SELECT * FROM grants WHERE id = ? AND owner_id = ?', m[1], me());
       if (!g) return json(404, { error: 'Grant not found or not yours.', code: 'NOT_FOUND' });
+      if (g.revoked_at) return json(200, { ok: true });
       await run(db, 'UPDATE grants SET revoked_at = ? WHERE id = ?', nowIso(), g.id);
       await audit(db, me(), 'grant.revoke', g.id);
       return json(200, { ok: true });
@@ -345,11 +382,14 @@ async function handleApi(request, env, url) {
     }
     const metadata = isDemo() ? 'sandbox: demo-only credential' : (body.metadata !== undefined ? String(body.metadata).slice(0, 500) : '');
     const keyPrefix = isDemo() ? DEMO_KEY_PREFIX : KEY_PREFIX;
+    await checkWriteBudget(db, me());
     const { id, secret, short } = mintKey(keyPrefix);
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    await run(db, 'INSERT INTO key_verifiers (id, owner_id, name, scope, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)',
-      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso());
+    const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
+      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso(), me());
+    assertClaimed(kc, 'key');
     await audit(db, me(), 'key.create', id, body.scope);
     const row = await first(db, 'SELECT * FROM key_verifiers WHERE id = ?', id);
     return json(201, { ...publicKey(mapKeyRow(row)), secret, oneTime: 'This secret is shown once. It cannot be recovered.' });
@@ -358,8 +398,9 @@ async function handleApi(request, env, url) {
     const m = /^\/api\/keys\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (m && method === 'DELETE') {
       const d = needSession() || needCsrf(); if (d) return deny(d);
-      const k = await first(db, 'SELECT id FROM key_verifiers WHERE id = ? AND owner_id = ?', m[1], me());
+      const k = await first(db, 'SELECT id, revoked_at FROM key_verifiers WHERE id = ? AND owner_id = ?', m[1], me());
       if (!k) return json(404, { error: 'Key not found or not yours.', code: 'NOT_FOUND' });
+      if (k.revoked_at) return json(200, { ok: true });
       await run(db, 'UPDATE key_verifiers SET revoked_at = ? WHERE id = ?', nowIso(), m[1]);
       await audit(db, me(), 'key.revoke', m[1]);
       return json(200, { ok: true });
@@ -413,6 +454,7 @@ async function handleApi(request, env, url) {
     const d = needSession() || needCsrf(); if (d) return deny(d);
     const body = await readJson(request);
     if (!isName(body.displayName)) return json(400, { error: 'displayName is required (1..80 chars).', code: 'BAD_NAME' });
+    await checkWriteBudget(db, me());
     await run(db, 'UPDATE "user" SET name = ?, updatedAt = ? WHERE id = ?', body.displayName.trim(), nowIso(), me());
     await audit(db, me(), 'settings.update', 'displayName');
     return json(200, { ok: true, displayName: body.displayName.trim() });
