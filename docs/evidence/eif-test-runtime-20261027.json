@@ -1,0 +1,71 @@
+{
+  "schema": "aipster.eif.test-runtime-evidence.v1",
+  "date": "2026-10-27",
+  "scope": "Public-safe offline verification summary; no private source/history or runtime qualification.",
+  "eif_change": {
+    "digest_algorithm": "sha256",
+    "digest": "64697d42416047afc22a95cb5b492f713647d679b19c7ed6441d196cbe4fc404",
+    "digest_input": "git show --format= --binary <private-fix-commit> -- fabric (operator-held commit)",
+    "layer": "test-tooling runtime pin/preflight and stronger existing assertion",
+    "production_worker_or_python_changes": false
+  },
+  "host": {
+    "os": "macOS",
+    "arch": "arm64",
+    "python": "3.12.13",
+    "supported_tested_node": "24.18.1",
+    "incompatible_reproduced_node": "25.6.1",
+    "system_node_changed": false
+  },
+  "runtime_artifact": {
+    "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-darwin-arm64.tar.xz",
+    "sha256": "1d60b703fe5d7e7072489be8187f430f1a095a658c31e5e1e281331a5873fac3",
+    "verification": "matches official HTTPS SHASUMS256.txt; isolated extraction"
+  },
+  "checks": {
+    "before_node25_focused": {
+      "passed": 56,
+      "failed": 1
+    },
+    "before_node24_same_tests": {
+      "passed": 57,
+      "failed": 0
+    },
+    "after_node24_focused": {
+      "passed": 60,
+      "failed": 0
+    },
+    "after_node24_complete_fabric": {
+      "passed": 109,
+      "failed": 0,
+      "skipped": 0
+    },
+    "complete_python": {
+      "passed": 134,
+      "failed": 0,
+      "warnings": 2
+    },
+    "focused_python": {
+      "passed": 57,
+      "failed": 0
+    },
+    "ruff": "passed",
+    "typescript_vite_build": "passed with existing dependency annotation and bundle-size warnings",
+    "node25_preflight": "expected nonzero unsupported-runtime rejection"
+  },
+  "commands": {
+    "fabric_focused": "node node_modules/tsx/dist/cli.mjs --test tests/fabric-room.test.ts tests/copilot.test.ts tests/domain.test.ts tests/access.test.ts tests/mcp.test.ts tests/test-runtime.test.ts",
+    "fabric_complete": "npm test",
+    "build": "npm run build",
+    "python_complete": "PYTHONPATH=<isolated-checkout> PYTHONDONTWRITEBYTECODE=1 <existing-python> -m pytest -q -p no:cacheprovider --basetemp <owned-temp-dir>",
+    "ruff": "<existing-ruff> check --no-cache dendrite tests"
+  },
+  "application_package_versions_changed": false,
+  "aipster_sources": {
+    "main": "5f4dfb04b140ca414a81973713e12be5a154910d",
+    "muse/federation-control-plane": "53f9e10cb3edfbe8ab10d4c8aa1b683f724c0c3a"
+  },
+  "aipster_local_tests": "Not run: offline locked dependency cache lacks zod@4.6.7; see PR CI for application checks.",
+  "live_model_execution": false,
+  "aipster_to_ik_live_qualification": false
+}
