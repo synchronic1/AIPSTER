@@ -7,7 +7,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
-import { checkWriteBudget, checkObjectCap } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from './lib/quotas.js';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -248,16 +248,18 @@ async function handleApi(request, env, url) {
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
     await checkWriteBudget(db, me());
-    await checkObjectCap(db, 'resource', me());
     const id = rid('r_');
     const now = nowIso();
-    await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?)`,
+    // Atomic cap: the count test is inside the single INSERT statement.
+    const rc = await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?
+      WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
       id, me(), body.name.trim(), kind, origin,
       String(body.cpu || 'unknown').slice(0, 80), String(body.gpu || 'none recorded').slice(0, 80),
       JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : []),
       JSON.stringify(body.limits && typeof body.limits === 'object' ? body.limits : {}),
-      'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now);
+      'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now, me());
+    assertClaimed(rc, 'resource');
     await audit(db, me(), 'resource.register', id, body.name.trim());
     const row = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
     return json(201, cardFor(row, await ownerName(db, me())));
@@ -312,10 +314,11 @@ async function handleApi(request, env, url) {
     const existing = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', resource.id, grantee.id);
     if (existing) return json(409, { error: 'An active grant already exists for this user and resource.', code: 'GRANT_EXISTS' });
     await checkWriteBudget(db, me());
-    await checkObjectCap(db, 'grant', me());
     const id = rid('g_');
-    await run(db, 'INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL)',
-      id, resource.id, me(), grantee.id, maxJobs, maxTokens, nowIso());
+    const gc = await run(db, `INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at)
+      SELECT ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL WHERE (SELECT COUNT(*) FROM grants WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_GRANTS_PER_USER}`,
+      id, resource.id, me(), grantee.id, maxJobs, maxTokens, nowIso(), me());
+    assertClaimed(gc, 'grant');
     await audit(db, me(), 'grant.create', id, `${resource.id} -> ${grantee.email}`);
     return json(201, mapGrantLite(await first(db, 'SELECT * FROM grants WHERE id = ?', id)));
   }
@@ -353,12 +356,13 @@ async function handleApi(request, env, url) {
     const metadata = isDemo() ? 'sandbox: demo-only credential' : (body.metadata !== undefined ? String(body.metadata).slice(0, 500) : '');
     const keyPrefix = isDemo() ? DEMO_KEY_PREFIX : KEY_PREFIX;
     await checkWriteBudget(db, me());
-    await checkObjectCap(db, 'key', me());
     const { id, secret, short } = mintKey(keyPrefix);
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    await run(db, 'INSERT INTO key_verifiers (id, owner_id, name, scope, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)',
-      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso());
+    const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
+      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso(), me());
+    assertClaimed(kc, 'key');
     await audit(db, me(), 'key.create', id, body.scope);
     const row = await first(db, 'SELECT * FROM key_verifiers WHERE id = ?', id);
     return json(201, { ...publicKey(mapKeyRow(row)), secret, oneTime: 'This secret is shown once. It cannot be recovered.' });

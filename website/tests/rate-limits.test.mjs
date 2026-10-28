@@ -45,6 +45,8 @@ test('resource cap rejects the 101st resource', async () => {
   const out = await readJson(await t.call('/api/inventory', { method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name: 'one-too-many' } }));
   assert.equal(out.status, 409);
   assert.equal(out.json.code, 'RESOURCE_LIMIT');
+  const n = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(n.n, MAX_RESOURCES_PER_USER, 'rejected insert adds no row');
 });
 
 test('key cap counts active keys; revoking frees a slot', async () => {
@@ -56,6 +58,8 @@ test('key cap counts active keys; revoking frees a slot', async () => {
   }
   const mk = () => t.call('/api/keys', { method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name: 'extra', scope: 'read' } });
   assert.equal((await readJson(await mk())).json.code, 'KEY_LIMIT');
+  const kn = await t.DB.prepare('SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(kn.n, MAX_KEYS_PER_USER, 'rejected insert adds no row');
   const rev = await readJson(await t.call('/api/keys/k_seed_0', { method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf } }));
   assert.equal(rev.status, 200);
   const ok = await readJson(await mk());
@@ -77,6 +81,8 @@ test('grant cap counts active outgoing grants', async () => {
   const out = await readJson(await t.call('/api/grants', { method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { resourceId: 'r_cap_' + MAX_GRANTS_PER_USER, grantee: 'bob@example.com', maxJobs: 50, maxTokens: 50000 } }));
   assert.equal(out.status, 409);
   assert.equal(out.json.code, 'GRANT_LIMIT');
+  const gn = await t.DB.prepare('SELECT COUNT(*) AS n FROM grants WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(gn.n, MAX_GRANTS_PER_USER, 'rejected insert adds no row');
 });
 
 test('key last-used writes at most once per hour', async () => {
@@ -131,5 +137,22 @@ test('rejected over-budget requests perform no D1 write', async () => {
   for (let i = 0; i < 5; i++) assert.equal((await readJson(await patchName(t, t.alice, 'W!'))).status, 429);
   const after = (await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, window).first()).count;
   assert.equal(after, WRITE_BUDGET_PER_HOUR, 'counter untouched by rejections');
+});
+
+test('atomic budget: exactly 120 of 200 rapid claims succeed, counter exact', async () => {
+  // node:sqlite serializes in-process callers, so this cannot exhibit a
+  // true race; it pins the exact accounting the atomic UPDATE guarantees
+  // under serialization (200 parallel claims admit exactly 120 on D1).
+  const t = await createTestEnv();
+  let admitted = 0, rejected = 0;
+  await Promise.all(Array.from({ length: 200 }, async (_, i) => {
+    const out = await readJson(await patchName(t, t.alice, 'R' + i));
+    if (out.status === 200) admitted++; else if (out.status === 429) rejected++;
+    else assert.fail('unexpected status ' + out.status);
+  }));
+  assert.equal(admitted, WRITE_BUDGET_PER_HOUR);
+  assert.equal(rejected, 200 - WRITE_BUDGET_PER_HOUR);
+  const row = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, budgetWindow()).first();
+  assert.equal(row.count, WRITE_BUDGET_PER_HOUR, 'counter matches admissions exactly');
 });
 

@@ -121,8 +121,9 @@ none named `aipster-app` exists; do not reuse or mutate unrelated ones.
   review): 120 mutating API calls per UTC hour (`429 WRITE_RATE_LIMITED`,
   migration 0005 `write_budget` table), at most 100 resources / 20 active
   keys / 100 active outgoing grants per user (`409 *_LIMIT`), and key
-  `last_used_at` stamped at most hourly. Quotas are approximate
-  abuse throttles under concurrency, documented in `src/lib/quotas.js`.
+  `last_used_at` stamped at most hourly. Admission is atomic
+  (single-statement conditional writes); rejections are read-only.
+  See `src/lib/quotas.js`.
 - **Demo username/password (APPROVED scope change):** one seeded `demo`
   identity signs in via the maintained Better Auth `username` plugin +
   credential account (scrypt via the library, never plaintext, never a
