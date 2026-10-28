@@ -55,7 +55,7 @@ async function mutate(ctx, fn) {
   let replay = null;
   try {
     replay = await S.checkIdempotency(db, factor, request.method, url.pathname, request.headers.get('Idempotency-Key'), await digestJson(body === undefined ? null : body),
-      request.method === 'POST' ? restrictionOf(url.pathname) : null);
+      request.method === 'POST' ? restrictionOf(url.pathname, null, body) : null);
   } catch (e) { return sendErr(ctx, e); }
   if (replay) return ctx.json(replay.status, { ...replay.body, replayed: true });
   const key = request.headers.get('Idempotency-Key');

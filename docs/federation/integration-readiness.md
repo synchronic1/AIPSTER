@@ -113,16 +113,19 @@ policy choice.
 
 The six restrictive actions are grant pause/revoke, connection
 suspend/disconnect, and invitation decline/revoke, over REST and the matching
-MCP tools. For each, the first admission per (owner, action, existing target)
-is uncharged and exempt from the ceiling. A partial unique index in additive
-`0012_fabric_restriction_admission.sql` enforces "first", across both
-transports. The free insert requires a live, non-demo owner and an existing
-target row. Any repeat, concurrent duplicate or nonexistent target falls
-through, in the same D1 batch, to the unchanged charged insert. Growth stays
-bounded by existing rows times six actions. Pause/suspend cycles stay bounded
-because resume and veto withdrawal are charged. Expansion is still blocked at
-both limits. No admission, ledger, history or audit row is deleted, and the
-10,000 ceiling is unchanged.
+MCP tools. Each gets one uncharged, ceiling-exempt admission per (owner,
+action, target, current version). A partial unique index in additive
+`0012_fabric_restriction_admission.sql` enforces this across both transports.
+The free insert is granted only when the store would accept the request: a
+live non-demo owner who is the grant exporter, owns a connection side, or is
+the invitation recipient/issuer; a target in an actionable state; and a current
+`expectedVersion` where the store requires one. Another tenant's target, a
+missing target and a stale request all take the unchanged charged path in the
+same D1 batch, so they neither consume the slot nor reveal whether the target
+exists (the response matches a missing target). Versions advance only through
+an applied restriction or a charged resume/revision, so free admissions stay
+bounded. Expansion is still blocked at both limits. No admission, ledger,
+history or audit row is deleted, and the 10,000 ceiling is unchanged.
 
 Still the operator's decision (not made here): a retention/archive policy for
 admissions and ledger rows (STATE-LAYER D4), and what an owner at the ceiling
@@ -132,5 +135,6 @@ restrict but cannot create, resume or revise.
 Tests (`federation-restrictive-admission.test.mjs`): both exhaustion modes over
 REST and MCP; uncharged first use; repeats and nonexistent targets charged;
 replay and request binding; a single audit record; the live-owner requirement;
+another tenant spending or probing the slot; a stale version keeping the slot;
 and ten concurrent same-target admissions on real local D1, of which exactly one
 is free and none is charged. On `b1c3bef` these fail with 429/409.
