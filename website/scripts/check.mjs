@@ -5,11 +5,12 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {parse} from 'parse5';
 
-export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/meta.svg','assets/sponsors/modal.svg','favicon.svg','index.html','release.json','styles.css'].sort();
+export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','favicon.svg','index.html','release.json','styles.css'].sort();
 
 export const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function files(root,dir=root){const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink(),'Symlinks are outside the public upload policy');const path=resolve(dir,entry.name);if(entry.isDirectory())result.push(...await files(root,path));else{assert(entry.isFile(),'Unexpected asset type');result.push(relative(root,path).replaceAll('\\','/'));}}return result.sort();}
 
+export const SPONSOR_DESTINATIONS=new Set(['https://www.meta.com/','https://modal.com/','https://www.baseten.co/']);
 const PRIVATE = /127\.0\.0\.1|localhost|4327|resource[-_. ]ledger|C:\\Users|(?:BEGIN (?:RSA |EC )?PRIVATE KEY)|(?:gh[pousr]_[\w]{20,})|(?:sk-[\w]{20,})/i;
 function checkPrivacy(text) {
   // Also catch ordinary escaped literals accidentally copied into the public JS.
@@ -37,6 +38,9 @@ function checkReference(ref, path, ids, navigation = false) {
     return;
   }
   const url = new URL(ref, 'https://public.invalid');
+  // Reviewed sponsor destinations: exact official-site URLs only. Exact
+  // string match — subdomains, lookalike hosts, and extra paths fail.
+  if (navigation && !path.endsWith('.svg') && SPONSOR_DESTINATIONS.has(ref)) return;
   assert(navigation && !path.endsWith('.svg') && url.protocol === 'https:'
     && url.hostname === 'github.com' && !url.port && !url.username && !url.password
     && (url.pathname === '/synchronic1/AIPSTER' || url.pathname.startsWith('/synchronic1/AIPSTER/')),
