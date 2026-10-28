@@ -94,3 +94,42 @@ test('key last-used writes at most once per hour', async () => {
   const t3 = (await t.DB.prepare('SELECT last_used_at FROM key_verifiers WHERE id = ?').bind(mk.json.id).first()).last_used_at;
   assert.ok(Date.parse(t3) > Date.parse('2000-01-01T00:00:00.000Z'), 'stale stamp refreshes');
 });
+
+test('exhausted users can still revoke keys and grants', async () => {
+  const t = await createTestEnv();
+  const as = { ...t.as(t.alice), ...t.csrf };
+  const key = await readJson(await t.call('/api/keys', { method: 'POST', headers: as, body: { name: 'leaked?', scope: 'read' } }));
+  const res = await readJson(await t.call('/api/inventory', { method: 'POST', headers: as, body: { name: 'shared-box' } }));
+  const grant = await readJson(await t.call('/api/grants', { method: 'POST', headers: as, body: { resourceId: res.json.id, grantee: 'bob@example.com', maxJobs: 50, maxTokens: 50000 } }));
+  assert.equal(grant.status, 201, grant.text);
+  for (let i = 3; i < WRITE_BUDGET_PER_HOUR; i++) await patchName(t, t.alice, 'F' + i);
+  assert.equal((await readJson(await patchName(t, t.alice, 'F!'))).json.code, 'WRITE_RATE_LIMITED');
+  const rk = await readJson(await t.call('/api/keys/' + key.json.id, { method: 'DELETE', headers: as }));
+  assert.equal(rk.status, 200, 'leaked key revokes despite spent budget');
+  const rg = await readJson(await t.call('/api/grants/' + grant.json.id, { method: 'DELETE', headers: as }));
+  assert.equal(rg.status, 200, 'grant revokes despite spent budget');
+  const used = await readJson(await t.call('/api/inventory', { headers: { Authorization: 'Bearer ' + key.json.secret } }));
+  assert.equal(used.status, 401, 'revoked key is dead');
+});
+
+test('repeat revocation is a no-op without a second audit row', async () => {
+  const t = await createTestEnv();
+  const as = { ...t.as(t.alice), ...t.csrf };
+  const key = await readJson(await t.call('/api/keys', { method: 'POST', headers: as, body: { name: 'x', scope: 'read' } }));
+  assert.equal((await readJson(await t.call('/api/keys/' + key.json.id, { method: 'DELETE', headers: as }))).status, 200);
+  assert.equal((await readJson(await t.call('/api/keys/' + key.json.id, { method: 'DELETE', headers: as }))).status, 200);
+  const audits = await t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'key.revoke' AND target = ?").bind(key.json.id).first();
+  assert.equal(audits.n, 1, 'one audit row for any number of repeats');
+});
+
+test('rejected over-budget requests perform no D1 write', async () => {
+  const t = await createTestEnv();
+  for (let i = 0; i < WRITE_BUDGET_PER_HOUR; i++) await patchName(t, t.alice, 'W' + i);
+  const window = budgetWindow();
+  const before = (await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, window).first()).count;
+  assert.equal(before, WRITE_BUDGET_PER_HOUR);
+  for (let i = 0; i < 5; i++) assert.equal((await readJson(await patchName(t, t.alice, 'W!'))).status, 429);
+  const after = (await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, window).first()).count;
+  assert.equal(after, WRITE_BUDGET_PER_HOUR, 'counter untouched by rejections');
+});
+

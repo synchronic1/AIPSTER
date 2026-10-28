@@ -325,7 +325,7 @@ async function handleApi(request, env, url) {
       const d = needSession() || needCsrf(); if (d) return deny(d);
       const g = await first(db, 'SELECT * FROM grants WHERE id = ? AND owner_id = ?', m[1], me());
       if (!g) return json(404, { error: 'Grant not found or not yours.', code: 'NOT_FOUND' });
-      await checkWriteBudget(db, me());
+      if (g.revoked_at) return json(200, { ok: true });
       await run(db, 'UPDATE grants SET revoked_at = ? WHERE id = ?', nowIso(), g.id);
       await audit(db, me(), 'grant.revoke', g.id);
       return json(200, { ok: true });
@@ -367,9 +367,9 @@ async function handleApi(request, env, url) {
     const m = /^\/api\/keys\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (m && method === 'DELETE') {
       const d = needSession() || needCsrf(); if (d) return deny(d);
-      const k = await first(db, 'SELECT id FROM key_verifiers WHERE id = ? AND owner_id = ?', m[1], me());
+      const k = await first(db, 'SELECT id, revoked_at FROM key_verifiers WHERE id = ? AND owner_id = ?', m[1], me());
       if (!k) return json(404, { error: 'Key not found or not yours.', code: 'NOT_FOUND' });
-      await checkWriteBudget(db, me());
+      if (k.revoked_at) return json(200, { ok: true });
       await run(db, 'UPDATE key_verifiers SET revoked_at = ? WHERE id = ?', nowIso(), m[1]);
       await audit(db, me(), 'key.revoke', m[1]);
       return json(200, { ok: true });

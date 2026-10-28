@@ -1,9 +1,12 @@
 /* Built with Meta Muse. */
 // Per-user write quotas for public registration: a fixed hourly write
 // budget plus per-object caps, so one account cannot exhaust shared D1
-// storage/quota. Best-effort abuse throttles, not billing: increments are
-// atomic (single UPSERT) but the limit check is approximate under
-// concurrency (slight over-admission possible, never under-).
+// storage/quota. Best-effort abuse throttles, not billing: a rejected
+// request performs no D1 write at all (check-first on a plain SELECT),
+// while admitted requests may slightly over-admit under concurrency (two
+// racers can both pass the same under-limit read). Bucket cleanup runs
+// only when a request opens a fresh hourly bucket (once per user per
+// hour), never on the rejection path.
 import { first, run } from './store.js';
 import { httpError } from './validate.js';
 
@@ -18,14 +21,19 @@ export function budgetWindow(now = new Date()) {
 
 export async function checkWriteBudget(db, userId) {
   const window = budgetWindow();
-  await run(db, `INSERT INTO write_budget (user_id, window, count) VALUES (?, ?, 1)
-    ON CONFLICT (user_id, window) DO UPDATE SET count = count + 1`, userId, window);
-  // Opportunistic cleanup: keep only the current and previous buckets.
-  await run(db, 'DELETE FROM write_budget WHERE window < ?', budgetWindow(new Date(Date.now() - 3600 * 1000)));
   const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', userId, window);
-  if (row && Number(row.count) > WRITE_BUDGET_PER_HOUR) {
+  if (row && Number(row.count) >= WRITE_BUDGET_PER_HOUR) {
+    // Rejection path: a read only, no D1 write, so hammering a spent
+    // budget cannot itself consume database writes.
     throw httpError(429, 'Too many changes in the last hour. Try again later.', 'WRITE_RATE_LIMITED');
   }
+  if (!row) {
+    // Fresh hourly bucket: OR IGNORE keeps a concurrent opener from
+    // erroring, and cleanup runs here (once per user per hour).
+    await run(db, 'INSERT OR IGNORE INTO write_budget (user_id, window, count) VALUES (?, ?, 0)', userId, window);
+    await run(db, 'DELETE FROM write_budget WHERE window < ?', budgetWindow(new Date(Date.now() - 3600 * 1000)));
+  }
+  await run(db, 'UPDATE write_budget SET count = count + 1 WHERE user_id = ? AND window = ?', userId, window);
 }
 
 export async function checkObjectCap(db, kind, ownerId) {
