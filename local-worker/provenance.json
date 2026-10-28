@@ -1,0 +1,88 @@
+{
+  "source": "https://github.com/synchronic1/elastic-inference-fabric",
+  "commit": "536508832b12d993dc272e03d4f09aca53801f68",
+  "license": "Apache-2.0",
+  "license_basis": "Peter Medina explicitly authorized original worker files and selected Apache-2.0 on 2026-10-28; upstream snapshot had no LICENSE. This grant applies to this copy, not an edit to upstream.",
+  "files": [
+    {
+      "path": "dendrite/__init__.py",
+      "sha256": "90055e1082a31026c3b735d7974b853db416e4bc650ca40d05a024432e6e69a4",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/api.py",
+      "sha256": "99ae96c2871c640c9d656671b954ce1d6c5ec1f338a3e7e4ec423e1d762532ef",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/cache.py",
+      "sha256": "5fe24e3cb6bb1ed04cacceab45489e8d0100de75c0b9b6d1ee52725bba9f26da",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/cli.py",
+      "sha256": "6f06aed48b1d9086323f8c997c5578fea6c69dd80e6e1c2a3d4c8c086166f488",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/config.py",
+      "sha256": "3bc453d5f767a1a823816661c2cda1bd34b573e16be2d87d3b78cebf3502e122",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/fabric.py",
+      "sha256": "8af8327a3c110bdbe7ff580e852ddf40778b457eeada73f8a83257a13d0c954b",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/hardware.py",
+      "sha256": "410a17efe6f4a5a86839e8ef574a7463635d31d701abf68e16f830dd8e314413",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/node.py",
+      "sha256": "fa0d5e47b04573975a630938e7010fa8a1c6e4a2b4b990782ea21bf4f5dceb3e",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/performance.py",
+      "sha256": "d21077d8e119bf80fabcbae03e569b0d20a40b51b96809f127c55deddc8e9665",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/runtimes/__init__.py",
+      "sha256": "38241299dead23aa4a90bfa2bdff8627725fb15d63f25bc7e7973b9be2002254",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/runtimes/base.py",
+      "sha256": "f137894780dff249ffdba1a57865be22e9beb2e20eeb37f0881fc6c84b462dc7",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/runtimes/llama.py",
+      "sha256": "7638b3164b074434313ddb74b7a2b6db8b721d6e8d984cb897ceb69299ccef34",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/runtimes/mock.py",
+      "sha256": "6b017a75d1879b0acf5d24fa88e446855274f3fb4f7537e3fbfad8aa6973d6c9",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "dendrite/schemas.py",
+      "sha256": "30842e6602192646d41d6cea168b8b421d05364e9663dce9753d556ed04a86a9",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "3c6824f10cb450d0c16198a91c199b6a09de73a2879aa2f28711ed0a7d76e669",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    },
+    {
+      "path": "uv.lock",
+      "sha256": "405784b3a776f8000820d9811703ec70ce1beaae0897fa82cbc5efa99132b793",
+      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    }
+  ]
+}

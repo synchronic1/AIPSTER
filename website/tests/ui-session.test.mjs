@@ -13,7 +13,7 @@ import { createTestEnv } from './d1-shim.mjs';
 const APP_JS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public', 'app', 'app.js');
 const DEMO_PASSWORD = 'ui-fixture-password-01';
 
-async function makeUi({ holdKey = false, logoutFails = false, holdError = false, holdLogout = false } = {}) {
+async function makeUi({ holdKey = false, logoutFails = false, holdError = false, holdLogout = false, search = '', anonymous = false } = {}) {
   const source = await readFile(APP_JS, 'utf8');
   const t = await createTestEnv();
   const now = new Date().toISOString();
@@ -42,7 +42,7 @@ async function makeUi({ holdKey = false, logoutFails = false, holdError = false,
     'login-error', 'demo-error', 'resource-error', 'grant-error', 'key-error', 'settings-error']) el(id).hidden = true;
   el('view-login').hidden = false;
 
-  let cookie = t.as(t.alice).Cookie;
+  let cookie = anonymous ? '' : t.as(t.alice).Cookie;
   let keySecret = null, releaseKey, releaseError = null;
   let keySeenResolve;
   const keySeen = new Promise((resolve) => { keySeenResolve = resolve; });
@@ -68,9 +68,12 @@ async function makeUi({ holdKey = false, logoutFails = false, holdError = false,
     }
     return res;
   };
+  let replacedUrl = null;
   const context = vm.createContext({
     document: { getElementById: el, querySelectorAll(sel) { return sel === '[data-tab]' ? tabs : sel === '[role="tabpanel"]' ? names.map((n) => el('tab-' + n)) : []; } },
-    location: { origin: 'http://localhost:8787' }, fetch: fetchImpl, setTimeout() { return 0; }, console
+    location: { origin: 'http://localhost:8787', pathname: '/app/', search }, fetch: fetchImpl, setTimeout() { return 0; }, console,
+    URLSearchParams,
+    history: { replaceState(_a, _b, url) { replacedUrl = url; } }
   });
   await new vm.Script(source, { filename: 'exact-client.js' }).runInContext(context);
   const flush = async () => { await new Promise(setImmediate); await new Promise(setImmediate); };
@@ -93,6 +96,7 @@ async function makeUi({ holdKey = false, logoutFails = false, holdError = false,
       await el('demo-form').listeners.submit({ preventDefault() {} });
       await flush();
     },
+    replacedUrl: () => replacedUrl,
     sessionActive: async () => !!(await (await t.call('/api/auth/get-session', { headers: { Cookie: cookie } })).json())?.user,
     leaked: () => !!keySecret && domText().includes(keySecret),
     overviewSelected: () => tabs.find((e) => e.dataset.tab === 'overview').attrs['aria-selected'] === 'true'
@@ -193,3 +197,24 @@ test('failed logout keeps the session and reports visibly', async () => {
   assert.ok(ui.el('banner').textContent.startsWith('Sign-out failed:'), 'failure visible');
   assert.equal(await ui.sessionActive(), true, 'session intact');
 });
+
+test('OAuth callback errors surface on the login view with mapped copy', async () => {
+  const ui = await makeUi({ anonymous: true, search: '?error=account_not_linked' });
+  assert.equal(ui.el('view-login').hidden, false, 'stays on login');
+  assert.equal(ui.el('login-error').hidden, false, 'error shown');
+  assert.ok(ui.el('login-error').textContent.includes('different sign-in method'), ui.el('login-error').textContent);
+  assert.ok(!ui.el('login-error').textContent.includes('account_not_linked'), 'mapped copy, not the raw code');
+  assert.equal(ui.replacedUrl(), '/app/', 'error param cleared from the URL');
+});
+
+test('unverified-email callback error explains the requirement', async () => {
+  const ui = await makeUi({ anonymous: true, search: '?error=NOT_VERIFIED&error_description=A+provider-verified+email+is+required.' });
+  assert.equal(ui.el('login-error').hidden, false);
+  assert.ok(ui.el('login-error').textContent.includes('verified email'), ui.el('login-error').textContent);
+});
+
+test('unknown callback errors fall back to a generic message', async () => {
+  const ui = await makeUi({ anonymous: true, search: '?error=weird_provider_thing' });
+  assert.equal(ui.el('login-error').textContent, 'GitHub sign-in failed. Please try again.');
+});
+

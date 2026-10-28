@@ -60,7 +60,7 @@ test('R2 MIGRATION: exporter backfill derives issuer from approval, not changed 
  t.sqlite.exec('ALTER TABLE connections DROP COLUMN vetoed_by; ALTER TABLE fabric_grants DROP COLUMN exporter_id; ALTER TABLE fabric_grants DROP COLUMN last_approval_id;');
  const now=new Date().toISOString();t.sqlite.prepare('INSERT INTO user (id,name,email,emailVerified,createdAt,updatedAt) VALUES (?,?,?,?,?,?)').run('u_third','Third','third@example.com',1,now,now);
  t.sqlite.exec("UPDATE resources SET owner_id='u_third' WHERE id='r_gpu1'");
- t.sqlite.exec(await readFile(new URL('../migrations/0007_repair2.sql',import.meta.url),'utf8'));
+ t.sqlite.exec(await readFile(new URL('../migrations/0008_repair2.sql',import.meta.url),'utf8'));
  const row=t.sqlite.prepare('SELECT exporter_id FROM fabric_grants WHERE id=?').get(grant.id);const r=await auth(t,nodeB.id);
  assert.equal(row.exporter_id,'u_alice',`backfill assigns ${row.exporter_id}; admission=${r.json.decision}`);
 });
@@ -82,7 +82,7 @@ test('R2 CONTROL: 0007 actual migration purges secrets and preserves intact expo
  const t=await fabricEnv();const {conn,nodeA}=await connectPair(t);const {grant}=await commitFlow(t,conn.id);await post(t,t.alice,`connections/${conn.id}/suspend`,{expectedVersion:1});
  t.sqlite.exec('ALTER TABLE connections DROP COLUMN vetoed_by; ALTER TABLE fabric_grants DROP COLUMN exporter_id; ALTER TABLE fabric_grants DROP COLUMN last_approval_id;');
  t.sqlite.prepare("INSERT INTO idempotency_records (idem_key,actor,method,path,request_hash,status,response_code,response_body,created_at) VALUES ('legacy','session:u_alice','POST','/v1/fabric/nodes','h','completed',201,?,'2000')").run(JSON.stringify({nodeSecret:'SYNTHETIC',token:'SYNTHETIC',secret:'SYNTHETIC',id:'keep'}));
- t.sqlite.exec(await readFile(new URL('../migrations/0007_repair2.sql',import.meta.url),'utf8'));
+ t.sqlite.exec(await readFile(new URL('../migrations/0008_repair2.sql',import.meta.url),'utf8'));
  const b=JSON.parse(t.sqlite.prepare("SELECT response_body FROM idempotency_records WHERE idem_key='legacy'").get().response_body);assert.equal(b.id,'keep');assert.ok(!b.nodeSecret&&!b.token&&!b.secret);
  assert.equal(t.sqlite.prepare('SELECT exporter_id FROM fabric_grants WHERE id=?').get(grant.id).exporter_id,'u_alice');assert.deepEqual(JSON.parse(t.sqlite.prepare('SELECT vetoed_by FROM connections WHERE id=?').get(conn.id).vetoed_by),[nodeA.id]);
 });

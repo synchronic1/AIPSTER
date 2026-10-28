@@ -33,3 +33,13 @@
 .post figcaption{font-size:11px;color:var(--muted);padding:10px 14px;border-top:1px solid var(--line)}
 @media(max-width:1000px){.progress-grid{gap:32px}}
 @media(max-width:760px){.progress-grid{grid-template-columns:1fr}.blog-trace{max-height:480px}}
+/* Hackathon sponsors banner, revision 2026-10-27.1. */
+.sponsors-banner{background:var(--green);color:#eef3e9}
+.sponsors-line{display:flex;align-items:center;justify-content:center;gap:8px 14px;flex-wrap:wrap;max-width:1184px;margin:0 auto;padding:12px 48px;font-size:13px;font-weight:600;letter-spacing:.01em;text-align:center}
+.sponsors-line strong{font-weight:750}
+.sponsor-logos{display:inline-flex;align-items:center;gap:10px}
+.sponsor-chip{display:inline-flex;align-items:center;padding:5px 12px;border-radius:8px}
+.sponsor-chip.light{background:#fff}
+.sponsor-chip.dark{background:#0b0e12}
+.sponsor-logos img{height:30px;width:auto}
+@media(max-width:760px){.sponsors-line{padding:12px 20px;font-size:12px}.sponsor-logos img{height:26px}}

@@ -66,7 +66,7 @@ export function createD1Shim(sqlite) {
   };
 }
 
-export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_fabric.sql', '0006_consent.sql', '0007_repair2.sql', '0008_state_layer.sql', '0009_revision_receipts.sql'];
+export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_write_budget.sql', '0006_fabric.sql', '0007_consent.sql', '0008_repair2.sql', '0009_state_layer.sql', '0010_revision_receipts.sql'];
 
 export function applyMigrations(sqlite, names = MIGRATION_FILES) {
   for (const name of names) {

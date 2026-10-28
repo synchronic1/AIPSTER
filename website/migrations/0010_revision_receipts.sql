@@ -1,6 +1,5 @@
 -- Applied revision receipts. No backfill: old before-images cannot be inferred.
--- This follows the federation branch's 0008. Renumber together with that
--- branch's unapplied migration block when integrating with main.
+-- Follows 0009_state_layer; main's applied 0005_write_budget stays unchanged.
 CREATE TABLE IF NOT EXISTS fabric_revision_receipts (
   operation_id TEXT PRIMARY KEY,
   grant_id TEXT NOT NULL REFERENCES fabric_grants(id),

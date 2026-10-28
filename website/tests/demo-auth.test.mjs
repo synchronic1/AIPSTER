@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
-import { checkInvitation } from '../src/lib/auth.js';
+import { requireVerifiedEmail } from '../src/lib/auth.js';
 import { readJson as readBody } from '../src/lib/validate.js';
 import { splitPresented, DEMO_KEY_PREFIX, KEY_PREFIX } from '../src/lib/keys.js';
 
@@ -131,17 +131,18 @@ test('demo keys are sandbox-prefixed; real users keep the live prefix', async ()
   assert.ok(real.json.secret.startsWith(KEY_PREFIX));
 });
 
-test('invitation gate requires allowlist AND provider-verified email', async () => {
-  const t = await createTestEnv();
+test('public signup gate requires a provider-verified email, no invitation', async () => {
   const codeOf = async (user) => {
-    try { await checkInvitation(t.DB, user); return 'ALLOWED'; }
+    try { await requireVerifiedEmail(user); return 'ALLOWED'; }
     catch (e) { return e && e.body && e.body.code ? e.body.code : String((e && e.message) || e); }
   };
-  assert.equal(await codeOf({ email: 'alice@example.com', emailVerified: false }), 'NOT_VERIFIED');
-  assert.equal(await codeOf({ email: 'mallory@evil.example', emailVerified: true }), 'NOT_INVITED');
-  assert.equal(await codeOf({ email: 'not-an-email', emailVerified: true }), 'NOT_INVITED');
-  assert.equal(await codeOf(null), 'NOT_INVITED');
+  assert.equal(await codeOf({ email: 'newcomer@example.com', emailVerified: true }), 'ALLOWED');
   assert.equal(await codeOf({ email: 'alice@example.com', emailVerified: true }), 'ALLOWED');
+  assert.equal(await codeOf({ email: 'alice@example.com', emailVerified: false }), 'NOT_VERIFIED');
+  assert.equal(await codeOf({ email: 'alice@example.com' }), 'NOT_VERIFIED');
+  assert.equal(await codeOf({ email: 'not-an-email', emailVerified: true }), 'NOT_VERIFIED');
+  assert.equal(await codeOf({ email: null, emailVerified: true }), 'NOT_VERIFIED');
+  assert.equal(await codeOf(null), 'NOT_VERIFIED');
 });
 
 test('byte cap counts wire bytes, not characters', async () => {

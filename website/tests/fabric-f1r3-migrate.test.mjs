@@ -8,7 +8,7 @@ import { fabricEnv, connectPair, commitFlow, S, freshKey, readJson } from './qa-
 const post = (t, u, p, b = {}, key = freshKey()) => t.call('/v1/fabric/' + p, { method: 'POST', headers: S(t, u, { 'Idempotency-Key': key }), body: b }).then(readJson);
 const MIGRATE_DOWN = 'ALTER TABLE connections DROP COLUMN grant_gen; ALTER TABLE approvals DROP COLUMN decided_at; ALTER TABLE approvals DROP COLUMN issued_connection; ALTER TABLE approvals DROP COLUMN issued_version; ALTER TABLE approvals DROP COLUMN issued_grant_gen; ALTER TABLE approvals DROP COLUMN bound_grant_id; ALTER TABLE approvals DROP COLUMN bound_grant_version; ALTER TABLE approvals DROP COLUMN consumed_by_op; ALTER TABLE approvals DROP COLUMN consumed_action; ALTER TABLE approvals DROP COLUMN consumed_target; ALTER TABLE idempotency_records DROP COLUMN attempt; ALTER TABLE fabric_grants DROP COLUMN quarantine_reason; DROP TABLE connection_vetoes;';
 async function apply0008(t) {
-  t.sqlite.exec(await readFile(new URL('../migrations/0008_state_layer.sql', import.meta.url), 'utf8'));
+  t.sqlite.exec(await readFile(new URL('../migrations/0009_state_layer.sql', import.meta.url), 'utf8'));
 }
 
 test('F1R3 MIGRATE: fresh install carries all 0008 tables and columns', async () => {

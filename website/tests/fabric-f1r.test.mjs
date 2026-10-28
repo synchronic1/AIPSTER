@@ -117,7 +117,7 @@ test('F1R2: migration purge statement strips persisted secrets in place', async 
   const t = await fabricEnv();
   t.sqlite.prepare("INSERT INTO idempotency_records (idem_key, actor, method, path, request_hash, status, response_code, response_body, created_at) VALUES ('legacy-k', 'session:u_alice', 'POST', '/v1/fabric/nodes', 'h', 'completed', 201, ?, '2000-01-01')")
     .run(JSON.stringify({ id: 'n', nodeSecret: 'SYNTHETIC' }));
-  // Same statement as migrations/0007_repair2.sql (already applied at setup).
+  // Same statement as migrations/0008_repair2.sql (already applied at setup).
   t.sqlite.exec("UPDATE idempotency_records SET response_body = json_set(json_remove(response_body, '$.nodeSecret', '$.token', '$.secret'), '$.replayNote', 'Secret fields are shown once and are not stored for replay.') WHERE status = 'completed' AND (json_extract(response_body, '$.nodeSecret') IS NOT NULL OR json_extract(response_body, '$.token') IS NOT NULL OR json_extract(response_body, '$.secret') IS NOT NULL)");
   const row = t.sqlite.prepare('SELECT response_body AS b FROM idempotency_records WHERE idem_key = ?').get('legacy-k');
   assert.ok(!row.b.includes('SYNTHETIC'));

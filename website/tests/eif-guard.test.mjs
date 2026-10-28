@@ -31,3 +31,33 @@ test('worker source performs no outbound inference calls', () => {
     assert.ok(!/elastic-inference|eif-restoration/i.test(src), `${f} must not hardcode EIF endpoints`);
   }
 });
+
+// Until placement confinement and atomic authorization/budget admission exist,
+// even attempted activation and unsafe capability claims cannot dispatch work.
+test('attempted CPU activation and invalid admission claims still create no job or network call', async () => {
+  const t = await createTestEnv({ EIF_CPU_ENABLED: '1', EIF_CPU_TOKEN: 'fixture-secret' });
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; throw new Error('unexpected execution transport'); };
+  try {
+    for (const body of [
+      { resourceId: 'other-tenant', model: 'fixture' },
+      { resourceId: 'revoked', model: 'fixture' },
+      { resourceId: 'stale', available: false },
+      { model: 'incompatible', memoryBytes: 0 },
+      { model: 'fixture', maxTokens: 999999, budget: 0 },
+      { endpoint: 'https://untrusted.invalid', model: 'fixture' },
+      { model: 'fixture', idempotencyKey: 'same-operation' },
+      { model: 'fixture', idempotencyKey: 'same-operation' },
+    ]) {
+      const out = await readJson(await t.call('/api/jobs', {
+        method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body
+      }));
+      assert.equal(out.status, 501);
+      assert.equal(out.json.code, 'INFERENCE_DISABLED');
+      assert.ok(!out.text.includes('fixture-secret'));
+    }
+    assert.equal((await t.DB.prepare('SELECT id FROM jobs').all()).results.length, 0);
+    assert.equal(calls, 0);
+  } finally { globalThis.fetch = originalFetch; t.sqlite.close(); }
+});

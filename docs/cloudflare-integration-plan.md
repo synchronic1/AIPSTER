@@ -45,7 +45,7 @@ One apex Worker (`aipster-public-site`) keeps serving the static landing page
 byte-for-byte (including progress/changelog/journal sections). Worker code runs
 first and routes:
 
-- `/api/auth/*` → Better Auth handler (GitHub OAuth for invited testers +
+- `/api/auth/*` → Better Auth handler (public GitHub registration +
   seeded demo username/password via the maintained `username` plugin, D1
   sessions, database-backed throttling).
 - `/api/*` (other) → control-panel JSON API, always JSON (errors never fall
@@ -86,6 +86,17 @@ bundles, or this document.
 - `0003_demo_auth.sql`: `username`/`displayUsername` plugin columns, `demo`
   workspace flag, `rateLimit` table for database-backed throttling.
 - `0004_disable_flag.sql`: `disabled` account flag for membership revocation.
+- `0005_write_budget.sql` (PR #11): `write_budget` table for the per-user
+  hourly write budget (120/hour, `429 WRITE_RATE_LIMITED`).
+  ORDERING NOTE: federation (PR #6, unmerged) separately adds
+  `0005_fabric.sql` + `0006`-`0008` with different tables — verified, no
+  table overlap with `write_budget`, so no confirmed conflict — but both
+  branches share the `0005` slot. Whichever PR merges second renumbers
+  to the next free sequence BEFORE merge (auth file -> `0009_*` if
+  federation lands first; federation block -> `0006`-`0009` if this
+  lands first — the federation block must stay ordered), then re-runs
+  migrations tests + CI. Neither `0005` has been applied to production
+  yet, so renumbering before first apply is safe for the D1 journal.
 
 Apply in order: `wrangler d1 migrations apply aipster-app --remote`
 (production), `--local` for development. 0001/0002 are re-runnable
@@ -95,22 +106,35 @@ none named `aipster-app` exists; do not reuse or mutate unrelated ones.
 
 ## 5. Policy decisions (confirm where marked)
 
-- **Invited test users (ASSUMED — needs confirmation):** signup beyond the
-  `allowlist` is rejected in `databaseHooks.user.create.before`, which now
-  also requires a provider-verified email (`emailVerified === true` from the
-  GitHub verified-emails adapter). Public signup policy is NOT established;
-  do not treat the allowlist as a general production owner policy. Seed
-  invited emails per environment with `wrangler d1 execute` (documented
-  command, never committed data). Two approved identity names are still
-  pending from Peter — do not invent or seed them.
+- **Public GitHub registration (APPROVED — invite-only explicitly rejected by
+  Peter):** any GitHub user with a provider-verified email may register;
+  `databaseHooks.user.create.before` requires `emailVerified === true` from
+  the GitHub verified-emails adapter (server-side, never a client claim).
+  No invitation, no allowlist check. Each new user gets an empty workspace;
+  signup grants no admin role (none exists), no shared compute, and no
+  inference permission. Implicit account linking on email-text match is
+  disabled (`accountLinking.disableImplicitLinking`): a colliding login
+  fails closed with `account_not_linked` instead of joining the wrong
+  account. The legacy `allowlist` table remains in the schema (no
+  destructive migration) but is no longer read by the signup path.
+  Public registration ships with per-user write quotas (Codex security
+  review): 120 mutating API calls per UTC hour (`429 WRITE_RATE_LIMITED`,
+  migration 0005 `write_budget` table), at most 100 resources / 20 active
+  keys / 100 active outgoing grants per user (`409 *_LIMIT`), and key
+  `last_used_at` stamped at most hourly. Authenticated Better Auth
+  profile/credential mutations bill the same budget (method + origin
+  gated); sign-out/revocation/unlink stay free. Session creation is
+  capped separately at 20/user/hour (deletion-proof counter).
+  Admission is atomic (single-statement conditional writes);
+  rejections are read-only. See `src/lib/quotas.js`.
 - **Demo username/password (APPROVED scope change):** one seeded `demo`
   identity signs in via the maintained Better Auth `username` plugin +
   credential account (scrypt via the library, never plaintext, never a
   parallel session system). `user.demo = 1` marks the isolated demo
-  workspace: synthetic fixtures only, grants/invitations refused server-side
+  workspace: synthetic fixtures only, grants/sharing refused server-side
   (`403 DEMO_RESTRICTED`), minted API keys forced to the `aip_demo_` prefix
   with sandbox metadata, dispatch disabled like everyone else. Public
-  registration stays closed (`disableSignUp`, verified by test). Provision
+  registration stays closed on the password path (`disableSignUp`, verified by test). Provision
   with `D1_PASSWORD='<generated-20+>' node scripts/setup-demo.mjs --db
   aipster-app [--remote]` (idempotent; hashes before touching SQL; password
   travels a private channel only, never source/logs). When D1_PASSWORD is
@@ -200,11 +224,15 @@ re-reviewed.
 
 ## 7. Test plan (all committed under `website/`)
 
-`npm test` (135 green on the final head): migrations incl. 0003/0004; real
-session round-trips; unauthenticated 401s; cross-user 404s; grants/quotas
-incl. real↔demo boundary both directions; key lifecycle incl. `aip_demo_`
-sandbox prefix; allowlist + verified-email gate (unit + stubbed-GitHub
-OAuth callback matrix, Codex-adopted probes); byte-cap streaming incl.
+`npm test` (167 green on the final head): migrations incl. 0005;
+public GitHub registration (verified-email gate, no invitation, no
+implicit linking; two-user + repeat + collision + isolation cases
+through the stubbed-GitHub callback path); per-user write quotas
+(hourly budget, object caps, revocation exemption, no-write-on-reject,
+auth-mutation billing, per-user session-creation cap);
+real session round-trips; unauthenticated 401s; cross-user 404s;
+grants/quotas incl. real↔demo boundary both directions; key lifecycle
+incl. `aip_demo_` sandbox prefix; byte-cap streaming incl.
 multibyte + chunked/flood auth bodies; token stripping; operator disable
 (canonical statements, immutable demo, sessions/keys/sign-ins revoked);
 demo/disabled auth-endpoint fencing through the actual handler; canonical
@@ -231,9 +259,9 @@ stubbed flows are not presented as OAuth evidence.
    `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` via `wrangler secret put`
    (production) and local `.dev.vars` (gitignored). `BETTER_AUTH_URL` is
    already `https://aipster.net` in committed `vars` (non-secret).
-5. Seed ONLY approved identities: invited emails via `wrangler d1 execute`;
-   demo account via `scripts/setup-demo.mjs --remote` with a privately
-   delivered generated password (never committed/logged).
+5. Seed ONLY the demo account via `scripts/setup-demo.mjs --remote` with a
+   privately delivered generated password (never committed/logged). No email
+   allowlist seeding: GitHub registration is public.
 6. Merge the reviewed head; dispatch the production workflow with
    `reviewed_sha` = full merged SHA; run the wired anonymous verifier and
    correlate `deployment.json`, CI run, merged commit, Cloudflare version.
@@ -247,12 +275,22 @@ stubbed flows are not presented as OAuth evidence.
    restore over newer user data for a code rollback. Rotate secrets if
    exposure is suspected.
 
+PR #11 (public signup) rollout delta: apply `0005_write_budget.sql` via
+`wrangler d1 migrations apply aipster-app --remote` BEFORE deploying the
+new Worker — health `ready` requires the `write_budget` table, and the
+verifier rejects unready health. Reconcile the `0005` slot with PR #6
+per §4 before merge. Rollback is code-only (step 8): the additive
+`write_budget` table stays; its rows are ephemeral hourly buckets,
+harmless if left behind.
+
 ## 9. Open confirmations
 
-- Invited-email policy vs another signup rule.
+- ~~Invited-email policy vs another signup rule.~~ RESOLVED: public GitHub
+  registration approved; invite-only rejected (this change).
 - D1 database name `aipster-app` acceptable.
 - Custom domain stays apex-only (no `app.` subdomain, no DNS change).
-- Two approved identity names (pending from Peter).
+- ~~Two approved identity names (pending from Peter).~~ MOOT under public
+  registration; no seed identities required.
 - Hermes incident summary: sanitized log references unavailable — treated as
   reported evidence only; no incident reproduction claimed.
 
@@ -284,7 +322,7 @@ restart, or shared-token-across-users design.
 
 | # | Finding | Disposition |
 |---|---------|-------------|
-| 1 | Invitation gate admits `emailVerified:false` | FIXED: `checkInvitation` requires allowlist + verified email; unit + stubbed-callback matrix green |
+| 1 | Invitation gate admits `emailVerified:false` | FIXED: `requireVerifiedEmail` requires a provider-verified email for public signup (allowlist retired); unit + stubbed-callback matrix green |
 | 2 | Provider tokens persisted in plaintext | FIXED: account create/update hooks strip OAuth tokens; credential passwords untouched; hook-level tests |
 | 3 | Verifier unwired + expects `/app` 404 | FIXED by Codex tooling `e6a4557` (wired anonymous verifier + preflight + explicit-dispatch workflow) |
 | 4 | Static-checker bypasses | FIXED by Codex tooling `e6a4557` (44 parse5 checker tests); this branch's checker edits reverted in favor of it |

@@ -1,5 +1,9 @@
 # Revision-history recovery repair
 
+For the current combined candidate, see [integration readiness](integration-readiness.md).
+It renumbers the unapplied migration block after main's unchanged write-budget
+migration; the original branch-local numbers below remain historical context.
+
 This is a focused repair stacked on PR #6 at
 `8a2233099a8f11a3a3d618e8481eaf05b5c80c96`. F1/F1P remain held. It does not
 enable inference, merge federation to main, or authorize deployment.
