@@ -10,7 +10,7 @@ import { httpError } from '../lib/validate.js';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
 import { opDigest, claimApproval, ensureAudit, ensureHistory, redactForReplay, freshAttempt, readAttempt } from './operations.mjs';
-import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
+import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, acceptRecoverInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
 // Maps a failed actor-live predicate: disabled/missing users authorize
@@ -254,9 +254,15 @@ export async function acceptInvitation(db, actor, input = {}, op = null) {
       acceptConnInsert({ connId, invId: inv.id, aNode: inv.issuer_node, bNode: acceptor.id, aWs: issuerRow ? issuerRow.workspace : '', bWs: acceptor.workspace, useRecord, now })
     ]);
   } catch {
-    // UNIQUE(invitation binding) lost to a concurrent winner: settle
-    // by reading; the winner's connection is returned, never doubled.
-    return recoverAcceptance(db, actor, inv, acceptor, op);
+    // A thrown batch proves nothing about who won: it may have aborted
+    // on the UNIQUE binding (concurrent winner), failed with nothing
+    // applied, or committed before the error surfaced. Settle on the
+    // durable invitation state; only an accepted invitation is
+    // completed, and completion re-checks it in the same statement.
+    const cur = await first(db, 'SELECT state FROM invitations WHERE id = ?', inv.id);
+    if (cur && cur.state === 'accepted') return recoverAcceptance(db, actor, inv, acceptor, op);
+    if (cur && cur.state !== 'issued') throw err(409, 'INVITATION_USED', `Invitation is ${cur.state}.`);
+    throw err(500, 'INTERNAL', 'Request failed.');
   }
   if (changes(res, 0) === 1 && changes(res, 1) === 1) {
     await auditFabric(db, actor, op, 'fabric.invitation.accept', inv.id, `connection ${connId}`);
@@ -275,29 +281,32 @@ export async function acceptInvitation(db, actor, input = {}, op = null) {
 }
 
 // Complete an accepted-but-connectionless invitation (legacy rows from
-// before the flip+insert batch, or a batch that aborted on UNIQUE), or
-// return the existing connection. Guarded by the UNIQUE
-// created_by_invitation binding: concurrent recoverers converge.
+// before the flip+insert batch, or a batch whose outcome was unknown),
+// or return the existing connection. The insert is conditional on the
+// invitation still being accepted for this recipient and on a live
+// actor; the UNIQUE created_by_invitation binding makes concurrent
+// recoverers converge.
 async function recoverAcceptance(db, actor, inv, acceptor, op = null) {
-  const done = await insertAcceptance(db, inv, acceptor);
+  const done = await insertAcceptance(db, actor, inv, acceptor);
   if (!done.created) return { status: 200, body: { id: done.id, state: 'active', note: 'Connection already existed for this invitation.' } };
   await auditFabric(db, actor, op, 'fabric.invitation.accept', inv.id, `connection ${done.id} (recovered)`);
   return { status: 201, body: { id: done.id, aNode: inv.issuer_node, bNode: acceptor.id, state: 'active' } };
 }
 
-async function insertAcceptance(db, inv, acceptor) {
+async function insertAcceptance(db, actor, inv, acceptor) {
   const issuerRow = await first(db, 'SELECT workspace FROM fabric_nodes WHERE id = ?', inv.issuer_node);
+  const connId = `conn_${randHex(8)}`;
   const now = nowIso();
+  let res;
   try {
-    const connId = `conn_${randHex(8)}`;
-    await db.prepare('INSERT INTO connections (id, a_node, b_node, a_workspace, b_workspace, state, version, created_by_invitation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)')
-      .bind(connId, inv.issuer_node, acceptor.id, issuerRow ? issuerRow.workspace : '', acceptor.workspace, 'active', inv.id, now, now).run();
-    return { created: true, id: connId };
-  } catch {
-    const existing = await first(db, 'SELECT id FROM connections WHERE created_by_invitation = ?', inv.id);
-    if (existing) return { created: false, id: existing.id };
-    throw err(500, 'INTERNAL', 'Request failed.');
-  }
+    res = await runBatch(db, [acceptRecoverInsert({ connId, invId: inv.id, aNode: inv.issuer_node, bNode: acceptor.id, aWs: issuerRow ? issuerRow.workspace : '', bWs: acceptor.workspace, now, actorId: actor.user.id })]);
+  } catch { /* UNIQUE lost to a concurrent recoverer: settle below */ }
+  if (res && changes(res, 0) === 1) return { created: true, id: connId };
+  const existing = await first(db, 'SELECT id FROM connections WHERE created_by_invitation = ?', inv.id);
+  if (existing) return { created: false, id: existing.id };
+  const cur = await first(db, 'SELECT state FROM invitations WHERE id = ?', inv.id);
+  if (!cur || cur.state !== 'accepted') throw err(409, 'INVITATION_USED', `Invitation is ${cur ? cur.state : 'gone'}.`);
+  await throwActorClosed(db, actor);
 }
 
 export async function declineInvitation(db, actor, id, op = null) {
@@ -941,6 +950,19 @@ export async function resumeGrant(db, actor, id, input = {}, op = null) {
   const grant = await first(db, 'SELECT * FROM fabric_grants WHERE id = ?', id);
   if (!grant || !(await grantVisibleTo(db, actor, grant))) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (grant.quarantine_reason) throw err(409, 'GRANT_QUARANTINED', 'Grant is quarantined; re-issue it.');
+  // Same-operation retry of a resume whose effect already committed
+  // (e.g. its audit write failed and the router released the key): the
+  // effect advanced version and status, so the fresh-mutation checks
+  // below would reject it terminally. Recognise it first by the
+  // approval this very operation consumed, and repair the audit.
+  if (typeof input.approvalId === 'string' && input.approvalId && grant.status === 'enforced' && grant.last_approval_id === input.approvalId
+    && await actorExportsGrant(db, actor, grant)) {
+    const prior = await first(db, 'SELECT action, target_id, consumed_at, consumed_by_op FROM approvals WHERE id = ?', input.approvalId);
+    if (prior && prior.action === 'grant.resume' && prior.target_id === id && prior.consumed_at && prior.consumed_by_op === await opDigest(actor, op)) {
+      await auditFabric(db, actor, op, 'fabric.grant.resume', id, 'reconciled');
+      return { status: 200, body: { id, status: 'enforced', note: 'This approval was already applied to this grant.' } };
+    }
+  }
   const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', grant.connection_id);
   if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
   if (!await actorExportsGrant(db, actor, grant)) throw err(403, 'FORBIDDEN', 'Only the exporting owner can resume.');

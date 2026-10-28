@@ -50,6 +50,19 @@ export function acceptConnInsert({ connId, invId, aNode, bNode, aWs, bWs, useRec
     connId, aNode, bNode, aWs, bWs, invId, now, now, invId, useRecord];
 }
 
+// ---- acceptance recovery: completes only a durably accepted invitation ----
+// Re-pins the accepted state, the proven recipient, and a live actor in
+// the same statement, so recovery can never resurrect a revoked,
+// declined, expired, or still-issued invitation.
+
+export function acceptRecoverInsert({ connId, invId, aNode, bNode, aWs, bWs, now, actorId }) {
+  return [`INSERT INTO connections (id, a_node, b_node, a_workspace, b_workspace, state, version, created_by_invitation, created_at, updated_at)
+    SELECT ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?
+    WHERE EXISTS(SELECT 1 FROM invitations WHERE id = ? AND state = 'accepted' AND recipient_node = ? AND recipient_workspace = ?)
+    AND NOT EXISTS(SELECT 1 FROM connections WHERE created_by_invitation = ?) AND ${ACTOR_LIVE}`,
+    connId, aNode, bNode, aWs, bWs, invId, now, now, invId, bNode, bWs, invId, actorId];
+}
+
 // ---- veto add: version-pinned restriction first, veto row chained on it ----
 
 export function vetoRestrict({ connId, side, version, newState, mirror, now, actorId }) {
@@ -65,12 +78,20 @@ export function vetoRestrict({ connId, side, version, newState, mirror, now, act
 }
 
 // ---- veto withdraw: delete proven sides, then version-pinned derivation ----
+// A zero-row UPDATE does not roll the batch back, so the DELETE carries
+// every predicate the UPDATE does (pre-delete form of the count): a
+// withdrawal that loses the version race or the actor check deletes
+// nothing, and a DELETE that lands guarantees the UPDATE lands.
 
 export function vetoWithdraw({ connId, sides, version, newState, suspendedBy, mirror, remaining, now, actorId }) {
   const newV = Number(version) + 1;
   const qs = sides.map(() => '?').join(',');
   return [
-    [`DELETE FROM connection_vetoes WHERE connection_id = ? AND side_node IN (${qs})`, connId, ...sides],
+    [`DELETE FROM connection_vetoes WHERE connection_id = ? AND side_node IN (${qs})
+      AND EXISTS(SELECT 1 FROM connections c WHERE c.id = ? AND c.version = ? AND c.state != 'active') AND ${ACTOR_LIVE}
+      AND (SELECT count(*) FROM connection_vetoes WHERE connection_id = ? AND side_node IN (${qs})) = ?
+      AND (SELECT count(*) FROM connection_vetoes WHERE connection_id = ?) = ?`,
+      connId, ...sides, connId, version, actorId, connId, ...sides, sides.length, connId, remaining + sides.length],
     [`UPDATE connections SET state = ?, suspended_by = ?, vetoed_by = ?, version = ?, updated_at = ?
       WHERE id = ? AND version = ? AND state != 'active' AND ${ACTOR_LIVE}
       AND (SELECT count(*) FROM connection_vetoes WHERE connection_id = ?) = ?`,

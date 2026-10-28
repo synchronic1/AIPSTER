@@ -8,7 +8,7 @@ import { readFile } from 'node:fs/promises';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { MIGRATION_FILES } from './d1-shim.mjs';
 import * as core from '../src/fabric/store.mjs';
-import { SNAPSHOT_VALID } from '../src/fabric/transitions.mjs';
+import { SNAPSHOT_VALID, runBatch, changes, vetoWithdraw, acceptRecoverInsert } from '../src/fabric/transitions.mjs';
 
 async function d1Env() {
   const mf = new Miniflare(convertV4MiniflareOptions({
@@ -165,5 +165,35 @@ test('local D1: ledger uncertain-reclaim and completed-immutability', async () =
     const done = await core.checkIdempotency(t.db, t.alice, 'POST', '/synthetic', key, 'h1');
     assert.equal(done.body.ok, true);
     console.log('Local D1 ledger PASS');
+  } finally { await t.mf.dispose(); }
+});
+
+test('local D1: lost veto withdrawal and unaccepted recovery change nothing', async () => {
+  const t = await d1Env();
+  try {
+    const nA = await core.registerNode(t.db, t.alice, { label: 'a' });
+    const nB = await core.registerNode(t.db, t.bob, { label: 'b' });
+    const inv = await core.createInvitation(t.db, t.alice, { issuerNode: nA.body.id, recipientNode: nB.body.id, recipientWorkspace: 'default' });
+    // Recovery insert against a merely issued invitation: zero rows.
+    const now = new Date().toISOString();
+    const rec = acceptRecoverInsert({ connId: 'conn_d1probe', invId: inv.body.id, aNode: nA.body.id, bNode: nB.body.id, aWs: 'default', bWs: 'default', now, actorId: 'u_bob' });
+    assert.equal(changes(await runBatch(t.db, [rec]), 0), 0);
+    assert.equal(await t.db.prepare('SELECT count(*) n FROM connections').first('n'), 0);
+    const acc = await core.acceptInvitation(t.db, t.bob, { token: inv.body.token, nodeId: nB.body.id, nodeKey: nB.body.nodeSecret });
+    const conn = acc.body.id;
+    assert.equal((await core.suspendConnection(t.db, t.alice, conn, { expectedVersion: 1 })).status, 200);
+    assert.equal((await core.disconnectConnection(t.db, t.bob, conn, { expectedVersion: 2 })).status, 200);
+    // A withdrawal pinned to a superseded version deletes no veto.
+    const stale = vetoWithdraw({ connId: conn, sides: [nB.body.id], version: 2, newState: 'disconnected', suspendedBy: nA.body.id, mirror: JSON.stringify([nA.body.id]), remaining: 1, now, actorId: 'u_bob' });
+    const res = await runBatch(t.db, stale);
+    assert.equal(changes(res, 0), 0);
+    assert.equal(changes(res, 1), 0);
+    assert.equal(await t.db.prepare('SELECT count(*) n FROM connection_vetoes WHERE connection_id = ?').bind(conn).first('n'), 2);
+    // The current version withdraws exactly the proven side.
+    const live = vetoWithdraw({ connId: conn, sides: [nB.body.id], newState: 'disconnected', suspendedBy: nA.body.id, mirror: JSON.stringify([nA.body.id]), remaining: 1, now, actorId: 'u_bob', version: 3 });
+    const ok = await runBatch(t.db, live);
+    assert.equal(changes(ok, 0), 1);
+    assert.equal(changes(ok, 1), 1);
+    console.log('Local D1 review fences PASS');
   } finally { await t.mf.dispose(); }
 });
