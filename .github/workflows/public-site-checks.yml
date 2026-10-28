@@ -1,7 +1,9 @@
 name: Public site checks
 on:
   pull_request:
-    branches: [main]
+    # Stacked fixes into the federation branch (PR #6) get the same
+    # full checks as PRs into main. Read-only token, no secrets.
+    branches: [main, muse/federation-control-plane]
   push:
     branches: [main]
 permissions:
