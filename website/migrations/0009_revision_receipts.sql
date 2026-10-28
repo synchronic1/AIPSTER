@@ -21,5 +21,8 @@ CREATE TABLE IF NOT EXISTS fabric_revision_failures (
   operation_id TEXT PRIMARY KEY,
   approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id),
   grant_id TEXT NOT NULL REFERENCES fabric_grants(id),
+  request_hash TEXT NOT NULL,
+  response_code INTEGER NOT NULL,
+  response_body TEXT NOT NULL,
   failed_at TEXT NOT NULL
 );

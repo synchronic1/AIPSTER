@@ -838,9 +838,21 @@ async function completeRevision(db, actor, id, operationId, requestHash) {
   return { status: 200, body: { id, version: receipt.after_version } };
 }
 
-async function unresolvedRevision(db, approvalId, id, operationId) {
-  const failed = await first(db, 'SELECT operation_id FROM fabric_revision_failures WHERE operation_id = ? AND approval_id = ? AND grant_id = ?', operationId, approvalId, id);
-  if (failed) return { status: 409, body: { error: 'Revision failed without applying; re-approve a fresh operation.', code: 'APPROVAL_CONSUMED' } };
+async function fenceRevision(db, approvalId, id, operationId, requestHash, outcome = {
+  status: 409, body: { error: 'Revision failed without applying; re-approve a fresh operation.', code: 'APPROVAL_CONSUMED' }
+}) {
+  await db.prepare(`INSERT OR IGNORE INTO fabric_revision_failures (operation_id, approval_id, grant_id, request_hash, response_code, response_body, failed_at)
+    SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS(SELECT 1 FROM fabric_revision_receipts WHERE operation_id = ?)
+    AND EXISTS(SELECT 1 FROM approvals WHERE id = ? AND consumed_by_op = ? AND consumed_action = 'grant.revise' AND consumed_target = ?)`)
+    .bind(operationId, approvalId, id, requestHash, outcome.status, JSON.stringify(outcome.body), nowIso(), operationId, approvalId, operationId, id).run();
+}
+
+async function unresolvedRevision(db, approvalId, id, operationId, requestHash) {
+  const failed = await first(db, 'SELECT * FROM fabric_revision_failures WHERE operation_id = ? AND approval_id = ? AND grant_id = ?', operationId, approvalId, id);
+  if (failed) {
+    if (failed.request_hash !== requestHash) throw err(409, 'IDEMPOTENCY_CONFLICT', 'Operation is bound to a different request.');
+    return { status: failed.response_code, body: JSON.parse(failed.response_body) };
+  }
   const claim = await first(db, 'SELECT consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', approvalId);
   if (claim && claim.consumed_by_op === operationId && claim.consumed_action === 'grant.revise' && claim.consumed_target === id) {
     // The winner may still be running after a processing-lease takeover.
@@ -875,7 +887,7 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
     // A concurrent winner may have committed since the first receipt read.
     const recovered = await completeRevision(db, actor, id, opd, requestHash);
     if (recovered) return recovered;
-    return unresolvedRevision(db, appr.id, id, opd);
+    return unresolvedRevision(db, appr.id, id, opd, requestHash);
   }
   if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
   if (appr.created_by !== actor.user.id || appr.approver !== actor.user.id) {
@@ -923,7 +935,7 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
   if (!(await claimApproval(db, { id: appr.id, action: 'grant.revise', target: id, op: opd, now: claimNow }))) {
     const recovered = await completeRevision(db, actor, id, opd, requestHash);
     if (recovered) return recovered;
-    return unresolvedRevision(db, appr.id, id, opd);
+    return unresolvedRevision(db, appr.id, id, opd, requestHash);
   }
   const now = nowIso();
   const snapshotJson = JSON.stringify(terms.snapshot || []);
@@ -945,27 +957,35 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
     // apply. If the fence itself is uncertain, retries remain 503 until a
     // persisted receipt or fence establishes the outcome.
     try {
-      await db.prepare(`INSERT OR IGNORE INTO fabric_revision_failures (operation_id, approval_id, grant_id, failed_at)
-        SELECT ?, ?, ?, ? WHERE NOT EXISTS(SELECT 1 FROM fabric_revision_receipts WHERE operation_id = ?)
-        AND EXISTS(SELECT 1 FROM approvals WHERE id = ? AND consumed_by_op = ? AND consumed_action = 'grant.revise' AND consumed_target = ?)`)
-        .bind(opd, appr.id, id, nowIso(), opd, appr.id, opd, id).run();
+      await fenceRevision(db, appr.id, id, opd, requestHash);
     } catch { /* preserve unknown outcome; never invent history */ }
     throw err(500, 'INTERNAL', 'Request failed.');
   }
   if (changes(res, 0) === 1) {
     return completeRevision(db, actor, id, opd, requestHash);
   }
-  // Effect lost after a won claim (fail-closed burn): map precisely.
-  const cur = await first(db, 'SELECT status, version, quarantine_reason, connection_id FROM fabric_grants WHERE id = ?', id);
-  if (!cur) throw err(404, 'NOT_FOUND', 'Grant not found.');
-  if (cur.quarantine_reason) return { status: 409, body: { error: 'Grant is quarantined; re-issue it.', code: 'GRANT_QUARANTINED' } };
-  if (cur.status === 'revoked') return { status: 409, body: { error: 'Grant is revoked.', code: 'BAD_STATE' } };
-  const curConn = await first(db, 'SELECT state, version FROM connections WHERE id = ?', cur.connection_id);
-  if (!curConn || curConn.state !== 'active') return { status: 409, body: { error: 'Connection is not active.', code: 'CONNECTION_DOWN' } };
-  if (cur.version !== grant.version || curConn.version !== conn.version) return lostRace();
-  const u = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
-  if (!u || Number(u.disabled) === 1 || Number(u.demo) === 1) { await throwActorClosed(db, actor); }
-  return { status: 412, body: { error: 'A resource changed since the preview.', code: 'PREVIEW_STALE' } };
+  // No effect committed: persist its classified terminal result before the
+  // router can lose finalization. Otherwise a known CAS loss becomes 503 on
+  // every retry merely because the HTTP ledger write failed.
+  const recovered = await completeRevision(db, actor, id, opd, requestHash);
+  if (recovered) return recovered;
+  const outcome = await (async () => {
+    const cur = await first(db, 'SELECT status, version, quarantine_reason, connection_id FROM fabric_grants WHERE id = ?', id);
+    if (!cur) throw err(404, 'NOT_FOUND', 'Grant not found.');
+    if (cur.quarantine_reason) return { status: 409, body: { error: 'Grant is quarantined; re-issue it.', code: 'GRANT_QUARANTINED' } };
+    if (cur.status === 'revoked') return { status: 409, body: { error: 'Grant is revoked.', code: 'BAD_STATE' } };
+    const curConn = await first(db, 'SELECT state, version FROM connections WHERE id = ?', cur.connection_id);
+    if (!curConn || curConn.state !== 'active') return { status: 409, body: { error: 'Connection is not active.', code: 'CONNECTION_DOWN' } };
+    if (cur.version !== grant.version || curConn.version !== conn.version) return lostRace();
+    const u = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+    if (!u || Number(u.disabled) === 1 || Number(u.demo) === 1) { await throwActorClosed(db, actor); }
+    return { status: 412, body: { error: 'A resource changed since the preview.', code: 'PREVIEW_STALE' } };
+  })().catch(e => {
+    if (!e.status || e.status >= 500) throw e;
+    return { status: e.status, body: { error: e.message, code: e.code } };
+  });
+  await fenceRevision(db, appr.id, id, opd, requestHash, outcome);
+  return outcome;
 }
 
 export async function pauseGrant(db, actor, id, input = {}, op = null) {

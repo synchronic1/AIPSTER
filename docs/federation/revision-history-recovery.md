@@ -77,6 +77,13 @@ from the persisted marker. Fences, like receipts, must not be expired with
 processing leases. Fresh approval/operation handling must first resolve any
 in-flight attempt. Other operations still receive 409 for a spent approval.
 
+A known zero-row CAS also records its classified terminal status/body in the
+failure fence before returning. If HTTP ledger finalization then fails, retry
+recovers that original result (for example 412), rather than becoming permanently
+uncertain. Failure records bind the original request digest. Independent review
+found this edge on the first repair candidate; HTTP and both database engines
+now cover it explicitly.
+
 Direct store callers without `op` receive a random operation identity and
 cannot reconcile by presenting the same approval alone. Retrying direct callers
 must preserve `{key, path}`; processing attempt tokens may change. HTTP/MCP
@@ -117,7 +124,8 @@ claim/finalization boundaries, before and after persistence. It covers lost
 responses, lease expiry, completed replay, repeated replay and changed input.
 Existing federation regressions are preserved unchanged.
 
-The full suite contains 306 tests (260 existing plus 46 repair diagnostics).
+The full suite contains 309 tests (260 existing plus 49 repair diagnostics,
+including 22 new real local D1 cases).
 
 From `website` on Node 24:
 

@@ -165,4 +165,25 @@ for (const real of [false, true]) {
     assert.deepEqual(await t.state(), before);
     assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_revision_failures').first()).n, 1);
   });
+
+  test(`${engine}: zero-row CAS result survives lost ledger finalization`, async context => {
+    const t = await revisionFixture(real); context.after(t.close);
+    const hash = await digestJson(t.input);
+    assert.equal(await core.checkIdempotency(t.db, t.alice, 'POST', t.op.path, t.op.key, hash), null);
+    const attempt = await core.readAttempt(t.db, 'session:u_alice', t.op.key);
+    const racing = faultOnce(t.db, /UPDATE fabric_grants SET consumers/, 'before', true, async () => {
+      await core.pauseGrant(t.db, t.alice, t.grant, { expectedVersion: 1 });
+    });
+    const outcome = await t.revise(racing);
+    assert.equal(outcome.status, 412);
+    await assert.rejects(core.storeIdempotency(faultOnce(t.db, /UPDATE idempotency_records SET status = \?, response_code/),
+      t.alice, t.op.key, outcome.status, outcome.body, attempt));
+    const saved = await t.state();
+    for (let i = 0; i < 3; i++) assert.deepEqual(await t.revise(), outcome);
+    const fence = await t.db.prepare('SELECT * FROM fabric_revision_failures').first();
+    assert.equal(fence.request_hash, hash); assert.equal(fence.response_code, 412);
+    assert.deepEqual(JSON.parse(fence.response_body), outcome.body);
+    assert.deepEqual(await t.state(), saved);
+    assert.equal(saved.receipts.length, 0); assert.equal(saved.history.length, 0);
+  });
 }
