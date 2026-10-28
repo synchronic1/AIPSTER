@@ -210,22 +210,19 @@ async function handleApi(request, env, url) {
         return json(403, { error: 'This auth endpoint is not available to the demo account.', code: 'DEMO_RESTRICTED' });
       }
       // Authenticated profile/credential mutations consume the hourly
-      // write budget, exactly like app mutations — but only on each
-      // endpoint's real mutation method and only same-origin. Billing
-      // bare GETs would let cross-site top-level navigations (SameSite=Lax
-      // carries the cookie) drain the victim's budget with no mutation;
-      // billing cross-origin POSTs would do the same one claim at a time.
-      // Cross-origin POSTs still fail: better-auth's own origin check
-      // (trustedOrigins) rejects them after we decline to bill.
-      // Exception: delete-user/callback completes over GET with a
-      // single-use emailed token, so token-bearing GETs are billed;
-      // blind tokenless GETs are not.
-      if (!disabled && found.user) {
-        if (method === 'POST' && BUDGETED_AUTH_POST_ROUTES.has(path) && sameOrigin(request)) {
-          await checkWriteBudget(env.DB, found.user.id);
-        } else if (method === 'GET' && path === '/api/auth/delete-user/callback' && url.searchParams.has('token')) {
-          await checkWriteBudget(env.DB, found.user.id);
-        }
+      // write budget, exactly like app mutations — but only on POST and
+      // only same-origin. Billing bare GETs would let cross-site
+      // top-level navigations (SameSite=Lax carries the cookie) drain the
+      // victim's budget with no mutation; billing cross-origin POSTs
+      // would do the same one claim at a time. Cross-origin POSTs still
+      // fail: better-auth's own origin check (trustedOrigins) rejects
+      // them after we decline to bill. delete-user/callback (a GET) is
+      // deliberately unbilled: fake tokens write nothing, and a valid
+      // single-use token completes at most once per billed delete-user
+      // initiation — billing the completion too would only reopen a
+      // fake-token drain with no accounting benefit.
+      if (!disabled && found.user && method === 'POST' && BUDGETED_AUTH_POST_ROUTES.has(path) && sameOrigin(request)) {
+        await checkWriteBudget(env.DB, found.user.id);
       }
     }
     return auth.handler(forwarded);

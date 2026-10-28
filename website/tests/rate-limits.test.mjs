@@ -260,16 +260,21 @@ test('auth budget ignores wrong-method and cross-origin requests', async () => {
   assert.equal(u.name, 'Alice');
 });
 
-test('delete-user/callback bills only token-bearing GETs', async () => {
+test('delete-user/callback completion is never billed (no fake-token drain)', async () => {
   const t = await createTestEnv();
   const as = { ...t.as(t.alice), Origin: 'http://localhost:8787' };
-  await readJson(await t.call('/api/auth/delete-user/callback', { headers: as }));
-  assert.equal(await budgetCount(t, t.alice), 0, 'tokenless GET unbilled');
-  const tok = await readJson(await t.call('/api/auth/delete-user/callback?token=fake&callbackURL=http://localhost:8787/', { headers: as }));
-  assert.ok(tok.status >= 400 && tok.status !== 429, 'flow rejects, budget claimed: ' + tok.status);
-  assert.equal(await budgetCount(t, t.alice), 1);
+  // Completions are bounded by the billed delete-user initiation (one
+  // completion per single-use token); billing here would only let
+  // cross-site navigations with fake tokens drain the victim.
+  for (const q of ['', '?token=fake&callbackURL=http://localhost:8787/']) {
+    const out = await readJson(await t.call('/api/auth/delete-user/callback' + q, { headers: as }));
+    assert.notEqual(out.status, 429, 'library decides, budget untouched: ' + out.status);
+  }
+  assert.equal(await budgetCount(t, t.alice), 0);
   await exhaustBudget(t, t.bob);
-  const denied = await readJson(await t.call('/api/auth/delete-user/callback?token=fake&callbackURL=http://localhost:8787/', { headers: { ...t.as(t.bob), Origin: 'http://localhost:8787' } }));
-  assert.equal(denied.status, 429);
+  const bs = { ...t.as(t.bob), Origin: 'http://localhost:8787' };
+  const denied = await readJson(await t.call('/api/auth/delete-user/callback?token=fake&callbackURL=http://localhost:8787/', { headers: bs }));
+  assert.notEqual(denied.status, 429, 'no budget gate on completion: ' + denied.status);
+  assert.equal(await budgetCount(t, t.bob), WRITE_BUDGET_PER_HOUR);
 });
 
