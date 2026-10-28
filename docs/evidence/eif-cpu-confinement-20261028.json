@@ -1,0 +1,26 @@
+{
+  "date": "2026-10-28",
+  "visibility": "public-safe receipt; no private history or source",
+  "change_patch_sha256": "005dd08997ad7ee2ff339b4d27a7d4fc158afeaef0e68a42e71403c6710c8a61",
+  "scope": "Explicit CPU placement binding and opt-in managed IK worker enforcement",
+  "worker_opt_in_default": false,
+  "private_backup": "Exact commit and fresh-clone verification retained in operator receipt",
+  "runtime": { "node": "24.18.1", "python": "3.12.13", "platform": "macOS arm64" },
+  "tests": {
+    "python_complete": { "passed": 148, "failed": 0 },
+    "fabric_complete": { "passed": 125, "failed": 0 },
+    "python_cpu_focused": { "passed": 14, "failed": 0 },
+    "fabric_cpu_focused": { "passed": 16, "failed": 0 },
+    "ruff": "passed",
+    "typescript_vite_build": "passed"
+  },
+  "commands": [
+    "PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider",
+    "ruff check dendrite tests",
+    "npm --prefix fabric test",
+    "npm --prefix fabric run build"
+  ],
+  "qualification": "Offline actual handlers and runtime boundaries with controlled fixtures; no real model execution",
+  "not_implemented": ["AIPSTER atomic authorization/budget admission", "worker start redemption", "connected AIPSTER transport", "measured RAM/context/model qualification"],
+  "deployment": "none"
+}
