@@ -254,7 +254,7 @@ export async function handleFabric(ctx) {
       const m = /^\/v1\/fabric\/denies\/([A-Za-z0-9_-]{1,64})$/.exec(path);
       if (m && method === 'DELETE') {
         const d = guardSessionWrite(ctx); if (d) return d;
-        return send(ctx, await S.deleteDeny(db, factor(), m[1]));
+        return send(ctx, await S.deleteDeny(db, factor(), m[1], { budgeted: true }));
       }
     }
     // ---- authorization preview + discovery (reads) ----
@@ -311,7 +311,7 @@ const MCP_TOOLS = {
   'fabric.revoke_grant': { guard: 'narrow', run: (db, f, p, op) => S.revokeGrant(db, f, p.id, p, op) },
   'fabric.create_deny': { guard: 'session', run: (db, f, p, op) => S.createDeny(db, f, p, op) },
   'fabric.list_denies': { guard: 'read', run: (db, f, p) => S.listDenies(db, f) },
-  'fabric.delete_deny': { guard: 'session-no-idem', run: (db, f, p) => S.deleteDeny(db, f, p.id) },
+  'fabric.delete_deny': { guard: 'session-no-idem', run: (db, f, p) => S.deleteDeny(db, f, p.id, { budgeted: true }) },
   'fabric.authorization_preview': { guard: 'read', run: (db, f, p) => S.authorizationPreview(db, f, p) },
   'fabric.discover_resources': { guard: 'read', run: (db, f, p) => S.discoverResources(db, f) },
 };

@@ -11,7 +11,7 @@ test('real local D1: federation upgrade preserves main signup budget and identit
   assert.equal(new Set(files.map(f => f.split('_')[0])).size, files.length, 'unique migration numbers');
   assert.equal(files[4], '0005_write_budget.sql');
   assert.equal(files[5], '0006_fabric.sql');
-  assert.equal(files.at(-1), '0010_revision_receipts.sql');
+  assert.equal(files.at(-1), '0011_fabric_admission.sql');
   const mf = new Miniflare(convertV4MiniflareOptions({ modules: true,
     script: 'export default {fetch(){return new Response("synthetic upgrade")}}',
     compatibilityDate: '2026-10-01', d1Databases: { DB: 'main-upgrade-synthetic' },

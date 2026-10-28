@@ -62,3 +62,40 @@ included rather than replaced.
 Green tests/CI establish the tested control-plane behavior, not whole-stage F1
 clearance, runtime placement, atomic execution admission or a production rollout.
 Inference stays disabled, F1P stays held, and no models or remote D1 are used.
+
+## Public-signup federation admission repair
+
+Security review of the initial combined candidate found that federation mutations
+did not use main's 120/hour owner budget. The regression reproduced 121 successful
+node registrations with no budget row. Both REST and MCP now call the same
+durable admission through `checkIdempotency` before creating a new ledger record.
+Admission and shared `write_budget` increment are one D1 batch, with live-actor,
+hourly-cap and retained-operation predicates in the insert. Duplicate keys and
+lost responses recover the original admission without another charge. Request
+bindings cannot change. Existing completed/uncertain ledger operations retain
+their recovery behavior. Non-idempotent deny deletion uses the shared budget
+after ownership validation in both transports; nonexistent deletes are read-only.
+
+New additive `0011_fabric_admission.sql` follows the reordered block. Admissions
+are retained with the security evidence, never expired with processing leases or
+replenished by object deletion. A per-owner ceiling of 10,000 admitted operations
+(shared across session/key actors and transports) bounds new federation objects,
+ledger records and associated audit/history growth. This is a retained-operation
+ceiling, not an independent node/object limit and not a global anti-Sybil limit.
+Already-existing pre-admission records are preserved, not silently backfilled or
+deleted. Other application endpoints keep their existing caps and budget behavior.
+
+At the retention ceiling, **new mutations, including new restrictive operations,
+fail closed**; already-admitted retries remain available. There is no automatic
+quota reset, pruning or evidence-deleting recovery endpoint. An explicit operator
+retention/archive policy is required before changing this ceiling or enabling
+long-running production federation. Hourly limits count admitted mutations,
+not individual SQL statements or reads. Internal store helpers are not public
+RPC endpoints; public HTTP/MCP ingress supplies the admission boundary.
+
+Tests cover the original 121st-request regression, shared REST/MCP budget,
+concurrent distinct and duplicate admissions, lost responses, transactional
+rollback, request mismatch, per-user isolation, retained-operation exhaustion,
+reads/replay/guard behavior, and deny deletion. Actual concurrency is tested on
+real local D1; the SQLite shim uses serial boundary checks because its nested
+savepoint hooks do not model independent concurrent transactions.

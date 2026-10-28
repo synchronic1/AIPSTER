@@ -7,6 +7,8 @@
 import { first, all } from '../lib/store.js';
 import { verifierFor, timingSafeEqualStr } from '../lib/keys.js';
 import { httpError } from '../lib/validate.js';
+import { checkWriteBudget } from '../lib/quotas.js';
+import { admitFabricOperation } from './admission.mjs';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
 import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt } from './operations.mjs';
@@ -1179,6 +1181,7 @@ export async function deleteDeny(db, actor, id, op = null) {
   needId(id, 'Deny');
   const row = await first(db, 'SELECT * FROM fabric_denies WHERE id = ?', id);
   if (!row || row.owner_id !== actor.user.id) throw err(404, 'NOT_FOUND', 'Deny not found.');
+  if (op?.budgeted) await checkWriteBudget(db, actor.user.id);
   const del = await db.prepare('DELETE FROM fabric_denies WHERE id = ? AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)').bind(id, actor.user.id).run();
   if (!del.meta.changes) {
     const gone = await first(db, 'SELECT id FROM fabric_denies WHERE id = ?', id);
@@ -1283,6 +1286,7 @@ export async function checkIdempotency(db, actor, method, path, key, bodyHash) {
   const actorKey = `${actor.kind}:${actor.user.id}`;
   const existing = await first(db, 'SELECT * FROM idempotency_records WHERE idem_key = ? AND actor = ?', key, actorKey);
   if (!existing) {
+    await admitFabricOperation(db, actor, method, path, key, bodyHash);
     try {
       await db.prepare('INSERT INTO idempotency_records (idem_key, actor, method, path, request_hash, status, response_code, response_body, created_at, attempt) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)')
         .bind(key, actorKey, method, path, bodyHash, 'processing', nowIso(), freshAttempt()).run();
