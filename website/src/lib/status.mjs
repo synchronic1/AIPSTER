@@ -35,6 +35,8 @@
  * @property {'declared-resources'|'demo-fixture'} source
  * @property {'unavailable'} telemetry
  * @property {{total:number,online:number,stale:number,offline:number,unknown:number}} summary
+ * @property {number} total
+ * @property {boolean} itemsTruncated
  * @property {number} sharedWithMe
  * @property {StatusItem[]} items
  */
@@ -87,21 +89,49 @@ function ageMs(trusted, liveness, nowMs) {
   return Number.isFinite(seen) ? Math.max(0, nowMs - seen) : null;
 }
 
+const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
+
+/**
+ * Validate a caller-supplied aggregate summary (SQL COUNT over ALL owned
+ * rows). Returns the trusted summary or null when absent/malformed, in
+ * which case the caller falls back to deriving counts from the listed page.
+ */
+function parseAggregateSummary(summary, total) {
+  if (summary === undefined && total === undefined) return null;
+  if (!summary || typeof summary !== 'object') return null;
+  const counts = {
+    online: summary.online,
+    stale: summary.stale,
+    offline: summary.offline,
+    unknown: summary.unknown,
+  };
+  if (!Object.values(counts).every(isCount) || !isCount(total)) return null;
+  return { total, ...counts };
+}
+
 /**
  * Build the public status payload from already-authorized rows.
- * @param {{rows: unknown[], sharedWithMe: number, demo: boolean, nowMs: number}} input
+ *
+ * `rows` is the capped page (at most MAX_STATUS_ITEMS) used for the listed
+ * items only. `summary`+`total` is the SQL aggregate over ALL owned rows and
+ * is the only source of the reported counts, so summary.total always equals
+ * the Overview inventory total even when the list is truncated. Callers that
+ * omit the aggregate get the legacy derivation from the listed page.
+ *
+ * @param {{rows: unknown[], summary?: {online:number,stale:number,offline:number,unknown:number}, total?: number, sharedWithMe: number, demo: boolean, nowMs: number}} input
  * @returns {StatusPayload}
  */
-export function buildStatus({ rows, sharedWithMe, demo, nowMs }) {
+export function buildStatus({ rows, summary, total, sharedWithMe, demo, nowMs }) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   /** @type {StatusItem[]} */
   const items = [];
-  const summary = { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 };
-  for (const raw of Array.isArray(rows) ? rows.slice(0, MAX_STATUS_ITEMS) : []) {
+  const page = { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 };
+  const input = Array.isArray(rows) ? rows : [];
+  for (const raw of input.slice(0, MAX_STATUS_ITEMS)) {
     const trusted = parseStatusRow(raw);
     if (!trusted) continue;
     const liveness = resourceLiveness(trusted, now);
-    summary[liveness] += 1;
+    page[liveness] += 1;
     items.push({
       id: trusted.id,
       name: trusted.name,
@@ -112,14 +142,24 @@ export function buildStatus({ rows, sharedWithMe, demo, nowMs }) {
       demoFixture: demo === true,
     });
   }
-  summary.total = items.length;
+  page.total = items.length;
+  const aggregate = parseAggregateSummary(summary, total);
+  const finalSummary = aggregate ? { ...aggregate } : page;
+  // Truncated whenever fewer rows are listed than owned: the 50-item cap bit
+  // off rows (aggregate path), or the input page itself exceeded the cap
+  // (legacy path with no aggregate).
+  const itemsTruncated = aggregate
+    ? finalSummary.total > items.length
+    : input.length > MAX_STATUS_ITEMS;
   return {
     schema: 'aipster.status/1',
     generatedAt: new Date(now).toISOString(),
     demo: demo === true,
     source: demo === true ? 'demo-fixture' : 'declared-resources',
     telemetry: 'unavailable',
-    summary,
+    summary: finalSummary,
+    total: finalSummary.total,
+    itemsTruncated,
     sharedWithMe: Number.isSafeInteger(sharedWithMe) && sharedWithMe >= 0 ? sharedWithMe : 0,
     items,
   };

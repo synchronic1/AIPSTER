@@ -134,3 +134,108 @@ test('demo workspace is labeled as fixture, never live', async () => {
   assert.equal(out.json.telemetry, 'unavailable');
   assert.ok(out.json.items.every((i) => i.demoFixture === true));
 });
+
+test('buildStatus uses the aggregate summary and flags truncation', () => {
+  const rows = Array.from({ length: 60 }, (_, i) => ({ id: `r_${i}`, name: `n${i}`, kind: 'local', online: 0, heartbeat_at: null }));
+  const agg = buildStatus({
+    rows, summary: { online: 3, stale: 3, offline: 52, unknown: 2 }, total: 60,
+    sharedWithMe: 0, demo: false, nowMs: NOW,
+  });
+  assert.deepEqual(agg.summary, { total: 60, online: 3, stale: 3, offline: 52, unknown: 2 });
+  assert.equal(agg.total, 60);
+  assert.equal(agg.items.length, 50);
+  assert.equal(agg.itemsTruncated, true);
+  const small = buildStatus({
+    rows: rows.slice(0, 4), summary: { online: 0, stale: 0, offline: 4, unknown: 0 }, total: 4,
+    sharedWithMe: 0, demo: false, nowMs: NOW,
+  });
+  assert.equal(small.total, 4);
+  assert.equal(small.itemsTruncated, false);
+  // Legacy callers without an aggregate still derive counts from the page.
+  const legacy = buildStatus({ rows: rows.slice(0, 4), sharedWithMe: 0, demo: false, nowMs: NOW });
+  assert.deepEqual(legacy.summary, { total: 4, online: 0, stale: 0, offline: 4, unknown: 0 });
+  assert.equal(legacy.itemsTruncated, false);
+});
+
+// Bulk seeding with deterministic created_at ordering: index 0 is the
+// oldest, so ORDER BY created_at DESC pages from the end of `states`.
+async function seedResources(t, user, states) {
+  const base = Date.now();
+  for (let i = 0; i < states.length; i++) {
+    const s = states[i];
+    await t.DB.prepare(`INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+      VALUES (?, ?, ?, 'local', 'seed', 'x', 'y', '[]', 1, 0, ?, 0, ?, '{}', 'owner only', '{}', NULL, ?)`)
+      .bind(`r_seed_${i}`, user.id, `seed-${i}`, s.online ? 1 : 0, s.hb ?? null,
+        new Date(base + i * 1000).toISOString()).run();
+  }
+}
+const freshHb = () => new Date(Date.now() - 1000).toISOString();
+const staleHb = () => new Date(Date.now() - STALE_AFTER_MS - 60000).toISOString();
+
+test('status total equals the inventory total beyond the 50-item page (60 resources)', async () => {
+  const t = await createTestEnv();
+  await seedResources(t, t.alice, Array.from({ length: 60 }, (_, i) => {
+    const m = i % 4;
+    if (m === 0) return { online: true, hb: freshHb() };
+    if (m === 1) return { online: true, hb: staleHb() };
+    if (m === 2) return { online: false, hb: null };
+    return { online: true, hb: null };
+  }));
+  const out = await readJson(await t.call('/api/status', { headers: t.as(t.alice) }));
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.json.summary, { total: 60, online: 15, stale: 15, offline: 15, unknown: 15 });
+  assert.equal(out.json.total, 60);
+  assert.equal(out.json.items.length, 50);
+  assert.equal(out.json.itemsTruncated, true);
+  const inv = await readJson(await t.call('/api/inventory?limit=1', { headers: t.as(t.alice) }));
+  assert.equal(inv.json.total, 60);
+  assert.equal(out.json.total, inv.json.total, 'status total must equal the Overview inventory total');
+});
+
+test('status total equals the inventory total at the 100-resource cap', async () => {
+  const t = await createTestEnv();
+  await seedResources(t, t.alice, Array.from({ length: 100 }, (_, i) =>
+    (i < 5 ? { online: true, hb: freshHb() } : { online: false, hb: null })));
+  const out = await readJson(await t.call('/api/status', { headers: t.as(t.alice) }));
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.json.summary, { total: 100, online: 5, stale: 0, offline: 95, unknown: 0 });
+  assert.equal(out.json.total, 100);
+  assert.equal(out.json.items.length, 50);
+  assert.equal(out.json.itemsTruncated, true);
+  const inv = await readJson(await t.call('/api/inventory?limit=1', { headers: t.as(t.alice) }));
+  assert.equal(inv.json.total, 100);
+  assert.equal(out.json.total, inv.json.total, 'status total must equal the Overview inventory total');
+});
+
+test('status with zero resources reports an empty untruncated summary', async () => {
+  const t = await createTestEnv();
+  const out = await readJson(await t.call('/api/status', { headers: t.as(t.alice) }));
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.json.summary, { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 });
+  assert.equal(out.json.total, 0);
+  assert.deepEqual(out.json.items, []);
+  assert.equal(out.json.itemsTruncated, false);
+  const inv = await readJson(await t.call('/api/inventory?limit=1', { headers: t.as(t.alice) }));
+  assert.equal(inv.json.total, 0);
+});
+
+test('status counts come from the aggregate, not the listed page', async () => {
+  const t = await createTestEnv();
+  // Oldest 10 carry every liveness; the newest 50 (the listed page) are all offline.
+  const head = [
+    { online: true, hb: freshHb() }, { online: true, hb: freshHb() }, { online: true, hb: freshHb() },
+    { online: true, hb: staleHb() }, { online: true, hb: staleHb() }, { online: true, hb: staleHb() },
+    { online: true, hb: null }, { online: true, hb: null },
+    { online: false, hb: null }, { online: false, hb: null },
+  ];
+  await seedResources(t, t.alice, [...head, ...Array.from({ length: 50 }, () => ({ online: false, hb: null }))]);
+  const out = await readJson(await t.call('/api/status', { headers: t.as(t.alice) }));
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.json.summary, { total: 60, online: 3, stale: 3, offline: 52, unknown: 2 });
+  assert.equal(out.json.total, 60);
+  assert.equal(out.json.items.length, 50);
+  assert.equal(out.json.itemsTruncated, true);
+  assert.ok(out.json.items.every((i) => i.liveness === 'offline'), 'listed page is all offline while the aggregate is mixed');
+  const inv = await readJson(await t.call('/api/inventory?limit=1', { headers: t.as(t.alice) }));
+  assert.equal(out.json.total, inv.json.total, 'status total must equal the Overview inventory total');
+});

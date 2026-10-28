@@ -69,13 +69,19 @@ const formatAge = (ms) => {
 
 function renderStatus(el, data) {
   const s = data.summary || { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 };
-  const items = (data.items || []).map((r) =>
+  const list = data.items || [];
+  const items = list.map((r) =>
     `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs))}${r.demoFixture ? ' · DEMO' : ''}</p>`).join('');
   const note = data.demo
     ? 'DEMO DATA: simulated fixture, not a live node.'
     : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
+  // Counts always cover every owned resource; only the listed page is capped.
+  const truncated = data.itemsTruncated === true
+    ? `<p class="muted">showing ${list.length} of ${s.total} — older resources omitted from the list; counts cover all resources.</p>`
+    : '';
   el.innerHTML = `<h2>Resource status</h2>
     <p class="muted">${s.total} resource(s) · ${s.online} online · ${s.stale} stale · ${s.offline} offline · ${s.unknown} unknown · ${data.sharedWithMe} shared with me</p>
+    ${truncated}
     ${items || '<p class="muted">No resources yet.</p>'}
     <p class="muted">${esc(note)}</p>`;
 }
