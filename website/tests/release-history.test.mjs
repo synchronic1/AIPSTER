@@ -1,0 +1,23 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { fabricEnv, connectPair, commitFlow, S, freshKey, readJson } from './qa-helpers.mjs';
+const post = (t, p, b = {}, key = freshKey()) => t.call('/v1/fabric/' + p, { method: 'POST', headers: S(t, t.alice, { 'Idempotency-Key': key }), body: b }).then(readJson);
+test('release review: revision recovery preserves superseded terms', async () => {
+  const t = await fabricEnv();
+  const { conn } = await connectPair(t);
+  const { grant } = await commitFlow(t, conn.id);
+  const before = JSON.parse(t.sqlite.prepare('SELECT ceilings FROM fabric_grants WHERE id = ?').get(grant.id).ceilings);
+  const p = await post(t, 'previews', { connectionId: conn.id, resourceIds: ['r_gpu1'], consumers: ['bob-op'], models: ['llama'], maxTokens: 50, maxRequests: 10 });
+  assert.equal(p.status, 201);
+  const a = await post(t, 'approvals', { action: 'grant.revise', previewId: p.json.id, targetId: grant.id });
+  assert.equal(a.status, 201);
+  assert.equal((await post(t, `approvals/${a.json.id}/decide`, { decision: 'approve' })).status, 200);
+  const key = freshKey(), body = { approvalId: a.json.id, previewHash: p.json.digest };
+  t.sqlite.exec("CREATE TRIGGER release_history BEFORE INSERT ON fabric_grant_revisions BEGIN SELECT RAISE(ABORT, 'synthetic history failure'); END");
+  assert.equal((await post(t, `grants/${grant.id}/revise`, body, key)).status, 500);
+  t.sqlite.exec('DROP TRIGGER release_history');
+  assert.equal((await post(t, `grants/${grant.id}/revise`, body, key)).status, 200);
+  const old = t.sqlite.prepare('SELECT version, terms_json FROM fabric_grant_revisions WHERE grant_id = ?').get(grant.id);
+  assert.equal(old.version, 1);
+  assert.deepEqual(JSON.parse(old.terms_json).ceilings, before);
+});

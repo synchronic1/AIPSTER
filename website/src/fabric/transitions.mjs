@@ -116,16 +116,22 @@ export function grantInsert({ row, snapshotJson, exporterId, connId, connVersion
 
 // ---- grant revise: status-preserving update, consumers first ----
 
-export function grantRevise({ id, version, sets, snapshotJson, exporterId, connId, connVersion, apprId, actorId }) {
+export function grantRevise({ id, version, sets, snapshotJson, exporterId, connId, connVersion, apprId, actorId, receipt }) {
   const newV = Number(version) + 1;
   return [
     [`UPDATE fabric_grants SET consumers = ?, snapshot = ?, models = ?, ceilings = ?, expiry = ?, version = ?, preview_hash = ?, last_approval_id = ?, updated_at = ?
       WHERE id = ? AND version = ? AND status != 'revoked' AND quarantine_reason IS NULL AND ${ACTOR_LIVE}
+      AND NOT EXISTS(SELECT 1 FROM fabric_revision_failures WHERE operation_id = ?)
       AND EXISTS(SELECT 1 FROM connections c WHERE c.id = ? AND c.state = 'active' AND c.version = ?) AND ${SNAPSHOT_VALID}`,
       sets.consumers, sets.snapshot, sets.models, sets.ceilings, sets.expiry, newV, sets.previewHash, apprId, sets.now,
-      id, version, actorId, connId, connVersion, snapshotJson, exporterId],
-    [`UPDATE connections SET grant_gen = grant_gen + 1 WHERE id = ? AND EXISTS(SELECT 1 FROM fabric_grants WHERE id = ? AND last_approval_id = ?)`,
-      connId, id, apprId]
+      id, version, actorId, receipt.operationId, connId, connVersion, snapshotJson, exporterId],
+    // Immediately follows the CAS in the same transaction: a zero-row
+    // effect creates no receipt. SQL failures roll back both. Do not use
+    // OR IGNORE: a conflicting receipt must roll back the effect.
+    [`INSERT INTO fabric_revision_receipts (operation_id, grant_id, approval_id, actor_id, request_hash, approval_json, before_version, after_version, before_json, after_json, applied_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1`,
+      receipt.operationId, id, apprId, actorId, receipt.requestHash, receipt.approvalJson, version, newV, receipt.beforeJson, receipt.afterJson, sets.now],
+    [`UPDATE connections SET grant_gen = grant_gen + 1 WHERE id = ? AND changes() = 1`, connId]
   ];
 }
 

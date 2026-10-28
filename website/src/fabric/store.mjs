@@ -9,7 +9,7 @@ import { verifierFor, timingSafeEqualStr } from '../lib/keys.js';
 import { httpError } from '../lib/validate.js';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
-import { opDigest, claimApproval, ensureAudit, ensureHistory, redactForReplay, freshAttempt, readAttempt } from './operations.mjs';
+import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt } from './operations.mjs';
 import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, acceptRecoverInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
@@ -814,6 +814,44 @@ function modelsOf(terms) {
   return [...set];
 }
 
+// Complete only a committed operation, never infer a previous revision from
+// mutable grant state. Receipt identity also survives later valid revisions.
+async function completeRevision(db, actor, id, operationId, requestHash) {
+  const receipt = await first(db, 'SELECT * FROM fabric_revision_receipts WHERE operation_id = ?', operationId);
+  if (!receipt) return null;
+  if (receipt.actor_id !== actor.user.id || receipt.grant_id !== id || receipt.request_hash !== requestHash) {
+    throw err(409, 'IDEMPOTENCY_CONFLICT', 'Operation is bound to a different request.');
+  }
+  const before = JSON.parse(receipt.before_json);
+  const after = JSON.parse(receipt.after_json);
+  const termsJson = JSON.stringify({ consumers: parseJson(before.consumers, []), snapshot: parseJson(before.snapshot, []),
+    ceilings: parseJson(before.ceilings, {}), before, after, operationId, approval: JSON.parse(receipt.approval_json) });
+  await ensureHistory(db, { grantId: id, version: receipt.before_version, termsJson,
+    approvalId: receipt.approval_id, now: receipt.applied_at });
+  const history = await first(db, 'SELECT * FROM fabric_grant_revisions WHERE id = ?', historyIdFor(id, receipt.before_version, receipt.approval_id));
+  if (!history || history.terms_json !== termsJson || history.superseded_at !== receipt.applied_at
+    || history.grant_id !== id || history.version !== receipt.before_version || history.approval_id !== receipt.approval_id) {
+    throw err(500, 'HISTORY_CONFLICT', 'Revision history conflicts with its operation receipt.');
+  }
+  await ensureAudit(db, { op: operationId, action: 'fabric.grant.revise', actorId: receipt.actor_id,
+    target: id, detail: `v${receipt.after_version} via session`, now: receipt.applied_at });
+  return { status: 200, body: { id, version: receipt.after_version } };
+}
+
+async function unresolvedRevision(db, approvalId, id, operationId) {
+  const failed = await first(db, 'SELECT operation_id FROM fabric_revision_failures WHERE operation_id = ? AND approval_id = ? AND grant_id = ?', operationId, approvalId, id);
+  if (failed) return { status: 409, body: { error: 'Revision failed without applying; re-approve a fresh operation.', code: 'APPROVAL_CONSUMED' } };
+  const claim = await first(db, 'SELECT consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', approvalId);
+  if (claim && claim.consumed_by_op === operationId && claim.consumed_action === 'grant.revise' && claim.consumed_target === id) {
+    // The winner may still be running after a processing-lease takeover.
+    // Never finalize a terminal 409 over an effect that could still commit.
+    // A claim with no committed receipt cannot prove either success or a
+    // historical before-image; keep the router operation uncertain.
+    throw err(503, 'REVISION_UNCERTAIN', 'Revision outcome is not recorded; retry reconciliation or re-approve a fresh operation.');
+  }
+  return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
+}
+
 export async function reviseGrant(db, actor, id, input = {}, op = null) {
   if (!isHuman(actor)) needHuman();
   needId(id, 'Grant');
@@ -822,18 +860,22 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
   if (grant.quarantine_reason) throw err(409, 'GRANT_QUARANTINED', 'Grant is quarantined; re-issue it.');
   if (grant.status === 'revoked') throw err(409, 'BAD_STATE', 'Revoked grants cannot be revised.');
   if (!await actorExportsGrant(db, actor, grant)) throw err(403, 'FORBIDDEN', 'Only the exporting owner can revise.');
+  const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+  if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
+  const opd = await opDigest(actor, op);
+  const requestHash = await digestJson(input);
+  const completed = await completeRevision(db, actor, id, opd, requestHash);
+  if (completed) return completed;
   if (typeof input.approvalId !== 'string' || !input.approvalId) throw err(409, 'NOT_APPROVED', 'A fresh approved, unconsumed approval is required.');
   const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', input.approvalId);
   if (!appr || (appr.action !== 'grant.commit' && appr.action !== 'grant.revise') || appr.decision !== 'approved') {
     throw err(409, 'NOT_APPROVED', 'A fresh approved, unconsumed approval is required.');
   }
   if (appr.consumed_at) {
-    if (grant.last_approval_id === appr.id) {
-      await ensureHistory(db, { grantId: id, version: grant.version - 1, termsJson: JSON.stringify({ consumers: parseJson(grant.consumers, []), snapshot: parseJson(grant.snapshot, []), ceilings: parseJson(grant.ceilings, {}), reconciled: true }), approvalId: appr.id, now: nowIso() });
-      await auditFabric(db, actor, op, 'fabric.grant.revise', id, `v${grant.version} reconciled`);
-      return { status: 200, body: { id, version: grant.version, note: 'This approval was already applied to this grant.' } };
-    }
-    return { status: 409, body: { error: 'A fresh approved, unconsumed approval is required.', code: 'NOT_APPROVED' } };
+    // A concurrent winner may have committed since the first receipt read.
+    const recovered = await completeRevision(db, actor, id, opd, requestHash);
+    if (recovered) return recovered;
+    return unresolvedRevision(db, appr.id, id, opd);
   }
   if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
   if (appr.created_by !== actor.user.id || appr.approver !== actor.user.id) {
@@ -877,35 +919,41 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
   // The shared claim: exactly one of commit/revise/resume wins this
   // approval. Losers change nothing. A won claim followed by an
   // effect failure leaves the approval spent (fail-closed reapproval).
-  const opd = await opDigest(actor, op);
   const claimNow = nowIso();
   if (!(await claimApproval(db, { id: appr.id, action: 'grant.revise', target: id, op: opd, now: claimNow }))) {
-    const recheck = await first(db, 'SELECT last_approval_id FROM fabric_grants WHERE id = ?', id);
-    if (recheck && recheck.last_approval_id === appr.id) {
-      const cur = await first(db, 'SELECT version, consumers, snapshot, ceilings FROM fabric_grants WHERE id = ?', id);
-      await ensureHistory(db, { grantId: id, version: cur.version - 1, termsJson: JSON.stringify({ consumers: parseJson(cur.consumers, []), snapshot: parseJson(cur.snapshot, []), ceilings: parseJson(cur.ceilings, {}), reconciled: true }), approvalId: appr.id, now: nowIso() });
-      await auditFabric(db, actor, op, 'fabric.grant.revise', id, `v${cur.version} reconciled`);
-      return { status: 200, body: { id, version: cur.version, note: 'This approval was already applied to this grant.' } };
-    }
-    return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
+    const recovered = await completeRevision(db, actor, id, opd, requestHash);
+    if (recovered) return recovered;
+    return unresolvedRevision(db, appr.id, id, opd);
   }
   const now = nowIso();
   const snapshotJson = JSON.stringify(terms.snapshot || []);
-  const beforeJson = JSON.stringify({ consumers: parseJson(grant.consumers, []), snapshot: parseJson(grant.snapshot, []), ceilings: parseJson(grant.ceilings, {}) });
+  const sets = { consumers: JSON.stringify(terms.consumers), snapshot: snapshotJson, models: JSON.stringify(modelsOf(terms)),
+    ceilings: JSON.stringify(terms.ceilings), expiry: terms.expiry, previewHash: preview.digest, now };
+  const after = { ...grant, consumers: sets.consumers, snapshot: sets.snapshot, models: sets.models, ceilings: sets.ceilings,
+    expiry: sets.expiry, version: grant.version + 1, preview_hash: sets.previewHash, last_approval_id: appr.id, updated_at: now };
   let res;
   try {
     res = await runBatch(db, grantRevise({
       id, version: grant.version,
-      sets: { consumers: JSON.stringify(terms.consumers), snapshot: snapshotJson, models: JSON.stringify(modelsOf(terms)), ceilings: JSON.stringify(terms.ceilings), expiry: terms.expiry, previewHash: preview.digest, now },
-      snapshotJson, exporterId: actor.user.id, connId: conn.id, connVersion: conn.version, apprId: appr.id, actorId: actor.user.id
+      sets, snapshotJson, exporterId: actor.user.id, connId: conn.id, connVersion: conn.version, apprId: appr.id, actorId: actor.user.id,
+      receipt: { operationId: opd, requestHash, beforeJson: JSON.stringify(grant), afterJson: JSON.stringify(after),
+        approvalJson: JSON.stringify({ ...appr, consumed_at: claimNow, consumed_by_op: opd, consumed_action: 'grant.revise', consumed_target: id }) }
     }));
   } catch {
+    // This single conditional write races atomically with the effect batch.
+    // Receipt first => no fence. Fence first => even a delayed batch cannot
+    // apply. If the fence itself is uncertain, retries remain 503 until a
+    // persisted receipt or fence establishes the outcome.
+    try {
+      await db.prepare(`INSERT OR IGNORE INTO fabric_revision_failures (operation_id, approval_id, grant_id, failed_at)
+        SELECT ?, ?, ?, ? WHERE NOT EXISTS(SELECT 1 FROM fabric_revision_receipts WHERE operation_id = ?)
+        AND EXISTS(SELECT 1 FROM approvals WHERE id = ? AND consumed_by_op = ? AND consumed_action = 'grant.revise' AND consumed_target = ?)`)
+        .bind(opd, appr.id, id, nowIso(), opd, appr.id, opd, id).run();
+    } catch { /* preserve unknown outcome; never invent history */ }
     throw err(500, 'INTERNAL', 'Request failed.');
   }
   if (changes(res, 0) === 1) {
-    await ensureHistory(db, { grantId: id, version: grant.version, termsJson: beforeJson, approvalId: appr.id, now });
-    await auditFabric(db, actor, op, 'fabric.grant.revise', id, `v${grant.version + 1}`);
-    return { status: 200, body: { id, version: grant.version + 1 } };
+    return completeRevision(db, actor, id, opd, requestHash);
   }
   // Effect lost after a won claim (fail-closed burn): map precisely.
   const cur = await first(db, 'SELECT status, version, quarantine_reason, connection_id FROM fabric_grants WHERE id = ?', id);
