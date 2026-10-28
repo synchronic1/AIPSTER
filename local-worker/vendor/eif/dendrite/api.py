@@ -1,15 +1,20 @@
+# Modified by AIPSTER local patch 0001 (2026-10-28): the API token is required on every
+# bind (including loopback), Host and Origin are checked against node.allowed_hosts, the
+# unauthenticated health route no longer returns node identity, and generated API docs are
+# disabled. Upstream base and hashes: local-worker/provenance.json.
 import asyncio
 import hmac
 import logging
 import os
 import time
 from contextlib import asynccontextmanager, suppress
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header
 from fastapi.responses import JSONResponse
 
-from dendrite.config import Config
+from dendrite.config import LOOPBACK_BIND_HOSTS, Config, canonical_authority
 from dendrite.fabric import run_fabric_bridge
 from dendrite.node import Node
 from dendrite.runtimes.base import RuntimeFailure
@@ -37,15 +42,64 @@ async def publish_heartbeats(node: Node, token: str | None):
             await asyncio.sleep(node.config.node.heartbeat_seconds)
 
 
+MIN_TOKEN_LENGTH = 32
+
+
+class HostOriginGuard:
+    """Reject requests whose Host (or browser Origin) is not an exact allowed authority.
+
+    Loopback binding is not an origin boundary: a DNS-rebound page reaches 127.0.0.1 with
+    its own name in Host. This check is independent of bearer authentication and of CORS
+    (the app sends no CORS headers, so cross-origin reads stay blocked by the browser).
+    """
+
+    def __init__(self, app, allowed: frozenset[str]):
+        self.app = app
+        self.allowed = allowed
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            hosts = [v for k, v in scope["headers"] if k == b"host"]
+            origins = [v for k, v in scope["headers"] if k == b"origin"]
+            error = None
+            if len(hosts) != 1 or canonical_authority(hosts[0].decode("latin-1")) not in self.allowed:
+                error = 400, "Host not allowed"
+            elif origins:
+                origin = urlsplit(origins[0].decode("latin-1")) if len(origins) == 1 else None
+                if (
+                    origin is None
+                    or origin.scheme not in ("http", "https")
+                    or origin.path
+                    or canonical_authority(origin.netloc) not in self.allowed
+                ):
+                    error = 403, "Origin not allowed"
+            if error:
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                response = JSONResponse(status_code=error[0], content={"error": error[1]})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_app(config: Config) -> FastAPI:
     token = os.environ.get(config.node.token_env)
     fabric_token = os.environ.get(config.node.fabric_token_env)
     if config.node.fabric_url and not fabric_token:
         raise ValueError(f"Set {config.node.fabric_token_env} before joining the cloud fabric")
-    if config.node.host not in ("127.0.0.1", "::1", "localhost") and not token:
-        raise ValueError(f"Set {config.node.token_env} before binding to a network interface")
+    if not token or token != token.strip() or len(token) < MIN_TOKEN_LENGTH:
+        where = "loopback" if config.node.host in LOOPBACK_BIND_HOSTS else "a network interface"
+        raise ValueError(
+            f"Set {config.node.token_env} (at least {MIN_TOKEN_LENGTH} characters, no surrounding "
+            f"whitespace) before serving on {where}; loopback is not an authentication boundary"
+        )
+    allowed_hosts = config.node.effective_allowed_hosts()
+    if not allowed_hosts:
+        raise ValueError("Set node.allowed_hosts (or advertise_url) before binding to a network interface")
     if config.node.control_plane_url and not config.node.advertise_url:
         raise ValueError("advertise_url is required when publishing heartbeats")
+    expected_authorization = ("Bearer " + token).encode()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -71,10 +125,19 @@ def create_app(config: Config) -> FastAPI:
                     await heartbeat
             await node.close()
 
-    app = FastAPI(title="Dendrite", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="Dendrite",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.add_middleware(HostOriginGuard, allowed=allowed_hosts)
 
     async def authorize(authorization: str | None = Header(default=None)):
-        if token and not hmac.compare_digest(authorization or "", "Bearer " + token):
+        supplied = (authorization or "").encode("utf-8", "surrogateescape")
+        if not hmac.compare_digest(supplied, expected_authorization):
             raise RuntimeFailure("Invalid or missing Dendrite token", 401)
 
     protected = [Depends(authorize)]
@@ -87,9 +150,10 @@ def create_app(config: Config) -> FastAPI:
             headers={"Retry-After": "1"} if exc.status_code == 429 else None,
         )
 
+    # Deliberately unauthenticated liveness probe; Host-checked and carries no node identity.
     @app.get("/healthz")
     async def health():
-        return {"status": "ok", "node_id": config.node.id}
+        return {"status": "ok"}
 
     @app.get("/v1/node", dependencies=protected)
     async def snapshot():

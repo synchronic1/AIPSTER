@@ -1,2 +1,4 @@
 # Preserve upstream blob bytes on Windows checkouts for SHA-256 provenance.
 vendor/eif/** -text
+# Local patches are hashed and applied byte-for-byte.
+patches/** -text

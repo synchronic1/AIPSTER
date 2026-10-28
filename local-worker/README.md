@@ -25,8 +25,13 @@ cd AIPSTER/local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
 .\.venv\Scripts\python.exe test_installation.py
+$env:DENDRITE_API_TOKEN = .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
 .\.venv\Scripts\dendrite.exe serve --config configs/mock.toml
 ```
+
+`serve` refuses to start without `DENDRITE_API_TOKEN` (at least 32 characters),
+including on loopback. Generate a fresh random value per machine; do not reuse a
+cloud or AIPSTER credential. `inspect` and the tests need no token.
 
 The installer verifies every vendored source hash, refuses an existing `.venv`,
 installs hash-locked wheels from public PyPI, builds the local package offline
@@ -37,18 +42,29 @@ Network access to public Python distribution/PyPI hosts is required on first use
 The locks pin dependency artifacts, not a bit-for-bit native build or a promise
 that upstream distribution hosts will remain available.
 
-In a second terminal:
+In a second terminal, set `$env:DENDRITE_API_TOKEN` to the same value, then:
 
 ```powershell
+$auth = @{ Authorization = "Bearer $env:DENDRITE_API_TOKEN" }
 Invoke-RestMethod http://127.0.0.1:8090/healthz
-Invoke-RestMethod http://127.0.0.1:8090/v1/node
-Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/execute -ContentType application/json -Body '{"capability":"summarize","model_id":"mock-summary","prompt":"Synthetic installation check","max_tokens":16}'
+Invoke-RestMethod http://127.0.0.1:8090/v1/node -Headers $auth
+Invoke-RestMethod -Method Post http://127.0.0.1:8090/v1/execute -Headers $auth -ContentType application/json -Body '{"capability":"summarize","model_id":"mock-summary","prompt":"Synthetic installation check","max_tokens":16}'
 ```
 
-Expect `status=ok` and `simulated=true` on execution. `/healthz` checks daemon
-liveness only. It does not prove that a real model/engine is installed or ready.
-`/v1/node` exposes local machine information; use loopback on a trusted single-user
-machine. Loopback without a token is not isolation from other local users.
+Expect `status=ok` and `simulated=true` on execution. `/healthz` is the only
+unauthenticated route: it checks daemon liveness, returns no node identity, and
+does not prove that a real model/engine is installed or ready. Every other route
+returns 401 without the bearer token. `/v1/node` exposes local machine information;
+keep the token private and use loopback on a trusted machine.
+
+Requests must name an allowed `Host`. On a loopback bind that is exactly
+`127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`; anything else (for example
+a DNS-rebound `attacker.example:<port>`) gets 400 before authentication runs. A
+browser `Origin` header, when present, must also be one of those authorities or the
+request gets 403. The API sends no CORS headers, so other web origins cannot read
+responses. A network bind additionally needs `advertise_url` or an explicit
+`[node] allowed_hosts = ["worker.lan:8090"]` (exact `host[:port]` values; no
+wildcards), or `serve` refuses to start.
 Do not expose this old worker to a network or configure its optional cloud bridge
 as part of this quickstart. No AIPSTER token/endpoint belongs in these examples.
 
@@ -113,6 +129,9 @@ startup task, global Python package or cloud configuration.
 | Hash mismatch | Restore from the exact public commit using `verify_vendor.py`; investigate changes. |
 | Port 8090 occupied | Stop the old instance or choose a free loopback port in the config. |
 | Invalid TOML/unknown field | CLI exits 2; use the provided strict examples. |
+| `serve` exits 2 asking for `DENDRITE_API_TOKEN` | Set a fresh random value of at least 32 characters (see quickstart). |
+| 401 from `/v1/...` | Send `Authorization: Bearer <token>` with the exact token the daemon started with. |
+| 400 `Host not allowed` / 403 `Origin not allowed` | Use `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`; for a network bind set `advertise_url` or `allowed_hosts`. |
 | Model unavailable | Check real GGUF path/magic and engine PATH; daemon health alone is insufficient. |
 | Runtime binary not found | Set the actual compiled executable path; no automatic native download occurs. |
 | TLS/index failure | Check access to public PyPI; installer deliberately ignores private indexes/proxies. |
@@ -120,15 +139,21 @@ startup task, global Python package or cloud configuration.
 ## Provenance and updates
 
 `vendor/eif` has 14 upstream Python modules plus original `pyproject.toml` and
-`uv.lock`, copied byte-for-byte from public EIF
-`536508832b12d993dc272e03d4f09aca53801f68`. `provenance.json` is the allowlist and
-SHA-256 record. All modules are retained because CLI/API imports transitively use
+`uv.lock` from public EIF `536508832b12d993dc272e03d4f09aca53801f68`. Fourteen
+files are byte-for-byte upstream. `dendrite/api.py` and `dendrite/config.py` carry
+AIPSTER local patch [0001](patches/0001-require-token-and-validate-host.patch),
+a security fix that requires the API token on every bind and validates Host/Origin.
+Each patched file has a change notice at the top. `provenance.json` is the
+allowlist and SHA-256 record: `upstream_sha256` identifies the pinned upstream
+bytes and `sha256` the patched bytes in this tree. The patch is not upstream. All modules are retained because CLI/API imports transitively use
 them, including the optional fabric bridge; no separate server/scheduler, Oxen
 tools, tests, machine configs, private history or binaries are copied. Sanitized
 configs and installation tests live outside the vendor directory. Runtime logic
 is not forked into a second implementation.
 
-Verify: `python verify_vendor.py`. Restore exact pinned files only:
+Verify: `python verify_vendor.py` (add `--check-patches` to prove that reversing
+the recorded patches reproduces the upstream hashes; needs Git). Restore from the
+exact pinned commit and reapply the recorded patches:
 `python verify_vendor.py --restore-from PATH_TO_PUBLIC_EIF_CLONE`.
 For an update, review the new public commit, every allowlisted diff, new imports,
 rights and notices; deliberately update the pin/hashes in a PR. The restore tool
@@ -138,7 +163,10 @@ does not automatically follow a branch or accept new hashes. Regenerate
 --no-config`; regenerate build dependencies with `uv pip compile
 build-requirements.in --generate-hashes --output-file build-requirements.lock`.
 Review public indexes, license metadata and artifact hashes, then repeat a clean
-installation and synthetic tests. Do not hand-patch vendor scheduling/auth logic.
+installation and synthetic tests. Do not hand-patch vendor files: any change goes
+in a new numbered file under `patches/`, recorded in `provenance.json` with
+upstream and patched hashes, and the vendored files keep their change notices.
+On an upstream update, rebase or retire each patch and re-verify.
 
 See [licensing findings](LICENSING.md), [execution gaps](EXECUTION-GAPS.md), and
 [verification evidence](VERIFICATION.md).

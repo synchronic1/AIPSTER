@@ -11,7 +11,11 @@ The pinned EIF snapshot has no root LICENSE and none of the 16 copied files has
 a copyright/SPDX/license notice. Its public visibility was not treated as a
 license. This copy is licensed under the owner's explicit grant, without editing
 or claiming to license the separate EIF repository. The 16-file allowlist and
-individual hashes are in provenance.json. All original source bytes are retained.
+individual hashes are in provenance.json. Fourteen files keep their original bytes.
+`dendrite/api.py` and `dendrite/config.py` were modified by AIPSTER local patch 0001
+(2026-10-28, security fix). As Apache-2.0 section 4(b) requires, each carries a
+prominent change notice, and provenance.json records both the upstream and patched
+hashes plus the patch itself.
 Dependencies, third-party logos, native engines and model weights are excluded
 from this project-owned license grant and keep their own terms.
 
