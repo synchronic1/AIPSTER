@@ -39,3 +39,15 @@ export function classifyTransportOutcome(outcome) {
   if (!['timeout', 'cancelled', 'connection_lost'].includes(outcome)) fail();
   return { status: 'uncertain', automaticRetry: false, remoteStopped: false };
 }
+
+// Wire encoding only. The target must eventually come from durable admitted
+// state, never browser input. This does not authorize, reserve, or dispatch.
+export function encodeBoundCpuTask(input, target) {
+  if (!object(target) || Object.keys(target).some(k => !['device', 'nodeId', 'runtimeId'].includes(k))
+    || target.device !== 'cpu'
+    || ![target.nodeId, target.runtimeId].every(v => typeof v === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(v))) fail();
+  return { ...encodeCpuTask(input), placement: {
+    device: 'cpu', node_id: target.nodeId, runtime_id: target.runtimeId,
+  } };
+}
