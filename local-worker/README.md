@@ -64,7 +64,13 @@ browser `Origin` header, when present, must also be one of those authorities or 
 request gets 403. The API sends no CORS headers, so other web origins cannot read
 responses. A network bind additionally needs `advertise_url` or an explicit
 `[node] allowed_hosts = ["worker.lan:8090"]` (exact `host[:port]` values; no
-wildcards), or `serve` refuses to start.
+wildcards), or `serve` refuses to start. Derived Origins are scheme-exact:
+`http://` for the daemon's own addresses and the `advertise_url` scheme for
+that name. Explicit `allowed_hosts` accept both `http://` and `https://` Origins.
+Explicit entries *replace* the derived defaults. So a loopback daemon behind a
+proxy or tunnel that forwards the public Host must list that name **and** the
+loopback names, e.g. `["worker.example.com", "127.0.0.1:8090", "localhost:8090"]`.
+`advertise_url` alone does not add a name to a loopback bind.
 Do not expose this old worker to a network or configure its optional cloud bridge
 as part of this quickstart. No AIPSTER token/endpoint belongs in these examples.
 

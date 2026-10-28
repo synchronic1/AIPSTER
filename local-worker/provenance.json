@@ -11,7 +11,7 @@
     },
     {
       "path": "dendrite/api.py",
-      "sha256": "b78fa234fc544de9c8f4164393dc748f90fe43effd2698a6f502b4d2944fcc6d",
+      "sha256": "f786664702783a7a0d9874e4fdc8edab5f28d9a8795566de71d35c833bf13981",
       "notice": "Modified locally by AIPSTER patch 0001 (prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
       "upstream_sha256": "99ae96c2871c640c9d656671b954ce1d6c5ec1f338a3e7e4ec423e1d762532ef",
       "local_patch": "patches/0001-require-token-and-validate-host.patch"
@@ -28,7 +28,7 @@
     },
     {
       "path": "dendrite/config.py",
-      "sha256": "465a573c3994944c5f613cdd0c764d5a592610a6f5a15136266afa0465ee4ce1",
+      "sha256": "40841dcfc8e2517196a1afe3e7ed0d10cb7089e76fa682db2562e627aeed1141",
       "notice": "Modified locally by AIPSTER patch 0001 (prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
       "upstream_sha256": "3bc453d5f767a1a823816661c2cda1bd34b573e16be2d87d3b78cebf3502e122",
       "local_patch": "patches/0001-require-token-and-validate-host.patch"
@@ -93,7 +93,7 @@
     {
       "id": "0001",
       "path": "patches/0001-require-token-and-validate-host.patch",
-      "sha256": "970f2d3eb459cbe0de3f4903c61b2ebb037318992b30b3d2399d9b9b29fd5ae8",
+      "sha256": "c8555ba1d022bd5442c6bc9efa5688740a7b2483ff6ad00a116f2e9819df7c50",
       "date": "2026-10-28",
       "applies_to_commit": "536508832b12d993dc272e03d4f09aca53801f68",
       "files": [

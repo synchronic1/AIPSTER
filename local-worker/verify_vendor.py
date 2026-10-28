@@ -50,6 +50,8 @@ def main():
         if patch["applies_to_commit"] != manifest["commit"]:
             raise SystemExit("Patch base differs from pinned commit: " + patch["path"])
     patched = {path for patch in patches for path in patch["files"]}
+    if not patched <= {item["path"] for item in manifest["files"]}:
+        raise SystemExit("Patch names a file outside the allowlist: " + str(sorted(patched)))
     upstream = {}
     for item in manifest["files"]:
         path = item["path"]
@@ -67,6 +69,10 @@ def main():
             upstream[path] = data
     if args.restore_from:
         restored = upstream | apply_patches({p: upstream[p] for p in patched}, patches)
+        expected = {item["path"]: item["sha256"] for item in manifest["files"]}
+        for path, data in restored.items():
+            if sha256(data) != expected[path]:
+                raise SystemExit("Restored bytes do not match the recorded hash; nothing written: " + path)
         for path, data in restored.items():
             (vendor / path).parent.mkdir(parents=True, exist_ok=True)
             (vendor / path).write_bytes(data)

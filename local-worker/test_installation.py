@@ -88,7 +88,7 @@ class InstallationTests(unittest.TestCase):
 
     def test_loopback_bind_requires_strong_token(self):
         config = load_config(ROOT / "configs/mock.toml")
-        for value in (None, "", "short-token", " " + TOKEN, TOKEN + "\n"):
+        for value in (None, "", "short-token", " " + TOKEN, TOKEN + "\n", TOKEN.replace("-", " "), "\u00e9" * 32):
             env = {} if value is None else {"DENDRITE_API_TOKEN": value}
             with self.subTest(token=value), patch.dict(os.environ, env, clear=True):
                 with self.assertRaisesRegex(ValueError, "DENDRITE_API_TOKEN.*loopback"):
@@ -149,6 +149,7 @@ class InstallationTests(unittest.TestCase):
                 with self.subTest(origin=origin):
                     self.assertEqual(client.get("/v1/node", headers=good | {"Origin": origin}).status_code, 200)
             for origin in ("http://attacker.example:8090", "null", "http://127.0.0.1:9999", "http://[::1",
+                           "https://127.0.0.1:8090", "ws://127.0.0.1:8090",
                            "http://[::1]:8090:1",
                            "file://", "http://127.0.0.1:8090/path", "https://attacker.example"):
                 with self.subTest(origin=origin):
@@ -186,6 +187,10 @@ class InstallationTests(unittest.TestCase):
                     with self.subTest(port80_hostile=host):
                         self.assertEqual(client.get("/v1/node", headers=good | {"Host": host}).status_code, 400)
             self.assertNotIn("127.0.0.1", mock_config(temp).node.effective_allowed_hosts())
+            https_only = mock_config(temp, host="0.0.0.0", advertise_url="https://worker.example").node
+            self.assertIn("https://worker.example", https_only.effective_allowed_origins())
+            self.assertNotIn("http://worker.example", https_only.effective_allowed_origins())
+            self.assertNotIn("https://localhost", mock_config(temp, port=80).node.effective_allowed_origins())
             self.assertEqual(mock_config(temp, host="0.0.0.0", advertise_url="https://worker.example:443")
                              .node.effective_allowed_hosts(), {"worker.example", "worker.example:443"})
             self.assertEqual(mock_config(temp, host="0.0.0.0", advertise_url="http://worker.lan:80")

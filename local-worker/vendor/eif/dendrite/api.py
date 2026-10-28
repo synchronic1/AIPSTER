@@ -53,9 +53,10 @@ class HostOriginGuard:
     (the app sends no CORS headers, so cross-origin reads stay blocked by the browser).
     """
 
-    def __init__(self, app, allowed: frozenset[str]):
+    def __init__(self, app, allowed: frozenset[str], origins: frozenset[str]):
         self.app = app
         self.allowed = allowed
+        self.origins = origins
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
@@ -73,7 +74,7 @@ class HostOriginGuard:
                     origin is None
                     or origin.scheme not in ("http", "https")
                     or origin.path
-                    or canonical_authority(origin.netloc) not in self.allowed
+                    or f"{origin.scheme}://{canonical_authority(origin.netloc)}" not in self.origins
                 ):
                     error = 403, "Origin not allowed"
             if error:
@@ -91,11 +92,12 @@ def create_app(config: Config) -> FastAPI:
     fabric_token = os.environ.get(config.node.fabric_token_env)
     if config.node.fabric_url and not fabric_token:
         raise ValueError(f"Set {config.node.fabric_token_env} before joining the cloud fabric")
-    if not token or token != token.strip() or len(token) < MIN_TOKEN_LENGTH:
+    # Printable ASCII only: the header is decoded as latin-1, so other characters never match.
+    if not token or len(token) < MIN_TOKEN_LENGTH or not all("!" <= c <= "~" for c in token):
         where = "loopback" if config.node.host in LOOPBACK_BIND_HOSTS else "a network interface"
         raise ValueError(
-            f"Set {config.node.token_env} (at least {MIN_TOKEN_LENGTH} characters, no surrounding "
-            f"whitespace) before serving on {where}; loopback is not an authentication boundary"
+            f"Set {config.node.token_env} (at least {MIN_TOKEN_LENGTH} printable ASCII characters, no "
+            f"spaces) before serving on {where}; loopback is not an authentication boundary"
         )
     allowed_hosts = config.node.effective_allowed_hosts()
     if not allowed_hosts:
@@ -136,7 +138,8 @@ def create_app(config: Config) -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
-    app.add_middleware(HostOriginGuard, allowed=allowed_hosts)
+    app.add_middleware(HostOriginGuard, allowed=allowed_hosts,
+                       origins=config.node.effective_allowed_origins())
 
     async def authorize(authorization: str | None = Header(default=None)):
         supplied = (authorization or "").encode("utf-8", "surrogateescape")

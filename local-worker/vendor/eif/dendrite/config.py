@@ -118,36 +118,44 @@ class NodeConfig(StrictModel):
                 raise ValueError(f"allowed_hosts entry {entry!r} must be an exact host[:port]")
         return self
 
-    def effective_allowed_hosts(self) -> frozenset[str]:
-        """Explicit allowed_hosts, else loopback names on the bound port, else advertise_url."""
+    def _allowed_origins(self) -> set[tuple[str, str]]:
+        """(scheme, authority) pairs: explicit allowed_hosts, else derived defaults."""
         if self.allowed_hosts:
-            return frozenset(canonical_authority(h) for h in self.allowed_hosts)
-        hosts = set()
+            # A bare host[:port] cannot say which scheme a proxy terminates; allow both.
+            return {(s, canonical_authority(h)) for h in self.allowed_hosts for s in ("http", "https")}
+        origins = set()
 
-        def add(host: str, port: int | None, default_port: int):
+        def add(scheme: str, host: str, port: int | None):
             # Clients omit a scheme-default port from Host/Origin, so accept both forms.
-            hosts.add(host if port is None else f"{host}:{port}")
+            default_port = 443 if scheme == "https" else 80
+            origins.add((scheme, host if port is None else f"{host}:{port}"))
             if port in (None, default_port):
-                hosts.add(host)
-                hosts.add(f"{host}:{default_port}")
+                origins.update({(scheme, host), (scheme, f"{host}:{default_port}")})
 
         if self.host in LOOPBACK_BIND_HOSTS:
             for name in ("127.0.0.1", "localhost", "[::1]"):
-                add(name, self.port, 80)  # the daemon itself serves plain HTTP
-            return frozenset(hosts)
+                add("http", name, self.port)  # the daemon itself serves plain HTTP
+            return origins
         if self.advertise_url:
             url = urlsplit(self.advertise_url)
             authority = canonical_authority(url.netloc)
             if authority:
-                host = authority if url.port is None else authority.rsplit(":", 1)[0]
-                add(host, url.port, 443 if url.scheme == "https" else 80)
+                add(url.scheme, authority if url.port is None else authority.rsplit(":", 1)[0], url.port)
         try:
             address = ipaddress.ip_address(self.host)
         except ValueError:
             address = None
         if address and not address.is_unspecified:
-            add(f"[{address}]" if address.version == 6 else str(address), self.port, 80)
-        return frozenset(hosts)
+            add("http", f"[{address}]" if address.version == 6 else str(address), self.port)
+        return origins
+
+    def effective_allowed_hosts(self) -> frozenset[str]:
+        """Exact Host header values the API accepts."""
+        return frozenset(authority for _, authority in self._allowed_origins())
+
+    def effective_allowed_origins(self) -> frozenset[str]:
+        """Exact browser Origin values (scheme://authority) the API accepts."""
+        return frozenset(f"{scheme}://{authority}" for scheme, authority in self._allowed_origins())
 
     @model_validator(mode="after")
     def validate_fabric_origin(self):
