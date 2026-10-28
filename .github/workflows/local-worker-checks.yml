@@ -1,0 +1,27 @@
+name: Public local worker installation
+on:
+  pull_request:
+    paths:
+      - 'local-worker/**'
+      - '.github/workflows/local-worker-checks.yml'
+      - 'LICENSE'
+      - 'NOTICE'
+permissions:
+  contents: read
+jobs:
+  mock-install:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7 resolved 2026-10-28
+        with:
+          version: '0.12.12'
+          enable-cache: false
+      - run: uv python install 3.12.14
+      - run: uv run --no-project --python 3.12.14 python install.py
+        working-directory: local-worker
+      - run: ./.venv/Scripts/python.exe test_installation.py
+        working-directory: local-worker

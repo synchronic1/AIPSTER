@@ -1,0 +1,19 @@
+AIPSTER and vendored Dendrite worker
+Copyright 2026 Peter Medina
+
+Project-owned code is licensed under the Apache License, Version 2.0.
+Peter Medina (GitHub synchronic1) confirmed authority for the original AIPSTER
+and public EIF worker files and selected Apache-2.0 on 2026-10-28.
+
+local-worker/vendor/eif contains unmodified source files from
+https://github.com/synchronic1/elastic-inference-fabric
+commit 536508832b12d993dc272e03d4f09aca53801f68.
+The upstream snapshot contained no root LICENSE and no per-file license notices
+in these files. The license for this copy is an explicit owner grant, not an
+inference from public availability. The accompanying LICENSE/NOTICE are added
+packaging documents. See local-worker/provenance.json for hashes and scope.
+
+Third-party dependencies, sponsor logos/trademarks, model weights and native
+engines retain their respective terms; this grant does not relicense them.
+No permission to use third-party trademarks is granted here. No model weights
+or native engine binaries are distributed. Other repositories are unchanged.

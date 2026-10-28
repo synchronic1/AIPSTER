@@ -1,0 +1,23 @@
+# Operator template; no model is loaded by inspect/serve alone.
+# Use a CPU-only native build. This old worker does not enforce CPU confinement.
+[node]
+id = "standalone-cpu"
+host = "127.0.0.1"
+port = 8090
+state_dir = "../.state"
+
+[[runtimes]]
+id = "cpu"
+kind = "ik_llama"
+mode = "managed"
+executable = "llama-server"
+port = 8081
+context_size = 2048
+threads = 2
+gpu_layers = 0
+
+[[models]]
+id = "operator-model"
+runtime = "cpu"
+capabilities = ["summarize"]
+path = "../models/replace-with-your-model.gguf"

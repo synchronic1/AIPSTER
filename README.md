@@ -1,5 +1,13 @@
 # AIPSTER
 
+## Install the standalone local worker
+
+The [local-worker quickstart](local-worker/README.md) installs the included public
+Dendrite source with pinned dependencies and a model-free mock health check.
+No private repository access is required. This does not connect or enable AIPSTER
+jobs; real execution remains gated. Project-owned code is licensed under
+[Apache-2.0](LICENSE); see [NOTICE](NOTICE) for scope and third-party exclusions.
+
 AIPSTER is a planned research system for running bounded, evidence-driven experiments on AI workflows. It combines IRB refinement infrastructure with an external trusted Darwin Gödel Machine (DGM) controller and archive, short Karpathy-style experiment loops, and optional JEV decision advice.
 
 The design keeps experiments within explicit budgets and requires recorded evidence, independent evaluation, and promotion gates before promoting a change. Planned distributed inference routes whole workloads across machines; it does not split a model across them.
