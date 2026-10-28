@@ -51,7 +51,7 @@ for (const real of [false, true]) {
   test(`${engine}: lifetime retention cap is shared across actor kinds; old admission still recovers`, async c => {
     const t = await revisionFixture(real); c.after(t.close);
     await t.db.prepare(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < ?)
-      INSERT INTO fabric_operation_admissions SELECT 'u_alice','key','seed-'||x,'POST','/seed','hash','2026-01-01' FROM n`)
+      INSERT INTO fabric_operation_admissions (owner_id, actor_kind, idem_key, method, path, request_hash, admitted_at) SELECT 'u_alice','key','seed-'||x,'POST','/seed','hash','2026-01-01' FROM n`)
       .bind(MAX_RETAINED_FABRIC_OPERATIONS).run();
     await assert.rejects(admitFabricOperation(t.db, t.alice, 'POST', '/v1/fabric/nodes', 'over', 'hash'), { code: 'FABRIC_RETENTION_LIMIT' });
     assert.equal((await t.db.prepare('SELECT count(*) n FROM write_budget').first()).n, 0);

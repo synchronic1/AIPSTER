@@ -6,6 +6,7 @@
 import { readJson } from '../lib/validate.js';
 import { digestJson } from './canonical.mjs';
 import * as S from './store.mjs';
+import { restrictionOf } from './admission.mjs';
 
 export function federationEnabled(env) {
   return !!env && env.FEDERATION_ENABLED === '1';
@@ -53,7 +54,8 @@ async function mutate(ctx, fn) {
   const factor = fabricActor(ctx.actor);
   let replay = null;
   try {
-    replay = await S.checkIdempotency(db, factor, request.method, url.pathname, request.headers.get('Idempotency-Key'), await digestJson(body === undefined ? null : body));
+    replay = await S.checkIdempotency(db, factor, request.method, url.pathname, request.headers.get('Idempotency-Key'), await digestJson(body === undefined ? null : body),
+      request.method === 'POST' ? restrictionOf(url.pathname) : null);
   } catch (e) { return sendErr(ctx, e); }
   if (replay) return ctx.json(replay.status, { ...replay.body, replayed: true });
   const key = request.headers.get('Idempotency-Key');
@@ -346,7 +348,7 @@ export async function handleMcp(ctx) {
     if (d) return d;
     const key = body.idempotencyKey;
     const ipath = `/v1/fabric/mcp:${tool}`;
-    const replay = await S.checkIdempotency(db, f, 'POST', ipath, key, await digestJson(params));
+    const replay = await S.checkIdempotency(db, f, 'POST', ipath, key, await digestJson(params), restrictionOf(ipath, tool, params));
     if (replay) {
       // Terminal failures replay the same raw error shape as the initial
       // call — never a success envelope — matching REST semantics.

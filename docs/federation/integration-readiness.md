@@ -99,3 +99,38 @@ rollback, request mismatch, per-user isolation, retained-operation exhaustion,
 reads/replay/guard behavior, and deny deletion. Actual concurrency is tested on
 real local D1; the SQLite shim uses serial boundary checks because its nested
 savepoint hooks do not model independent concurrent transactions.
+
+## Restrictive actions at exhaustion (0012)
+
+Review of `b1c3bef` found that the shared admission above also gated
+security-reducing actions. With the hourly budget spent, REST grant revoke, MCP
+`fabric.pause_grant` and REST connection suspend returned 429, and the grant
+stayed `enforced`. At 10,000 retained admissions they returned 409 indefinitely.
+Main's policy (`worker.js` auth budget, plan §5 "revocation exemption") keeps
+revocation free at exhaustion, and main's `DELETE /api/grants/:id` returns 200
+there. So the federation behaviour was an engineering defect, not a retention
+policy choice.
+
+The six restrictive actions are grant pause/revoke, connection
+suspend/disconnect, and invitation decline/revoke, over REST and the matching
+MCP tools. For each, the first admission per (owner, action, existing target)
+is uncharged and exempt from the ceiling. A partial unique index in additive
+`0012_fabric_restriction_admission.sql` enforces "first", across both
+transports. The free insert requires a live, non-demo owner and an existing
+target row. Any repeat, concurrent duplicate or nonexistent target falls
+through, in the same D1 batch, to the unchanged charged insert. Growth stays
+bounded by existing rows times six actions. Pause/suspend cycles stay bounded
+because resume and veto withdrawal are charged. Expansion is still blocked at
+both limits. No admission, ledger, history or audit row is deleted, and the
+10,000 ceiling is unchanged.
+
+Still the operator's decision (not made here): a retention/archive policy for
+admissions and ledger rows (STATE-LAYER D4), and what an owner at the ceiling
+may do beyond restriction. Until that is decided, an owner at the ceiling can
+restrict but cannot create, resume or revise.
+
+Tests (`federation-restrictive-admission.test.mjs`): both exhaustion modes over
+REST and MCP; uncharged first use; repeats and nonexistent targets charged;
+replay and request binding; a single audit record; the live-owner requirement;
+and ten concurrent same-target admissions on real local D1, of which exactly one
+is free and none is charged. On `b1c3bef` these fail with 429/409.

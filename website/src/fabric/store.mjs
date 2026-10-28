@@ -1281,12 +1281,12 @@ export async function discoverResources(db, actor) {
 // rows never replay or execute. Binding (method/path/body-hash) is
 // compared FIRST for every existing state; any difference is 409.
 const IDEM_TTL_MS = 10 * 60e3;
-export async function checkIdempotency(db, actor, method, path, key, bodyHash) {
+export async function checkIdempotency(db, actor, method, path, key, bodyHash, restriction = null) {
   if (!key || typeof key !== 'string' || key.length > 128) throw err(400, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header is required for this mutation.');
   const actorKey = `${actor.kind}:${actor.user.id}`;
   const existing = await first(db, 'SELECT * FROM idempotency_records WHERE idem_key = ? AND actor = ?', key, actorKey);
   if (!existing) {
-    await admitFabricOperation(db, actor, method, path, key, bodyHash);
+    await admitFabricOperation(db, actor, method, path, key, bodyHash, restriction);
     try {
       await db.prepare('INSERT INTO idempotency_records (idem_key, actor, method, path, request_hash, status, response_code, response_body, created_at, attempt) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)')
         .bind(key, actorKey, method, path, bodyHash, 'processing', nowIso(), freshAttempt()).run();

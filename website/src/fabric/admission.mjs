@@ -6,7 +6,34 @@ import { httpError } from '../lib/validate.js';
 
 export const MAX_RETAINED_FABRIC_OPERATIONS = 10000;
 
-export async function admitFabricOperation(db, actor, method, path, key, requestHash) {
+// Security-reducing actions must work at exhaustion (main's revocation
+// exemption). Each maps to (table, kind.action) so REST and MCP share one key.
+const RESTRICTIVE_REST = /^\/v1\/fabric\/(grants|connections|invitations)\/([A-Za-z0-9_-]{1,64})\/(pause|revoke|suspend|disconnect|decline)$/;
+const RESTRICTIVE_ACTIONS = {
+  'grants/pause': 'grant.pause', 'grants/revoke': 'grant.revoke',
+  'connections/suspend': 'connection.suspend', 'connections/disconnect': 'connection.disconnect',
+  'invitations/decline': 'invitation.decline', 'invitations/revoke': 'invitation.revoke'
+};
+const RESTRICTIVE_TOOLS = {
+  'fabric.pause_grant': 'grant.pause', 'fabric.revoke_grant': 'grant.revoke',
+  'fabric.suspend_connection': 'connection.suspend', 'fabric.disconnect_connection': 'connection.disconnect',
+  'fabric.decline_invitation': 'invitation.decline', 'fabric.revoke_invitation': 'invitation.revoke'
+};
+const TARGET_TABLES = { grant: 'fabric_grants', connection: 'connections', invitation: 'invitations' };
+
+// Returns { action, id } for a restrictive mutation, else null. MCP passes the
+// tool name and its params; REST passes the request path.
+export function restrictionOf(path, tool = null, params = null) {
+  if (tool) {
+    const action = RESTRICTIVE_TOOLS[tool], id = params && params.id;
+    return action && typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id) ? { action, id } : null;
+  }
+  const m = RESTRICTIVE_REST.exec(path);
+  const action = m && RESTRICTIVE_ACTIONS[`${m[1]}/${m[3]}`];
+  return action ? { action, id: m[2] } : null;
+}
+
+export async function admitFabricOperation(db, actor, method, path, key, requestHash, restriction = null) {
   const owner = actor.user.id, kind = actor.kind;
   const read = () => db.prepare('SELECT * FROM fabric_operation_admissions WHERE owner_id = ? AND actor_kind = ? AND idem_key = ?')
     .bind(owner, kind, key).first();
@@ -17,19 +44,33 @@ export async function admitFabricOperation(db, actor, method, path, key, request
   };
   const previous = await read();
   if (previous) { verify(previous); return; }
-  const window = budgetWindow();
+  const window = budgetWindow(), now = new Date().toISOString();
   // The insert, capacity predicates and shared budget increment serialize as
   // one D1 transaction. Concurrent duplicate keys have changes()=0 and pay zero.
-  // A failure of either statement rolls back both; lost responses are recovered
+  // A failure of any statement rolls back all; lost responses are recovered
   // by the durable admission row. No interactive transaction is assumed.
-  await db.batch([
-    db.prepare(`INSERT OR IGNORE INTO fabric_operation_admissions
+  //
+  // A restrictive action first tries its one uncharged, ceiling-exempt slot for
+  // (owner, action, existing target); the partial unique index makes concurrent
+  // or repeated attempts fall through to the normal charged insert, which only
+  // runs when the free insert changed nothing. Growth stays bounded by existing
+  // rows x six actions; nothing is deleted and the ceiling is unchanged.
+  const free = restriction && TARGET_TABLES[restriction.action.split('.')[0]];
+  const charged = `INSERT OR IGNORE INTO fabric_operation_admissions
       (owner_id, actor_kind, idem_key, method, path, request_hash, admitted_at)
       SELECT ?, ?, ?, ?, ?, ?, ?
       WHERE COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) < ?
       AND (SELECT count(*) FROM fabric_operation_admissions WHERE owner_id = ?) < ?
+      AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0 AND demo = 0)`;
+  await db.batch([
+    ...(free ? [db.prepare(`INSERT OR IGNORE INTO fabric_operation_admissions
+      (owner_id, actor_kind, idem_key, method, path, request_hash, admitted_at, restriction)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS(SELECT 1 FROM ${free} WHERE id = ?)
       AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0 AND demo = 0)`)
-      .bind(owner, kind, key, method, path, requestHash, new Date().toISOString(),
+      .bind(owner, kind, key, method, path, requestHash, now, `${restriction.action}:${restriction.id}`, restriction.id, owner)] : []),
+    db.prepare(free ? charged + ' AND changes() = 0' : charged)
+      .bind(owner, kind, key, method, path, requestHash, now,
         owner, window, WRITE_BUDGET_PER_HOUR, owner, MAX_RETAINED_FABRIC_OPERATIONS, owner),
     db.prepare(`INSERT INTO write_budget(user_id, window, count)
       SELECT ?, ?, 1 WHERE changes() = 1
