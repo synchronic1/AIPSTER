@@ -49,3 +49,44 @@ No native build, real model load, GPU behavior, Linux/macOS installation, AIPSTE
 admission or connected execution was verified. Existing federation holds remain.
 Public CI repeats mock installation on Windows; its result is separate from
 these locally observed checks. See PR checks for the eventual CI result.
+
+## Local patch 0001: token on every bind, Host/Origin validation (2026-10-28)
+
+Fixes review finding
+[PR #14 discussion r4405943472](https://github.com/synchronic1/AIPSTER/pull/14#discussion_r4405943472)
+(P2: optional loopback authentication, arbitrary Host). Base: main `7b38ba0`.
+Windows x64, CPython 3.12.14, uv 0.12.12, clean `.venv` from `install.py`.
+
+Synthetic probe against a real `dendrite serve` mock daemon on 127.0.0.1 (raw
+socket requests; no browser, no DNS rebinding attack, no network scan):
+
+| Request | Before (main) | After |
+|---|---|---|
+| Start `serve` on loopback without token | starts | exits 2 |
+| `GET /v1/node`, no token, Host `127.0.0.1:port` | 200 | 401 |
+| `GET /v1/node`, no token, Host `attacker.example:port` + Origin | 200 | 400 |
+| `POST /v1/execute`, no token, Host `attacker.example:port` | 200 | 400 |
+| `GET /healthz`, Host `attacker.example:port` | 200 (returns node_id) | 400 |
+| `GET /v1/node`, valid token, Host `127.0.0.1:port` | 200 | 200 |
+| `GET /v1/node`, valid token, Host `attacker.example:port` | 200 | 400 |
+
+`test_installation.py` now has 14 tests. The five new ones cover missing, wrong,
+malformed and non-ASCII tokens on every protected route; 19 hostile or non-canonical
+Host values (ports, IPv6, userinfo, trailing dot, numeric aliases); a hostile
+Origin, `null` and a path-bearing Origin; the absence of CORS headers on a preflight;
+derived and explicit remote-bind allow-lists, including IPv6 and proxy Host without
+a port; and invalid `allowed_hosts` entries. The daemon test also sends raw
+duplicate, missing and hostile Host headers. All 14 pass on the patched tree.
+Run against the unpatched upstream `api.py`/`config.py`, the new tests record
+33 failures and 1 error (the non-ASCII token raised a 500).
+
+`verify_vendor.py --check-patches` reverses the recorded patch in an isolated
+temporary tree and reproduces both upstream SHA-256 values. `--restore-from` a
+fresh public EIF clone at the pinned commit rebuilds byte-identical patched
+files. An appended byte is detected as a hash mismatch.
+
+Compatibility: the optional fabric bridge and control-plane heartbeat are outbound
+clients and do not use these inbound routes. A network bind already required a
+token; it now also requires `advertise_url` or `allowed_hosts`. Loopback quickstart
+clients must send the bearer token. No native engine, model, inference or AIPSTER
+connection was exercised.

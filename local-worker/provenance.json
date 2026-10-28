@@ -11,8 +11,10 @@
     },
     {
       "path": "dendrite/api.py",
-      "sha256": "99ae96c2871c640c9d656671b954ce1d6c5ec1f338a3e7e4ec423e1d762532ef",
-      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+      "sha256": "f786664702783a7a0d9874e4fdc8edab5f28d9a8795566de71d35c833bf13981",
+      "notice": "Modified locally by AIPSTER patch 0001 (prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
+      "upstream_sha256": "99ae96c2871c640c9d656671b954ce1d6c5ec1f338a3e7e4ec423e1d762532ef",
+      "local_patch": "patches/0001-require-token-and-validate-host.patch"
     },
     {
       "path": "dendrite/cache.py",
@@ -26,8 +28,10 @@
     },
     {
       "path": "dendrite/config.py",
-      "sha256": "3bc453d5f767a1a823816661c2cda1bd34b573e16be2d87d3b78cebf3502e122",
-      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+      "sha256": "40841dcfc8e2517196a1afe3e7ed0d10cb7089e76fa682db2562e627aeed1141",
+      "notice": "Modified locally by AIPSTER patch 0001 (prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
+      "upstream_sha256": "3bc453d5f767a1a823816661c2cda1bd34b573e16be2d87d3b78cebf3502e122",
+      "local_patch": "patches/0001-require-token-and-validate-host.patch"
     },
     {
       "path": "dendrite/fabric.py",
@@ -83,6 +87,21 @@
       "path": "uv.lock",
       "sha256": "405784b3a776f8000820d9811703ec70ce1beaae0897fa82cbc5efa99132b793",
       "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+    }
+  ],
+  "local_patches": [
+    {
+      "id": "0001",
+      "path": "patches/0001-require-token-and-validate-host.patch",
+      "sha256": "c8555ba1d022bd5442c6bc9efa5688740a7b2483ff6ad00a116f2e9819df7c50",
+      "date": "2026-10-28",
+      "applies_to_commit": "536508832b12d993dc272e03d4f09aca53801f68",
+      "files": [
+        "dendrite/api.py",
+        "dendrite/config.py"
+      ],
+      "reason": "Security: require the API token on every bind including loopback, validate Host/Origin against node.allowed_hosts (DNS-rebinding defence), remove node identity from the unauthenticated health probe, disable generated API docs. Review: https://github.com/synchronic1/AIPSTER/pull/14#discussion_r4405943472",
+      "upstream_status": "Not submitted upstream; upstream commit above remains unpatched."
     }
   ]
 }
