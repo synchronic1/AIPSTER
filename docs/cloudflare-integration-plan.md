@@ -86,6 +86,17 @@ bundles, or this document.
 - `0003_demo_auth.sql`: `username`/`displayUsername` plugin columns, `demo`
   workspace flag, `rateLimit` table for database-backed throttling.
 - `0004_disable_flag.sql`: `disabled` account flag for membership revocation.
+- `0005_write_budget.sql` (PR #11): `write_budget` table for the per-user
+  hourly write budget (120/hour, `429 WRITE_RATE_LIMITED`).
+  ORDERING NOTE: federation (PR #6, unmerged) separately adds
+  `0005_fabric.sql` + `0006`-`0008` with different tables — verified, no
+  table overlap with `write_budget`, so no confirmed conflict — but both
+  branches share the `0005` slot. Whichever PR merges second renumbers
+  to the next free sequence BEFORE merge (auth file -> `0009_*` if
+  federation lands first; federation block -> `0006`-`0009` if this
+  lands first — the federation block must stay ordered), then re-runs
+  migrations tests + CI. Neither `0005` has been applied to production
+  yet, so renumbering before first apply is safe for the D1 journal.
 
 Apply in order: `wrangler d1 migrations apply aipster-app --remote`
 (production), `--local` for development. 0001/0002 are re-runnable
@@ -209,11 +220,14 @@ re-reviewed.
 
 ## 7. Test plan (all committed under `website/`)
 
-`npm test` (135 green on the final head): migrations incl. 0003/0004; real
-session round-trips; unauthenticated 401s; cross-user 404s; grants/quotas
-incl. real↔demo boundary both directions; key lifecycle incl. `aip_demo_`
-sandbox prefix; allowlist + verified-email gate (unit + stubbed-GitHub
-OAuth callback matrix, Codex-adopted probes); byte-cap streaming incl.
+`npm test` (156 green on the final head): migrations incl. 0005;
+public GitHub registration (verified-email gate, no invitation, no
+implicit linking; two-user + repeat + collision + isolation cases
+through the stubbed-GitHub callback path); per-user write quotas
+(hourly budget, object caps, revocation exemption, no-write-on-reject);
+real session round-trips; unauthenticated 401s; cross-user 404s;
+grants/quotas incl. real↔demo boundary both directions; key lifecycle
+incl. `aip_demo_` sandbox prefix; byte-cap streaming incl.
 multibyte + chunked/flood auth bodies; token stripping; operator disable
 (canonical statements, immutable demo, sessions/keys/sign-ins revoked);
 demo/disabled auth-endpoint fencing through the actual handler; canonical
@@ -255,6 +269,14 @@ stubbed flows are not presented as OAuth evidence.
    Preserve D1 data/migrations/identities/secrets — never drop tables or
    restore over newer user data for a code rollback. Rotate secrets if
    exposure is suspected.
+
+PR #11 (public signup) rollout delta: apply `0005_write_budget.sql` via
+`wrangler d1 migrations apply aipster-app --remote` BEFORE deploying the
+new Worker — health `ready` requires the `write_budget` table, and the
+verifier rejects unready health. Reconcile the `0005` slot with PR #6
+per §4 before merge. Rollback is code-only (step 8): the additive
+`write_budget` table stays; its rows are ephemeral hourly buckets,
+harmless if left behind.
 
 ## 9. Open confirmations
 
