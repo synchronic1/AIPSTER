@@ -122,20 +122,31 @@ class NodeConfig(StrictModel):
         """Explicit allowed_hosts, else loopback names on the bound port, else advertise_url."""
         if self.allowed_hosts:
             return frozenset(canonical_authority(h) for h in self.allowed_hosts)
-        if self.host in LOOPBACK_BIND_HOSTS:
-            return frozenset(f"{h}:{self.port}" for h in ("127.0.0.1", "localhost", "[::1]"))
         hosts = set()
+
+        def add(host: str, port: int | None, default_port: int):
+            # Clients omit a scheme-default port from Host/Origin, so accept both forms.
+            hosts.add(host if port is None else f"{host}:{port}")
+            if port in (None, default_port):
+                hosts.add(host)
+                hosts.add(f"{host}:{default_port}")
+
+        if self.host in LOOPBACK_BIND_HOSTS:
+            for name in ("127.0.0.1", "localhost", "[::1]"):
+                add(name, self.port, 80)  # the daemon itself serves plain HTTP
+            return frozenset(hosts)
         if self.advertise_url:
-            authority = canonical_authority(urlsplit(self.advertise_url).netloc)
+            url = urlsplit(self.advertise_url)
+            authority = canonical_authority(url.netloc)
             if authority:
-                hosts.add(authority)
+                host = authority if url.port is None else authority.rsplit(":", 1)[0]
+                add(host, url.port, 443 if url.scheme == "https" else 80)
         try:
             address = ipaddress.ip_address(self.host)
         except ValueError:
             address = None
         if address and not address.is_unspecified:
-            literal = f"[{address}]" if address.version == 6 else str(address)
-            hosts.add(f"{literal}:{self.port}")
+            add(f"[{address}]" if address.version == 6 else str(address), self.port, 80)
         return frozenset(hosts)
 
     @model_validator(mode="after")

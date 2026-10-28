@@ -148,7 +148,8 @@ class InstallationTests(unittest.TestCase):
             for origin in ("http://127.0.0.1:8090", "http://localhost:8090"):
                 with self.subTest(origin=origin):
                     self.assertEqual(client.get("/v1/node", headers=good | {"Origin": origin}).status_code, 200)
-            for origin in ("http://attacker.example:8090", "null", "http://127.0.0.1:9999",
+            for origin in ("http://attacker.example:8090", "null", "http://127.0.0.1:9999", "http://[::1",
+                           "http://[::1]:8090:1",
                            "file://", "http://127.0.0.1:8090/path", "https://attacker.example"):
                 with self.subTest(origin=origin):
                     response = client.get("/v1/node", headers=good | {"Origin": origin})
@@ -174,6 +175,21 @@ class InstallationTests(unittest.TestCase):
             for host in ("127.0.0.1:8090", "attacker.example:8090", "worker.lan"):
                 with self.subTest(host=host), self.client(config, host) as client:
                     self.assertEqual(client.get("/v1/node", headers=good).status_code, 400)
+            port80 = mock_config(temp, port=80).node.effective_allowed_hosts()
+            self.assertLessEqual({"127.0.0.1", "127.0.0.1:80", "localhost", "[::1]"}, port80)
+            with self.client(mock_config(temp, port=80), "127.0.0.1") as client:
+                for host in ("127.0.0.1", "127.0.0.1:80", "localhost"):
+                    with self.subTest(port80_host=host):
+                        self.assertEqual(client.get("/v1/node", headers=good | {
+                            "Host": host, "Origin": "http://" + host}).status_code, 200)
+                for host in ("127.0.0.1:8090", "attacker.example"):
+                    with self.subTest(port80_hostile=host):
+                        self.assertEqual(client.get("/v1/node", headers=good | {"Host": host}).status_code, 400)
+            self.assertNotIn("127.0.0.1", mock_config(temp).node.effective_allowed_hosts())
+            self.assertEqual(mock_config(temp, host="0.0.0.0", advertise_url="https://worker.example:443")
+                             .node.effective_allowed_hosts(), {"worker.example", "worker.example:443"})
+            self.assertEqual(mock_config(temp, host="0.0.0.0", advertise_url="http://worker.lan:80")
+                             .node.effective_allowed_hosts(), {"worker.lan", "worker.lan:80"})
             self.assertEqual(mock_config(temp, host="192.168.50.10").node.effective_allowed_hosts(),
                              {"192.168.50.10:8090"})
             self.assertEqual(mock_config(temp, host="fd00::10").node.effective_allowed_hosts(),

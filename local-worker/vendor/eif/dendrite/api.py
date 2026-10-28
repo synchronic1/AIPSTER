@@ -65,7 +65,10 @@ class HostOriginGuard:
             if len(hosts) != 1 or canonical_authority(hosts[0].decode("latin-1")) not in self.allowed:
                 error = 400, "Host not allowed"
             elif origins:
-                origin = urlsplit(origins[0].decode("latin-1")) if len(origins) == 1 else None
+                try:
+                    origin = urlsplit(origins[0].decode("latin-1")) if len(origins) == 1 else None
+                except ValueError:  # e.g. an unterminated IPv6 literal
+                    origin = None
                 if (
                     origin is None
                     or origin.scheme not in ("http", "https")
