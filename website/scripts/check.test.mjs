@@ -6,7 +6,7 @@ import {resolve,join,sep} from 'node:path';
 import {checkPublic} from './check.mjs';
 const original=resolve(import.meta.dirname,'../public');
 async function fixture(change,run){const root=await mkdtemp(join(tmpdir(),'aipster-public-check-'));try{await cp(original,root,{recursive:true});await change(root);await run(root);}finally{assert(root.startsWith(resolve(tmpdir())+sep)&&root.includes('aipster-public-check-'));await rm(root,{recursive:true,force:true});}}
-test('valid public-only artifact passes',async()=>{assert.equal((await checkPublic(original)).files.length,21);});
+test('valid public-only artifact passes',async()=>{assert.equal((await checkPublic(original)).files.length,23);});
 
 test('an accidentally copied auth/credential file fails',async()=>fixture(root=>writeFile(resolve(root,'.dev.vars'),'SYNTHETIC_ONLY=1'),root=>assert.rejects(checkPublic(root),/allowlist/)));
 test('inline active HTML fails',async()=>fixture(async root=>{const path=resolve(root,'index.html');await writeFile(path,(await readFile(path,'utf8')).replace('</body>','<script>1</script></body>'));},root=>assert.rejects(checkPublic(root),/Active/)));
@@ -34,6 +34,9 @@ for (const [name, path, payload] of [
   ['sponsor path lookalike', 'index.html', '<a href="https://modal.com/unreviewed">link</a>'],
   ['sponsor scheme downgrade', 'index.html', '<a href="http://modal.com/">link</a>'],
   ['sponsor extra subdomain', 'index.html', '<a href="https://www.modal.com/">link</a>'],
+  ['non-canonical absolute link', 'index.html', '<link rel="alternate" href="https://evil.example/feed">'],
+  ['canonical lookalike host', 'index.html', '<link rel="canonical" href="https://aipster.net.evil.example/">'],
+  ['off-origin meta image', 'index.html', '<meta property="og:image" content="https://evil.example/card.png">'],
   ['dot-segment alias', 'index.html', '<a href="/app/../favicon.svg">link</a>'],
   ['encoded path alias', 'index.html', '<a href="/%61pp/">link</a>'],
   ['app external navigation', 'app/index.html', '<a href="https://evil.example/sign-in">Continue sign-in</a>'],
@@ -93,7 +96,7 @@ test('semantic approved script and link spellings remain allowed', async () => f
   await edit(root, 'app/index.html', text => text.replace('<script src="/app/app.js"></script>', "<script SRC = '/app/app.js'></script>"));
   await edit(root, 'index.html', text => text.replace('href="#overview"', "HREF = '#overview'"));
   await edit(root, 'styles.css', text => text + '\nbody{background-image:url(/favicon.svg)}');
-}, async root => assert.equal((await checkPublic(root)).files.length, 21)));
+}, async root => assert.equal((await checkPublic(root)).files.length, 23)));
 
 test('approved script cannot acquire inline code or be duplicated', async () => {
   for (const replacement of [
@@ -103,4 +106,26 @@ test('approved script cannot acquire inline code or be duplicated', async () => 
     root => edit(root, 'app/index.html', text => text.replace('<script src="/app/app.js"></script>', replacement)),
     root => assert.rejects(checkPublic(root), /Active|exactly/),
   );
+});
+
+test('social preview metadata is one consistent absolute-URL set', async () => {
+  const html = await readFile(resolve(original, 'index.html'), 'utf8');
+  const metas = [...html.matchAll(/<meta\s+(?:property|name)="([^"]+)"\s+content="([^"]*)"\s*\/?>/g)];
+  const get = (k) => metas.filter(m => m[1] === k).map(m => m[2]);
+  for (const k of ['og:type', 'og:site_name', 'og:title', 'og:description', 'og:url', 'og:image', 'og:image:type', 'og:image:width', 'og:image:height', 'og:image:alt', 'twitter:card', 'twitter:title', 'twitter:description', 'twitter:image', 'twitter:image:alt']) {
+    assert.equal(get(k).length, 1, `exactly one ${k}`);
+  }
+  assert.equal(get('og:type')[0], 'website');
+  assert.equal(get('twitter:card')[0], 'summary_large_image');
+  assert.equal(get('og:title')[0], get('twitter:title')[0], 'titles match');
+  assert.equal(get('og:description')[0], get('twitter:description')[0], 'descriptions match');
+  assert.equal(get('og:image')[0], get('twitter:image')[0], 'images match');
+  assert.equal(get('og:image')[0], 'https://aipster.net/assets/social-preview.png');
+  assert.equal(get('og:image:type')[0], 'image/png');
+  assert.equal(get('og:image:width')[0], '1200');
+  assert.equal(get('og:image:height')[0], '630');
+  assert.ok(!/test|staging|localhost/i.test(get('og:description')[0]), 'no staging claims');
+  const canon = [...html.matchAll(/<link\s+rel="canonical"\s+href="([^"]+)"\s*\/?>/g)];
+  assert.equal(canon.length, 1, 'exactly one canonical link');
+  assert.equal(canon[0][1], 'https://aipster.net/');
 });
