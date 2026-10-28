@@ -59,6 +59,7 @@ export function mapGrant(g) {
 export function mapKey(k) {
   const { verifier, salt, ...rest } = {
     id: k.id, ownerId: k.owner_id, name: k.name, scope: k.scope,
+    resourceId: k.resource_id || null,
     verifier: k.verifier, salt: k.salt, prefix: k.prefix,
     expiresAt: k.expires_at || null, metadata: k.metadata || '',
     createdAt: k.created_at, lastUsedAt: k.last_used_at || null, revokedAt: k.revoked_at || null
