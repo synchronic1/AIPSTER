@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {parse} from 'parse5';
 
-export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','favicon.svg','index.html','release.json','styles.css'].sort();
+export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','assets/social-preview.png','assets/social-preview.svg','favicon.svg','index.html','release.json','styles.css'].sort();
 
 export const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function files(root,dir=root){const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink(),'Symlinks are outside the public upload policy');const path=resolve(dir,entry.name);if(entry.isDirectory())result.push(...await files(root,path));else{assert(entry.isFile(),'Unexpected asset type');result.push(relative(root,path).replaceAll('\\','/'));}}return result.sort();}
@@ -95,7 +95,14 @@ function checkMarkup(text, path) {
         'App forms must be JS-handled (no action/method attributes)');
       if (name === 'style') checkCss(attr.value, path, ids);
       if (['href', 'xlink:href', 'src', 'poster', 'background', 'data', 'cite', 'longdesc', 'manifest'].includes(name)) {
+        // Reviewed: self canonical only; every other absolute link needs review.
+        if (tag === 'link' && attr.value === 'https://aipster.net/'
+          && attrs.some(a => a.name === 'rel' && a.value === 'canonical')) continue;
         checkReference(attr.value, path, ids, tag === 'a' && name === 'href');
+      }
+      // Meta content URLs (og:image, og:url, ...) must be same-origin https.
+      if (tag === 'meta' && name === 'content' && /^\s*https?:\/\//i.test(attr.value)) {
+        assert(attr.value.startsWith('https://aipster.net/'), `External metadata URL requires review: ${attr.value}`);
       }
       if (tag === 'meta') assert(name !== 'http-equiv', 'Active metadata requires review');
     }
