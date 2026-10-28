@@ -57,9 +57,10 @@ async function mutate(ctx, fn) {
   } catch (e) { return sendErr(ctx, e); }
   if (replay) return ctx.json(replay.status, { ...replay.body, replayed: true });
   const key = request.headers.get('Idempotency-Key');
+  const op = { key, path: url.pathname };
   let out;
   try {
-    out = await fn(factor, body || {});
+    out = await fn(factor, body || {}, op);
   } catch (e) {
     // Terminal (4xx) failures finalize the record so the same key replays
     // the same failure instead of wedging on IDEMPOTENCY_PENDING; unknown
@@ -109,7 +110,7 @@ export async function handleFabric(ctx) {
     // ---- nodes ----
     if (path === '/v1/fabric/nodes' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.registerNode(db, f, b));
+      return mutate(ctx, (f, b, op) => S.registerNode(db, f, b, op));
     }
     if (path === '/v1/fabric/nodes' && method === 'GET') {
       const d = ctx.needAuthz('read'); if (d) return d;
@@ -125,7 +126,7 @@ export async function handleFabric(ctx) {
     // ---- invitations ----
     if (path === '/v1/fabric/invitations' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.createInvitation(db, f, b));
+      return mutate(ctx, (f, b, op) => S.createInvitation(db, f, b, op));
     }
     if (path === '/v1/fabric/invitations' && method === 'GET') {
       const d = ctx.needAuthz('read'); if (d) return d;
@@ -182,11 +183,11 @@ export async function handleFabric(ctx) {
     // ---- previews + approvals ----
     if (path === '/v1/fabric/previews' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.createPreview(db, f, b));
+      return mutate(ctx, (f, b, op) => S.createPreview(db, f, b, op));
     }
     if (path === '/v1/fabric/approvals' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.requestApproval(db, f, b));
+      return mutate(ctx, (f, b, op) => S.requestApproval(db, f, b, op));
     }
     if (path === '/v1/fabric/approvals' && method === 'GET') {
       const d = ctx.needAuthz('read'); if (d) return d;
@@ -243,7 +244,7 @@ export async function handleFabric(ctx) {
     // ---- denies ----
     if (path === '/v1/fabric/denies' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.createDeny(db, f, b));
+      return mutate(ctx, (f, b, op) => S.createDeny(db, f, b, op));
     }
     if (path === '/v1/fabric/denies' && method === 'GET') {
       const d = ctx.needAuthz('read'); if (d) return d;
@@ -284,8 +285,8 @@ export async function handleFabric(ctx) {
 const MCP_TOOLS = {
   'fabric.list_nodes': { guard: 'read', run: (db, f, p) => S.listNodes(db, f) },
   'fabric.get_node': { guard: 'read', run: (db, f, p) => S.getNode(db, f, p.id) },
-  'fabric.register_node': { guard: 'session', run: (db, f, p) => S.registerNode(db, f, p) },
-  'fabric.create_invitation': { guard: 'session', run: (db, f, p) => S.createInvitation(db, f, p) },
+  'fabric.register_node': { guard: 'session', run: (db, f, p, op) => S.registerNode(db, f, p, op) },
+  'fabric.create_invitation': { guard: 'session', run: (db, f, p, op) => S.createInvitation(db, f, p, op) },
   'fabric.list_invitations': { guard: 'read', run: (db, f, p) => S.listInvitations(db, f, p.role) },
   'fabric.get_invitation': { guard: 'read', run: (db, f, p) => S.getInvitation(db, f, p.id) },
   'fabric.accept_invitation': { guard: 'session', run: (db, f, p) => S.acceptInvitation(db, f, p) },
@@ -296,8 +297,8 @@ const MCP_TOOLS = {
   'fabric.suspend_connection': { guard: 'narrow', run: (db, f, p) => S.suspendConnection(db, f, p.id, p) },
   'fabric.disconnect_connection': { guard: 'narrow', run: (db, f, p) => S.disconnectConnection(db, f, p.id, p) },
   'fabric.resume_connection': { guard: 'session', run: (db, f, p) => S.resumeConnection(db, f, p.id, p) },
-  'fabric.create_preview': { guard: 'session', run: (db, f, p) => S.createPreview(db, f, p) },
-  'fabric.request_approval': { guard: 'session', run: (db, f, p) => S.requestApproval(db, f, p) },
+  'fabric.create_preview': { guard: 'session', run: (db, f, p, op) => S.createPreview(db, f, p, op) },
+  'fabric.request_approval': { guard: 'session', run: (db, f, p, op) => S.requestApproval(db, f, p, op) },
   'fabric.list_approvals': { guard: 'read', run: (db, f, p) => S.listApprovals(db, f) },
   'fabric.get_approval': { guard: 'read', run: (db, f, p) => S.getApproval(db, f, p.id) },
   'fabric.decide_approval': { guard: 'session', run: (db, f, p) => S.decideApproval(db, f, p.id, p) },
@@ -308,7 +309,7 @@ const MCP_TOOLS = {
   'fabric.pause_grant': { guard: 'narrow', run: (db, f, p) => S.pauseGrant(db, f, p.id, p) },
   'fabric.resume_grant': { guard: 'session', run: (db, f, p) => S.resumeGrant(db, f, p.id, p) },
   'fabric.revoke_grant': { guard: 'narrow', run: (db, f, p) => S.revokeGrant(db, f, p.id, p) },
-  'fabric.create_deny': { guard: 'session', run: (db, f, p) => S.createDeny(db, f, p) },
+  'fabric.create_deny': { guard: 'session', run: (db, f, p, op) => S.createDeny(db, f, p, op) },
   'fabric.list_denies': { guard: 'read', run: (db, f, p) => S.listDenies(db, f) },
   'fabric.delete_deny': { guard: 'session-no-idem', run: (db, f, p) => S.deleteDeny(db, f, p.id) },
   'fabric.authorization_preview': { guard: 'read', run: (db, f, p) => S.authorizationPreview(db, f, p) },
@@ -346,10 +347,16 @@ export async function handleMcp(ctx) {
     const key = body.idempotencyKey;
     const ipath = `/v1/fabric/mcp:${tool}`;
     const replay = await S.checkIdempotency(db, f, 'POST', ipath, key, await digestJson(params));
-    if (replay) return ctx.json(replay.status, { ok: true, tool, result: replay.body, replayed: true });
+    if (replay) {
+      // Terminal failures replay the same raw error shape as the initial
+      // call — never a success envelope — matching REST semantics.
+      if (replay.status >= 400) return ctx.json(replay.status, { ...replay.body, replayed: true });
+      return ctx.json(replay.status, { ok: true, tool, result: replay.body, replayed: true });
+    }
     try {
-      const out = await spec.run(db, f, params);
+      const out = await spec.run(db, f, params, { key, path: ipath });
       await S.storeIdempotency(db, f, key, out.status, out.body);
+      if (out.status >= 400) return ctx.json(out.status, out.body);
       return ctx.json(out.status, { ok: true, tool, result: out.body });
     } catch (e) {
       const status = Number(e && e.status) || 500;

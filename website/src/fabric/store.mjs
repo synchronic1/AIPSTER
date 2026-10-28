@@ -12,6 +12,18 @@ import { evaluate } from './policy.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
 const needId = (id, kind) => { if (typeof id !== 'string' || !id) throw err(404, 'NOT_FOUND', `${kind} not found.`); };
+// Operation-bound entity ids: when the router supplies its idempotency
+// context (key + path), created entities derive their ids from it, so a
+// retry of the same operation converges on the existing row instead of
+// duplicating it — even when a 5xx landed after the first write committed.
+// Direct store callers pass no context and keep random ids.
+async function opEntityId(actor, op, prefix) {
+  if (!op || typeof op.key !== 'string' || !op.key || typeof op.path !== 'string' || !op.path) {
+    return `${prefix}_${randHex(8)}`;
+  }
+  const h = await digestJson(`${actor.kind}:${actor.user.id}:${op.path}:${op.key}`);
+  return `${prefix}_${h.slice(0, 16)}`;
+}
 const nowIso = () => new Date().toISOString();
 const randHex = (n) => [...globalThis.crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
 const randB64 = (n) => {
@@ -56,17 +68,30 @@ async function auditFabric(db, actor, action, target, detail = '') {
 }
 
 // ---- nodes ----
-export async function registerNode(db, actor, input = {}) {
+export async function registerNode(db, actor, input = {}, op = null) {
   if (isAgentKey(actor)) throw err(403, 'FORBIDDEN', 'Agent credentials cannot register nodes.');
   const label = typeof input.label === 'string' ? input.label.trim().slice(0, 80) : '';
   if (!label) throw err(400, 'BAD_LABEL', 'Node label is required.');
   const workspace = typeof input.workspace === 'string' && input.workspace.trim() ? input.workspace.trim().slice(0, 64) : 'default';
   const tok = mintToken('ndkey');
   const now = nowIso();
-  const nodeId = `node_${randHex(8)}`;
+  const nodeId = await opEntityId(actor, op, 'node');
   const fingerprint = (await digestJson(`node:${nodeId}`)).slice(0, 16);
-  await db.prepare('INSERT INTO fabric_nodes (id, owner_id, workspace, label, fingerprint, protocol, transport, issuer, status, node_secret_verifier, node_secret_salt, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')
-    .bind(nodeId, actor.user.id, workspace, label, fingerprint, 'fixture-0', 'fixture', 'fixture-local', 'registered', await verifierFor(tok.secret, tok.salt), tok.salt, now, now).run();
+  try {
+    await db.prepare('INSERT INTO fabric_nodes (id, owner_id, workspace, label, fingerprint, protocol, transport, issuer, status, node_secret_verifier, node_secret_salt, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')
+      .bind(nodeId, actor.user.id, workspace, label, fingerprint, 'fixture-0', 'fixture', 'fixture-local', 'registered', await verifierFor(tok.secret, tok.salt), tok.salt, now, now).run();
+  } catch {
+    // Same operation id already exists: a prior attempt committed this
+    // node and then failed (5xx) before responding. Converge on the one
+    // row instead of registering a second node. The original secret is
+    // unrecoverable by design (verifier-only custody), so the reconciled
+    // response carries metadata only.
+    const existing = await first(db, 'SELECT * FROM fabric_nodes WHERE id = ?', nodeId);
+    if (existing && existing.owner_id === actor.user.id) {
+      return { status: 200, body: { id: existing.id, workspace: existing.workspace, label: existing.label, fingerprint: existing.fingerprint, protocol: existing.protocol, transport: existing.transport, status: existing.status, reconciled: true, note: 'This registration already committed; its one-time secret cannot be re-shown. Register a new node if you need a usable secret.' } };
+    }
+    throw err(500, 'INTERNAL', 'Request failed.');
+  }
   await auditFabric(db, actor, 'fabric.node.register', nodeId, label);
   return { status: 201, body: { id: nodeId, workspace, label, fingerprint, protocol: 'fixture-0', transport: 'fixture', status: 'registered', nodeSecret: tok.secret, oneTime: 'This node secret is shown once. It proves node possession when accepting invitations.' } };
 }
@@ -95,7 +120,7 @@ export async function listNodes(db, actor) {
 
 // ---- invitations ----
 const INV_EXPIRY_MAX_H = 168;
-export async function createInvitation(db, actor, input = {}) {
+export async function createInvitation(db, actor, input = {}, op = null) {
   if (isAgentKey(actor)) throw err(403, 'FORBIDDEN', 'Agent credentials cannot issue invitations.');
   const issuer = await ownNode(db, actor, input.issuerNode);
   const recipientNode = typeof input.recipientNode === 'string' ? input.recipientNode.trim().slice(0, 64) : '';
@@ -106,12 +131,25 @@ export async function createInvitation(db, actor, input = {}) {
   if (recipientNode === issuer.id) throw err(400, 'SELF_INVITE', 'A node cannot invite itself.');
   const hours = Math.min(Math.max(Number(input.expiryHours) || 24, 1), INV_EXPIRY_MAX_H);
   const purpose = typeof input.purpose === 'string' ? input.purpose.trim().slice(0, 280) : '';
-  const tok = mintToken('inv');
+  const invId = await opEntityId(actor, op, 'inv');
+  const secret = `${invId}_${randB64(32)}`;
+  const salt = randHex(16);
   const now = nowIso();
-  await db.prepare('INSERT INTO invitations (id, issuer_node, recipient_node, recipient_workspace, purpose, token_verifier, token_salt, state, expiry, use_record, created_by, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)')
-    .bind(tok.id, issuer.id, recipientNode, recipientWorkspace, purpose, await verifierFor(tok.secret, tok.salt), tok.salt, 'issued', new Date(Date.now() + hours * 3600e3).toISOString(), actor.user.id, now).run();
-  await auditFabric(db, actor, 'fabric.invitation.create', tok.id, `${issuer.id} -> ${recipientNode}`);
-  return { status: 201, body: { id: tok.id, issuerNode: issuer.id, recipientNode, recipientWorkspace, purpose, expiry: new Date(Date.now() + hours * 3600e3).toISOString(), token: tok.secret, oneTime: 'This invitation token is shown once. Deliver it to the recipient out of band.' } };
+  const expiry = new Date(Date.now() + hours * 3600e3).toISOString();
+  try {
+    await db.prepare('INSERT INTO invitations (id, issuer_node, recipient_node, recipient_workspace, purpose, token_verifier, token_salt, state, expiry, use_record, created_by, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)')
+      .bind(invId, issuer.id, recipientNode, recipientWorkspace, purpose, await verifierFor(secret, salt), salt, 'issued', expiry, actor.user.id, now).run();
+  } catch {
+    // Same operation id already exists: converge on the one invitation.
+    // The original token is unrecoverable (verifier-only custody).
+    const existing = await first(db, 'SELECT * FROM invitations WHERE id = ?', invId);
+    if (existing && existing.created_by === actor.user.id) {
+      return { status: 200, body: { id: existing.id, issuerNode: existing.issuer_node, recipientNode: existing.recipient_node, recipientWorkspace: existing.recipient_workspace, purpose: existing.purpose, expiry: existing.expiry, reconciled: true, note: 'This invitation already committed; its one-time token cannot be re-shown. Issue a new invitation if needed.' } };
+    }
+    throw err(500, 'INTERNAL', 'Request failed.');
+  }
+  await auditFabric(db, actor, 'fabric.invitation.create', invId, `${issuer.id} -> ${recipientNode}`);
+  return { status: 201, body: { id: invId, issuerNode: issuer.id, recipientNode, recipientWorkspace, purpose, expiry, token: secret, oneTime: 'This invitation token is shown once. Deliver it to the recipient out of band.' } };
 }
 
 async function invitationVisibleTo(db, actor, inv) {
@@ -293,6 +331,18 @@ async function actingSideNode(db, actor, conn) {
   return null;
 }
 
+// Each side that suspends or disconnects holds an independent veto until
+// it consents to resume. A peer transition (e.g. Bob disconnecting Alice's
+// suspension) ADDS a veto; it never removes the other side's. Resume
+// requires one node-secret proof per vetoing side, so no sequence can
+// restore admission without every restricting side's authority.
+function vetoSet(conn) {
+  const v = parseJson(conn.vetoed_by, null);
+  if (Array.isArray(v)) return [...new Set(v.filter((x) => typeof x === 'string' && x))];
+  // Pre-veto rows fall back to the single recorded suspender, if any.
+  return conn.suspended_by ? [conn.suspended_by] : [];
+}
+
 export async function suspendConnection(db, actor, id, input = {}) {
   needId(id, 'Connection');
   const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', id);
@@ -301,8 +351,9 @@ export async function suspendConnection(db, actor, id, input = {}) {
   checkVersion(conn, input);
   if (conn.state !== 'active') throw err(409, 'BAD_STATE', `Connection is ${conn.state}.`);
   const side = await actingSideNode(db, actor, conn);
-  const upd = await db.prepare('UPDATE connections SET state = ?, suspended_by = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND state = ?')
-    .bind('suspended', side, nowIso(), id, conn.version, 'active').run();
+  const veto = [...new Set([...vetoSet(conn), side].filter(Boolean))];
+  const upd = await db.prepare('UPDATE connections SET state = ?, suspended_by = ?, vetoed_by = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND state = ?')
+    .bind('suspended', side, JSON.stringify(veto), nowIso(), id, conn.version, 'active').run();
   if (!upd.meta.changes) return lostRace();
   await auditFabric(db, actor, 'fabric.connection.suspend', id);
   return { status: 200, body: { id, state: 'suspended' } };
@@ -316,8 +367,9 @@ export async function disconnectConnection(db, actor, id, input = {}) {
   checkVersion(conn, input);
   if (conn.state === 'disconnected') throw err(409, 'BAD_STATE', 'Connection is already disconnected.');
   const side = await actingSideNode(db, actor, conn);
-  const upd = await db.prepare("UPDATE connections SET state = ?, suspended_by = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND state != 'disconnected'")
-    .bind('disconnected', side, nowIso(), id, conn.version).run();
+  const veto = [...new Set([...vetoSet(conn), side].filter(Boolean))];
+  const upd = await db.prepare("UPDATE connections SET state = ?, suspended_by = ?, vetoed_by = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND state != 'disconnected'")
+    .bind('disconnected', side, JSON.stringify(veto), nowIso(), id, conn.version).run();
   if (!upd.meta.changes) return lostRace();
   await auditFabric(db, actor, 'fabric.connection.disconnect', id);
   return { status: 200, body: { id, state: 'disconnected' } };
@@ -330,19 +382,22 @@ export async function resumeConnection(db, actor, id, input = {}) {
   await ownConnectionSide(db, actor, conn);
   checkVersion(conn, input);
   if (conn.state === 'active') throw err(409, 'BAD_STATE', 'Connection is already active.');
-  // Reactivation consent: only the side that suspended/disconnected may
-  // resume, proven by THAT side's node secret. A peer can neither undo the
-  // exporter's disconnect nor restore grant admission on its own; the
-  // suspending side (or a fresh invitation) must act.
   if (!conn.suspended_by) throw err(409, 'BAD_STATE', 'This connection predates consent tracking; re-invite to reconnect.');
-  const home = await first(db, 'SELECT * FROM fabric_nodes WHERE id = ?', conn.suspended_by);
-  if (!home || home.owner_id !== actor.user.id) {
-    throw err(403, 'FORBIDDEN', 'Only the suspending side can resume this connection.');
+  const veto = vetoSet(conn);
+  if (!veto.length) throw err(409, 'BAD_STATE', 'This connection has no recorded consent; re-invite to reconnect.');
+  // Bearer proofs: one node secret per vetoing side, delivered out of band
+  // like invitation tokens. The resumer must own a side (checked above);
+  // each vetoing side consents by its secret, regardless of who holds it.
+  const presented = [input.nodeKey, ...(Array.isArray(input.nodeKeys) ? input.nodeKeys : [])].filter((s) => typeof s === 'string' && s);
+  for (const nodeId of veto) {
+    const n = await first(db, 'SELECT node_secret_verifier, node_secret_salt FROM fabric_nodes WHERE id = ?', nodeId);
+    let proven = false;
+    for (const s of presented) {
+      if (n && await verifyToken(s, { verifier: n.node_secret_verifier, salt: n.node_secret_salt })) { proven = true; break; }
+    }
+    if (!proven) throw err(403, 'FORBIDDEN', 'Resume requires every vetoing side\u2019s node secret.');
   }
-  if (!(await verifyToken(input.nodeKey, { verifier: home.node_secret_verifier, salt: home.node_secret_salt }))) {
-    throw err(403, 'BAD_NODE_KEY', 'Resume requires the suspending side node secret.');
-  }
-  const upd = await db.prepare("UPDATE connections SET state = ?, suspended_by = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND state != 'active'")
+  const upd = await db.prepare("UPDATE connections SET state = ?, suspended_by = NULL, vetoed_by = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND state != 'active'")
     .bind('active', nowIso(), id, conn.version).run();
   if (!upd.meta.changes) return lostRace();
   await auditFabric(db, actor, 'fabric.connection.resume', id);
@@ -351,7 +406,13 @@ export async function resumeConnection(db, actor, id, input = {}) {
 
 // ---- previews ----
 const PREVIEW_TTL_MS = 30 * 60e3;
-export async function createPreview(db, actor, input = {}) {
+function buildConfirmation(terms) {
+  const models = new Set();
+  for (const s of terms.snapshot || []) for (const m of s.models || []) models.add(m);
+  return `Share ${(terms.snapshot || []).length} resource(s) with ${terms.importerNode} for ${(terms.consumers || []).length} consumer(s), models ${[...models].join(', ')}, up to ${terms.ceilings.maxTokens} tokens / ${terms.ceilings.maxRequests} requests, until ${terms.expiry}. ${(terms.exclusions || []).length} owned resource(s) excluded. Connection only carries inference; nothing else is shared.`;
+}
+
+export async function createPreview(db, actor, input = {}, op = null) {
   if (isAgentKey(actor)) throw err(403, 'FORBIDDEN', 'Agent credentials cannot draft previews.');
   needId(input.connectionId, 'Connection');
   const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', input.connectionId);
@@ -392,17 +453,27 @@ export async function createPreview(db, actor, input = {}) {
   };
   const digest = await digestJson(preview);
   const revisionVector = { connection: conn.version, policy: 1 };
-  const id = `prev_${randHex(8)}`;
-  await db.prepare('INSERT INTO grant_previews (id, connection_id, canonical_json, digest, revision_vector, expiry, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, conn.id, canonicalize(preview), digest, JSON.stringify(revisionVector), new Date(Date.now() + PREVIEW_TTL_MS).toISOString(), actor.user.id, now).run();
+  const id = await opEntityId(actor, op, 'prev');
+  try {
+    await db.prepare('INSERT INTO grant_previews (id, connection_id, canonical_json, digest, revision_vector, expiry, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(id, conn.id, canonicalize(preview), digest, JSON.stringify(revisionVector), new Date(Date.now() + PREVIEW_TTL_MS).toISOString(), actor.user.id, now).run();
+  } catch {
+    // Same operation id already exists: converge on the committed preview
+    // (fully reconstructible from the row — no secrets involved).
+    const existing = await first(db, 'SELECT * FROM grant_previews WHERE id = ?', id);
+    if (existing && existing.created_by === actor.user.id) {
+      const terms = parseJson(existing.canonical_json, {});
+      return { status: 200, body: { id: existing.id, digest: existing.digest, preview: terms, revisionVector: parseJson(existing.revision_vector, {}), confirmation: buildConfirmation(terms), reconciled: true } };
+    }
+    throw err(500, 'INTERNAL', 'Request failed.');
+  }
   await auditFabric(db, actor, 'fabric.preview.create', id, `${snapshot.length} resources`);
-  const confirmation = `Share ${snapshot.length} resource(s) with ${importerNode} for ${consumers.length} consumer(s), models ${models.join(', ')}, up to ${ceilings.maxTokens} tokens / ${ceilings.maxRequests} requests, until ${preview.expiry}. ${exclusions.length} owned resource(s) excluded. Connection only carries inference; nothing else is shared.`;
-  return { status: 201, body: { id, digest, preview, revisionVector, confirmation } };
+  return { status: 201, body: { id, digest, preview, revisionVector, confirmation: buildConfirmation(preview) } };
 }
 
 // ---- approvals ----
 const APPROVAL_TTL_MS = 10 * 60e3;
-export async function requestApproval(db, actor, input = {}) {
+export async function requestApproval(db, actor, input = {}, op = null) {
   if (!canPropose(actor)) throw err(403, 'FORBIDDEN', 'This credential cannot request approvals.');
   const action = input.action === 'grant.resume' ? 'grant.resume' : 'grant.commit';
   let preview = null;
@@ -429,12 +500,23 @@ export async function requestApproval(db, actor, input = {}) {
     if (!grant || !(await actorExportsGrant(db, actor, grant))) throw err(404, 'NOT_FOUND', 'Grant not found.');
     revisionVector = { grant: grant.version };
   }
-  const id = `appr_${randHex(8)}`;
+  const id = await opEntityId(actor, op, 'appr');
   const now = nowIso();
-  await db.prepare('INSERT INTO approvals (id, action, target_id, preview_id, preview_digest, revision_vector, approver, interaction_ref, decision, expiry, consumed_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?)')
-    .bind(id, action, input.targetId || null, preview ? preview.id : null, preview ? preview.digest : null, JSON.stringify(revisionVector), 'requested', new Date(Date.now() + APPROVAL_TTL_MS).toISOString(), actor.user.id, now).run();
+  const expiresAt = new Date(Date.now() + APPROVAL_TTL_MS).toISOString();
+  try {
+    await db.prepare('INSERT INTO approvals (id, action, target_id, preview_id, preview_digest, revision_vector, approver, interaction_ref, decision, expiry, consumed_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?)')
+      .bind(id, action, input.targetId || null, preview ? preview.id : null, preview ? preview.digest : null, JSON.stringify(revisionVector), 'requested', expiresAt, actor.user.id, now).run();
+  } catch {
+    // Same operation id already exists: converge on the committed
+    // approval (fully reconstructible — no secrets involved).
+    const existing = await first(db, 'SELECT * FROM approvals WHERE id = ?', id);
+    if (existing && existing.created_by === actor.user.id) {
+      return { status: 200, body: { id: existing.id, action: existing.action, previewId: existing.preview_id, previewDigest: existing.preview_digest, revisionVector: parseJson(existing.revision_vector, {}), expiresAt: existing.expiry, reconciled: true } };
+    }
+    throw err(500, 'INTERNAL', 'Request failed.');
+  }
   await auditFabric(db, actor, 'fabric.approval.request', id, action);
-  return { status: 201, body: { id, action, previewId: preview ? preview.id : null, previewDigest: preview ? preview.digest : null, revisionVector, expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString() } };
+  return { status: 201, body: { id, action, previewId: preview ? preview.id : null, previewDigest: preview ? preview.digest : null, revisionVector, expiresAt } };
 }
 
 export async function decideApproval(db, actor, id, input = {}) {
@@ -528,8 +610,8 @@ export async function commitGrant(db, actor, input = {}) {
   const id = `fg_${randHex(8)}`;
   const now = nowIso();
   try {
-    await db.prepare('INSERT INTO fabric_grants (id, connection_id, recipient_node, recipient_workspace, consumers, snapshot, actions, models, ceilings, route, retention, expiry, status, version, preview_hash, approval_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)')
-      .bind(id, conn.id, terms.importerNode, terms.importerWorkspace, JSON.stringify(terms.consumers), JSON.stringify(terms.snapshot), JSON.stringify(terms.actions), JSON.stringify(modelsOf(terms)), JSON.stringify(terms.ceilings), terms.route, terms.retention, terms.expiry, 'enforced', preview.digest, appr.id, now, now).run();
+    await db.prepare('INSERT INTO fabric_grants (id, connection_id, recipient_node, recipient_workspace, consumers, snapshot, actions, models, ceilings, route, retention, expiry, status, version, preview_hash, approval_id, exporter_id, last_approval_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)')
+      .bind(id, conn.id, terms.importerNode, terms.importerWorkspace, JSON.stringify(terms.consumers), JSON.stringify(terms.snapshot), JSON.stringify(terms.actions), JSON.stringify(modelsOf(terms)), JSON.stringify(terms.ceilings), terms.route, terms.retention, terms.expiry, 'enforced', preview.digest, appr.id, actor.user.id, appr.id, now, now).run();
   } catch {
     const existing = await first(db, 'SELECT id FROM fabric_grants WHERE approval_id = ?', appr.id);
     if (existing) return { status: 200, body: { id: existing.id, note: 'Approval was already consumed for this grant.' } };
@@ -558,7 +640,16 @@ export async function reviseGrant(db, actor, id, input = {}) {
   // against concurrent writers on the version read here.
   if (typeof input.approvalId !== 'string' || !input.approvalId) throw err(409, 'NOT_APPROVED', 'A fresh approved, unconsumed approval is required.');
   const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', input.approvalId);
-  if (!appr || appr.action !== 'grant.commit' || appr.decision !== 'approved' || appr.consumed_at) {
+  if (!appr || appr.action !== 'grant.commit' || appr.decision !== 'approved') {
+    throw err(409, 'NOT_APPROVED', 'A fresh approved, unconsumed approval is required.');
+  }
+  if (appr.consumed_at) {
+    // Reconcile, don't duplicate: if this approval already revised this
+    // grant (5xx after the write), report the current terms instead of
+    // failing. A foreign consumption stays a conflict.
+    if (grant.last_approval_id === appr.id) {
+      return { status: 200, body: { id, version: grant.version, note: 'This approval was already applied to this grant.' } };
+    }
     throw err(409, 'NOT_APPROVED', 'A fresh approved, unconsumed approval is required.');
   }
   if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
@@ -566,6 +657,15 @@ export async function reviseGrant(db, actor, id, input = {}) {
   // requested by them, decided by them, for this exact recipient.
   if (appr.created_by !== actor.user.id || appr.approver !== actor.user.id) {
     throw err(403, 'FORBIDDEN', 'This approval belongs to a different owner.');
+  }
+  // Freshness gate (Lamport clock on approval insertion order): an approval
+  // reviewed the grant as of some earlier revision. Once this grant has
+  // moved on under a newer approval, older approvals go stale instead of
+  // silently reverting narrowing changes. Grants that predate tracking
+  // accept one binding revision, then join the clock.
+  if (grant.last_approval_id) {
+    const newer = await first(db, 'SELECT id FROM approvals WHERE id = ? AND rowid > (SELECT rowid FROM approvals WHERE id = ?)', appr.id, grant.last_approval_id);
+    if (!newer) throw err(412, 'PREVIEW_STALE', 'Approval predates the latest grant change; re-approve the current terms.');
   }
   const preview = await first(db, 'SELECT * FROM grant_previews WHERE id = ?', appr.preview_id);
   if (!preview || appr.preview_digest !== preview.digest || input.previewHash !== preview.digest) {
@@ -594,14 +694,21 @@ export async function reviseGrant(db, actor, id, input = {}) {
     }
   }
   const now = nowIso();
+  // Claim-first, then mutate: the approval is consumed by conditional
+  // update before the grant changes, so one approval can never revise two
+  // targets concurrently — exactly one claim wins and losers change
+  // nothing. (If the grant write then loses a race, the approval is spent
+  // and the caller re-approves: fail-closed, never double-applied.)
+  const claim = await db.prepare("UPDATE approvals SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL AND decision = 'approved'")
+    .bind(now, appr.id).run();
+  if (!claim.meta.changes) return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
   // Linearization point: conditional update on id + version + live status.
   // A concurrent pause/revoke/earlier revise wins instead of being lost.
-  const upd = await db.prepare("UPDATE fabric_grants SET consumers = ?, snapshot = ?, models = ?, ceilings = ?, expiry = ?, version = version + 1, preview_hash = ?, updated_at = ? WHERE id = ? AND version = ? AND status != 'revoked'")
-    .bind(JSON.stringify(terms.consumers), JSON.stringify(terms.snapshot), JSON.stringify(modelsOf(terms)), JSON.stringify(terms.ceilings), terms.expiry, preview.digest, now, id, grant.version).run();
+  const upd = await db.prepare("UPDATE fabric_grants SET consumers = ?, snapshot = ?, models = ?, ceilings = ?, expiry = ?, version = version + 1, preview_hash = ?, last_approval_id = ?, updated_at = ? WHERE id = ? AND version = ? AND status != 'revoked'")
+    .bind(JSON.stringify(terms.consumers), JSON.stringify(terms.snapshot), JSON.stringify(modelsOf(terms)), JSON.stringify(terms.ceilings), terms.expiry, preview.digest, appr.id, now, id, grant.version).run();
   if (!upd.meta.changes) return lostRace();
   await db.prepare('INSERT INTO fabric_grant_revisions (id, grant_id, version, terms_json, approval_id, superseded_at) VALUES (?, ?, ?, ?, ?, ?)')
     .bind(`fgr_${randHex(8)}`, id, grant.version, JSON.stringify({ consumers: parseJson(grant.consumers, []), snapshot: parseJson(grant.snapshot, []), ceilings: parseJson(grant.ceilings, {}) }), appr.id, now).run();
-  await db.prepare('UPDATE approvals SET consumed_at = ? WHERE id = ?').bind(now, appr.id).run();
   await auditFabric(db, actor, 'fabric.grant.revise', id, `v${grant.version + 1}`);
   return { status: 200, body: { id, version: grant.version + 1 } };
 }
@@ -674,8 +781,12 @@ export async function revokeGrant(db, actor, id, input = {}) {
 }
 
 async function actorExportsGrant(db, actor, grant) {
-  // The exporter is whoever owns the granted resources — not merely a
-  // connection side. Importers can read the grant but never mutate it.
+  // The exporter is the recorded issuing authority — not merely a
+  // connection side, and not whoever happens to own the resource today.
+  // Importers can read the grant but never mutate it. Rows that predate
+  // exporter binding fall back to live ownership (documented upgrade
+  // behavior; migration 0007 backfills intact rows).
+  if (grant.exporter_id) return grant.exporter_id === actor.user.id;
   const snap = parseJson(grant.snapshot, []);
   if (!snap.length) return false;
   for (const s of snap) {
@@ -716,16 +827,23 @@ export async function getGrant(db, actor, id) {
 }
 
 // ---- denies ----
-export async function createDeny(db, actor, input = {}) {
+export async function createDeny(db, actor, input = {}, op = null) {
   if (isAgentKey(actor)) throw err(403, 'FORBIDDEN', 'Agent credentials cannot manage denies.');
   const resourceId = typeof input.resourceId === 'string' ? input.resourceId.slice(0, 64) : null;
   if (resourceId) {
     const r = await first(db, 'SELECT owner_id FROM resources WHERE id = ?', resourceId);
     if (!r || r.owner_id !== actor.user.id) throw err(404, 'NOT_FOUND', 'Resource not found or not yours.');
   }
-  const id = `fdeny_${randHex(8)}`;
-  await db.prepare('INSERT INTO fabric_denies (id, owner_id, principal, resource_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(id, actor.user.id, input.principal ? String(input.principal).slice(0, 128) : null, resourceId, input.action ? String(input.action).slice(0, 32) : null, nowIso()).run();
+  const id = await opEntityId(actor, op, 'fdeny');
+  try {
+    await db.prepare('INSERT INTO fabric_denies (id, owner_id, principal, resource_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(id, actor.user.id, input.principal ? String(input.principal).slice(0, 128) : null, resourceId, input.action ? String(input.action).slice(0, 32) : null, nowIso()).run();
+  } catch {
+    // Same operation id already exists: converge on the committed deny.
+    const existing = await first(db, 'SELECT id, owner_id FROM fabric_denies WHERE id = ?', id);
+    if (existing && existing.owner_id === actor.user.id) return { status: 200, body: { id, reconciled: true } };
+    throw err(500, 'INTERNAL', 'Request failed.');
+  }
   await auditFabric(db, actor, 'fabric.deny.create', id);
   return { status: 201, body: { id } };
 }
@@ -766,6 +884,10 @@ export async function authorizationPreview(db, actor, input = {}) {
     for (const g of rows) {
       const hit = parseJson(g.snapshot, []).find((s) => s.resourceId === request.resourceId);
       if (!hit || hit.incarnation !== live.incarnation) continue;
+      // Issuing-authority binding: a grant authorizes only while the live
+      // row is still held by the recorded exporter. Ownership drift fails
+      // closed even when the incarnation is unchanged.
+      if (g.exporter_id && live.owner_id !== g.exporter_id) continue;
       grants.push({
         id: g.id, status: g.status, recipientNode: g.recipient_node, recipientWorkspace: g.recipient_workspace,
         consumers: parseJson(g.consumers, []), resourceId: hit.resourceId, incarnation: hit.incarnation,
@@ -797,12 +919,13 @@ export async function discoverResources(db, actor) {
       const consumers = parseJson(g.consumers, []);
       for (const s of parseJson(g.snapshot, [])) {
         if (seen.has(s.resourceId)) continue;
-        seen.add(s.resourceId);
         // Effective visibility, mirroring the authorization matcher: the
         // live row must still be the snapshotted incarnation, and at least
         // one grant consumer must be undenied for inference — otherwise
         // discovery would advertise what authorization refuses. Live
-        // name/incarnation are reported, never stale copies.
+        // name/incarnation are reported, never stale copies. Deduplication
+        // happens only for visible witnesses: an ineligible grant must not
+        // mask the same resource granted eligibly elsewhere.
         const r = await first(db, 'SELECT name, owner_id, incarnation FROM resources WHERE id = ?', s.resourceId);
         if (!r || r.incarnation !== s.incarnation) continue;
         let visible = false;
@@ -812,6 +935,7 @@ export async function discoverResources(db, actor) {
           if (!blocked) { visible = true; break; }
         }
         if (!visible) continue;
+        seen.add(s.resourceId);
         items.push({ id: s.resourceId, name: r.name, incarnation: r.incarnation, via: 'grant' });
       }
     }
@@ -843,7 +967,9 @@ async function finishIdempotentRead(db, actorKey, rec, method, path, bodyHash) {
   if (rec.method !== method || rec.path !== path || rec.request_hash !== bodyHash) {
     throw err(409, 'IDEMPOTENCY_MISMATCH', 'Idempotency-Key was already used with a different request.');
   }
-  if (rec.status === 'completed') return { status: rec.response_code, body: parseJson(rec.response_body, {}), replayed: true };
+  // Read-path redaction backstops the write path and migration 0007:
+  // even a pre-repair persisted secret is stripped before replay.
+  if (rec.status === 'completed') return { status: rec.response_code, body: redactForReplay(parseJson(rec.response_body, {})), replayed: true };
   // A 'processing' record older than the lease is a crashed attempt, not an
   // in-flight one: steal it (conditional on the exact observed row, so only
   // one stealer proceeds) instead of wedging the key forever.
@@ -854,7 +980,7 @@ async function finishIdempotentRead(db, actorKey, rec, method, path, bodyHash) {
     if (steal.meta.changes) return null;
     const reread = await first(db, 'SELECT * FROM idempotency_records WHERE idem_key = ? AND actor = ?', keyOf(rec), actorKey);
     if (reread && reread.status === 'completed' && reread.method === method && reread.path === path && reread.request_hash === bodyHash) {
-      return { status: reread.response_code, body: parseJson(reread.response_body, {}), replayed: true };
+      return { status: reread.response_code, body: redactForReplay(parseJson(reread.response_body, {})), replayed: true };
     }
   }
   throw err(409, 'IDEMPOTENCY_PENDING', 'Same key is already processing; retry.');
