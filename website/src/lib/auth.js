@@ -9,14 +9,15 @@
 import { betterAuth } from 'better-auth';
 import { APIError } from 'better-auth/api';
 import { username } from 'better-auth/plugins/username';
-import { first } from './store.js';
+import { first, run } from './store.js';
 
 export const OAUTH_SCOPES = ['read:user', 'user:email'];
 // Per-user session-creation cap: at most this many sessions minted per
 // rolling UTC hour. Bounds repeat-login D1 writes without touching the
 // mutation budget (a spent budget must never lock a user out of
 // signing in). Sign-out and revocation stay free, so recovery is
-// always available.
+// always available. Counted in a deletion-proof hourly counter (not
+// live session rows: sign-out deletes rows, which would reopen slots).
 export const MAX_SESSIONS_PER_HOUR = 20;
 export const OAUTH_CALLBACK_PATH = '/api/auth/callback/github';
 
@@ -141,13 +142,16 @@ export function createAuth(env) {
               if (row && Number(row.disabled) === 1) {
                 throw new APIError(403, { message: 'This sign-in is disabled.', code: 'ACCOUNT_DISABLED' });
               }
-              // Rolling hourly cap on session creation (repeat logins).
-              // Timestamps are ISO-8601 strings, so the window compares
-              // lexicographically. Refusing here writes nothing: the
-              // callback surfaces SESSION_RATE_LIMITED instead.
-              const since = new Date(Date.now() - 3600 * 1000).toISOString();
-              const recent = await first(env.DB, 'SELECT COUNT(*) AS n FROM session WHERE userId = ? AND createdAt > ?', session.userId, since);
-              if (recent && Number(recent.n) >= MAX_SESSIONS_PER_HOUR) {
+              // Rolling hourly cap on session creation (repeat logins),
+              // counted in the write_budget table under an 's:' namespace
+              // so sign-outs and revocations (which delete session rows)
+              // cannot reopen slots. Atomic conditional claim, exactly
+              // like the mutation budget; a lost race mutates nothing.
+              const swindow = 's:' + new Date().toISOString().slice(0, 13);
+              await run(env.DB, 'INSERT OR IGNORE INTO write_budget (user_id, window, count) VALUES (?, ?, 0)', session.userId, swindow);
+              await run(env.DB, "DELETE FROM write_budget WHERE window LIKE 's:%' AND window < ?", 's:' + new Date(Date.now() - 3600 * 1000).toISOString().slice(0, 13));
+              const sclaim = await run(env.DB, 'UPDATE write_budget SET count = count + 1 WHERE user_id = ? AND window = ? AND count < ?', session.userId, swindow, MAX_SESSIONS_PER_HOUR);
+              if (Number(sclaim.meta.changes) !== 1) {
                 throw new APIError(429, { message: 'Too many sign-ins in the last hour. Try again later.', code: 'SESSION_RATE_LIMITED' });
               }
             }

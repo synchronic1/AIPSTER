@@ -208,15 +208,35 @@ test('repeat logins are capped per user per hour', async (context) => {
   assert.equal(n.n, MAX_SESSIONS_PER_HOUR, 'exactly the cap, no extra row');
 });
 
-test('session cap is a rolling window; old sessions age out', async (context) => {
+test('session cap is a rolling window; old buckets age out', async (context) => {
   const t = await createTestEnv();
   context.after(() => t.sqlite.close());
   const first = await oauthLogin(t, context, ghUser(902, 'steady@example.com'));
   assert.ok(first.sessionCookie);
   const user = await userRow(t, 'steady@example.com');
-  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
-  await t.DB.prepare('UPDATE session SET createdAt = ? WHERE userId = ?').bind(old, user.id).run();
+  const stale = 's:' + new Date(Date.now() - 2 * 3600 * 1000).toISOString().slice(0, 13);
+  await t.DB.prepare("UPDATE write_budget SET window = ?, count = 99 WHERE user_id = ? AND window LIKE 's:%'").bind(stale, user.id).run();
+  await t.DB.prepare('DELETE FROM rateLimit').run();
   const again = await oauthLogin(t, context, ghUser(902, 'steady@example.com'));
-  assert.ok(again.sessionCookie, 'aged-out session frees the window');
+  assert.ok(again.sessionCookie, 'aged-out bucket frees the window');
+});
+
+test('login/sign-out cycles cannot evade the session cap', async (context) => {
+  const t = await createTestEnv();
+  context.after(() => t.sqlite.close());
+  for (let i = 0; i < MAX_SESSIONS_PER_HOUR; i++) {
+    await t.DB.prepare('DELETE FROM rateLimit').run();
+    const r = await oauthLogin(t, context, ghUser(903, 'cyclist@example.com'));
+    assert.ok(r.sessionCookie, `cycle ${i} logs in`);
+    const bye = await t.call('/api/auth/sign-out', { method: 'POST', headers: { Cookie: r.sessionCookie, Origin: 'http://localhost:8787' }, body: {} });
+    assert.equal(bye.status, 200, `cycle ${i} signs out`);
+  }
+  await t.DB.prepare('DELETE FROM rateLimit').run();
+  const over = await oauthLogin(t, context, ghUser(903, 'cyclist@example.com'));
+  assert.equal(over.sessionCookie, null, 'cap holds despite sign-outs');
+  assert.ok(String(over.location).includes('error=SESSION_RATE_LIMITED'), over.location);
+  const user = await userRow(t, 'cyclist@example.com');
+  const live = await t.DB.prepare('SELECT COUNT(*) AS n FROM session WHERE userId = ?').bind(user.id).first();
+  assert.equal(live.n, 0, 'no live sessions left, yet the cap held');
 });
 

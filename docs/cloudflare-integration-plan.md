@@ -121,9 +121,12 @@ none named `aipster-app` exists; do not reuse or mutate unrelated ones.
   review): 120 mutating API calls per UTC hour (`429 WRITE_RATE_LIMITED`,
   migration 0005 `write_budget` table), at most 100 resources / 20 active
   keys / 100 active outgoing grants per user (`409 *_LIMIT`), and key
-  `last_used_at` stamped at most hourly. Admission is atomic
-  (single-statement conditional writes); rejections are read-only.
-  See `src/lib/quotas.js`.
+  `last_used_at` stamped at most hourly. Authenticated Better Auth
+  profile/credential mutations bill the same budget (method + origin
+  gated); sign-out/revocation/unlink stay free. Session creation is
+  capped separately at 20/user/hour (deletion-proof counter).
+  Admission is atomic (single-statement conditional writes);
+  rejections are read-only. See `src/lib/quotas.js`.
 - **Demo username/password (APPROVED scope change):** one seeded `demo`
   identity signs in via the maintained Better Auth `username` plugin +
   credential account (scrypt via the library, never plaintext, never a
@@ -221,11 +224,12 @@ re-reviewed.
 
 ## 7. Test plan (all committed under `website/`)
 
-`npm test` (156 green on the final head): migrations incl. 0005;
+`npm test` (167 green on the final head): migrations incl. 0005;
 public GitHub registration (verified-email gate, no invitation, no
 implicit linking; two-user + repeat + collision + isolation cases
 through the stubbed-GitHub callback path); per-user write quotas
-(hourly budget, object caps, revocation exemption, no-write-on-reject);
+(hourly budget, object caps, revocation exemption, no-write-on-reject,
+auth-mutation billing, per-user session-creation cap);
 real session round-trips; unauthenticated 401s; cross-user 404s;
 grants/quotas incl. real↔demo boundary both directions; key lifecycle
 incl. `aip_demo_` sandbox prefix; byte-cap streaming incl.
