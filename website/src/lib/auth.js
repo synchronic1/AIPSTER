@@ -12,6 +12,12 @@ import { username } from 'better-auth/plugins/username';
 import { first } from './store.js';
 
 export const OAUTH_SCOPES = ['read:user', 'user:email'];
+// Per-user session-creation cap: at most this many sessions minted per
+// rolling UTC hour. Bounds repeat-login D1 writes without touching the
+// mutation budget (a spent budget must never lock a user out of
+// signing in). Sign-out and revocation stay free, so recovery is
+// always available.
+export const MAX_SESSIONS_PER_HOUR = 20;
 export const OAUTH_CALLBACK_PATH = '/api/auth/callback/github';
 
 export function configError(message) {
@@ -134,6 +140,15 @@ export function createAuth(env) {
               const row = await first(env.DB, 'SELECT disabled FROM "user" WHERE id = ?', session.userId);
               if (row && Number(row.disabled) === 1) {
                 throw new APIError(403, { message: 'This sign-in is disabled.', code: 'ACCOUNT_DISABLED' });
+              }
+              // Rolling hourly cap on session creation (repeat logins).
+              // Timestamps are ISO-8601 strings, so the window compares
+              // lexicographically. Refusing here writes nothing: the
+              // callback surfaces SESSION_RATE_LIMITED instead.
+              const since = new Date(Date.now() - 3600 * 1000).toISOString();
+              const recent = await first(env.DB, 'SELECT COUNT(*) AS n FROM session WHERE userId = ? AND createdAt > ?', session.userId, since);
+              if (recent && Number(recent.n) >= MAX_SESSIONS_PER_HOUR) {
+                throw new APIError(429, { message: 'Too many sign-ins in the last hour. Try again later.', code: 'SESSION_RATE_LIMITED' });
               }
             }
             return { data: session };

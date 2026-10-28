@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
+import { MAX_SESSIONS_PER_HOUR } from '../src/lib/auth.js';
 
 // Drives POST sign-in/social -> GET callback/github with stubbed GitHub.
 // profile: { id, login, name, email }, emails: [{ email, primary, verified }].
@@ -186,3 +187,36 @@ test('public signup: provider tokens are stripped, fixtures leak nowhere', async
   const body = await r.callback.text();
   assert.ok(!body.includes('fixture-access-token'), 'no token in callback body');
 });
+
+test('repeat logins are capped per user per hour', async (context) => {
+  const t = await createTestEnv();
+  context.after(() => t.sqlite.close());
+  // The library initiation throttle (shared bucket, trips after a few
+  // sign-in/social calls) is per-bucket, not per-user; clear it between
+  // logins so this test isolates the per-user session cap.
+  for (let i = 0; i < MAX_SESSIONS_PER_HOUR; i++) {
+    await t.DB.prepare('DELETE FROM rateLimit').run();
+    const r = await oauthLogin(t, context, ghUser(901, 'burst@example.com'));
+    assert.ok(r.sessionCookie, `login ${i} issues a session`);
+  }
+  await t.DB.prepare('DELETE FROM rateLimit').run();
+  const over = await oauthLogin(t, context, ghUser(901, 'burst@example.com'));
+  assert.equal(over.sessionCookie, null, 'no session past the cap');
+  assert.ok(String(over.location).includes('error=SESSION_RATE_LIMITED'), over.location);
+  const user = await userRow(t, 'burst@example.com');
+  const n = await t.DB.prepare('SELECT COUNT(*) AS n FROM session WHERE userId = ?').bind(user.id).first();
+  assert.equal(n.n, MAX_SESSIONS_PER_HOUR, 'exactly the cap, no extra row');
+});
+
+test('session cap is a rolling window; old sessions age out', async (context) => {
+  const t = await createTestEnv();
+  context.after(() => t.sqlite.close());
+  const first = await oauthLogin(t, context, ghUser(902, 'steady@example.com'));
+  assert.ok(first.sessionCookie);
+  const user = await userRow(t, 'steady@example.com');
+  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  await t.DB.prepare('UPDATE session SET createdAt = ? WHERE userId = ?').bind(old, user.id).run();
+  const again = await oauthLogin(t, context, ghUser(902, 'steady@example.com'));
+  assert.ok(again.sessionCookie, 'aged-out session frees the window');
+});
+

@@ -245,3 +245,31 @@ test('logout, revocation, unlink, and reads stay available at exhaustion', async
   assert.ok(after.json === null || after.status === 401, 'session ended');
 });
 
+test('auth budget ignores wrong-method and cross-origin requests', async () => {
+  const t = await createTestEnv();
+  const as = { ...t.as(t.alice), Origin: 'http://localhost:8787' };
+  const get = await readJson(await t.call('/api/auth/update-user', { headers: as }));
+  assert.notEqual(get.status, 429, 'bare GET never billed: ' + get.status);
+  assert.equal(await budgetCount(t, t.alice), 0);
+  for (const forged of [{ Origin: 'https://evil.example' }, { Referer: 'https://evil.example/x' }]) {
+    const out = await readJson(await t.call('/api/auth/update-user', { method: 'POST', headers: { ...t.as(t.alice), ...forged }, body: { name: 'Forged' } }));
+    assert.equal(out.status, 403, 'cross-site POST rejected: ' + out.text);
+  }
+  assert.equal(await budgetCount(t, t.alice), 0, 'rejected forgeries bill nothing');
+  const u = await t.DB.prepare('SELECT name FROM "user" WHERE id = ?').bind(t.alice.id).first();
+  assert.equal(u.name, 'Alice');
+});
+
+test('delete-user/callback bills only token-bearing GETs', async () => {
+  const t = await createTestEnv();
+  const as = { ...t.as(t.alice), Origin: 'http://localhost:8787' };
+  await readJson(await t.call('/api/auth/delete-user/callback', { headers: as }));
+  assert.equal(await budgetCount(t, t.alice), 0, 'tokenless GET unbilled');
+  const tok = await readJson(await t.call('/api/auth/delete-user/callback?token=fake&callbackURL=http://localhost:8787/', { headers: as }));
+  assert.ok(tok.status >= 400 && tok.status !== 429, 'flow rejects, budget claimed: ' + tok.status);
+  assert.equal(await budgetCount(t, t.alice), 1);
+  await exhaustBudget(t, t.bob);
+  const denied = await readJson(await t.call('/api/auth/delete-user/callback?token=fake&callbackURL=http://localhost:8787/', { headers: { ...t.as(t.bob), Origin: 'http://localhost:8787' } }));
+  assert.equal(denied.status, 429);
+});
+
