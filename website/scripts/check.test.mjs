@@ -6,7 +6,7 @@ import {resolve,join,sep} from 'node:path';
 import {checkPublic} from './check.mjs';
 const original=resolve(import.meta.dirname,'../public');
 async function fixture(change,run){const root=await mkdtemp(join(tmpdir(),'aipster-public-check-'));try{await cp(original,root,{recursive:true});await change(root);await run(root);}finally{assert(root.startsWith(resolve(tmpdir())+sep)&&root.includes('aipster-public-check-'));await rm(root,{recursive:true,force:true});}}
-test('valid public-only artifact passes',async()=>{assert.equal((await checkPublic(original)).files.length,20);});
+test('valid public-only artifact passes',async()=>{assert.equal((await checkPublic(original)).files.length,21);});
 
 test('an accidentally copied auth/credential file fails',async()=>fixture(root=>writeFile(resolve(root,'.dev.vars'),'SYNTHETIC_ONLY=1'),root=>assert.rejects(checkPublic(root),/allowlist/)));
 test('inline active HTML fails',async()=>fixture(async root=>{const path=resolve(root,'index.html');await writeFile(path,(await readFile(path,'utf8')).replace('</body>','<script>1</script></body>'));},root=>assert.rejects(checkPublic(root),/Active/)));
@@ -30,6 +30,10 @@ for (const [name, path, payload] of [
   ['data scheme', 'index.html', '<a href="data:text/html,fixture">link</a>'],
   ['protocol-relative host', 'index.html', '<a href="//evil.example/collect">link</a>'],
   ['GitHub repository prefix lookalike', 'index.html', '<a href="https://github.com/synchronic1/AIPSTER-unreviewed">link</a>'],
+  ['sponsor host lookalike', 'index.html', '<a href="https://modal.com.evil.example/collect">link</a>'],
+  ['sponsor path lookalike', 'index.html', '<a href="https://modal.com/unreviewed">link</a>'],
+  ['sponsor scheme downgrade', 'index.html', '<a href="http://modal.com/">link</a>'],
+  ['sponsor extra subdomain', 'index.html', '<a href="https://www.modal.com/">link</a>'],
   ['dot-segment alias', 'index.html', '<a href="/app/../favicon.svg">link</a>'],
   ['encoded path alias', 'index.html', '<a href="/%61pp/">link</a>'],
   ['app external navigation', 'app/index.html', '<a href="https://evil.example/sign-in">Continue sign-in</a>'],
@@ -89,7 +93,7 @@ test('semantic approved script and link spellings remain allowed', async () => f
   await edit(root, 'app/index.html', text => text.replace('<script src="/app/app.js"></script>', "<script SRC = '/app/app.js'></script>"));
   await edit(root, 'index.html', text => text.replace('href="#overview"', "HREF = '#overview'"));
   await edit(root, 'styles.css', text => text + '\nbody{background-image:url(/favicon.svg)}');
-}, async root => assert.equal((await checkPublic(root)).files.length, 20)));
+}, async root => assert.equal((await checkPublic(root)).files.length, 21)));
 
 test('approved script cannot acquire inline code or be duplicated', async () => {
   for (const replacement of [
