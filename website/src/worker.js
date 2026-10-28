@@ -8,6 +8,7 @@ import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
 import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from './lib/quotas.js';
+import { buildStatus, MAX_STATUS_ITEMS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -303,6 +304,20 @@ async function handleApi(request, env, url) {
       }
       return json(200, cardFor(r, await ownerName(db, r.owner_id)));
     }
+  }
+
+  // ---- status (read-only readiness strip; no telemetry writer exists) ----
+  if (path === '/api/status' && method === 'GET') {
+    const d = needAuthz('read'); if (d) return deny(d);
+    // Owner-scoped minimal columns only: free-text cpu/gpu/origin/limits and
+    // credits stay out of this payload (they can carry private addresses).
+    const rows = await all(db,
+      'SELECT id, name, kind, online, heartbeat_at FROM resources WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+      me(), MAX_STATUS_ITEMS);
+    const shared = await first(db,
+      'SELECT COUNT(*) AS n FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.grantee_id = ? AND g.revoked_at IS NULL AND o.demo = r.demo',
+      me());
+    return json(200, buildStatus({ rows, sharedWithMe: Number(shared ? shared.n : 0), demo: isDemo(), nowMs: Date.now() }));
   }
 
   // ---- sharing ----
