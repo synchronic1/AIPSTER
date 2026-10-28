@@ -1,0 +1,16 @@
+# Simulation only. No engine, model download, credentials, or cloud connection.
+[node]
+id = "standalone-demo"
+host = "127.0.0.1"
+port = 8090
+state_dir = "../.state"
+
+[[runtimes]]
+id = "mock"
+kind = "mock"
+gpu_layers = 0
+
+[[models]]
+id = "mock-summary"
+runtime = "mock"
+capabilities = ["summarize"]
