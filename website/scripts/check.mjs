@@ -5,7 +5,8 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {parse} from 'parse5';
 
-export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','favicon.svg','index.html','release.json','styles.css'].sort();
+export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/meta.svg','assets/sponsors/modal.svg','favicon.svg','index.html','release.json','styles.css'].sort();
+
 export const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function files(root,dir=root){const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink(),'Symlinks are outside the public upload policy');const path=resolve(dir,entry.name);if(entry.isDirectory())result.push(...await files(root,path));else{assert(entry.isFile(),'Unexpected asset type');result.push(relative(root,path).replaceAll('\\','/'));}}return result.sort();}
 
