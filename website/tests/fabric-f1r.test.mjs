@@ -23,13 +23,13 @@ test('F1R: migration 0006 records the suspending side for consent', async () => 
   assert.equal(row2.suspended_by, null);
 });
 
-test('F1R: only the suspending side may resume, by code', async () => {
+test('F1R3: a side with no veto cannot withdraw, by code', async () => {
   const t = await fabricEnv();
   const { conn, nodeB } = await connectPair(t);
   await readJson(await t.call(`/v1/fabric/connections/${conn.id}/suspend`, { method: 'POST', headers: S(t, t.alice, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 1 } }));
   const peer = await readJson(await t.call(`/v1/fabric/connections/${conn.id}/resume`, { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 2, nodeKey: nodeB.nodeSecret } }));
-  assert.equal(peer.status, 403);
-  assert.equal(peer.json.code, 'FORBIDDEN');
+  assert.equal(peer.status, 409);
+  assert.equal(peer.json.code, 'NO_OWN_VETO');
 });
 
 test('F1R: replay of secret issuance returns metadata without the secret', async () => {
@@ -68,7 +68,7 @@ test('F1R2: migration 0007 adds veto, exporter and approval-recency columns', as
   assert.ok(cols('fabric_grants').includes('last_approval_id'));
 });
 
-test('F1R2: commit records exporter and approval; resume clears accumulated vetoes only with all proofs', async () => {
+test('F1R3: commit records exporter and approval; each side withdraws only its own veto', async () => {
   const t = await fabricEnv();
   const { conn, nodeA, nodeB } = await connectPair(t);
   const { grant, appr } = await commitFlow(t, conn.id);
@@ -79,11 +79,22 @@ test('F1R2: commit records exporter and approval; resume clears accumulated veto
   await readJson(await t.call(`/v1/fabric/connections/${conn.id}/disconnect`, { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 2 } }));
   const veto = JSON.parse(t.sqlite.prepare('SELECT vetoed_by AS v FROM connections WHERE id = ?').get(conn.id).v);
   assert.deepEqual([...veto].sort(), [nodeA.id, nodeB.id].sort());
+  const rows = t.sqlite.prepare('SELECT side_node AS s FROM connection_vetoes WHERE connection_id = ?').all(conn.id).map((r) => r.s);
+  assert.deepEqual([...rows].sort(), [nodeA.id, nodeB.id].sort());
+  // Bob withdraws his own side only; Alice's veto survives with its proof.
   const partial = await readJson(await t.call(`/v1/fabric/connections/${conn.id}/resume`, { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 3, nodeKeys: [nodeB.nodeSecret] } }));
-  assert.equal(partial.status, 403);
-  const full = await readJson(await t.call(`/v1/fabric/connections/${conn.id}/resume`, { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 3, nodeKeys: [nodeB.nodeSecret, nodeA.nodeSecret] } }));
+  assert.equal(partial.status, 200);
+  assert.deepEqual(partial.json.remainingVetoes, [nodeA.id]);
+  assert.notEqual(partial.json.state, 'active');
+  // A peer secret in Bob's hands withdraws nothing once his own veto is gone.
+  const foreign = await readJson(await t.call(`/v1/fabric/connections/${conn.id}/resume`, { method: 'POST', headers: S(t, t.bob, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 4, nodeKeys: [nodeB.nodeSecret, nodeA.nodeSecret] } }));
+  assert.equal(foreign.status, 409);
+  assert.equal(foreign.json.code, 'NO_OWN_VETO');
+  // Alice withdraws her own side; the connection reactivates.
+  const full = await readJson(await t.call(`/v1/fabric/connections/${conn.id}/resume`, { method: 'POST', headers: S(t, t.alice, { 'Idempotency-Key': freshKey() }), body: { expectedVersion: 4, nodeKey: nodeA.nodeSecret } }));
   assert.equal(full.status, 200);
   assert.equal(full.json.state, 'active');
+  assert.deepEqual(full.json.remainingVetoes, []);
 });
 
 test('F1R2: same-key retry after a lost response reconciles instead of duplicating', async () => {

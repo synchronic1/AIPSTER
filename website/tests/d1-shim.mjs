@@ -13,6 +13,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const TEST_SECRET = 'test-only-better-auth-secret-0123456789abcdef-0123456789abcdef';
 export const TEST_URL = 'http://localhost:8787';
 
+let batchSeq = 0;
+
 export function createD1Shim(sqlite) {
   const bound = (sql, params) => ({
     sql, params,
@@ -31,15 +33,40 @@ export function createD1Shim(sqlite) {
   return {
     prepare(sql) { return bound(sql, []); },
     async batch(stmts) {
+      // F1R3: mirror D1 batch-as-transaction (proven by
+      // qa-d1-contract.test.mjs against real local D1): all-or-nothing.
+      // Savepoints (nestable) instead of BEGIN: deterministic test
+      // interleavings run a nested batch inside an intercepted
+      // statement, which then behaves like a separate serial batch.
+      // Statements execute through their own run()/all() methods so
+      // white-box statement interceptors observe them.
+      const sp = `f1r3_${++batchSeq}`;
+      sqlite.exec(`SAVEPOINT ${sp}`);
       const out = [];
-      for (const s of stmts) out.push(await bound(s.sql, s.params || []).all());
-      return out;
+      try {
+        for (const s of stmts) {
+          const isSelect = /^\s*(SELECT|WITH|PRAGMA|EXPLAIN)\b/i.test(s.sql || '');
+          if (s && typeof s.run === 'function' && typeof s.all === 'function') {
+            out.push(isSelect ? await s.all() : await s.run());
+          } else if (isSelect) {
+            out.push({ results: sqlite.prepare(s.sql).all(...(s.params || [])), success: true, meta: {} });
+          } else {
+            const info = sqlite.prepare(s.sql).run(...(s.params || []));
+            out.push({ success: true, meta: { changes: Number(info.changes), last_row_id: Number(info.lastInsertRowid) } });
+          }
+        }
+        sqlite.exec(`RELEASE ${sp}`);
+        return out;
+      } catch (e) {
+        try { sqlite.exec(`ROLLBACK TO ${sp}`); sqlite.exec(`RELEASE ${sp}`); } catch { /* torn down */ }
+        throw e;
+      }
     },
     async exec(sql) { sqlite.exec(sql); return { success: true }; }
   };
 }
 
-export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_fabric.sql', '0006_consent.sql', '0007_repair2.sql'];
+export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_fabric.sql', '0006_consent.sql', '0007_repair2.sql', '0008_state_layer.sql'];
 
 export function applyMigrations(sqlite, names = MIGRATION_FILES) {
   for (const name of names) {

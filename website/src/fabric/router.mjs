@@ -57,7 +57,7 @@ async function mutate(ctx, fn) {
   } catch (e) { return sendErr(ctx, e); }
   if (replay) return ctx.json(replay.status, { ...replay.body, replayed: true });
   const key = request.headers.get('Idempotency-Key');
-  const op = { key, path: url.pathname };
+  const op = { key, path: url.pathname, attempt: await S.readAttempt(db, `${factor.kind}:${factor.user.id}`, key) };
   let out;
   try {
     out = await fn(factor, body || {}, op);
@@ -68,14 +68,14 @@ async function mutate(ctx, fn) {
     const status = Number(e && e.status) || 500;
     if (status < 500) {
       const failure = { error: (e && e.message) || 'Request failed.', code: (e && e.code) || 'INTERNAL' };
-      try { await S.storeIdempotency(db, factor, key, status, failure); } catch { /* fall through to error */ }
+      try { await S.storeIdempotency(db, factor, key, status, failure, op.attempt); } catch { /* fall through to error */ }
       return ctx.json(status, failure);
     }
-    try { await S.releaseIdempotency(db, factor, key); } catch { /* fall through to error */ }
+    try { await S.releaseIdempotency(db, factor, key, op.attempt); } catch { /* fall through to error */ }
     return sendErr(ctx, e);
   }
   try {
-    await S.storeIdempotency(db, factor, key, out.status, out.body);
+    await S.storeIdempotency(db, factor, key, out.status, out.body, op.attempt);
   } catch (e) { return sendErr(ctx, e); }
   return send(ctx, out);
 }
@@ -135,14 +135,14 @@ export async function handleFabric(ctx) {
     }
     if (path === '/v1/fabric/invitations/accept' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.acceptInvitation(db, f, b));
+      return mutate(ctx, (f, b, op) => S.acceptInvitation(db, f, b, op));
     }
     {
       const m = /^\/v1\/fabric\/invitations\/([A-Za-z0-9_-]{1,64})\/(decline|revoke)$/.exec(path);
       if (m && method === 'POST') {
         const d = guardSessionWrite(ctx); if (d) return d;
         const id = m[1];
-        return mutate(ctx, (f) => (m[2] === 'decline' ? S.declineInvitation(db, f, id) : S.revokeInvitation(db, f, id)));
+        return mutate(ctx, (f, b, op) => (m[2] === 'decline' ? S.declineInvitation(db, f, id, op) : S.revokeInvitation(db, f, id, op)));
       }
     }
     {
@@ -169,7 +169,7 @@ export async function handleFabric(ctx) {
       if (m && method === 'POST') {
         const d = guardNarrow(ctx); if (d) return d;
         const id = m[1];
-        return mutate(ctx, (f, b) => (m[2] === 'suspend' ? S.suspendConnection(db, f, id, b) : S.disconnectConnection(db, f, id, b)));
+        return mutate(ctx, (f, b, op) => (m[2] === 'suspend' ? S.suspendConnection(db, f, id, b, op) : S.disconnectConnection(db, f, id, b, op)));
       }
     }
     {
@@ -177,7 +177,7 @@ export async function handleFabric(ctx) {
       if (m && method === 'POST') {
         const d = guardSessionWrite(ctx); if (d) return d;
         const id = m[1];
-        return mutate(ctx, (f, b) => S.resumeConnection(db, f, id, b));
+        return mutate(ctx, (f, b, op) => S.resumeConnection(db, f, id, b, op));
       }
     }
     // ---- previews + approvals ----
@@ -205,13 +205,13 @@ export async function handleFabric(ctx) {
       if (m && method === 'POST') {
         const d = guardSessionWrite(ctx); if (d) return d;
         const id = m[1];
-        return mutate(ctx, (f, b) => S.decideApproval(db, f, id, b));
+        return mutate(ctx, (f, b, op) => S.decideApproval(db, f, id, b, op));
       }
     }
     // ---- grants ----
     if (path === '/v1/fabric/grants' && method === 'POST') {
       const d = guardSessionWrite(ctx); if (d) return d;
-      return mutate(ctx, (f, b) => S.commitGrant(db, f, b));
+      return mutate(ctx, (f, b, op) => S.commitGrant(db, f, b, op));
     }
     if (path === '/v1/fabric/grants' && method === 'GET') {
       const d = ctx.needAuthz('read'); if (d) return d;
@@ -230,7 +230,7 @@ export async function handleFabric(ctx) {
       if (m && method === 'POST') {
         const d = guardSessionWrite(ctx); if (d) return d;
         const id = m[1];
-        return mutate(ctx, (f, b) => (m[2] === 'revise' ? S.reviseGrant(db, f, id, b) : S.resumeGrant(db, f, id, b)));
+        return mutate(ctx, (f, b, op) => (m[2] === 'revise' ? S.reviseGrant(db, f, id, b, op) : S.resumeGrant(db, f, id, b, op)));
       }
     }
     {
@@ -238,7 +238,7 @@ export async function handleFabric(ctx) {
       if (m && method === 'POST') {
         const d = guardNarrow(ctx); if (d) return d;
         const id = m[1];
-        return mutate(ctx, (f, b) => (m[2] === 'pause' ? S.pauseGrant(db, f, id, b) : S.revokeGrant(db, f, id, b)));
+        return mutate(ctx, (f, b, op) => (m[2] === 'pause' ? S.pauseGrant(db, f, id, b, op) : S.revokeGrant(db, f, id, b, op)));
       }
     }
     // ---- denies ----
@@ -289,26 +289,26 @@ const MCP_TOOLS = {
   'fabric.create_invitation': { guard: 'session', run: (db, f, p, op) => S.createInvitation(db, f, p, op) },
   'fabric.list_invitations': { guard: 'read', run: (db, f, p) => S.listInvitations(db, f, p.role) },
   'fabric.get_invitation': { guard: 'read', run: (db, f, p) => S.getInvitation(db, f, p.id) },
-  'fabric.accept_invitation': { guard: 'session', run: (db, f, p) => S.acceptInvitation(db, f, p) },
-  'fabric.decline_invitation': { guard: 'session', run: (db, f, p) => S.declineInvitation(db, f, p.id) },
-  'fabric.revoke_invitation': { guard: 'session', run: (db, f, p) => S.revokeInvitation(db, f, p.id) },
+  'fabric.accept_invitation': { guard: 'session', run: (db, f, p, op) => S.acceptInvitation(db, f, p, op) },
+  'fabric.decline_invitation': { guard: 'session', run: (db, f, p, op) => S.declineInvitation(db, f, p.id, op) },
+  'fabric.revoke_invitation': { guard: 'session', run: (db, f, p, op) => S.revokeInvitation(db, f, p.id, op) },
   'fabric.list_connections': { guard: 'read', run: (db, f, p) => S.listConnections(db, f) },
   'fabric.get_connection': { guard: 'read', run: (db, f, p) => S.getConnection(db, f, p.id) },
-  'fabric.suspend_connection': { guard: 'narrow', run: (db, f, p) => S.suspendConnection(db, f, p.id, p) },
-  'fabric.disconnect_connection': { guard: 'narrow', run: (db, f, p) => S.disconnectConnection(db, f, p.id, p) },
-  'fabric.resume_connection': { guard: 'session', run: (db, f, p) => S.resumeConnection(db, f, p.id, p) },
+  'fabric.suspend_connection': { guard: 'narrow', run: (db, f, p, op) => S.suspendConnection(db, f, p.id, p, op) },
+  'fabric.disconnect_connection': { guard: 'narrow', run: (db, f, p, op) => S.disconnectConnection(db, f, p.id, p, op) },
+  'fabric.resume_connection': { guard: 'session', run: (db, f, p, op) => S.resumeConnection(db, f, p.id, p, op) },
   'fabric.create_preview': { guard: 'session', run: (db, f, p, op) => S.createPreview(db, f, p, op) },
   'fabric.request_approval': { guard: 'session', run: (db, f, p, op) => S.requestApproval(db, f, p, op) },
   'fabric.list_approvals': { guard: 'read', run: (db, f, p) => S.listApprovals(db, f) },
   'fabric.get_approval': { guard: 'read', run: (db, f, p) => S.getApproval(db, f, p.id) },
-  'fabric.decide_approval': { guard: 'session', run: (db, f, p) => S.decideApproval(db, f, p.id, p) },
-  'fabric.commit_grant': { guard: 'session', run: (db, f, p) => S.commitGrant(db, f, p) },
+  'fabric.decide_approval': { guard: 'session', run: (db, f, p, op) => S.decideApproval(db, f, p.id, p, op) },
+  'fabric.commit_grant': { guard: 'session', run: (db, f, p, op) => S.commitGrant(db, f, p, op) },
   'fabric.list_grants': { guard: 'read', run: (db, f, p) => S.listGrants(db, f, p.scope) },
   'fabric.get_grant': { guard: 'read', run: (db, f, p) => S.getGrant(db, f, p.id) },
-  'fabric.revise_grant': { guard: 'session', run: (db, f, p) => S.reviseGrant(db, f, p.id, p) },
-  'fabric.pause_grant': { guard: 'narrow', run: (db, f, p) => S.pauseGrant(db, f, p.id, p) },
-  'fabric.resume_grant': { guard: 'session', run: (db, f, p) => S.resumeGrant(db, f, p.id, p) },
-  'fabric.revoke_grant': { guard: 'narrow', run: (db, f, p) => S.revokeGrant(db, f, p.id, p) },
+  'fabric.revise_grant': { guard: 'session', run: (db, f, p, op) => S.reviseGrant(db, f, p.id, p, op) },
+  'fabric.pause_grant': { guard: 'narrow', run: (db, f, p, op) => S.pauseGrant(db, f, p.id, p, op) },
+  'fabric.resume_grant': { guard: 'session', run: (db, f, p, op) => S.resumeGrant(db, f, p.id, p, op) },
+  'fabric.revoke_grant': { guard: 'narrow', run: (db, f, p, op) => S.revokeGrant(db, f, p.id, p, op) },
   'fabric.create_deny': { guard: 'session', run: (db, f, p, op) => S.createDeny(db, f, p, op) },
   'fabric.list_denies': { guard: 'read', run: (db, f, p) => S.listDenies(db, f) },
   'fabric.delete_deny': { guard: 'session-no-idem', run: (db, f, p) => S.deleteDeny(db, f, p.id) },
@@ -353,19 +353,20 @@ export async function handleMcp(ctx) {
       if (replay.status >= 400) return ctx.json(replay.status, { ...replay.body, replayed: true });
       return ctx.json(replay.status, { ok: true, tool, result: replay.body, replayed: true });
     }
+    const mop = { key, path: ipath, attempt: await S.readAttempt(db, `${f.kind}:${f.user.id}`, key) };
     try {
-      const out = await spec.run(db, f, params, { key, path: ipath });
-      await S.storeIdempotency(db, f, key, out.status, out.body);
+      const out = await spec.run(db, f, params, mop);
+      await S.storeIdempotency(db, f, key, out.status, out.body, mop.attempt);
       if (out.status >= 400) return ctx.json(out.status, out.body);
       return ctx.json(out.status, { ok: true, tool, result: out.body });
     } catch (e) {
       const status = Number(e && e.status) || 500;
       if (status < 500) {
         const failure = { error: (e && e.message) || 'Request failed.', code: (e && e.code) || 'INTERNAL' };
-        try { await S.storeIdempotency(db, f, key, status, failure); } catch { /* fall through */ }
+        try { await S.storeIdempotency(db, f, key, status, failure, mop.attempt); } catch { /* fall through */ }
         return ctx.json(status, failure);
       }
-      try { await S.releaseIdempotency(db, f, key); } catch { /* fall through */ }
+      try { await S.releaseIdempotency(db, f, key, mop.attempt); } catch { /* fall through */ }
       return sendErr(ctx, e);
     }
   } catch (e) {

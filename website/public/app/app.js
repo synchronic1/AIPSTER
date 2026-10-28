@@ -227,10 +227,13 @@ function wireFabButtons() {
   click('[data-fab-disc]', async (e) => { try { await api('/v1/fabric/connections/' + e.target.dataset.fabDisc + '/disconnect', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Connection disconnected.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
   click('[data-fab-resume]', async (e) => {
     const id = e.target.dataset.fabResume, v = Number(e.target.dataset.v);
-    const keys = prompt('Resume requires every vetoing side\u2019s node secret. Paste one, or several comma-separated:');
-    if (!keys) return;
-    const nodeKeys = keys.split(',').map((s) => s.trim()).filter(Boolean);
-    try { await api('/v1/fabric/connections/' + id + '/resume', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: v, nodeKeys }) }); banner('Connection resumed.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); }
+    const key = prompt('Withdraw your side\u2019s veto: paste YOUR node\u2019s own secret (shown once at registration). A peer secret withdraws nothing.');
+    if (!key) return;
+    try {
+      const out = await api('/v1/fabric/connections/' + id + '/resume', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: v, nodeKey: key.trim() }) });
+      banner(out && out.state === 'active' ? 'Connection resumed.' : 'Your veto is withdrawn; ' + ((out && out.remainingVetoes) || []).length + ' peer veto(s) remain.');
+      loadFederation();
+    } catch (ex) { if (!isStale(ex)) banner(ex.message); }
   });
   click('[data-fab-pause]', async (e) => { try { await api('/v1/fabric/grants/' + e.target.dataset.fabPause + '/pause', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Grant paused.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
   click('[data-fab-revoke]', async (e) => { try { await api('/v1/fabric/grants/' + e.target.dataset.fabRevoke + '/revoke', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Grant revoked.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
