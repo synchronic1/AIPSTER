@@ -3,7 +3,7 @@
 // existing static site. Routing: /api/auth/* -> Better Auth, /api/* -> JSON
 // API (errors always JSON, never the static 404 page), /app* -> panel assets,
 // everything else -> ASSETS (landing page preserved byte-for-byte).
-import { createAuth, isInvited, oauthConfigured, sessionUser } from './lib/auth.js';
+import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
@@ -296,7 +296,7 @@ async function handleApi(request, env, url) {
     if (!isId(body.resourceId)) return json(400, { error: 'resourceId is required.', code: 'BAD_RESOURCE' });
     const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resourceId);
     if (!resource || resource.owner_id !== me()) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
-    if (!isEmail(body.grantee)) return json(400, { error: 'Grantee must be an invited user email.', code: 'BAD_GRANTEE' });
+    if (!isEmail(body.grantee)) return json(400, { error: 'Grantee must be a registered user email.', code: 'BAD_GRANTEE' });
     const grantee = await first(db, 'SELECT id, email, demo FROM "user" WHERE email = ?', String(body.grantee).trim().toLowerCase());
     if (!grantee) return json(404, { error: 'Grantee user not found.', code: 'USER_NOT_FOUND' });
     if (grantee.id === me()) return json(400, { error: 'Cannot share with yourself.', code: 'SELF_SHARE' });

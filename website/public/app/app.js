@@ -1,6 +1,6 @@
 /* Built with Meta Muse. */
 // Control-panel client. Session cookie is httpOnly; sign-in is GitHub OAuth
-// for invited testers or the seeded demo username/password (same sessions).
+// for public GitHub registration or the seeded demo username/password (same sessions).
 // Mutations carry a custom CSRF header (never a secret). API secrets are
 // shown once and never persisted.
 'use strict';
@@ -181,7 +181,7 @@ document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('c
 $('github-login').addEventListener('click', async () => {
   const err = $('login-error'); err.hidden = true;
   try {
-    const data = await api('/api/auth/sign-in/social', { method: 'POST', body: JSON.stringify({ provider: 'github', callbackURL: location.origin + '/app/' }) });
+    const data = await api('/api/auth/sign-in/social', { method: 'POST', body: JSON.stringify({ provider: 'github', callbackURL: location.origin + '/app/', errorCallbackURL: location.origin + '/app/' }) });
     const url = data && (data.url || data.redirect);
     if (!url) throw new Error('Sign-in did not return a redirect.');
     location.assign(url);
@@ -273,8 +273,28 @@ function showApp() {
   loadOverview();
 }
 
+function callbackErrorMessage(code) {
+  const c = String(code || '').toLowerCase();
+  if (c === 'not_verified' || c === 'email_not_found' || c === 'email_not_verified') {
+    return 'GitHub sign-in needs a verified email on your GitHub account. Verify an email there, then try again.';
+  }
+  if (c === 'account_not_linked') {
+    return 'This GitHub email is already registered with a different sign-in method. Sign in with that method instead; accounts are never merged automatically.';
+  }
+  if (c === 'access_denied') return 'GitHub sign-in was cancelled.'
+  return 'GitHub sign-in failed. Please try again.'
+}
+
 (async () => {
   try {
+    try {
+      const params = new URLSearchParams(location.search || '');
+      const cbError = params.get('error');
+      if (cbError) {
+        const err = $('login-error'); err.textContent = callbackErrorMessage(cbError); err.hidden = false;
+        history.replaceState(null, '', location.pathname);
+      }
+    } catch { /* error display must never break session restore */ }
     const data = await api('/api/auth/get-session');
     if (data && data.user) { me = data.user; showApp(); }
   } catch { /* stay on login */ }

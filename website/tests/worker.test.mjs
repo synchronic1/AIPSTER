@@ -2,7 +2,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestEnv, readJson, TEST_SECRET } from './d1-shim.mjs';
-import { isInvited } from '../src/lib/auth.js';
 
 async function registerResource(t, name = 'lab-1') {
   const res = await t.call('/api/inventory', { method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name, kind: 'local', origin: 'lab', cpu: 'x', gpu: 'y', capabilities: ['text'], limits: { maxJobs: 5 } } });
@@ -142,17 +141,6 @@ test('settings and audit round-trip per user', async () => {
   assert.ok(audit.json.items.some((a) => a.action === 'settings.update'));
   const bobAudit = await readJson(await t.call('/api/audit', { headers: t.as(t.bob) }));
   assert.ok(!bobAudit.json.items.some((a) => a.action === 'settings.update'));
-});
-
-test('allowlist accepts invited emails and rejects the rest', async () => {
-  const t = await createTestEnv();
-  assert.equal(await isInvited(t.DB, 'alice@example.com'), true);
-  assert.equal(await isInvited(t.DB, '  ALICE@example.com '), true);
-  assert.equal(await isInvited(t.DB, 'mallory@example.com'), false);
-  assert.equal(await isInvited(t.DB, ''), false);
-  assert.equal(await isInvited(t.DB, null), false);
-  // NOTE: the databaseHooks gate runs inside the live GitHub OAuth callback;
-  // that handshake needs a real OAuth app and stays PENDING (see manifest).
 });
 
 test('missing secrets fail closed without leaking', async () => {

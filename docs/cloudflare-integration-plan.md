@@ -45,7 +45,7 @@ One apex Worker (`aipster-public-site`) keeps serving the static landing page
 byte-for-byte (including progress/changelog/journal sections). Worker code runs
 first and routes:
 
-- `/api/auth/*` → Better Auth handler (GitHub OAuth for invited testers +
+- `/api/auth/*` → Better Auth handler (public GitHub registration +
   seeded demo username/password via the maintained `username` plugin, D1
   sessions, database-backed throttling).
 - `/api/*` (other) → control-panel JSON API, always JSON (errors never fall
@@ -95,22 +95,25 @@ none named `aipster-app` exists; do not reuse or mutate unrelated ones.
 
 ## 5. Policy decisions (confirm where marked)
 
-- **Invited test users (ASSUMED — needs confirmation):** signup beyond the
-  `allowlist` is rejected in `databaseHooks.user.create.before`, which now
-  also requires a provider-verified email (`emailVerified === true` from the
-  GitHub verified-emails adapter). Public signup policy is NOT established;
-  do not treat the allowlist as a general production owner policy. Seed
-  invited emails per environment with `wrangler d1 execute` (documented
-  command, never committed data). Two approved identity names are still
-  pending from Peter — do not invent or seed them.
+- **Public GitHub registration (APPROVED — invite-only explicitly rejected by
+  Peter):** any GitHub user with a provider-verified email may register;
+  `databaseHooks.user.create.before` requires `emailVerified === true` from
+  the GitHub verified-emails adapter (server-side, never a client claim).
+  No invitation, no allowlist check. Each new user gets an empty workspace;
+  signup grants no admin role (none exists), no shared compute, and no
+  inference permission. Implicit account linking on email-text match is
+  disabled (`accountLinking.disableImplicitLinking`): a colliding login
+  fails closed with `account_not_linked` instead of joining the wrong
+  account. The legacy `allowlist` table remains in the schema (no
+  destructive migration) but is no longer read by the signup path.
 - **Demo username/password (APPROVED scope change):** one seeded `demo`
   identity signs in via the maintained Better Auth `username` plugin +
   credential account (scrypt via the library, never plaintext, never a
   parallel session system). `user.demo = 1` marks the isolated demo
-  workspace: synthetic fixtures only, grants/invitations refused server-side
+  workspace: synthetic fixtures only, grants/sharing refused server-side
   (`403 DEMO_RESTRICTED`), minted API keys forced to the `aip_demo_` prefix
   with sandbox metadata, dispatch disabled like everyone else. Public
-  registration stays closed (`disableSignUp`, verified by test). Provision
+  registration stays closed on the password path (`disableSignUp`, verified by test). Provision
   with `D1_PASSWORD='<generated-20+>' node scripts/setup-demo.mjs --db
   aipster-app [--remote]` (idempotent; hashes before touching SQL; password
   travels a private channel only, never source/logs). When D1_PASSWORD is
@@ -231,9 +234,9 @@ stubbed flows are not presented as OAuth evidence.
    `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` via `wrangler secret put`
    (production) and local `.dev.vars` (gitignored). `BETTER_AUTH_URL` is
    already `https://aipster.net` in committed `vars` (non-secret).
-5. Seed ONLY approved identities: invited emails via `wrangler d1 execute`;
-   demo account via `scripts/setup-demo.mjs --remote` with a privately
-   delivered generated password (never committed/logged).
+5. Seed ONLY the demo account via `scripts/setup-demo.mjs --remote` with a
+   privately delivered generated password (never committed/logged). No email
+   allowlist seeding: GitHub registration is public.
 6. Merge the reviewed head; dispatch the production workflow with
    `reviewed_sha` = full merged SHA; run the wired anonymous verifier and
    correlate `deployment.json`, CI run, merged commit, Cloudflare version.
@@ -249,10 +252,12 @@ stubbed flows are not presented as OAuth evidence.
 
 ## 9. Open confirmations
 
-- Invited-email policy vs another signup rule.
+- ~~Invited-email policy vs another signup rule.~~ RESOLVED: public GitHub
+  registration approved; invite-only rejected (this change).
 - D1 database name `aipster-app` acceptable.
 - Custom domain stays apex-only (no `app.` subdomain, no DNS change).
-- Two approved identity names (pending from Peter).
+- ~~Two approved identity names (pending from Peter).~~ MOOT under public
+  registration; no seed identities required.
 - Hermes incident summary: sanitized log references unavailable — treated as
   reported evidence only; no incident reproduction claimed.
 
@@ -284,7 +289,7 @@ restart, or shared-token-across-users design.
 
 | # | Finding | Disposition |
 |---|---------|-------------|
-| 1 | Invitation gate admits `emailVerified:false` | FIXED: `checkInvitation` requires allowlist + verified email; unit + stubbed-callback matrix green |
+| 1 | Invitation gate admits `emailVerified:false` | FIXED: `requireVerifiedEmail` requires a provider-verified email for public signup (allowlist retired); unit + stubbed-callback matrix green |
 | 2 | Provider tokens persisted in plaintext | FIXED: account create/update hooks strip OAuth tokens; credential passwords untouched; hook-level tests |
 | 3 | Verifier unwired + expects `/app` 404 | FIXED by Codex tooling `e6a4557` (wired anonymous verifier + preflight + explicit-dispatch workflow) |
 | 4 | Static-checker bypasses | FIXED by Codex tooling `e6a4557` (44 parse5 checker tests); this branch's checker edits reverted in favor of it |
