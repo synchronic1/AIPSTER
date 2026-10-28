@@ -3,6 +3,7 @@
  * key last-used writes. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from '../src/lib/quotas.js';
 
@@ -154,5 +155,93 @@ test('atomic budget: exactly 120 of 200 rapid claims succeed, counter exact', as
   assert.equal(rejected, 200 - WRITE_BUDGET_PER_HOUR);
   const row = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, budgetWindow()).first();
   assert.equal(row.count, WRITE_BUDGET_PER_HOUR, 'counter matches admissions exactly');
+});
+
+// PR11 independent-review block: authenticated Better Auth profile writes
+// must honor the same budget (update-user returned 200 + mutated rows at
+// a spent budget). Exhaustion is seeded by direct SQL, matching the
+// independent repro; the property asserted is rejection with zero
+// mutation and zero accounting drift.
+async function exhaustBudget(t, user) {
+  await t.DB.prepare('INSERT INTO write_budget (user_id, window, count) VALUES (?, ?, ?)').bind(user.id, budgetWindow(), WRITE_BUDGET_PER_HOUR).run();
+}
+async function budgetCount(t, user) {
+  const r = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(user.id, budgetWindow()).first();
+  return r ? Number(r.count) : 0;
+}
+
+test('auth bypass closed: update-user is denied with zero mutation at exhaustion', async () => {
+  const t = await createTestEnv();
+  await exhaustBudget(t, t.alice);
+  assert.equal((await readJson(await patchName(t, t.alice, 'X'))).json.code, 'WRITE_RATE_LIMITED');
+  const upd = await readJson(await t.call('/api/auth/update-user', { method: 'POST', headers: { ...t.as(t.alice), Origin: 'http://localhost:8787' }, body: { name: 'Bypassed' } }));
+  assert.equal(upd.status, 429);
+  assert.equal(upd.json.code, 'WRITE_RATE_LIMITED');
+  const u = await t.DB.prepare('SELECT name FROM "user" WHERE id = ?').bind(t.alice.id).first();
+  assert.equal(u.name, 'Alice', 'profile unchanged');
+  assert.equal(await budgetCount(t, t.alice), WRITE_BUDGET_PER_HOUR, 'no accounting drift');
+});
+
+test('update-user consumes one budget claim when allowed', async () => {
+  const t = await createTestEnv();
+  const upd = await readJson(await t.call('/api/auth/update-user', { method: 'POST', headers: { ...t.as(t.alice), Origin: 'http://localhost:8787' }, body: { name: 'Alice New' } }));
+  assert.equal(upd.status, 200, upd.text);
+  const u = await t.DB.prepare('SELECT name FROM "user" WHERE id = ?').bind(t.alice.id).first();
+  assert.equal(u.name, 'Alice New');
+  assert.equal(await budgetCount(t, t.alice), 1);
+});
+
+test('change-password is budgeted; new credential works', async () => {
+  const t = await createTestEnv();
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO account (id, accountId, providerId, userId, password, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)').bind('acc_alice', t.alice.id, 'credential', t.alice.id, await hashPassword('old-password-01'), now, now).run();
+  const ch = await readJson(await t.call('/api/auth/change-password', { method: 'POST', headers: { ...t.as(t.alice), Origin: 'http://localhost:8787' }, body: { currentPassword: 'old-password-01', newPassword: 'new-password-02' } }));
+  assert.equal(ch.status, 200, ch.text);
+  assert.equal(await budgetCount(t, t.alice), 1);
+  const login = await readJson(await t.call('/api/auth/sign-in/email', { method: 'POST', body: { email: 'alice@example.com', password: 'new-password-02' } }));
+  assert.equal(login.status, 200, 'new password authenticates');
+  await exhaustBudget(t, t.bob);
+  const denied = await readJson(await t.call('/api/auth/change-password', { method: 'POST', headers: { ...t.as(t.bob), Origin: 'http://localhost:8787' }, body: { currentPassword: 'x', newPassword: 'y-abcdefgh' } }));
+  assert.equal(denied.status, 429);
+  assert.equal(await budgetCount(t, t.bob), WRITE_BUDGET_PER_HOUR);
+});
+
+test('change-email, link-social, update-session, delete-user honor exhaustion', async () => {
+  const t = await createTestEnv();
+  await exhaustBudget(t, t.alice);
+  const as = { ...t.as(t.alice), Origin: 'http://localhost:8787' };
+  for (const [p, body] of [
+    ['/api/auth/change-email', { newEmail: 'new@example.com' }],
+    ['/api/auth/link-social', { provider: 'github', callbackURL: 'http://localhost:8787/app/' }],
+    ['/api/auth/update-session', { foo: 'bar' }],
+    ['/api/auth/delete-user', { callbackURL: 'http://localhost:8787/' }],
+  ]) {
+    const out = await readJson(await t.call(p, { method: 'POST', headers: as, body }));
+    assert.equal(out.status, 429, p + ': ' + out.text);
+    assert.equal(out.json.code, 'WRITE_RATE_LIMITED');
+  }
+  assert.equal(await budgetCount(t, t.alice), WRITE_BUDGET_PER_HOUR);
+  const u = await t.DB.prepare('SELECT name, email FROM "user" WHERE id = ?').bind(t.alice.id).first();
+  assert.deepEqual([u.name, u.email], ['Alice', 'alice@example.com'], 'no profile drift');
+  const link = await readJson(await t.call('/api/auth/link-social', { method: 'POST', headers: { ...t.as(t.bob), Origin: 'http://localhost:8787' }, body: { provider: 'github', callbackURL: 'http://localhost:8787/app/' } }));
+  assert.equal(link.status, 200, 'link initiation works when budgeted');
+  assert.ok(String(link.json.url || link.json.redirect).includes('github.com'), 'provider URL returned');
+});
+
+test('logout, revocation, unlink, and reads stay available at exhaustion', async () => {
+  const t = await createTestEnv();
+  await exhaustBudget(t, t.alice);
+  const as = { ...t.as(t.alice), Origin: 'http://localhost:8787' };
+  const session = await readJson(await t.call('/api/auth/get-session', { headers: as }));
+  assert.equal(session.status, 200, 'session reads unaffected');
+  const rev = await readJson(await t.call('/api/auth/revoke-other-sessions', { method: 'POST', headers: as, body: {} }));
+  assert.equal(rev.status, 200, 'revocation available: ' + rev.text);
+  const unl = await readJson(await t.call('/api/auth/unlink-account', { method: 'POST', headers: as, body: { providerId: 'github' } }));
+  assert.notEqual(unl.status, 429, 'unlink never budget-blocked: ' + unl.text);
+  assert.equal(await budgetCount(t, t.alice), WRITE_BUDGET_PER_HOUR, 'termination paths bill nothing');
+  const bye = await readJson(await t.call('/api/auth/sign-out', { method: 'POST', headers: as, body: {} }));
+  assert.equal(bye.status, 200, 'logout available: ' + bye.text);
+  const after = await readJson(await t.call('/api/auth/get-session', { headers: as }));
+  assert.ok(after.json === null || after.status === 401, 'session ended');
 });
 

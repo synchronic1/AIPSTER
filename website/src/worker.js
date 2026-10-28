@@ -51,6 +51,17 @@ const AUTH_BODY_MAX = 64 * 1024;
 const DEMO_ALLOWED_AUTH = new Set(['/api/auth/sign-in/username', '/api/auth/sign-in/email', '/api/auth/sign-out', '/api/auth/get-session']);
 // A disabled account may only end sessions, never read or mutate auth state.
 const DISABLED_ALLOWED_AUTH = new Set(['/api/auth/sign-out', '/api/auth/revoke-session', '/api/auth/revoke-sessions', '/api/auth/revoke-other-sessions']);
+// Auth mutation budget: these maintained Better Auth routes mutate
+// user/credential/account rows for the CALLER, so an authenticated caller
+// is charged the same hourly write budget as app mutations (the PR11
+// independent review caught update-user bypassing it: 200 + row writes
+// at a spent budget). Deliberately NOT billed: sign-out, session
+// revocation, and unlink-account (security-reducing; must work at
+// exhaustion — unlink cannot be spammed without re-linking, which IS
+// billed), plus reads, unauthenticated login/registration/recovery
+// flows, and library-managed session upkeep. Verified against
+// better-auth 1.7.14 route sources (dist/api/routes/*.mjs).
+const BUDGETED_AUTH_ROUTES = new Set(['/api/auth/update-user', '/api/auth/change-email', '/api/auth/change-password', '/api/auth/delete-user', '/api/auth/delete-user/callback', '/api/auth/update-session', '/api/auth/link-social']);
 
 function canonicalOrigin(env) {
   const raw = (env && env.BETTER_AUTH_URL) || '';
@@ -196,6 +207,13 @@ async function handleApi(request, env, url) {
       }
       if (!disabled && demo && !DEMO_ALLOWED_AUTH.has(path)) {
         return json(403, { error: 'This auth endpoint is not available to the demo account.', code: 'DEMO_RESTRICTED' });
+      }
+      // Authenticated profile/credential mutations consume the hourly
+      // write budget, exactly like app mutations. HEAD/OPTIONS never
+      // mutate in better-auth; every other method on these paths is
+      // billed (delete-user/callback completes over GET).
+      if (!disabled && method !== 'HEAD' && method !== 'OPTIONS' && BUDGETED_AUTH_ROUTES.has(path)) {
+        await checkWriteBudget(env.DB, found.user.id);
       }
     }
     return auth.handler(forwarded);
