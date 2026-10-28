@@ -7,6 +7,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
+import { checkWriteBudget, checkObjectCap } from './lib/quotas.js';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -84,7 +85,8 @@ async function actorFrom(request, env, auth) {
           if (row.expires_at && Date.parse(row.expires_at) < Date.now()) return { kind: 'expired' };
           const user = await first(env.DB, 'SELECT id, name, email, username, demo, disabled FROM "user" WHERE id = ?', row.owner_id);
           if (user && Number(user.disabled) !== 1) {
-            await run(env.DB, 'UPDATE key_verifiers SET last_used_at = ? WHERE id = ?', nowIso(), row.id);
+            await run(env.DB, 'UPDATE key_verifiers SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)',
+              nowIso(), row.id, new Date(Date.now() - 3600 * 1000).toISOString());
             return { kind: 'key', user, key: row };
           }
         }
@@ -139,7 +141,7 @@ async function handleApi(request, env, url) {
       try {
         const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
         const names = new Set(rows.map((r) => r.name));
-        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit']
+        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit', 'write_budget']
           .every((n) => names.has(n));
         // Migration contract: required columns must exist, not just tables.
         // LIMIT 0 probes fail when any column is missing (e.g. 0003/0004
@@ -245,6 +247,8 @@ async function handleApi(request, env, url) {
     if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
+    await checkWriteBudget(db, me());
+    await checkObjectCap(db, 'resource', me());
     const id = rid('r_');
     const now = nowIso();
     await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
@@ -307,6 +311,8 @@ async function handleApi(request, env, url) {
     if (!Number.isSafeInteger(maxTokens) || maxTokens < 100 || maxTokens > 10000000) return json(400, { error: 'maxTokens must be 100..10000000.', code: 'BAD_QUOTA' });
     const existing = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', resource.id, grantee.id);
     if (existing) return json(409, { error: 'An active grant already exists for this user and resource.', code: 'GRANT_EXISTS' });
+    await checkWriteBudget(db, me());
+    await checkObjectCap(db, 'grant', me());
     const id = rid('g_');
     await run(db, 'INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL)',
       id, resource.id, me(), grantee.id, maxJobs, maxTokens, nowIso());
@@ -319,6 +325,7 @@ async function handleApi(request, env, url) {
       const d = needSession() || needCsrf(); if (d) return deny(d);
       const g = await first(db, 'SELECT * FROM grants WHERE id = ? AND owner_id = ?', m[1], me());
       if (!g) return json(404, { error: 'Grant not found or not yours.', code: 'NOT_FOUND' });
+      await checkWriteBudget(db, me());
       await run(db, 'UPDATE grants SET revoked_at = ? WHERE id = ?', nowIso(), g.id);
       await audit(db, me(), 'grant.revoke', g.id);
       return json(200, { ok: true });
@@ -345,6 +352,8 @@ async function handleApi(request, env, url) {
     }
     const metadata = isDemo() ? 'sandbox: demo-only credential' : (body.metadata !== undefined ? String(body.metadata).slice(0, 500) : '');
     const keyPrefix = isDemo() ? DEMO_KEY_PREFIX : KEY_PREFIX;
+    await checkWriteBudget(db, me());
+    await checkObjectCap(db, 'key', me());
     const { id, secret, short } = mintKey(keyPrefix);
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -360,6 +369,7 @@ async function handleApi(request, env, url) {
       const d = needSession() || needCsrf(); if (d) return deny(d);
       const k = await first(db, 'SELECT id FROM key_verifiers WHERE id = ? AND owner_id = ?', m[1], me());
       if (!k) return json(404, { error: 'Key not found or not yours.', code: 'NOT_FOUND' });
+      await checkWriteBudget(db, me());
       await run(db, 'UPDATE key_verifiers SET revoked_at = ? WHERE id = ?', nowIso(), m[1]);
       await audit(db, me(), 'key.revoke', m[1]);
       return json(200, { ok: true });
@@ -413,6 +423,7 @@ async function handleApi(request, env, url) {
     const d = needSession() || needCsrf(); if (d) return deny(d);
     const body = await readJson(request);
     if (!isName(body.displayName)) return json(400, { error: 'displayName is required (1..80 chars).', code: 'BAD_NAME' });
+    await checkWriteBudget(db, me());
     await run(db, 'UPDATE "user" SET name = ?, updatedAt = ? WHERE id = ?', body.displayName.trim(), nowIso(), me());
     await audit(db, me(), 'settings.update', 'displayName');
     return json(200, { ok: true, displayName: body.displayName.trim() });
