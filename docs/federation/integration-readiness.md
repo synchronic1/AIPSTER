@@ -85,8 +85,8 @@ ceiling, not an independent node/object limit and not a global anti-Sybil limit.
 Already-existing pre-admission records are preserved, not silently backfilled or
 deleted. Other application endpoints keep their existing caps and budget behavior.
 
-At the retention ceiling, **new mutations, including new restrictive operations,
-fail closed**; already-admitted retries remain available. There is no automatic
+At the retention ceiling, **new expansive mutations fail closed**; already-admitted
+retries and bounded restrictive admissions remain available (see 0012 below). There is no automatic
 quota reset, pruning or evidence-deleting recovery endpoint. An explicit operator
 retention/archive policy is required before changing this ceiling or enabling
 long-running production federation. Hourly limits count admitted mutations,
