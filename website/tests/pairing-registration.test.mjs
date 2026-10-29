@@ -5,6 +5,20 @@ const register=(t,key='same-registration',name='synthetic')=>t.call('/api/invent
 const snapshot=async t=>({resources:(await t.DB.prepare('SELECT * FROM resources ORDER BY id').all()).results,mappings:(await t.DB.prepare('SELECT * FROM idempotency_keys ORDER BY key').all()).results,budget:(await t.DB.prepare('SELECT * FROM write_budget ORDER BY user_id,window').all()).results,audits:(await t.DB.prepare("SELECT * FROM audit WHERE action='resource.register' ORDER BY id").all()).results});
 for(const real of [false,true]){
  const engine=real?'local D1':'sqlite';
+ test(`${engine}: stalled registration batch replays the later winner after the legacy lease window`,async c=>{
+  const t=await pairingEnv(c,real),db=t.DB;c.mock.timers.enable({apis:['Date'],now:Date.now()});
+  let entered,release;const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);c.after(()=>release());
+  t.env.DB=hookDb(db,{beforeBatch:async stmts=>{if(stmts.some(s=>/INSERT OR IGNORE INTO idempotency_keys/.test(s.sql))){entered();await gate;}}});
+  const original=register(t,'delayed-registration','original');await ready;t.env.DB=db;
+  assert.equal((await db.prepare('SELECT COUNT(*) n FROM idempotency_keys').first()).n,0,'new atomic claims publish no unbound reservation');
+  c.mock.timers.tick(10*60*1000);
+  const winner=await register(t,'delayed-registration','winner');assert.equal(winner.status,201,winner.text);
+  const committed=await snapshot(t);release();const late=await original;
+  assert.equal(late.status,200,late.text);assert.equal(late.json.id,winner.json.id);assert.equal(late.json.name,'winner');
+  assert.deepEqual(await snapshot(t),committed,'late original cannot duplicate, rebind, audit or charge');
+  assert.equal((await register(t,'delayed-registration','original')).json.id,winner.json.id);
+  assert.deepEqual(await snapshot(t),committed);
+ });
  test(`${engine}: legacy NULL registration claims keep their grace without charging rejected retries`,async c=>{
   const t=await pairingEnv(c,real);c.mock.timers.enable({apis:['Date'],now:Date.now()});
   await t.DB.prepare('INSERT INTO idempotency_keys(owner_id,key,resource_id,created_at) VALUES(?,?,NULL,?)').bind(t.alice.id,'legacy-pending',new Date().toISOString()).run();
