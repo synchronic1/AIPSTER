@@ -9,6 +9,7 @@ import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KE
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
 import { handleFabric } from './fabric/router.mjs';
 import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from './lib/quotas.js';
+import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -304,6 +305,48 @@ async function handleApi(request, env, url) {
       }
       return json(200, cardFor(r, await ownerName(db, r.owner_id)));
     }
+  }
+
+  // ---- status (read-only readiness strip; no telemetry writer exists) ----
+  if (path === '/api/status' && method === 'GET') {
+    const d = needAuthz('read'); if (d) return deny(d);
+    // Owner-scoped minimal columns only: free-text cpu/gpu/origin/limits and
+    // credits stay out of this payload (they can carry private addresses).
+    // The 50-item cap applies to the listed page only; the summary counts
+    // come from a separate aggregate over ALL owned rows, so summary.total
+    // always equals the Overview inventory total. The aggregate mirrors
+    // resourceLiveness exactly for ISO heartbeats: online=1 with a missing
+    // or unparseable heartbeat is unknown; otherwise fresh (>= cutoff) is
+    // online and older is stale; online != 1 is offline.
+    const nowMs = Date.now();
+    const cutoffIso = new Date(nowMs - STALE_AFTER_MS).toISOString();
+    const rows = await all(db,
+      'SELECT id, name, kind, online, heartbeat_at FROM resources WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+      me(), MAX_STATUS_ITEMS);
+    const agg = await first(db,
+      `SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN online = 1 THEN 0 ELSE 1 END), 0) AS offline,
+        COALESCE(SUM(CASE WHEN online = 1 AND (heartbeat_at IS NULL OR datetime(heartbeat_at) IS NULL) THEN 1 ELSE 0 END), 0) AS unknown,
+        COALESCE(SUM(CASE WHEN online = 1 AND datetime(heartbeat_at) IS NOT NULL AND heartbeat_at >= ? THEN 1 ELSE 0 END), 0) AS online,
+        COALESCE(SUM(CASE WHEN online = 1 AND datetime(heartbeat_at) IS NOT NULL AND heartbeat_at < ? THEN 1 ELSE 0 END), 0) AS stale
+        FROM resources WHERE owner_id = ?`,
+      cutoffIso, cutoffIso, me());
+    const shared = await first(db,
+      'SELECT COUNT(*) AS n FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.grantee_id = ? AND g.revoked_at IS NULL AND o.demo = r.demo',
+      me());
+    return json(200, buildStatus({
+      rows,
+      summary: {
+        online: Number(agg ? agg.online : 0),
+        stale: Number(agg ? agg.stale : 0),
+        offline: Number(agg ? agg.offline : 0),
+        unknown: Number(agg ? agg.unknown : 0),
+      },
+      total: Number(agg ? agg.total : 0),
+      sharedWithMe: Number(shared ? shared.n : 0),
+      demo: isDemo(),
+      nowMs,
+    }));
   }
 
   // ---- sharing ----
