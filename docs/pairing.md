@@ -129,3 +129,17 @@ denial, disabled-owner denial, name suffixing, idempotency replay/new/bad,
 replay-after-delete, DELETE teardown (keys `KEY_REVOKED`, grants/jobs gone,
 audit, second-delete 404), DELETE auth matrix, key-cap claim failure.
 Disposable local fixtures only; no production credentials.
+
+Worker slice (muse/onboarding-w3-worker): local-worker/test_pairing.py
+(17 unit tests, fake in-thread API; 2 POSIX-permission tests skip honestly
+on Windows) and local-worker/test_pairing_e2e.py (6 cross-language
+scenarios, real CLI against real worker.js over loopback): two-user
+isolation, repeat startup + quota, reclaim + rotation, expired/replayed
+codes, revocation, delete, disabled owner, stale strip.
+
+Dashboard slice (muse/onboarding-w4-dashboard):
+website/tests/ui-connect-card.test.mjs (18 tests, exact checked-in
+client): pair mint/reveal/dismiss/re-mint with no clipboard write and no
+new links, cap-failure retry, demo unavailability, stepper honesty,
+resource link states (needs-link/linked/reachable/stale), manual form
+under Advanced.

@@ -12,7 +12,8 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { parse } from 'parse5';
-import { createTestEnv } from './d1-shim.mjs';
+import { hashPassword } from 'better-auth/crypto';
+import { createTestEnv, readJson } from './d1-shim.mjs';
 import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -35,7 +36,7 @@ const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
 const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
 const SECRET_SHAPED = /aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i;
 
-async function makeUi({ anonymous = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent' } = {}) {
+async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent' } = {}) {
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
   const t = await createTestEnv();
   const elements = new Map();
@@ -55,6 +56,18 @@ async function makeUi({ anonymous = false, platform, touchPoints = 0, userAgent 
   names.forEach((name) => { el('tab-' + name).hidden = name !== 'overview'; });
   for (const id of ['view-app', 'sessionbar', 'connect-card']) el(id).hidden = true;
   let cookie = anonymous ? '' : t.as(t.alice).Cookie;
+  if (asDemo && !anonymous) {
+    const now = new Date().toISOString();
+    await t.DB.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, username, displayUsername, demo, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind('u_demo_ui', 'Demo', 'demo-ui@example.com', 0, null, 'demoui', 'demoui', 1, now, now).run();
+    const hash = await hashPassword('demo-ui-password-01');
+    await t.DB.prepare('INSERT INTO account (id, accountId, providerId, userId, password, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .bind('acc_demo_ui', 'u_demo_ui', 'credential', 'u_demo_ui', hash, now, now).run();
+    const res = await t.call('/api/auth/sign-in/username', { method: 'POST', body: { username: 'demoui', password: 'demo-ui-password-01' } });
+    const out = await readJson(res);
+    assert.equal(out.status, 200, out.text);
+    cookie = res.headers.getSetCookie().find((c) => c.startsWith('better-auth.session_token=')).split(';')[0];
+  }
   const calls = [];
   const fetchImpl = async (fetchPath, opts = {}) => {
     calls.push(`${opts.method ?? 'GET'} ${fetchPath}`);
@@ -92,8 +105,18 @@ async function makeUi({ anonymous = false, platform, touchPoints = 0, userAgent 
   const card = () => el('connect-card');
   const press = async (action) => { card().onclick({ target: { dataset: { action } } }); await flush(); };
   const chooseOs = async (value) => { card().onchange({ target: { dataset: { action: 'os' }, value } }); await flush(); };
+  // Bounded settle: async mint work (WebCrypto + DB + fenced api) can outrun
+  // the fixed flush, so pair tests wait for a terminal phase instead.
+  const settle = async (label) => {
+    for (let i = 0; i < 200; i++) {
+      const text = textOf(el('connect-card').innerHTML);
+      if (text.includes('Code minted') || text.includes('Pairing failed')) return text;
+      await new Promise(setImmediate);
+    }
+    assert.fail('pair never settled: ' + label);
+  };
   return {
-    el, calls, logs, clickTab, flush, press, chooseOs, captured,
+    el, calls, logs, clickTab, flush, press, chooseOs, captured, db: t.DB, settle,
     resolveDeferred: async () => { deferred(); deferred = null; await flush(); },
     setClipboard: (mode) => { context.navigator.clipboard = clipboards[mode]; },
     logout: async () => { await el('logout').listeners.click(); await flush(); }
@@ -128,7 +151,7 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const nodes = nodesOf(card.innerHTML);
   const buttons = nodes.filter((n) => n.tagName === 'button');
   const actioned = buttons.filter((b) => attr(b, 'data-action'));
-  assert.deepEqual(actioned.map((b) => attr(b, 'data-action')), ['copy-agent']);
+  assert.deepEqual(actioned.map((b) => attr(b, 'data-action')), ['copy-agent', 'pair'], 'pairing is a browser action, not an install action');
   const copyBtn = actioned[0];
   assert.equal(attr(copyBtn, 'type'), 'button');
   assert.equal(nodeText(copyBtn), 'Set up with my agent');
@@ -182,7 +205,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   assert.ok(textOf(macHtml).includes('Detected: macOS. Change it if that is wrong.'));
   assert.ok(textOf(macHtml).includes('Installer for macOS: not available'));
   const macActions = nodesOf(macHtml).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean);
-  assert.deepEqual(macActions, ['platforms'], 'no copy action on an unqualified platform');
+  assert.deepEqual(macActions, ['platforms', 'pair'], 'no copy action on an unqualified platform; pairing stays platform-independent');
   await mac.press('platforms');
   const platText = textOf(mac.el('connect-card').innerHTML);
   assert.ok(platText.includes('Supported platforms:'), 'platforms notice');
@@ -198,7 +221,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   assert.ok(linuxPre.includes('.venv/bin/python test_installation.py'), 'Advanced follows the picked OS');
   assert.ok(linuxPre.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
   await mac.chooseOs('windows');
-  assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['copy-agent'], 'agent setup returns on the qualified platform');
+  assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['copy-agent', 'pair'], 'agent setup returns on the qualified platform');
 
   // Detection unavailable: the tested platform is preselected and labelled.
   const unknown = await makeUi({ clipboard: 'ok' });
@@ -227,7 +250,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
     assert.deepEqual(picked.map((o) => attr(o, 'value')), [''], 'placeholder preselected so any pick fires');
     assert.ok(textOf(mobHtml).includes('Pick a target computer above'), 'primary gated too');
     assert.ok(textOf(mobHtml).includes('Pick a target computer to check installer availability.'));
-    assert.deepEqual(mobNodes.filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [], 'no install action before an explicit pick');
+    assert.deepEqual(mobNodes.filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['pair'], 'pairing alone is available before a pick: it mints in the browser, installs nothing');
     await mob.press('copy-agent');
     assert.deepEqual(mob.captured, [], 'fabricated copy on an unpicked phone writes nothing');
   }
@@ -267,8 +290,10 @@ test('agent setup copies pinned, secret-free instructions and confirms once', as
     'the root LICENSE only', 'required by local-worker/LICENSING.md', 'install.py', 'test_installation.py',
     'DENDRITE_API_TOKEN', 'worker-LOCAL token', 'NOT an AIPSTER key',
     'these steps cover x64 only', 'no qualified instructions exist',
-    'does NOT share this computer', 'does NOT enable inference', 'does NOT contact AIPSTER',
-    'no pairing code or worker credential yet', 'A running worker is NOT proof of inference readiness',
+    'does NOT share this computer', 'does NOT enable inference',
+    'does not contact AIPSTER until I pair it', 'holds no AIPSTER credential',
+    'Pair this computer', 'type the one-time code', 'registers the worker automatically',
+    'a heartbeat never means', 'A running worker is NOT proof of inference readiness',
     'delete local-worker/.venv', 'There is no automatic update']) {
     assert.ok(flat.includes(phrase), `missing: ${phrase}`);
   }
@@ -343,8 +368,9 @@ test('progress never claims an unverified installed, paired or connected state',
   assert.ok(nodeText(current[0]).startsWith('Setup needed'), 'Setup needed is the current stage');
   const progressText = textOf(progressHtml);
   assert.ok(progressText.includes('Blocked: no verified installer is packaged yet.'));
-  assert.ok(progressText.includes('Blocked:') && progressText.includes('heartbeat intake') && progressText.includes('not merged or deployed'));
-  assert.ok(progressText.includes('Pairing is a separate contract and is not implemented.'));
+  assert.ok(progressText.includes('Available: mint a one-time code below'), 'pairing is offered, not blocked');
+  assert.ok(progressText.includes('Heartbeats start after pairing.'));
+  assert.ok(!progressText.includes('not merged or deployed') && !progressText.includes('not implemented'), 'no stale blocked-pairing copy');
   assert.ok(!/pairing support/i.test(progressText), 'heartbeat intake is never called pairing support');
   assert.ok(progressText.includes('Needs verified worker evidence. A download or a running worker is not proof.'));
   const rest = textOf(html.replace(progressHtml, ''));
@@ -454,8 +480,9 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
   for (const phrase of ['refuses to start without DENDRITE_API_TOKEN', 'worker-local token',
     'It is not an AIPSTER API key or heartbeat key', 'never paste it into AIPSTER, a URL or a shared config',
     'security-fixed revision', 'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified',
-    'untested', 'separate prerequisites', 'There is no pairing code or worker credential yet',
-    'Disconnect and uninstall', 'Troubleshooting', 'not connected', 'worker and its root LICENSE only']) {
+    'untested', 'separate prerequisites', 'Mint a one-time pairing code above',
+    'not linked until paired', 'Advanced: manual resource registration',
+    'Disconnect and uninstall', 'Troubleshooting', 'worker and its root LICENSE only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   const commands = nodesOf(html.slice(html.indexOf('<pre'), html.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
@@ -498,4 +525,92 @@ test('card placeholder sits in My Compute and the public policy still passes', a
   assert.match(css, /button\.btn\[disabled\] \{[^}]*cursor:not-allowed/, 'disabled installer action is visibly inert');
   assert.match(css, /\.connect \.progress/, 'progress stepper is styled');
   await checkPublic(PUBLIC);
+});
+
+test('pairing mints a typed one-time code with no clipboard or new links', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  const before = ui.calls.length;
+  await ui.press('pair');
+  const text = await ui.settle('initial mint');
+  const html = ui.el('connect-card').innerHTML;
+  assert.ok(text.includes('Code minted'), 'mint confirmation');
+  assert.ok(text.includes('Single use'), 'one-time note');
+  assert.ok(text.includes('Expires '), 'expiry shown');
+  const code = nodesOf(html).filter((n) => n.tagName === 'code' && (attr(n, 'class') || '').includes('pair-code'));
+  assert.equal(code.length, 1, 'one displayed code');
+  assert.match(nodeText(code[0]), /^pair-[0-9a-f]{8}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
+  assert.deepEqual(ui.captured, [], 'a bearer code is typed, never clipboarded');
+  assert.deepEqual(cardLinks(html), EXPECTED_LINKS, 'no new destinations');
+  assert.ok(!SECRET_SHAPED.test(html), 'shown code matches no credential shape');
+  assert.deepEqual(ui.calls.slice(before), ['POST /api/pairing/codes'], 'mint is the only added call');
+  // Done clears the code; minting again replaces it.
+  const first = nodeText(code[0]);
+  await ui.press('pair-done');
+  assert.ok(!ui.el('connect-card').innerHTML.includes(first), 'done clears the code');
+  await ui.press('pair-again');
+  const again = await ui.settle('re-mint');
+  assert.ok(again.includes('Code minted'), 're-mint works');
+  assert.ok(!ui.el('connect-card').innerHTML.includes(first), 'old code replaced');
+  // Tab switch clears the reveal (same identity-scoped hygiene as secrets).
+  await ui.clickTab('compute');
+  assert.ok(!ui.el('connect-card').innerHTML.includes('Code minted'), 'revisit resets the pair view');
+});
+
+test('pairing failures explain and retry', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  // Exhaust the 5-code cap through the card itself, then mint once more.
+  for (let i = 0; i < 5; i++) { await ui.press('pair-again'); await ui.settle('cap fill ' + i); }
+  const callsBefore = ui.calls.length;
+  await ui.press('pair');
+  const text = await ui.settle('cap overflow');
+  assert.ok(text.includes('Pairing failed'), 'cap error surfaces');
+  assert.ok(text.includes('Try again'), 'retry offered');
+  assert.deepEqual(ui.calls.slice(callsBefore), ['POST /api/pairing/codes'], 'failed mint still attempted');
+});
+
+test('demo accounts see pairing as unavailable, never a mint', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', asDemo: true });
+  await ui.clickTab('compute');
+  const html = ui.el('connect-card').innerHTML;
+  assert.ok(textOf(html).includes('Pairing unavailable for demo'), 'honest demo state');
+  const before = ui.calls.length;
+  await ui.press('pair');
+  assert.deepEqual(ui.calls.slice(before), [], 'disabled demo pair mints nothing');
+});
+
+test('resource cards show derivable link states, never installed/ready', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  const now = new Date().toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_manual', 'u_alice', 'manual-box', 'local', 'declared', 'c', 'g', 1, 0, 0, 0, null, now).run();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_linked', 'u_alice', 'n_uilink', 'linked-box', 'local', 'paired', 'c', 'g', 1, 1, 0, 0, null, now).run();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_live', 'u_alice', 'n_uilive', 'live-box', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, now, now).run();
+  const staleAt = new Date(Date.now() - 3600 * 1000).toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_stale', 'u_alice', 'n_uistale', 'stale-box', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, staleAt, now).run();
+  await ui.clickTab('compute');
+  const text = textOf(ui.el('compute-list').innerHTML);
+  assert.ok(text.includes('needs-link'), 'manual row needs a link');
+  assert.ok(text.includes('linked'), 'paired row awaits its beat');
+  assert.ok(text.includes('reachable'), 'fresh beat reads reachable');
+  assert.ok(text.includes('stale'), 'old beat reads stale');
+  assert.ok(!/\binstalled\b/i.test(text), 'the browser never claims an install state');
+});
+
+test('manual registration lives under Advanced with all fields intact', async () => {
+  const html = await readFile(path.join(PUBLIC, 'app', 'index.html'), 'utf8');
+  const compute = html.slice(html.indexOf('<section id="tab-compute"'), html.indexOf('<section id="tab-shared"'));
+  const det = compute.indexOf('<details');
+  assert.ok(det !== -1, 'manual form wrapped in details');
+  assert.ok(compute.includes('<summary>Advanced: manual resource registration</summary>'));
+  const formAt = compute.indexOf('<form id="resource-form"');
+  assert.ok(formAt > det, 'form nested inside the details');
+  for (const id of ['res-name', 'res-kind', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'resource-error']) {
+    assert.ok(compute.includes(`id="${id}"`), `field kept: ${id}`);
+  }
 });
