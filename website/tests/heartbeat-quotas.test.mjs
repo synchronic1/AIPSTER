@@ -107,7 +107,7 @@ test('REAL D1: 10 concurrent heartbeats at cap-1 produce exactly one accepted', 
   assert.equal(row.heartbeat_at, winner.json.heartbeatAt);
   const owner = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, heartbeatWindow()).first();
   const global = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('heartbeat:global', heartbeatWindow()).first();
-  assert.equal(owner.count, 1, 'losers refunded their owner claims');
+  assert.ok(owner.count >= 1 && owner.count <= 10, 'owner claims are never refunded: one per attempt that passed the global probe');
   assert.equal(global.count, 1, 'global bucket holds exactly the accepted heartbeat');
 });
 
@@ -131,4 +131,55 @@ test('heartbeat budgets stay separate from the 120/hour write budget', async () 
   assert.equal(writes.count, 3, 'write bucket holds register+mint+register only (no heartbeat draws)');
   const hb = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, heartbeatWindow()).first();
   assert.equal(hb.count, 1, 'heartbeat bucket holds the accepted heartbeat only');
+});
+
+test('spent global ceiling rejects read-only: no owner claim/refund write loop', async () => {
+  // Codex PR #20 r4407568064 / r4407276171-follow-up: with the global
+  // bucket spent, each rejected heartbeat used to claim and then refund the
+  // owner bucket (2 writes, net zero), so the owner never ran out and the
+  // 429s were an unbounded write loop. A spent global bucket must now
+  // reject before any budget write.
+  const t = await createTestEnv({ HEARTBEAT_OWNER_PER_HOUR: '5', HEARTBEAT_GLOBAL_PER_HOUR: '1' });
+  const a = await register(t, t.alice, 'alice-box');
+  const b = await register(t, t.bob, 'bob-box');
+  const ka = await mintHeartbeat(t, t.alice, a.id);
+  const kb = await mintHeartbeat(t, t.bob, b.id);
+  assert.equal((await readJson(await beat(t, ka.secret, a.id))).status, 200);
+  for (let i = 0; i < 25; i++) {
+    const out = await readJson(await beat(t, kb.secret, b.id));
+    assert.equal(out.status, 429);
+    assert.equal(out.json.code, 'HEARTBEAT_GLOBAL_QUOTA');
+  }
+  const bobBucket = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.bob.id, heartbeatWindow()).first();
+  assert.equal(bobBucket, null, 'no owner bucket row was created or touched for read-only rejections');
+  const global = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('heartbeat:global', heartbeatWindow()).first();
+  assert.equal(global.count, 1);
+});
+
+test('lost resource races count as attempts: claims are never refunded', async () => {
+  // Without refunds an owner's own bucket bounds every write their keys can
+  // cause, including requests that lose the 25s window race.
+  const t = await createTestEnv({ HEARTBEAT_OWNER_PER_HOUR: '100000', HEARTBEAT_GLOBAL_PER_HOUR: '100000' });
+  const r = await register(t, t.alice, 'box');
+  const key = await mintHeartbeat(t, t.alice, r.id);
+  // Simulate a racer that passed the read-only window probe: open the
+  // window, then let a concurrent winner land before our UPDATE by
+  // stamping heartbeat_at between probe and claim via a patched prepare.
+  const realPrepare = t.DB.prepare.bind(t.DB);
+  let armed = true;
+  t.DB.prepare = (sql) => {
+    if (armed && /^\s*UPDATE resources SET heartbeat_at/.test(sql)) {
+      armed = false;
+      t.sqlite.prepare('UPDATE resources SET heartbeat_at = ? WHERE id = ?').run(new Date().toISOString(), r.id);
+    }
+    return realPrepare(sql);
+  };
+  const lost = await readJson(await beat(t, key.secret, r.id));
+  t.DB.prepare = realPrepare;
+  assert.equal(lost.status, 429);
+  assert.equal(lost.json.code, 'HEARTBEAT_TOO_SOON');
+  const owner = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, heartbeatWindow()).first();
+  const global = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('heartbeat:global', heartbeatWindow()).first();
+  assert.equal(owner.count, 1, 'the lost attempt stays charged to its owner');
+  assert.equal(global.count, 1, 'the lost attempt stays charged globally');
 });

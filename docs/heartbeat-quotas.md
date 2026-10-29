@@ -17,8 +17,12 @@ hourly ceiling, both enforced atomically.
 | Per owner | `HEARTBEAT_OWNER_PER_HOUR` | `500`/hour (**PLACEHOLDER**) | UTC hour bucket |
 | Deployment-wide | `HEARTBEAT_GLOBAL_PER_HOUR` | `1000`/hour (**PLACEHOLDER**) | UTC hour bucket |
 
-- Both limits count **accepted heartbeats only**. Rejected requests are
-  read-only except for the narrow cases listed under "Write cost".
+- Both limits count **claimed attempts**: every request that passes the
+  read-only window and global probes is charged, and claims are **never
+  refunded**. An earlier revision refunded claims for rejected requests,
+  which let a spent global bucket or a lost race write rows forever without
+  ever exhausting a bucket (Codex PR #20 r4407568064). Without refunds every
+  row an owner's keys can cause is bounded by that owner's bucket.
 - Constants live in `website/src/lib/quotas.js` with a `PLACEHOLDER` suffix;
   env vars (positive integers, anything else falls back to the constant) let
   the rollout owner tune without a code change.
@@ -37,17 +41,19 @@ Order inside `POST /api/resources/:id/heartbeat` (`website/src/worker.js`):
 2. Fast path: a closed 25s window returns `429 HEARTBEAT_TOO_SOON` before any
    budget write. Optimization only — the conditional `UPDATE` still enforces
    the window atomically.
-3. Claim the per-owner budget (one conditional `UPDATE`, exactly like
+3. Read-only global probe: if the deployment bucket is already spent,
+   return `429 HEARTBEAT_GLOBAL_QUOTA` with `Retry-After` before any
+   budget write.
+4. Claim the per-owner budget (one conditional `UPDATE`, exactly like
    `checkWriteBudget`). On failure: `429 HEARTBEAT_OWNER_QUOTA` with
    `Retry-After` (seconds until the next UTC hour) and a matching
    `retryAfterSec` body field. The resource row is untouched.
-4. Claim the global budget the same way. On failure the owner claim is
-   refunded and the response is `429 HEARTBEAT_GLOBAL_QUOTA` with
-   `Retry-After`.
-5. Run the existing single conditional resource `UPDATE`. On success: `200`.
-   On a lost race both claims are refunded (each refund pairs with its own
-   prior claim, so counts never go negative and accepted heartbeats never
-   exceed the caps), then the existing read-only reason mapping applies.
+5. Claim the global budget the same way. On failure (a race lost after the
+   probe) the owner claim stays spent and the response is
+   `429 HEARTBEAT_GLOBAL_QUOTA` with `Retry-After`.
+6. Run the existing single conditional resource `UPDATE`. On success: `200`.
+   On a lost race both claims stay spent, then the existing read-only reason
+   mapping applies.
 
 Concurrent racers serialize in SQLite/D1: at cap−1, ten concurrent
 heartbeats produce exactly one accepted heartbeat (covered on real local D1
@@ -82,8 +88,9 @@ and included as ~1k rows/day upper bound in the worst cases below.
 | Auth / binding / body reject (before claims) | 0 from intake; at most the coarse `last_used_at` refresh (≤1/key/hour) |
 | 25s window closed, sequential (pre-probe `429`) | 0 from intake (same `last_used_at` caveat) |
 | Per-owner cap spent (`HEARTBEAT_OWNER_QUOTA`) | 0 — the failed conditional `UPDATE` matches zero rows (see assumption A) |
-| Global ceiling spent (`HEARTBEAT_GLOBAL_QUOTA`) | 2 — owner claim + its refund |
-| Concurrent resource-race loser (refunded, then 404/401/`HEARTBEAT_TOO_SOON`) | 4 — two claims + two refunds |
+| Global ceiling already spent (`HEARTBEAT_GLOBAL_QUOTA`, read-only probe) | 0 |
+| Global claim lost to a concurrent racer (`HEARTBEAT_GLOBAL_QUOTA`) | 1 — the owner claim, which stays charged |
+| Concurrent resource-race loser (then 404/401/`HEARTBEAT_TOO_SOON`) | 2 — both claims, which stay charged |
 
 Counting assumptions (no explicit official sentence found for either;
 checked pricing, limits, billing, return-object, metrics-analytics, FAQ,
@@ -96,7 +103,7 @@ release-note, query and index docs):
 
 ### Per owner per day at the placeholder defaults
 
-500/hour × 24 h = 12,000 accepted heartbeats/day max per owner → × 3 rows =
+500/hour × 24 h = 12,000 charged attempts/day max per owner → × 3 rows =
 **≈36,000 rows/day per maxed-out owner** (+ ~300 rows hourly overhead).
 The per-resource 25s window binds small fleets further: one resource can
 accept at most 144/hour (3,456/day) however high the budgets are.
@@ -104,8 +111,10 @@ accept at most 144/hour (3,456/day) however high the budgets are.
 ### Worst case across N accounts
 
 The global ceiling binds before any per-owner sum can: 1,000/hour × 24 h =
-24,000 accepted heartbeats/day deployment-wide → × 3 rows =
-**≈72,000 rows/day (+ ~1k overhead), independent of N**.
+24,000 charged global claims/day deployment-wide → × 3 rows =
+**≈72,000 rows/day (+ ~1k overhead), independent of N**. Owner claims
+that lose the global race add at most one row each and only while the
+global bucket is filling; once it is spent every request is read-only.
 (Before this change the total was unbounded in N: only the 25s/resource
 window and the 100-resources/owner cap applied.)
 

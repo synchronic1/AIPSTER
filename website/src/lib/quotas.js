@@ -22,7 +22,9 @@ export function budgetWindow(now = new Date()) {
 }
 
 // ---- heartbeat intake budgets (docs/heartbeat-quotas.md) ----
-// Per-owner AND deployment-wide hourly ceilings on ACCEPTED heartbeats. Both
+// Per-owner AND deployment-wide hourly ceilings on heartbeat ATTEMPTS that
+// pass the read-only window probe (claims are never refunded, so every
+// write an owner's keys can cause stays inside that owner's bucket). Both
 // are enforced with the same atomic-claim pattern as the write budget (one
 // conditional UPDATE, losers mutate nothing), but in SEPARATE buckets: the
 // window key prefix keeps heartbeat counters apart from the 120/hour
@@ -76,12 +78,11 @@ export async function claimHeartbeatBudget(db, id, window, limit) {
   return Number(claim.meta.changes) === 1;
 }
 
-// Refund a claim this request no longer needs (the resource UPDATE lost its
-// race after the budgets were claimed). Each refund pairs with its own prior
-// claim, so counts never go negative and accepted heartbeats never exceed
-// the caps.
-export async function refundHeartbeatBudget(db, id, window) {
-  await run(db, 'UPDATE write_budget SET count = count - 1 WHERE user_id = ? AND window = ?', id, window);
+// Read-only test for an already spent bucket. Used to reject before any
+// other budget write; the conditional claim still decides races.
+export async function heartbeatBudgetSpent(db, id, window, limit) {
+  const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, window);
+  return !!row && Number(row.count) >= limit;
 }
 
 export async function checkWriteBudget(db, userId) {
