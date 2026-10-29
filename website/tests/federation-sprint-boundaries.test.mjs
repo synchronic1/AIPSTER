@@ -119,6 +119,9 @@ for (const real of [false, true]) {
     });
 
     test(`${engine}: HTTP ${action} recovers lost batch and finalization at exhaustion`, async c => {
+      // Keep the seeded UTC quota window fixed across asynchronous D1 faults/retries.
+      // Otherwise an hour rollover changes the scenario and its final bucket lookup.
+      c.mock.timers.enable({ apis: ['Date'], now: Date.now() });
       const t = await revisionFixture(real); c.after(t.close);
       const grant = ['pause', 'revoke'].includes(action), id = grant ? t.grant : t.conn;
       const table = grant ? 'fabric_grants' : 'connections', event = `fabric.${grant ? 'grant' : 'connection'}.${action}`;
