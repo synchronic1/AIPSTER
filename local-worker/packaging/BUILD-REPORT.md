@@ -1,6 +1,26 @@
 <!-- Built with Meta Muse; isolated Codex review and repair evidence below. -->
 # Windows worker build report
 
+## Takeover rebuilt artifact (local, unsigned, unpublished)
+
+Uninstall repair: running-process gate, payload-first removal order, exact
+removal verification, registration preserved on incomplete removal.
+
+| Field | Value |
+|---|---|
+| Artifact | `AIPSTER-Worker-0.1.0-win64-setup.exe` |
+| Size | 13,091,282 bytes |
+| SHA-256 | `08cc1ca4eac56f801e0c21c3f6182cdb6d41dc7169ce0a0dfb9d11aba5fcf755` |
+| Built from | `6f0c9f646adb6aee44bd8594da145b5b3a1a1d7b`, clean tree |
+| Payload | 98 files; complete hashes in generated `dist/manifest.json` |
+| Native uninstall fixtures | running-process abort (exit 2, zero deletions, registration preserved) and locked-payload abort (exit 2, registration preserved) pass; evidence `installer-uninstall-takeover-evidence.json` |
+| Coexist qualification | 52 PASS, 4 explicit installer-path SKIP, 0 FAIL next to a live install; full install/uninstall paths deferred to clean CI |
+
+The manifest/checksums and artifact are local build outputs, not a release.
+The release owner must rebuild from the eventual merge commit, re-qualify,
+then publish and wire that exact verified artifact. Installer download
+remains disabled.
+
 ## Native ownership follow-up
 
 Diagnostic CI run40935794359/job123665871201 confirmed the elevated runner's
