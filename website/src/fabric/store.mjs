@@ -780,6 +780,8 @@ async function grantVisibleTo(db, actor, grant) {
 // must first authorize the exporter and validate the supplied preview binding.
 async function completeCommit(db, actor, appr, preview, op, operationId) {
   if (!appr || appr.consumed_by_op !== operationId || appr.consumed_action !== 'grant.commit' || appr.consumed_target !== null) return null;
+  const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+  if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
   const existing = await first(db, 'SELECT id FROM fabric_grants WHERE approval_id = ? AND exporter_id = ? AND connection_id = ?',
     appr.id, actor.user.id, preview.connection_id);
   if (!existing) {
@@ -825,19 +827,30 @@ export async function commitGrant(db, actor, input = {}, op = null) {
     if (completed) return completed;
     return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
   }
-  if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
-  const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', preview.connection_id);
-  if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
-  const vector = parseJson(appr.revision_vector, {});
-  if (vector.connection !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the preview; regenerate it.');
-  if (appr.issued_version !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
-  // Revalidate every snapshot entry against live state (fast-fail; the
-  // batch re-pins the whole snapshot at write time).
-  for (const s of terms.snapshot || []) {
-    const r = await first(db, 'SELECT owner_id, incarnation, imported_from FROM resources WHERE id = ?', s.resourceId);
-    if (!r || r.owner_id !== actor.user.id || r.imported_from || r.incarnation !== s.incarnation) {
-      throw err(412, 'PREVIEW_STALE', `Resource ${s.resourceId} changed since the preview.`);
+  let conn;
+  try {
+    if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
+    conn = await first(db, 'SELECT * FROM connections WHERE id = ?', preview.connection_id);
+    if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
+    const vector = parseJson(appr.revision_vector, {});
+    if (vector.connection !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the preview; regenerate it.');
+    if (appr.issued_version !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
+    // Revalidate every snapshot entry against live state (fast-fail; the
+    // batch re-pins the whole snapshot at write time).
+    for (const s of terms.snapshot || []) {
+      const r = await first(db, 'SELECT owner_id, incarnation, imported_from FROM resources WHERE id = ?', s.resourceId);
+      if (!r || r.owner_id !== actor.user.id || r.imported_from || r.incarnation !== s.incarnation) {
+        throw err(412, 'PREVIEW_STALE', `Resource ${s.resourceId} changed since the preview.`);
+      }
     }
+  } catch (e) {
+    // The approval snapshot may predate an older attempt's claim. A fresh
+    // expiry/state/snapshot failure cannot terminalize that same operation
+    // while its grant batch is outstanding (or its effect already applied).
+    const raced = await first(db, 'SELECT id, consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', appr.id);
+    const recovered = await completeCommit(db, actor, raced, preview, op, opd);
+    if (recovered) return recovered;
+    throw e;
   }
   // The shared claim: exactly one of commit/revise/resume wins this
   // approval. Losers change nothing.
