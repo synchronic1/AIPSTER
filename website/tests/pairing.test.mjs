@@ -819,3 +819,112 @@ test('lost-response reclaim succeeds at the key cap (round 10)', async () => {
   }));
   assert.equal(fresh.status, 200, 'recovered sender key works');
 });
+test('rotation failure leaks no sender key (round 11)', async () => {
+  const t = await createTestEnv();
+  // Sabotage the rotation revocation inside its batch: the whole
+  // mint+revoke+audit must roll back, leaving no undisclosed live key
+  // consuming a slot. (Pre-fix there is no batch, so the claim simply
+  // succeeds and the 500 assertion below fails.)
+  const realBatch = t.DB.batch;
+  t.DB.batch = async (stmts) => {
+    const isRotate = Array.isArray(stmts) && stmts.length === 3
+      && stmts.some((s) => typeof s.sql === 'string' && s.sql.includes('INSERT INTO key_verifiers'))
+      && stmts.some((s) => typeof s.sql === 'string' && s.sql.includes('rowid < (SELECT rowid'));
+    if (isRotate) {
+      const revoke = stmts.find((s) => typeof s.sql === 'string' && s.sql.includes('rowid < (SELECT rowid'));
+      revoke.run = async () => { throw new Error('injected revoke failure'); };
+    }
+    return realBatch(stmts);
+  };
+  try {
+    const minted = await mintCode(t, t.alice);
+    const out = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_atomic' }));
+    assert.equal(out.status, 500, out.text);
+    const keys = await t.DB.prepare('SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ?').bind(t.alice.id).first();
+    assert.equal(keys.n, 0, 'rolled back: no leaked sender key');
+    const audits = await t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'key.create'").first();
+    assert.equal(audits.n, 0, 'rolled back: no phantom audit row');
+  } finally {
+    t.DB.batch = realBatch;
+  }
+});
+
+test('a stale refresh cannot overwrite a replacement row (round 11)', async () => {
+  const t = await createTestEnv();
+  const one = await pair(t, t.alice, 'n_stale', { name: 'stale-box', cpu: 'r1-cpu', gpu: 'r1-gpu', capabilities: ['r1'] });
+  // Intercept the stale claim between its consumption and its find: tear
+  // down its resource and pair a replacement for the same node first. The
+  // stale request then finds the replacement; its refresh must be fenced
+  // (pre-fix it overwrites the replacement before the binding 404).
+  const realPrepare = t.DB.prepare;
+  let fired = false;
+  t.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (!fired && sql === 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?') {
+      fired = true;
+      const realBind = stmt.bind;
+      stmt.bind = (...params) => {
+        const bound = realBind(...params);
+        const realFirst = bound.first;
+        bound.first = async (...args) => {
+          const del = await readJson(await t.call(`/api/inventory/${one.resourceId}`, {
+            method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf },
+          }));
+          assert.equal(del.status, 200, del.text);
+          const mc = await mintCode(t, t.alice);
+          const rep = await readJson(await claim(t, {
+            code: mc.json.code, nodeId: 'n_stale', cpu: 'r2-cpu', gpu: 'r2-gpu', capabilities: ['r2'],
+          }));
+          assert.equal(rep.status, 201, rep.text);
+          return realFirst(...args);
+        };
+        return bound;
+      };
+    }
+    return stmt;
+  };
+  try {
+    const stale = await mintCode(t, t.alice);
+    const out = await readJson(await claim(t, {
+      code: stale.json.code, nodeId: 'n_stale', cpu: 'stale-cpu', gpu: 'stale-gpu', capabilities: ['stale'],
+    }));
+    assert.equal(fired, true, 'interleaving engaged the stale find');
+    assert.equal(out.status, 404, out.text);
+    assert.equal(out.json.code, 'PAIRING_INVALID');
+    const row = await t.DB.prepare('SELECT cpu, gpu, capabilities_json FROM resources WHERE owner_id = ? AND node_id = ?').bind(t.alice.id, 'n_stale').first();
+    assert.equal(row.cpu, 'r2-cpu', 'replacement descriptors untouched');
+    assert.equal(row.gpu, 'r2-gpu');
+    assert.equal(row.capabilities_json, JSON.stringify(['r2']));
+  } finally {
+    t.DB.prepare = realPrepare;
+  }
+});
+
+test('display-name search costs one query however many collide (round 11)', async () => {
+  const t = await createTestEnv();
+  const now = new Date().toISOString();
+  for (let i = 0; i < 10; i++) {
+    const name = i === 0 ? 'lab' : `lab-${i + 1}`;
+    await t.DB.prepare('INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(`r_seed_${i}`, t.alice.id, name, 'local', 'declared', 'c', 'g', now).run();
+  }
+  const seen = { perCandidate: 0, bulk: 0 };
+  const realPrepare = t.DB.prepare;
+  t.DB.prepare = (sql) => {
+    if (typeof sql === 'string') {
+      if (sql.includes('SELECT id FROM resources WHERE owner_id = ? AND name = ?')) seen.perCandidate++;
+      if (sql.includes('SELECT name FROM resources WHERE owner_id = ?')) seen.bulk++;
+    }
+    return realPrepare(sql);
+  };
+  try {
+    const minted = await mintCode(t, t.alice);
+    const out = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_names', name: 'lab' }));
+    assert.equal(out.status, 201, out.text);
+    assert.equal(out.json.resource.name, 'lab-11', 'same suffix sequence');
+    assert.equal(seen.perCandidate, 0, 'no per-candidate loop');
+    assert.equal(seen.bulk, 1, 'one bounded name read');
+  } finally {
+    t.DB.prepare = realPrepare;
+  }
+});
