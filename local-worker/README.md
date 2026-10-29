@@ -20,8 +20,11 @@ Python and uv are prerequisites; they are not bundled.
 From PowerShell, after this PR is integrated (until then clone its branch):
 
 ```powershell
-git clone https://github.com/synchronic1/AIPSTER.git
-cd AIPSTER/local-worker
+git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
+cd AIPSTER
+git sparse-checkout set --no-cone local-worker
+git checkout main
+cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
 .\.venv\Scripts\python.exe test_installation.py

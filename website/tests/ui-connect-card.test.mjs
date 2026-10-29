@@ -17,7 +17,6 @@ const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 
 const COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
-  `https://github.com/synchronic1/AIPSTER/archive/${COMMIT}.zip`,
   `${TREE}README.md`,
   `${TREE}README.md#tested-installation`,
   `${TREE}README.md#optional-real-engine-preparation-not-needed-for-the-mock-check`,
@@ -101,8 +100,11 @@ test('signed-in owner sees the card on My Compute with pinned public destination
     assert.deepEqual(a.attrs.map((x) => x.name === 'class' ? 'class' : x.name).filter((n) => n !== 'class'), ['href'], 'plain links: no target/onclick/download attributes');
     assert.ok(anchorText(a).length > 3, 'links have descriptive visible text');
   }
-  const archive = anchors.find((a) => a.attrs.find((x) => x.name === 'href').value.endsWith('.zip'));
-  assert.equal(anchorText(archive), 'Get worker source (.zip)', 'source-only download is labelled as source');
+  for (const a of anchors) {
+    const href = a.attrs.find((x) => x.name === 'href').value;
+    assert.ok(!href.endsWith('.zip') && !href.includes('/archive/'), 'no full-repo archive download is offered');
+  }
+  assert.ok(anchors.some((a) => anchorText(a) === 'Open quickstart'), 'quickstart action is present');
   assert.equal(nodes.filter((n) => n.tagName === 'button' || n.tagName === 'form' || n.tagName === 'input').length, 0, 'card performs no actions');
   // Only the existing inventory read happens; the card adds no API call.
   assert.deepEqual(ui.calls.slice(before), ['GET /api/inventory?limit=50']);
@@ -116,7 +118,7 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   for (const phrase of ['Connect your computer', 'Connection setup pending', 'Not connected.', 'does not share your resources or enable inference',
     'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified', 'untested', 'separate prerequisites',
     'There is no installer or binary yet', 'There is no pairing code or worker credential yet', 'Disconnect and uninstall', 'Troubleshooting',
-    'ganglion-dendrite 0.1.0', COMMIT]) {
+    'ganglion-dendrite 0.1.0', COMMIT, 'worker files only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   assert.ok(!/\bconnected\b/i.test(text.replace(/not connected/gi, '')), 'never claims a connected state');
@@ -125,14 +127,15 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   assert.ok(html.includes('<span class="pill warn">Connection setup pending</span>'));
   assert.equal((html.match(/class="pill ok"/g) || []).length, 1, 'only the Windows platform label is green');
   assert.ok(html.includes('<span class="pill ok">Windows x64: tested</span>'));
-  assert.ok(html.includes('<span class="pill warn">.zip install: not tested</span>'), 'zip path is never presented as tested');
+  assert.ok(!/\.zip/i.test(html), 'no zip download is offered or referenced');
   // Commands follow the security-fixed quickstart, pinned to the commit; the
   // worker-local token is generated before serve, which refuses to start without it.
   const commands = nodesOf(html.slice(html.indexOf('<pre'), html.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
   const lines = commands.split('\n').map((s) => s.trim()).filter(Boolean);
   assert.deepEqual(lines, [
-    'git clone https://github.com/synchronic1/AIPSTER.git',
+    'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
+    'git sparse-checkout set --no-cone local-worker',
     `git fetch origin ${COMMIT}`,
     `git checkout --detach ${COMMIT}`,
     'cd local-worker',

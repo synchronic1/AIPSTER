@@ -158,7 +158,6 @@ async function loadOverview() {
 const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
 const WORKER_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + WORKER_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
-  archive: 'https://github.com/synchronic1/AIPSTER/archive/' + WORKER_COMMIT + '.zip',
   quickstart: WORKER_TREE + 'README.md',
   tested: WORKER_TREE + 'README.md#tested-installation',
   engine: WORKER_TREE + 'README.md#optional-real-engine-preparation-not-needed-for-the-mock-check',
@@ -178,17 +177,17 @@ function renderConnectCard() {
     <ol class="steps">
       <li><h3>Get the worker</h3>
         <p>There is no installer or binary yet. The worker is published as source, pinned to the <a href="${L.securityFix}">security-fixed revision</a> that requires a local token and checks Host/Origin.</p>
-        <p class="actions"><a class="btn" href="${L.archive}">Get worker source (.zip)</a><a class="btn secondary" href="${L.quickstart}">Open quickstart</a></p>
+        <p class="actions"><a class="btn" href="${L.quickstart}">Open quickstart</a></p>
         <ul class="platforms">
           <li><span class="pill ok">Windows x64: tested</span> <span class="muted">mock check only, from a git clone with CPython 3.12.14 and uv 0.12.12 (<a href="${L.evidence}">evidence</a>). No real engine or model was tested.</span></li>
           <li><span class="pill warn">macOS / Linux: not qualified</span> <span class="muted">commands are for adaptation only (use <code>.venv/bin/</code>). They are untested.</span></li>
-          <li><span class="pill warn">.zip install: not tested</span> <span class="muted">the archive's files match this commit, but only the git clone below was installed and tested.</span></li>
         </ul>
       </li>
       <li><h3>Install</h3>
-        <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In PowerShell, following the <a href="${L.tested}">tested installation</a>:</p>
-        <pre tabindex="0" aria-label="Windows install commands"><code>git clone https://github.com/synchronic1/AIPSTER.git
+        <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In PowerShell, following the <a href="${L.tested}">tested installation</a> (the clone fetches worker files only via sparse checkout):</p>
+        <pre tabindex="0" aria-label="Windows install commands"><code>git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
+git sparse-checkout set --no-cone local-worker
 git fetch origin ${WORKER_COMMIT}
 git checkout --detach ${WORKER_COMMIT}
 cd local-worker
