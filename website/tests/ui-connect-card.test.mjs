@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { setTimeout as deadline, clearTimeout as cancelDeadline } from 'node:timers';
 import { parse } from 'parse5';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
@@ -41,14 +42,22 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
   const t = await createTestEnv();
   const elements = new Map();
+  const domObservers = new Set();
   function el(id) {
     if (!elements.has(id)) {
-      elements.set(id, {
+      const element = {
         id, hidden: false, textContent: '', innerHTML: '', value: '', attrs: {}, listeners: {}, dataset: {},
         addEventListener(type, fn) { this.listeners[type] = fn; },
         setAttribute(name, value) { this.attrs[name] = value; },
         querySelectorAll() { return []; }
+      };
+      let html = '';
+      Object.defineProperty(element, 'innerHTML', {
+        configurable: true, enumerable: true,
+        get() { return html; },
+        set(value) { html = value; for (const notify of [...domObservers]) notify(); }
       });
+      elements.set(id, element);
     }
     return elements.get(id);
   }
@@ -106,23 +115,29 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
   const card = () => el('connect-card');
   const press = async (action) => { card().onclick({ target: { dataset: { action } } }); await flush(); };
   const chooseOs = async (value) => { card().onchange({ target: { dataset: { action: 'os' }, value } }); await flush(); };
-  // Bounded settle: async mint work (WebCrypto + DB + fenced api) can outrun
-  // the fixed flush, so pair tests wait for a terminal phase instead.
-  const settleList = async (marker, label) => {
-    for (let i = 0; i < 200; i++) {
-      if (el('compute-list').innerHTML.includes(marker)) return;
-      await new Promise(setImmediate);
-    }
-    assert.fail('inventory never rendered: ' + label);
-  };
-  const settle = async (label) => {
-    for (let i = 0; i < 200; i++) {
+  // Rendering is observable; an event-loop iteration count is not a clock
+  // and can run out while DB/WebCrypto is still pending under parallel CI.
+  // Resolve only on the requested DOM condition. The timer is a safety
+  // deadline for genuinely missing completion, never a readiness delay.
+  const waitForDOM = (read, message) => new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => { domObservers.delete(check); cancelDeadline(timer); };
+    const check = () => {
+      try {
+        const value = read();
+        if (value) { cleanup(); resolve(value); }
+      } catch (error) { cleanup(); reject(error); }
+    };
+    domObservers.add(check);
+    timer = deadline(() => { cleanup(); reject(new assert.AssertionError({ message })); }, 10000);
+    check(); // Covers completion before subscription without losing a mutation.
+  });
+  const settleList = (marker, label) => waitForDOM(
+    () => el('compute-list').innerHTML.includes(marker), 'inventory never rendered: ' + label);
+  const settle = (label) => waitForDOM(() => {
       const text = textOf(el('connect-card').innerHTML);
-      if (text.includes('Code minted') || text.includes('Pairing failed')) return text;
-      await new Promise(setImmediate);
-    }
-    assert.fail('pair never settled: ' + label);
-  };
+      return (text.includes('Code minted') || text.includes('Pairing failed')) && text;
+    }, 'pair never settled: ' + label);
   return {
     el, calls, logs, clickTab, flush, press, chooseOs, captured, db: t.DB, settle, settleList,
     hasNavigator: typeof context.navigator !== 'undefined',
