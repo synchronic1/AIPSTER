@@ -204,6 +204,9 @@ function detectOs() {
     const ua = typeof navigator.userAgent === 'string' ? navigator.userAgent : '';
     const s = (String(plat) + ' ' + ua).toLowerCase();
     if (s.includes('android') || s.includes('iphone') || s.includes('ipad') || s.includes('mobile')) return 'mobile';
+    // ChromeOS identifies itself as CrOS while navigator.platform may only
+    // report Linux. It is not a supported Linux install target.
+    if (s.includes('cros')) return null;
     if (s.includes('win')) return 'windows';
     if (s.includes('mac')) {
       const touch = Number(navigator.maxTouchPoints || 0);
@@ -216,6 +219,7 @@ function detectOs() {
 }
 const OS_FAMILY = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 const MOBILE_NOTE = 'You seem to be on a phone or tablet. Open AIPSTER on the computer you want to connect — the steps below install on the computer in front of you.';
+const needsTargetSelection = (card) => !card.picked && (!card.detected || card.detected === 'mobile');
 
 // Pinned worker commands per OS: worker-only sparse checkout at WORKER_COMMIT,
 // isolated install, self-test, fresh worker-local token, mock serve.
@@ -341,27 +345,28 @@ function paintConnectCard() {
   const focusAction = active && active.dataset ? active.dataset.action || null : null;
   const L = WORKER_LINKS;
   const meta = OS_META[connect.os];
-  const unpickedMobile = connect.detected === 'mobile' && !connect.picked;
-  const options = (unpickedMobile ? '<option value="" selected>Choose a computer…</option>' : '') + ['windows', 'macos', 'linux'].map((k) =>
-    `<option value="${k}"${k === connect.os && !unpickedMobile ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
+  const unpickedTarget = needsTargetSelection(connect);
+  const targetLabel = connect.detected === 'mobile' ? 'computer' : 'system';
+  const options = (unpickedTarget ? `<option value="" selected>Choose a ${targetLabel}…</option>` : '') + ['windows', 'macos', 'linux'].map((k) =>
+    `<option value="${k}"${k === connect.os && !unpickedTarget ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
   const detectedNote = connect.detected === 'mobile'
     ? MOBILE_NOTE + (connect.picked ? ` You picked ${esc(meta.label)} as the target computer.` : '')
     : connect.detected
       ? `Detected: ${esc(OS_FAMILY[connect.detected])}. Change it if that is wrong.`
-      : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
+      : 'Detection unavailable in this browser - pick your system to see target-specific steps.';
   const inst = INSTALLERS[connect.os];
   const usable = installerUsable(inst);
-  const primary = unpickedMobile
-    ? '<button type="button" class="btn" disabled>Pick a target computer above</button>'
+  const primary = unpickedTarget
+    ? `<button type="button" class="btn" disabled>Pick a target ${targetLabel} above</button>`
     : usable
       ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
       : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
-  const secondary = unpickedMobile ? ''
+  const secondary = unpickedTarget ? ''
     : meta.agentQualified
       ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
       : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
-  const installerLine = unpickedMobile
-    ? '<p class="muted">Pick a target computer to check installer availability.</p>'
+  const installerLine = unpickedTarget
+    ? `<p class="muted">Pick a target ${targetLabel} to check installer availability.</p>`
     : usable
       ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
       : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
@@ -374,8 +379,8 @@ function paintConnectCard() {
     const saveNote = connect.saveFailed ? ' The file download failed in this browser, so use the selectable text.' : '';
     status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
   }
-  const commands = workerCommands(connect.os).map(esc).join('\n');
-  const advanced = `<details><summary>Advanced: manual install, source and troubleshooting</summary>
+  const commands = unpickedTarget ? '' : workerCommands(connect.os).map(esc).join('\n');
+  const advanced = unpickedTarget ? '' : `<details><summary>Advanced: manual install, source and troubleshooting</summary>
 <h3>Manual install (${esc(meta.label)})</h3>
 <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${esc(L.tested)}">tested installation</a> (the sparse checkout contains the worker and its root <code>LICENSE</code> only):</p>
 <pre tabindex="0" aria-label="${esc(meta.label)} install commands"><code>${commands}</code></pre>
@@ -443,7 +448,7 @@ function onConnectClick(ev) {
 }
 
 function saveInstructions() {
-  if (!connect || !connect.fallback) return;
+  if (!connect || needsTargetSelection(connect) || !connect.fallback) return;
   if (typeof Blob === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
   if (typeof document === 'undefined' || !document.createElement || !document.body) return;
   let url = null;
@@ -484,8 +489,7 @@ async function copyAgentInstructions() {
   // card the user has since re-rendered, switched OS on, or re-clicked.
   const card = connect;
   const os = card.os;
-  if (!OS_META[os].agentQualified) return;
-  if (card.detected === 'mobile' && !card.picked) return;
+  if (!OS_META[os] || !OS_META[os].agentQualified || needsTargetSelection(card)) return;
   const op = (card.copyOp = (card.copyOp || 0) + 1);
   const text = card.detected === 'mobile'
     ? `Target computer: ${OS_META[os].label} (these steps run on that computer, not on this phone or tablet).\n` + agentInstructions(os)
