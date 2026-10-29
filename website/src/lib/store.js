@@ -2,6 +2,8 @@
 // D1 access helpers + row mapping. API shapes mirror the local backend so the
 // control-panel UI ports without contract changes (except identity: Better
 // Auth user {id, name, email} replaces local {id, username, displayName}).
+import { resourceLiveness } from './status.mjs';
+
 export const nowIso = () => new Date().toISOString();
 
 export function rid(prefix) {
@@ -33,13 +35,26 @@ const asJson = (text, fallback) => {
   try { const v = JSON.parse(text || ''); return v ?? fallback; } catch { return fallback; }
 };
 
-export function cardFor(r, ownerName) {
-  const status = !r.configured ? 'unconfigured' : !r.authenticated ? 'unauthenticated' : !r.online ? 'offline' : !r.usable ? 'unusable' : 'ready';
+export function cardFor(r, ownerName, nowMs = Date.now()) {
+  // Displayed liveness derives from heartbeat freshness at READ time, using
+  // the same resourceLiveness/STALE_AFTER_MS rule as GET /api/status — never
+  // from the persisted online flag alone. A row whose flag claims online
+  // with a stale/missing heartbeat renders offline here, exactly as the
+  // status strip reports it. No background job rewrites the stored flag.
+  const liveness = resourceLiveness(
+    { online: Number(r.online) === 1, heartbeatAt: r.heartbeat_at ?? null },
+    Number.isFinite(nowMs) ? nowMs : Date.now(),
+  );
+  const online = liveness === 'online';
+  // usable is shown only while the resource is online: a stale usable=true
+  // must not imply readiness the strip denies.
+  const usable = online && Number(r.usable) === 1;
+  const status = !r.configured ? 'unconfigured' : !r.authenticated ? 'unauthenticated' : !online ? 'offline' : !usable ? 'unusable' : 'ready';
   return {
     id: r.id, name: r.name, kind: r.kind, origin: r.origin,
     owner: { id: r.owner_id, name: ownerName },
     compute: { cpu: r.cpu, gpu: r.gpu }, capabilities: asJson(r.capabilities_json, []),
-    state: { configured: !!r.configured, authenticated: !!r.authenticated, online: !!r.online, usable: !!r.usable, status },
+    state: { configured: !!r.configured, authenticated: !!r.authenticated, online, usable, status },
     heartbeatAt: r.heartbeat_at || null, limits: asJson(r.limits_json, {}), scope: r.scope,
     verification: asJson(r.verification_json, {}),
     credits: r.credits_json ? asJson(r.credits_json, null) : null, // informational only

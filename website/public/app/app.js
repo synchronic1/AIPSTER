@@ -46,6 +46,27 @@ async function api(path, opts = {}) {
 
 const pill = (ok, label) => `<span class="pill ${ok ? 'ok' : 'bad'}">${esc(label)}: ${ok ? 'yes' : 'no'}</span>`;
 
+// Paged inventory fetch: walks /api/inventory?limit=50&offset=… until the
+// reported total is reached (at most 2 requests under the 100-resource cap),
+// so selectors offer every owned resource instead of the newest 50. Each
+// page goes through the fenced api(), and the generation is re-checked
+// between pages so a tab switch mid-pagination drops the stale walk.
+async function allInventory() {
+  const gen = generation;
+  const items = [];
+  let offset = 0;
+  let total = Infinity;
+  for (let pages = 0; pages < 10 && items.length < total; pages++) {
+    const page = await api(`/api/inventory?limit=50&offset=${offset}`);
+    if (gen !== generation) throw staleError();
+    if (!page || !Array.isArray(page.items) || !page.items.length) break;
+    items.push(...page.items);
+    total = Number.isSafeInteger(page.total) && page.total >= 0 ? page.total : items.length;
+    offset += page.items.length;
+  }
+  return items;
+}
+
 // ---- resource-status strip (read-only, bounded polling) ----
 // Polls GET /api/status only while signed in on the Overview tab: a 30s base
 // interval with exponential backoff to 5min on failure, stopping entirely on
@@ -199,8 +220,8 @@ async function loadGrants() {
 async function loadKeys() {
   const el = $('key-list'); loading(el);
   try {
-    const [data, inv] = await Promise.all([api('/api/keys?limit=50'), api('/api/inventory?limit=50')]);
-    $('key-resource').innerHTML = inv.items.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    const [data, inv] = await Promise.all([api('/api/keys?limit=50'), allInventory()]);
+    $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
     el.innerHTML = data.items.filter((k) => !k.revokedAt).map((k) =>
       `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}${k.scope === 'heartbeat' && k.resourceId ? ` · resource: ${esc(k.resourceId)}` : ''}</p>
        <p class="muted">created ${esc(k.createdAt)} · expires ${esc(k.expiresAt || 'never')} · last used ${esc(k.lastUsedAt || 'never')}</p>

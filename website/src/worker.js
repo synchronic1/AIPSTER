@@ -7,7 +7,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, claimHeartbeatBudget, refundHeartbeatBudget, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
@@ -144,16 +144,19 @@ async function ownerName(db, userId) {
 async function revokedHeartbeatKey(request, db) {
   // The heartbeat endpoint reports a revoked key distinctly (401
   // KEY_REVOKED) instead of the generic 401, so honest senders can tell
-  // "rotate and re-mint" apart from "wrong credential". The probe needs a
-  // well-formed presented secret carrying the key id; ids are 64-bit random,
-  // so this is not an enumerable oracle.
+  // "rotate and re-mint" apart from "wrong credential". The presented
+  // secret is verified against the key's verifier BEFORE the revoked state
+  // is disclosed: any other caller gets the generic 401 AUTH_REQUIRED, so
+  // the key id alone is not a revocation oracle.
   const header = request.headers.get('Authorization') || '';
   const m = /^Bearer\s+(\S+)$/.exec(header);
   if (!m) return false;
   const parts = splitPresented(m[1]);
   if (!parts) return false;
-  const row = await first(db, 'SELECT revoked_at FROM key_verifiers WHERE id = ?', parts.id);
-  return !!(row && row.revoked_at);
+  const row = await first(db, 'SELECT verifier, salt, revoked_at FROM key_verifiers WHERE id = ?', parts.id);
+  if (!row || !row.revoked_at) return false;
+  const expect = await verifierFor(parts.secret, row.salt);
+  return timingSafeEqualStr(expect, row.verifier);
 }
 
 async function handleApi(request, env, url) {
@@ -342,7 +345,11 @@ async function handleApi(request, env, url) {
   // match + key live (not revoked/expired), and the 25s rate window — lives
   // inside ONE conditional UPDATE, never a read-then-write. The server sets
   // heartbeat_at=now and online=1 plus the body's usable bit; no other
-  // columns change. Heartbeats never draw the hourly write_budget.
+  // columns change. Heartbeats never draw the hourly write_budget (they
+  // claim the separate per-owner + global heartbeat budgets instead; a
+  // lost resource race refunds both claims). Aggregate ceilings, 429
+  // codes, and the D1 write-cost calculation live in
+  // docs/heartbeat-quotas.md.
   {
     const m = /^\/api\/resources\/([A-Za-z0-9_-]{1,64})\/heartbeat$/.exec(path);
     if (m && method === 'POST') {
@@ -372,6 +379,35 @@ async function handleApi(request, env, url) {
         if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
         throw error;
       }
+      // Fast path: a closed 25s window rejects before any budget write.
+      // This probe is an optimization only — the conditional UPDATE below
+      // still enforces the window atomically, so racers cannot slip through.
+      const probe = await first(db, 'SELECT heartbeat_at FROM resources WHERE id = ?', resourceId);
+      if (probe && probe.heartbeat_at) {
+        const last = Date.parse(probe.heartbeat_at);
+        if (Number.isFinite(last)) {
+          const retryMs = HEARTBEAT_MIN_INTERVAL_MS - (Date.now() - last);
+          if (retryMs > 0) {
+            const retrySec = Math.ceil(retryMs / 1000);
+            return json(429, { error: 'Heartbeat too soon; back off and retry.', code: 'HEARTBEAT_TOO_SOON', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+          }
+        }
+      }
+      // Aggregate ceilings (docs/heartbeat-quotas.md): per-owner first, then
+      // deployment-wide. Each claim is one conditional UPDATE; a failed
+      // claim matches zero rows and writes nothing. The resource row is
+      // untouched when either claim fails.
+      const budgets = heartbeatBudgets(env);
+      const hbWindow = heartbeatWindow();
+      if (!(await claimHeartbeatBudget(db, actor.key.owner_id, hbWindow, budgets.owner))) {
+        const retrySec = secondsUntilNextHour();
+        return json(429, { error: 'Heartbeat budget for this owner is spent for the hour; back off and retry.', code: 'HEARTBEAT_OWNER_QUOTA', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+      }
+      if (!(await claimHeartbeatBudget(db, HEARTBEAT_GLOBAL_ID, hbWindow, budgets.global))) {
+        await refundHeartbeatBudget(db, actor.key.owner_id, hbWindow);
+        const retrySec = secondsUntilNextHour();
+        return json(429, { error: 'Deployment heartbeat budget is spent for the hour; back off and retry.', code: 'HEARTBEAT_GLOBAL_QUOTA', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+      }
       const now = nowIso();
       const windowStart = new Date(Date.now() - HEARTBEAT_MIN_INTERVAL_MS).toISOString();
       const claimed = await run(db,
@@ -385,9 +421,13 @@ async function handleApi(request, env, url) {
       if (Number(claimed.meta.changes) === 1) {
         return json(200, { ok: true, id: resourceId, heartbeatAt: now, online: true, usable: usable === 1 });
       }
-      // Claim lost: map the reason with read-only probes (the write decision
-      // already happened atomically above). No audit row per heartbeat; the
-      // coarse key last_used_at update in actorFrom is the only trail.
+      // Claim lost: refund both budget claims (the budgets count ACCEPTED
+      // heartbeats only), then map the reason with read-only probes (the
+      // write decision already happened atomically above). No audit row per
+      // heartbeat; the coarse key last_used_at update in actorFrom is the
+      // only trail.
+      await refundHeartbeatBudget(db, actor.key.owner_id, hbWindow);
+      await refundHeartbeatBudget(db, HEARTBEAT_GLOBAL_ID, hbWindow);
       const keyRow = await first(db, 'SELECT revoked_at, expires_at FROM key_verifiers WHERE id = ?', actor.key.id);
       if (!keyRow || keyRow.revoked_at) return json(401, { error: 'API key revoked.', code: 'KEY_REVOKED' });
       if (keyRow.expires_at && Date.parse(keyRow.expires_at) < Date.now()) return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });

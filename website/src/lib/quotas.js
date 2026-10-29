@@ -21,6 +21,69 @@ export function budgetWindow(now = new Date()) {
   return now.toISOString().slice(0, 13); // UTC hour bucket: '2026-10-28T16'
 }
 
+// ---- heartbeat intake budgets (docs/heartbeat-quotas.md) ----
+// Per-owner AND deployment-wide hourly ceilings on ACCEPTED heartbeats. Both
+// are enforced with the same atomic-claim pattern as the write budget (one
+// conditional UPDATE, losers mutate nothing), but in SEPARATE buckets: the
+// window key prefix keeps heartbeat counters apart from the 120/hour
+// write_budget rows even though they share the write_budget TABLE, so no
+// migration is needed and neither budget draws from the other. Rejections
+// are read-only: a failed claim matches zero rows and writes nothing.
+// PLACEHOLDER defaults: production numbers are chosen by the user +
+// release review, never by this change. Env overrides (positive integers):
+// HEARTBEAT_OWNER_PER_HOUR, HEARTBEAT_GLOBAL_PER_HOUR.
+export const HEARTBEAT_OWNER_PER_HOUR_PLACEHOLDER = 500;
+export const HEARTBEAT_GLOBAL_PER_HOUR_PLACEHOLDER = 1000;
+// Reserved write_budget.user_id for the deployment-wide bucket. Real user
+// ids never contain ':', so this row cannot collide with a tenant bucket.
+export const HEARTBEAT_GLOBAL_ID = 'heartbeat:global';
+
+export function heartbeatWindow(now = new Date()) {
+  return 'hb/' + budgetWindow(now);
+}
+
+function parseBudget(raw, fallback) {
+  const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+export function heartbeatBudgets(env) {
+  return {
+    owner: parseBudget(env && env.HEARTBEAT_OWNER_PER_HOUR, HEARTBEAT_OWNER_PER_HOUR_PLACEHOLDER),
+    global: parseBudget(env && env.HEARTBEAT_GLOBAL_PER_HOUR, HEARTBEAT_GLOBAL_PER_HOUR_PLACEHOLDER),
+  };
+}
+
+export function secondsUntilNextHour(nowMs = Date.now()) {
+  const next = new Date(nowMs);
+  next.setUTCMinutes(60, 0, 0);
+  return Math.max(1, Math.ceil((next.getTime() - nowMs) / 1000));
+}
+
+// Atomic claim: increment and limit test in ONE statement. Returns true
+// when the claim succeeded. Concurrent racers serialize; losers match zero
+// rows and mutate nothing. Bucket creation + old-bucket cleanup run only
+// when opening a fresh hourly bucket (once per id per hour), never on the
+// rejection path.
+export async function claimHeartbeatBudget(db, id, window, limit) {
+  const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, window);
+  if (row && Number(row.count) >= limit) return false; // spent: read-only rejection
+  if (!row) {
+    await run(db, 'INSERT OR IGNORE INTO write_budget (user_id, window, count) VALUES (?, ?, 0)', id, window);
+    await run(db, "DELETE FROM write_budget WHERE window LIKE 'hb/%' AND window < ?", window);
+  }
+  const claim = await run(db, 'UPDATE write_budget SET count = count + 1 WHERE user_id = ? AND window = ? AND count < ?', id, window, limit);
+  return Number(claim.meta.changes) === 1;
+}
+
+// Refund a claim this request no longer needs (the resource UPDATE lost its
+// race after the budgets were claimed). Each refund pairs with its own prior
+// claim, so counts never go negative and accepted heartbeats never exceed
+// the caps.
+export async function refundHeartbeatBudget(db, id, window) {
+  await run(db, 'UPDATE write_budget SET count = count - 1 WHERE user_id = ? AND window = ?', id, window);
+}
+
 export async function checkWriteBudget(db, userId) {
   const window = budgetWindow();
   const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', userId, window);
