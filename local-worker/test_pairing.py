@@ -624,6 +624,12 @@ class PairMutexTests(unittest.TestCase):
         return argparse_namespace(args)
 
     def test_concurrent_pairs_install_the_live_credential(self):
+        # Pre-create the private store single-threaded: concurrent
+        # directory creation races the fail-closed ownership check on
+        # slow/elevated runners (see a3e1dfc). This test races the claim
+        # plus credential writes, not store creation.
+        pairing.private_dir(self.data)
+        node_id = load_or_create_node_id(self.data / "state")
         minted, minted_lock = [], threading.Lock()
 
         def hook(body):
@@ -675,6 +681,7 @@ class PairMutexTests(unittest.TestCase):
         self.assertEqual(results["b"][2], EXIT_OK, "both report success even in the race")
         live = minted[-1][0]
         loaded = load_pairing(self.data)
+        self.assertEqual(loaded["node_id"], node_id, "both pairs shared the pre-created identity")
         self.assertEqual(loaded["heartbeat_key"], live, "manifest selects the live generation")
         self.state.live_keys = {live}
         beat = send_heartbeat(self.base, loaded["resource_id"], live, False)
