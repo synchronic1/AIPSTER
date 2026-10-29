@@ -26,7 +26,7 @@ can land without a pairing-session edit.
   - `status` (secret-free) / `unpair` (local forget; server key stays
     live until revoked in the dashboard — printed every time). Failed attempts
     replace success status; `status` derives staleness after five minutes.
-- `local-worker/test_pairing.py` — 18 stdlib-only unit tests (fake
+- `local-worker/test_pairing.py` — 17 stdlib-only unit tests (fake
   in-thread API). Run: `python test_pairing.py` with any Python ≥ 3.11.
 - `local-worker/test_pairing_e2e.py` + `website/scripts/pairing-e2e-bridge.mjs`
   — 6 cross-language scenarios (real CLI against real `worker.js` over
