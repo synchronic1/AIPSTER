@@ -25,29 +25,91 @@ permits frozen applications under any license. The exception note ships in
 ```text
 packaging/
   README.md                  this file
+  BUILD-REPORT.md            latest qualified build: hashes, tests, screenshots, gaps
+  aipster_tray/              tray controller (Windows backend; portable core)
+    state.py                 pure state/menu/balloon model + honesty gate + state file
+    child.py                 worker child lifecycle (no-window spawn, job object, logs)
+    ipc_win32.py             single-instance mutex + window-message commands
+    controller.py            state machine, supervision, CLI, message pumps
+    backend_win32.py         tray icon/menu/balloons via ctypes (zero new deps)
+    backend_headless.py      stub backend: full behavior, zero shell calls
+    backend_base.py          backend interface
+    firstrun.py              shared first-run setup (data dir, token, config)
+    win32.py                 typed ctypes bindings (untyped calls truncate handles)
+  icon/
+    icon.py                  original tray icon generator (stdlib only)
+    ICON.md                  icon design + regeneration
+    tray.svg                 vector master
   windows/
     build.py                 orchestrated build: locked venv -> freeze -> licenses -> NSIS -> manifest
-    dendrite.spec            PyInstaller spec (two console exes, one shared directory)
+    dendrite.spec            PyInstaller spec (three exes, one shared directory)
     cli_entry.py             frozen `dendrite` CLI entry (serve/inspect)
-    launcher.py              frozen `aipster-worker` entry (first-run setup + foreground server)
+    launcher.py              frozen `aipster-worker` entry (foreground server + tray CLI)
+    tray_entry.py            frozen `aipster-tray` entry (windowed tray controller)
     default.toml             default config template (loopback, mock engine, simulation only)
-    worker.nsi               NSIS installer script (per-user, consent-based, data-preserving)
+    worker.nsi               NSIS installer script (per-user, consent-based)
+    icons/                   tray-ok/warn/off multi-resolution ICOs (generated)
     installer-build.in       build-tool pins; compiled to hash-locked installer-build.lock
     installer-build.lock     hash-pinned PyInstaller toolchain (generated, committed)
-    qualify.py               packaged-app qualification (scrubbed environment, install/uninstall)
+    qualify.py               packaged-app qualification (full + coexistence profiles)
     screenshots.py           drives the real installer UI for UX screenshots
     build/                   scratch (gitignored): venv, freeze output
     dist/                    artifacts (gitignored): Setup exe, manifest.json, SHA256SUMS
 ```
 
+## Tray architecture (Windows)
+
+`aipster-tray.exe` is the primary desktop entry (windowed: no console). It
+runs a hidden controller window, supervises at most one `dendrite serve`
+child, and presents state through a backend:
+
+- `backend_win32`: real tray icon (state-colored ICO), popup menu rendered
+  from `state.menu_model`, balloon notifications. Needs an interactive
+  desktop; reviewed by reading + owner-VM capture (see BUILD-REPORT.md).
+- `backend_headless`: identical controller behavior with zero shell calls.
+  Everything behind the menu (states, IPC, supervision, recovery) is covered
+  through this backend by `qualify.py`, including on headless CI.
+
+States describe the **local worker process only**: stopped, starting,
+running, port_busy, error. There is deliberately no connected or
+inference-ready state — pairing is not implemented and dispatch stays
+disabled — and `state.check_honest` fails the import if any shipped template
+overclaims. The menu carries a disabled "Pairing: not implemented" line.
+
+Single instance per data directory: a named mutex plus window-message IPC
+(`tray status|start|stop|restart|quit`, also via `aipster-worker tray ...`
+for visible console output). A second launch reuses the running instance
+(status balloon, worker relaunched if stopped) and exits 0; it never starts
+a duplicate worker or fights for the port.
+
+Ownership: the child is spawned with `CREATE_NO_WINDOW`, piped into a
+size-bounded rotating log (1 MiB x3), and — on normal desktop launches —
+joined to a kill-on-close job object, so a parent crash can never orphan a
+worker. Quit stops the owned child, removes the icon, and exits; nothing
+else is signaled. Crashes restart with backoff (1s/5s/15s, max 3 per 5 min)
+then park in an honest error state; a busy port never restart-loops.
+`data/state.json` records state, detail, pid, endpoint, restarts, and
+version on every transition plus a 30s heartbeat.
+
+Job-object caveat: under a sandboxed launcher the process already belongs to
+a job that forbids nesting, so assignment fails. That failure is logged with
+its Win32 reason (`confined=False confine_error=...`), and the strict
+orphan-kill test runs only where confinement engaged. Explicit Quit/stop
+paths terminate the child directly and work everywhere.
+
+macOS/Linux have no tray backend in this milestone; the controller core
+(`state`, supervision design) is portable, and non-Windows runs refuse with
+a clear message instead of pretending.
+
 ## Security properties (Windows)
 
 - Per-user install, no elevation: default `$LOCALAPPDATA\Programs\AIPSTER-Worker`,
   registry under HKCU only. No service, driver, firewall rule, or network touch.
-- Install location is selectable (Directory page).
+- Install location is selectable (Directory page). Shortcuts (Start Menu,
+  desktop, optional) launch the stable installed tray exe.
 - Autostart is an explicit opt-in, default OFF (components page checkbox, or
   scripted `/AUTOSTART=1`). It registers a per-user login entry, not a system
-  service; the UI labels it exactly that.
+  service; the UI labels it exactly that. Uninstall always clears it.
 - First run creates `%LOCALAPPDATA%\AIPSTER-Worker\` holding `config.toml`,
   `api-token.txt`, `state/`, `logs/`. The token is 256-bit `secrets.token_urlsafe`,
   stored user-ACL-only (`icacls /inheritance:r /grant:r <user>:F`), injected via
@@ -58,7 +120,9 @@ packaging/
   reviewed code, unchanged by packaging.
 - Upgrade/reinstall never touches the data directory, so config, token, state,
   and logs survive. Uninstall removes the app, shortcuts, and registry, and
-  preserves the data directory by default (the final page says where it is).
+  preserves the data directory by default; a removal checkbox (or scripted
+  `/REMOVEDATA=1`) deletes the default data dir on explicit choice. A custom
+  `AIPSTER_WORKER_DATA` folder is never touched by uninstall.
 - The installer and app ship no website source, dev tests, secrets, machine
   configs, or model weights. The manifest lists every shipped file with SHA-256.
 
@@ -69,17 +133,34 @@ NSIS 3.13 (`makensis` on PATH; `winget install NSIS.NSIS`), network to PyPI.
 
 ```powershell
 cd local-worker
+python packaging/icon/icon.py                 # regenerate ICOs after mark changes
 python packaging/windows/build.py            # -> packaging/windows/dist/
-python packaging/windows/qualify.py          # silent install, server tests, uninstall
+python packaging/windows/qualify.py          # full profile (refuses if a live install exists)
+python packaging/windows/qualify.py --app-dir packaging/windows/build/freeze/app
+                                             # coexistence profile: behavior-only, no install touch
 $env:AIPSTER_SCREENSHOTS_OK=1                # screenshots pop wizard windows on the
 python packaging/windows/screenshots.py      # interactive screen: never run while
                                              # the user is active, and never in CI
 ```
 
+Profiles: `qualify.py` without flags installs/uninstalls and owns the HKCU
+singletons; it refuses when a live install is registered. With `--app-dir`
+it tests the frozen behavior (console + tray matrices) without installing
+anything, using dynamic ports so a live worker keeps 8090. Installer paths
+print explicit SKIP lines in coexistence; CI runs the full profile on fresh
+runners.
+
 `screenshots.py` drives the real desktop UI with keystrokes. It refuses to run
 without `AIPSTER_SCREENSHOTS_OK=1`, verifies the wizard window before every
 keystroke, and aborts if the wizard is closed externally — keystrokes must
 never land in another application. `qualify.py` is silent and headless-safe.
+
+Owner-VM tray verification (manual; no isolated desktop exists on the dev
+machine): install, launch from the shortcut, confirm the tray icon appears
+(Windows 11 hides new icons in the overflow flyout — expected), right-click
+for the menu (status lines, dashboard/logs/pairing items, Start/Stop, Quit),
+re-run the shortcut (status balloon, no duplicate), Quit (icon gone, port
+freed). Behavior behind every item is headless-covered; the VM proves pixels.
 
 Reproducibility pins: CPython 3.12.14 (via uv), `requirements.lock`,
 `build-requirements.lock`, `installer-build.lock` (all `--require-hashes`),
@@ -103,10 +184,10 @@ code-signing certificate enrolled for the release workflow, then
 
 | Target | Format | Status |
 |---|---|---|
-| Windows x86-64 (10 1809+/11) | NSIS Setup exe, PyInstaller one-dir payload | **this change** |
-| macOS Apple Silicon (14+) | signed + notarized DMG, PyInstaller payload | pending: build on macOS runner, Apple Developer signing, notarization ticket |
-| macOS Intel (13+) | signed + notarized DMG, PyInstaller payload | pending: same, Intel runner |
-| Linux x86-64 (glibc 2.31+) | AppImage or .deb, PyInstaller payload | pending: oldest-supported glibc build image, desktop entry |
+| Windows x86-64 (10 1809+/11) | NSIS Setup exe, PyInstaller one-dir payload, tray | **this change** |
+| macOS Apple Silicon (14+) | signed + notarized DMG, PyInstaller payload, menu bar | pending: build on macOS runner, Apple Developer signing, notarization ticket |
+| macOS Intel (13+) | signed + notarized DMG, PyInstaller payload, menu bar | pending: same, Intel runner |
+| Linux x86-64 (glibc 2.31+) | AppImage or .deb, PyInstaller payload, tray | pending: oldest-supported glibc build image, desktop entry |
 | Linux ARM64 | AppImage or .deb | pending: depends on native-wheel availability for psutil/pydantic-core |
 
 One identical binary cannot run across these OSes; each target gets its own
@@ -117,6 +198,9 @@ dashboard (see `website/public/app/app.js` `INSTALLERS`).
 
 The Connect card renders a download only for entries shaped
 `{ available: true, url, sha256, version }` with a releases/download URL and a
-64-hex checksum. This change ships the Windows package and its SHA-256 to the
-release owner; the button flips to available when the release owner uploads the
-verified artifact, in a follow-up diff that only touches that entry.
+64-hex checksum. Until the release owner uploads, a qualified-but-unpublished
+platform is shaped `{ available: false, packaged: true, version, sha256,
+built_from }`: the card shows the version, checksum, and build source with an
+honest "release file not published yet" state and no link. The wired hash is
+the qualified clean-tree build; the release owner rebuilds from the merge
+commit and re-verifies before upload.

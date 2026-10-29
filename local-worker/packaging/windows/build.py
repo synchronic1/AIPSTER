@@ -219,9 +219,27 @@ def main():
         snapshot = json.loads(inspect_proc.stdout)
         if not snapshot["models"] or not snapshot["models"][0]["simulated"]:
             raise SystemExit(f"frozen inspect is not simulated: {inspect_proc.stdout[:500]}")
-        print("frozen --help + simulated inspect: OK")
+        tray = app_dir / "aipster-tray.exe"
+        if not tray.exists():
+            raise SystemExit("frozen bundle is missing aipster-tray.exe")
+        tray_env = dict(smoke_env)
+        tray_env["AIPSTER_WORKER_DATA"] = str(Path(temp) / "tray-data")
+        help_proc = subprocess.run([str(tray), "--help"], capture_output=True, text=True,
+                                   env=tray_env, timeout=60)
+        if help_proc.returncode != 0:
+            raise SystemExit(f"frozen tray --help failed: rc={help_proc.returncode}")
+        status_proc = subprocess.run([str(tray), "status"], capture_output=True, text=True,
+                                     env=tray_env, timeout=60)
+        if status_proc.returncode != 2:
+            raise SystemExit(f"frozen tray status without state: rc={status_proc.returncode}")
+        print("frozen --help + simulated inspect + tray --help/status: OK")
 
-    step(8, total, "assemble licenses")
+    step(8, total, "assemble licenses and icons")
+    icons_src = PACKAGING / "icons"
+    for name in ("tray-ok.ico", "tray-warn.ico", "tray-off.ico"):
+        if not (icons_src / name).exists():
+            raise SystemExit(f"missing tray icon: run packaging/icon/icon.py ({name})")
+    shutil.copytree(icons_src, app_dir / "icons")
     license_dir = app_dir / "licenses"
     (license_dir / "python").mkdir(parents=True)
     shutil.copy2(REPO / "LICENSE", license_dir / "AIPSTER-APACHE-LICENSE.txt")
