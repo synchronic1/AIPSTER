@@ -1,0 +1,18 @@
+# AIPSTER Worker default configuration (written on first run; safe to edit).
+# Simulation only: the mock engine answers locally. No model downloads, no
+# cloud connection, no sharing. Pairing is not implemented.
+[node]
+id = "standalone-demo"
+host = "127.0.0.1"
+port = 8090
+state_dir = "state"
+
+[[runtimes]]
+id = "mock"
+kind = "mock"
+gpu_layers = 0
+
+[[models]]
+id = "mock-summary"
+runtime = "mock"
+capabilities = ["summarize"]
