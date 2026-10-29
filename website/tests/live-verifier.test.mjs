@@ -76,3 +76,15 @@ test('verifier does not retry a wrong status or content type', async t => {
   await assert.rejects(verifyLive({...options, propagation: {attempts: 5, delayMs: 5}, sleep: async () => {}}), /Expected HTTPS 200/);
   assert.equal(calls, 1);
 });
+test('the propagation budget is shared across assets, not per asset', async t => {
+  let sleeps = 0;
+  const options = await fixture(t, (path, reply) => { if (path === '/' || path === '/app/app.js') reply.body = '/* previous release */'; });
+  await assert.rejects(verifyLive({...options, propagation: {attempts: 3, delayMs: 5}, sleep: async () => { sleeps++; }}), /Live bytes differ/);
+  assert.equal(sleeps, 2, 'two retries total across every stale asset');
+});
+test('a malformed propagation option falls back to a single attempt', async t => {
+  let sleeps = 0;
+  const options = await fixture(t, (path, reply) => { if (path === '/app/app.js') reply.body = '/* previous release */'; });
+  await assert.rejects(verifyLive({...options, propagation: {attempts: 'x', delayMs: -1}, sleep: async () => { sleeps++; }}), /Live bytes differ/);
+  assert.equal(sleeps, 0);
+});

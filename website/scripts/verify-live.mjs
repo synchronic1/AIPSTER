@@ -47,6 +47,11 @@ export async function verifyLive({base = 'https://aipster.net',
     assert.match(response.headers.get('content-type') || '', /application\/json/i, `${path}: expected JSON`);
     return response.json();
   }
+  // One propagation budget for the whole run, not per asset: a genuinely
+  // wrong release fails within the window instead of multiplying it.
+  const attempts = Math.max(1, Math.trunc(Number(propagation.attempts) || 1));
+  const delayMs = Math.max(0, Number(propagation.delayMs) || 0);
+  let retriesLeft = attempts - 1;
   let assets = 0;
   for (const path of [...files, 'deployment.json']) {
     if (path === '_headers' || path === '404.html') continue;
@@ -55,13 +60,14 @@ export async function verifyLive({base = 'https://aipster.net',
     // final attempt must still match exactly.
     const expected = sha(await readFile(resolve(dist, path)));
     let response, actual;
-    for (let attempt = 1; ; attempt++) {
+    for (;;) {
       response = await request(path === 'index.html' ? '/' : '/' + path);
       assert.equal(response.status, 200, `Expected HTTPS 200: ${path}`);
       verifyContentType(response, path);
       actual = sha(Buffer.from(await response.arrayBuffer()));
-      if (actual === expected || attempt >= propagation.attempts) break;
-      await sleep(propagation.delayMs);
+      if (actual === expected || retriesLeft <= 0) break;
+      retriesLeft--;
+      await sleep(delayMs);
     }
     assert.equal(actual, expected, `Live bytes differ: ${path}`);
     const cache = response.headers.get('cache-control') || '';
