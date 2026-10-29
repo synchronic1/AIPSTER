@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 WINDOWS = Path(__file__).resolve().parent
 ROOT = WINDOWS.parent.parent
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / 'vendor/eif'))
 sys.path.insert(0, str(WINDOWS.parent))
 from aipster_tray import firstrun as first, child, controller, state
