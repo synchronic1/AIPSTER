@@ -18,7 +18,7 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed #17 head: worker requires a local token and validates Host/Origin.
-const WORKER_COMMIT = '0cf2321defc091272b749ac34c1f1dac2aa5304e';
+const WORKER_COMMIT = 'ed561cdc5b067e9ef4330667c44af5c0532e70a9';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = 'e4695f2d5bf4086e315aa5a994ee7e182ac11159';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
