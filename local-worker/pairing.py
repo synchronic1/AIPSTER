@@ -21,6 +21,7 @@ local tests only).
 
 import argparse
 import getpass
+import http.client
 import json
 import os
 import platform
@@ -35,7 +36,7 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
@@ -62,6 +63,27 @@ class PairingError(Exception):
 
 class RePairRequired(PairingError):
     """The stored sender key is revoked/expired: pair again with a new code."""
+
+
+class _RedirectBlocked(Exception):
+    """A redirect was refused: credentials never follow one."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Fail closed on any redirect (Codex P2 round 4).
+
+    The default handler would re-send the heartbeat Authorization header
+    to wherever a 302 points — including a cross-origin or downgraded
+    target — while check_api_base only validated the original URL. The
+    AIPSTER API does not redirect, so every redirect is treated as a
+    transport failure instead of followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _RedirectBlocked(f"refusing {code} redirect to {newurl.split('?')[0][:80]}")
+
+
+_OPENER = build_opener(_NoRedirect())
 
 
 def check_api_base(raw):
@@ -304,7 +326,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
         headers["Authorization"] = "Bearer " + secret
     request = Request(url, data=data, headers=headers, method="POST")
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             status = response.status
             raw = response.read().decode("utf-8", "replace")
             retry_after = response.headers.get("Retry-After")
@@ -315,7 +337,14 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             raw = ""
         status = exc.code
         retry_after = exc.headers.get("Retry-After") if exc.headers else None
-    except (URLError, TimeoutError, socket.timeout, OSError) as exc:
+    except _RedirectBlocked as exc:
+        raise PairingError(None, "REDIRECT_BLOCKED", str(exc))
+    except (URLError, TimeoutError, socket.timeout, OSError,
+            http.client.IncompleteRead, http.client.RemoteDisconnected,
+            http.client.BadStatusLine) as exc:
+        # Truncated/mangled HTTP responses are transport failures, not
+        # sender-fatal errors (Codex P2 round 4): the bounded backoff owns
+        # them, exactly like a dropped connection.
         raise PairingError(None, "NETWORK", f"request failed: {exc}")
     try:
         body = json.loads(raw) if raw.strip() else {}
