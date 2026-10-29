@@ -163,8 +163,23 @@ No production migration, installer activation, running-worker enrollment or
 inference is authorized by this review evidence.
 
 
-Latest Muse W2 head `0b87808` is preserved in this candidate's ancestry. Its
+Latest Muse W2 head `f0e2bb1` is preserved in this candidate's ancestry. Its
 uppercase code-entry fix and all five additional regressions are retained,
 including the deterministic wrong-secret fixture. Overlapping rowid-based
 rotation and separate mapping/audit writes are superseded by the reviewed atomic
 operations here. The legacy five-minute NULL-claim grace is preserved.
+
+Used pairing consent with a NULL resource binding fails closed. That ambiguous
+legacy state can represent an interrupted old claim or an explicitly deleted
+resource; owner/node identity alone cannot distinguish them. Automatically
+adopting a replacement resource would revive deleted consent and rotate its new
+sender. Mint a fresh owner-approved code instead: the atomic claim finds the
+existing owner/node resource without duplicating it. Tests cover both legacy
+recovery through fresh consent and deletion followed by same-node replacement.
+This deliberately replaces the peer's unbound-consent adoption behavior.
+
+Code minting commits its live-owner/cap/budget admission, verifier and audit in
+one transaction. A failed audit cannot strand an undisclosed code or charge.
+Concurrent same-code claims refresh authenticated consent for one bounded retry,
+including an already-existing node, and revalidate the reclaim window and exact
+owner/node/resource binding before the atomic effect.
