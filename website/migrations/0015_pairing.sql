@@ -1,5 +1,5 @@
 -- Built with Meta Muse.
--- Migration 0014: worker pairing + registration hardening.
+-- Migration 0015: worker pairing + registration hardening.
 -- pairing_codes: short-lived single-use owner consent for one machine.
 --   The browser mints a code (session-only); the worker exchanges it for a
 --   resource row plus a resource-bound heartbeat key (docs/pairing.md). Only
@@ -11,7 +11,8 @@
 --   pre-pairing manual rows; SQLite treats NULLs as distinct, so no backfill.
 -- idempotency_keys: replay map for POST /api/inventory Idempotency-Key.
 -- Numbering: 0006-0012 remain reserved for the federation integration
--- lineage; 0014 continues past the 0013 heartbeat reservation (which still
+-- lineage; 0014 is the federation restriction receipt migration, and 0015
+-- follows the 0013 heartbeat reservation (which still
 -- needs federation-owner sign-off per docs/heartbeat-intake.md). Applies once
 -- via the D1 migration journal: ALTERs are not re-runnable.
 CREATE TABLE IF NOT EXISTS pairing_codes (

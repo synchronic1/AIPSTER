@@ -7,7 +7,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
@@ -309,46 +309,18 @@ async function handleApi(request, env, url) {
   }
   if (path === '/api/inventory' && method === 'POST') {
     const d = needSession() || needCsrf(); if (d) return deny(d);
-    // Replay safety (migration 0014): a client-supplied Idempotency-Key
+    // Replay safety (migration 0015): a client-supplied Idempotency-Key
     // makes retries return the original card instead of a duplicate row.
-    // The mapping is claimed BEFORE the resource insert, so concurrent
-    // same-key requests serialize on the PRIMARY KEY: the loser replays or
-    // waits, and a mapping whose resource was deleted is treated as new.
+    // Mapping, resource, budget and audit commit together. Concurrent losers
+    // replay the winner; deleted-resource mappings provision a fresh identity.
     const idemKey = request.headers.get('Idempotency-Key');
     if (idemKey !== null && !isId(idemKey)) return json(400, { error: 'Idempotency-Key must be 1..64 id chars.', code: 'BAD_IDEMPOTENCY' });
     const body = await readJson(request);
     if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
-    await checkWriteBudget(db, me());
-    if (idemKey) {
-      const replay = await claimIdempotencyKey(db, me(), idemKey);
-      if (replay === 'in-flight') return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
-      if (replay) return json(200, cardFor(replay, await ownerName(db, me())));
-    }
-    const id = rid('r_');
-    const now = nowIso();
-    // Atomic cap: the count test is inside the single INSERT statement.
-    try {
-      const rc = await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?
-        WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
-        id, me(), body.name.trim(), kind, origin,
-        String(body.cpu || 'unknown').slice(0, 80), String(body.gpu || 'none recorded').slice(0, 80),
-        JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : []),
-        JSON.stringify(body.limits && typeof body.limits === 'object' ? body.limits : {}),
-        'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now, me());
-      assertClaimed(rc, 'resource');
-    } catch (error) {
-      // A failed insert must not hold the key: release it so a later retry
-      // is a fresh attempt, not a phantom replay or a stuck in-flight.
-      if (idemKey) await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL', me(), idemKey);
-      throw error;
-    }
-    if (idemKey) await run(db, 'UPDATE idempotency_keys SET resource_id = ? WHERE owner_id = ? AND key = ?', id, me(), idemKey);
-    await audit(db, me(), 'resource.register', id, body.name.trim());
-    const row = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
-    return json(201, cardFor(row, await ownerName(db, me())));
+    const registered = await registerResource(db, me(), idemKey, body, kind, origin);
+    return json(registered.created ? 201 : 200, cardFor(registered.row, await ownerName(db, me())));
   }
   {
     const m = /^\/api\/inventory\/([A-Za-z0-9_-]{1,64})$/.exec(path);
@@ -379,13 +351,17 @@ async function handleApi(request, env, url) {
       // nulled, which the reclaim path treats as invalid. The heartbeat
       // intake's row-existence check rejects further beats either way.
       const now = nowIso();
-      await run(db, 'UPDATE key_verifiers SET revoked_at = ?, resource_id = NULL WHERE resource_id = ? AND revoked_at IS NULL', now, r.id);
-      await run(db, 'DELETE FROM grants WHERE resource_id = ?', r.id);
-      await run(db, 'DELETE FROM jobs WHERE resource_id = ?', r.id);
-      await run(db, 'UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ?', r.id);
-      await run(db, 'DELETE FROM idempotency_keys WHERE resource_id = ?', r.id);
-      await run(db, 'DELETE FROM resources WHERE id = ?', r.id);
-      await audit(db, me(), 'resource.delete', r.id);
+      const owned = `EXISTS(SELECT 1 FROM resources r JOIN "user" u ON u.id = r.owner_id WHERE r.id = ? AND r.owner_id = ? AND u.disabled = 0)`;
+      const deleted = await db.batch([
+        db.prepare(`DELETE FROM jobs WHERE (resource_id = ? OR grant_id IN (SELECT id FROM grants WHERE resource_id = ?)) AND ${owned}`).bind(r.id, r.id, r.id, me()),
+        db.prepare(`DELETE FROM grants WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(now, r.id, r.id, me()),
+        db.prepare(`UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`DELETE FROM idempotency_keys WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
+        db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
+      ]);
+      if (Number(deleted[5].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       return json(200, { ok: true });
     }
   }
@@ -658,72 +634,62 @@ async function handleApi(request, env, url) {
     if (!row) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
     const ownerId = row.owner_id;
     const nodeId = body.nodeId;
+    // The node/code ids are public lookup handles, never credentials. Verify
+    // the bearer and current owner before BOTH initial claims and reclaims.
+    if (Number(row.attempts) >= MAX_PAIRING_ATTEMPTS) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    if (!timingSafeEqualStr(await verifierFor(norm.secret, row.salt), row.verifier)) {
+      await run(db, 'UPDATE pairing_codes SET attempts = attempts + 1 WHERE id = ? AND attempts < ?', row.id, MAX_PAIRING_ATTEMPTS);
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
+    const owner = await first(db, 'SELECT id, demo, disabled FROM "user" WHERE id = ?', ownerId);
+    if (!owner || Number(owner.disabled) === 1 || Number(owner.demo) === 1) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    let resource = null;
     if (row.used_at) {
       // Lost-response retry: the same node re-binds within the reclaim
       // window and gets a fresh sender key; anything else sees the same
       // generic invalid as an unknown code.
       if (row.node_id === nodeId && row.resource_id
         && Number.isFinite(Date.parse(row.used_at)) && Date.parse(row.used_at) + PAIRING_RECLAIM_MS >= Date.now()) {
-        const again = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', row.resource_id, ownerId);
-        if (again) {
-          await checkWriteBudget(db, ownerId);
-          const rotated = await rotateHeartbeatKey(db, ownerId, again.id, nodeId, nowIso());
-          if (!rotated) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
-          await audit(db, ownerId, 'pairing.claim', row.id, `${nodeId} -> ${again.id} (reclaim)`);
-          return json(200, {
-            resourceId: again.id, created: false, resource: cardFor(again, await ownerName(db, ownerId)),
-            heartbeatKey: rotated.secret, keyId: rotated.id, keyPrefix: rotated.prefix,
-            heartbeatUrl: `/api/resources/${again.id}/heartbeat`,
-            oneTime: 'This secret is shown once. It cannot be recovered.'
-          });
-        }
+        resource = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?', row.resource_id, ownerId, nodeId);
       }
-      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
-    }
-    if (Number(row.attempts) >= MAX_PAIRING_ATTEMPTS) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
-    if (!Number.isFinite(Date.parse(row.expires_at)) || Date.parse(row.expires_at) < Date.now()) {
+      if (!resource) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    } else if (!Number.isFinite(Date.parse(row.expires_at)) || Date.parse(row.expires_at) < Date.now()) {
       return json(410, { error: 'Pairing code expired. Mint a new one.', code: 'PAIRING_EXPIRED' });
-    }
-    const expect = await verifierFor(norm.secret, row.salt);
-    if (!timingSafeEqualStr(expect, row.verifier)) {
-      await run(db, 'UPDATE pairing_codes SET attempts = attempts + 1 WHERE id = ?', row.id);
-      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
-    }
-    const owner = await first(db, 'SELECT id, demo, disabled FROM "user" WHERE id = ?', ownerId);
-    if (!owner || Number(owner.disabled) === 1 || Number(owner.demo) === 1) {
-      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
     }
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const cpu = typeof body.cpu === 'string' && body.cpu.trim() ? body.cpu.slice(0, 80) : 'unknown';
     const gpu = typeof body.gpu === 'string' && body.gpu.trim() ? body.gpu.slice(0, 80) : 'none recorded';
     const caps = Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : [];
     const wantName = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : `worker-${nodeId.slice(0, 16)}`;
-    await checkWriteBudget(db, ownerId);
-    // Serialize concurrent claims of one code: exactly one winner marks it
-    // used; losers see invalid and must use a fresh code.
     const now = nowIso();
-    const won = await run(db, 'UPDATE pairing_codes SET used_at = ?, node_id = ? WHERE id = ? AND used_at IS NULL', now, nodeId, row.id);
-    if (Number(won.meta.changes) !== 1) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
-    // Find-or-create by (owner, node): retries and re-pairs never duplicate.
-    let resource = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
-    let created = false;
-    if (!resource) {
-      const name = await uniqueResourceName(db, ownerId, wantName);
-      const id = rid('r_');
-      const rc = await run(db, `INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-        SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, ?, 'owner only', ?, NULL, ?
-        WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
-        id, ownerId, nodeId, name, kind, cpu, gpu, JSON.stringify(caps),
-        JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId);
-      assertClaimed(rc, 'resource');
-      await audit(db, ownerId, 'resource.register', id, name);
-      resource = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
-      created = true;
+    if (!resource) resource = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
+    let created = !resource;
+    let resourceId = resource ? resource.id : rid('r_');
+    let name = resource ? resource.name : await uniqueResourceName(db, ownerId, wantName);
+    let fresh = await completePairing(db, row, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, now);
+    if (!fresh && created) {
+      // A different code may have enrolled this same owner/node after our
+      // lookup. One bounded retry binds to that winner, never a duplicate.
+      const winner = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
+      if (winner) {
+        created = false; resourceId = winner.id; name = winner.name;
+        fresh = await completePairing(db, row, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, nowIso());
+      }
     }
-    await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', resource.id, row.id);
-    const fresh = await rotateHeartbeatKey(db, ownerId, resource.id, nodeId, now);
-    if (!fresh) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
-    await audit(db, ownerId, 'pairing.claim', row.id, `${nodeId} -> ${resource.id}`);
+    if (!fresh) {
+      const live = await first(db, 'SELECT disabled,demo FROM "user" WHERE id = ?', ownerId);
+      if (!live || Number(live.disabled) || Number(live.demo)) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+      const spent = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', ownerId, budgetWindow());
+      if (spent && spent.count >= WRITE_BUDGET_PER_HOUR) throw httpError(429, 'Too many changes in the last hour. Try again later.', 'WRITE_RATE_LIMITED');
+      const keys = await first(db, 'SELECT COUNT(*) n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL', ownerId);
+      if (keys.n >= MAX_KEYS_PER_USER) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
+      if (created) {
+        const count = await first(db, 'SELECT COUNT(*) n FROM resources WHERE owner_id = ?', ownerId);
+        if (count.n >= MAX_RESOURCES_PER_USER) return json(409, { error: `Resource limit reached (${MAX_RESOURCES_PER_USER} per user).`, code: 'RESOURCE_LIMIT' });
+      }
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
+    resource = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?', resourceId, ownerId, nodeId);
     return json(created ? 201 : 200, {
       resourceId: resource.id, created, resource: cardFor(resource, await ownerName(db, ownerId)),
       heartbeatKey: fresh.secret, keyId: fresh.id, keyPrefix: fresh.prefix,
@@ -888,49 +854,79 @@ async function uniqueResourceName(db, ownerId, base) {
   return `${clean.slice(0, 60)}-${rid('').slice(0, 6)}`;
 }
 
-async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now) {
-  // Mint-first rotation: the new sender key is cap-checked before any old
-  // key is touched, so a lost race never leaves the resource keyless.
-  // Returns the new {id, secret, prefix} or null at the key cap.
+async function completePairing(db, code, nodeId, resourceId, meta, now) {
+  // One transaction re-pins the authenticated consent, live owner and exact
+  // resource identity, then creates the sender before revoking older keys.
+  // No partial enrollment/rotation survives an audit or persistence failure.
+  const ownerId = code.owner_id;
   const { id, secret, short } = mintKey(KEY_PREFIX);
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
-    SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
-    id, ownerId, `worker heartbeat ${String(nodeId).slice(0, 32)}`, resourceId, salt, await verifierFor(secret, salt),
-    KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId);
-  if (Number(kc.meta.changes) !== 1) return null;
-  await run(db, "UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND id != ?", now, resourceId, id);
-  await audit(db, ownerId, 'key.create', id, `heartbeat:${resourceId}`);
+  const hash = await verifierFor(secret, salt);
+  const result = await db.batch([
+    db.prepare(`UPDATE pairing_codes SET used_at = COALESCE(used_at, ?), node_id = ?
+      WHERE id = ? AND owner_id = ? AND salt = ? AND verifier = ? AND used_at IS ? AND resource_id IS ? AND attempts < ?
+      AND ((used_at IS NULL AND expires_at >= ?) OR (used_at IS NOT NULL AND node_id = ? AND resource_id = ? AND used_at >= ?))
+      AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0 AND demo = 0)
+      AND ((? = 1 AND NOT EXISTS(SELECT 1 FROM resources WHERE owner_id = ? AND node_id = ?)
+        AND (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER})
+        OR (? = 0 AND EXISTS(SELECT 1 FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?)))
+      AND (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}
+      AND COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?),0) < ${WRITE_BUDGET_PER_HOUR}`)
+      .bind(now, nodeId, code.id, ownerId, code.salt, code.verifier, code.used_at, code.resource_id, MAX_PAIRING_ATTEMPTS,
+        now, nodeId, resourceId, new Date(Date.parse(now) - PAIRING_RECLAIM_MS).toISOString(), ownerId,
+        meta.created ? 1 : 0, ownerId, nodeId, ownerId, meta.created ? 1 : 0, resourceId, ownerId, nodeId, ownerId, ownerId, budgetWindow(new Date(now))),
+    db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes() = 1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(ownerId,budgetWindow(new Date(now))),
+    ...(meta.created ? [db.prepare(`INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+      SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, '{}', 'owner only', ?, NULL, ? WHERE changes() = 1`)
+      .bind(resourceId, ownerId, nodeId, meta.name, meta.kind, meta.cpu, meta.gpu, JSON.stringify(meta.caps), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now)] : []),
+    db.prepare(`INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+      SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE changes() = 1
+      AND EXISTS(SELECT 1 FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?)`)
+      .bind(id, ownerId, `worker heartbeat ${nodeId.slice(0, 32)}`, resourceId, salt, hash, KEY_PREFIX + id + '_' + short, `pairing node ${nodeId}`, now, resourceId, ownerId, nodeId),
+    db.prepare(`UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND id != ? AND changes() = 1`).bind(now, resourceId, id),
+    db.prepare(`UPDATE pairing_codes SET resource_id = ? WHERE id = ? AND EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(resourceId, code.id, id),
+    ...(meta.created ? [db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.register', ?, ? WHERE EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(rid('a_'), now, ownerId, resourceId, meta.name, id)] : []),
+    db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'key.create', ?, ? WHERE EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(rid('a_'), now, ownerId, id, `heartbeat:${resourceId}`, id),
+    db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'pairing.claim', ?, ? WHERE EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(rid('a_'), now, ownerId, code.id, `${nodeId} -> ${resourceId}`, id)
+  ]);
+  if (Number(result[0].meta.changes) !== 1) return null;
   return { id, secret, prefix: KEY_PREFIX + id + '_' + short };
 }
 
-async function claimIdempotencyKey(db, ownerId, key) {
-  // Returns the prior resource row on replay, null when this call owns the
-  // key, or 'in-flight' when another request holds an unbound mapping.
-  await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND created_at < ?',
-    ownerId, key, new Date(Date.now() - IDEMPOTENCY_TTL_MS).toISOString());
-  try {
-    await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
-      ownerId, key, nowIso());
-    return null;
-  } catch {
-    const prior = await first(db, 'SELECT resource_id FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
-    if (prior && prior.resource_id) {
-      const row = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', prior.resource_id, ownerId);
-      if (row) return row;
-      // Orphaned mapping (resource deleted since): drop it and own the key.
-      try {
-        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
-        await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
-          ownerId, key, nowIso());
-        return null;
-      } catch {
-        return 'in-flight';
-      }
-    }
-    return 'in-flight';
-  }
+async function registerResource(db, ownerId, key, body, kind, origin) {
+  const now = nowIso(), window = budgetWindow(new Date(now));
+  const cutoff = new Date(Date.parse(now) - IDEMPOTENCY_TTL_MS).toISOString();
+  const prior = key ? await first(db, 'SELECT * FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key) : null;
+  const replay = async () => key ? first(db, `SELECT r.* FROM idempotency_keys i JOIN resources r ON r.id=i.resource_id AND r.owner_id=i.owner_id WHERE i.owner_id=? AND i.key=? AND i.created_at>=?`, ownerId, key, cutoff) : null;
+  const existing = await replay();
+  if (existing) return { created: false, row: existing };
+  // Reserve the generated resource identity inside the same transaction as
+  // admission, insertion and audit. No committed NULL mapping can wedge a
+  // retry; concurrent losers read the winner without spending another slot.
+  const id = rid('r_');
+  const allowed = `EXISTS(SELECT 1 FROM "user" WHERE id=? AND disabled=0)
+    AND (SELECT COUNT(*) FROM resources WHERE owner_id=?) < ${MAX_RESOURCES_PER_USER}
+    AND COALESCE((SELECT count FROM write_budget WHERE user_id=? AND window=?),0) < ${WRITE_BUDGET_PER_HOUR}`;
+  const claim = key ? [db.prepare(`INSERT OR IGNORE INTO idempotency_keys(owner_id,key,resource_id,created_at) SELECT ?,?,?,? WHERE ${allowed}`).bind(ownerId,key,id,now,ownerId,ownerId,ownerId,window)] : [];
+  await db.batch([
+    ...(prior ? [db.prepare(`DELETE FROM idempotency_keys WHERE owner_id=? AND key=? AND created_at=? AND resource_id IS ? AND ${allowed}`).bind(ownerId,key,prior.created_at,prior.resource_id,ownerId,ownerId,ownerId,window)] : []),
+    ...claim,
+    db.prepare(`INSERT INTO resources (id,owner_id,name,kind,origin,cpu,gpu,capabilities_json,configured,authenticated,online,usable,heartbeat_at,limits_json,scope,verification_json,credits_json,created_at)
+      SELECT ?,?,?,?,?,?,?,?,1,0,0,0,NULL,?,'owner only',?,NULL,? WHERE ${key ? 'changes()=1 AND EXISTS(SELECT 1 FROM idempotency_keys WHERE owner_id=? AND key=? AND resource_id=?)' : allowed}`)
+      .bind(id,ownerId,body.name.trim(),kind,origin,String(body.cpu||'unknown').slice(0,80),String(body.gpu||'none recorded').slice(0,80),JSON.stringify(Array.isArray(body.capabilities)?body.capabilities.map(String).slice(0,20):[]),JSON.stringify(body.limits&&typeof body.limits==='object'?body.limits:{}),JSON.stringify({note:'Declared by owner; not verified.'}),now,...(key?[ownerId,key,id]:[ownerId,ownerId,ownerId,window])),
+    db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes()=1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(ownerId,window),
+    db.prepare(`INSERT INTO audit(id,at,actor_id,action,target,detail) SELECT ?,?,?,'resource.register',?,? WHERE changes()=1`).bind(rid('a_'),now,ownerId,id,body.name.trim())
+  ]);
+  const row = await first(db,'SELECT * FROM resources WHERE id=? AND owner_id=?',id,ownerId);
+  if (row) return { created: true, row };
+  const winner = await replay();
+  if (winner) return { created: false, row: winner };
+  const live = await first(db,'SELECT disabled FROM "user" WHERE id=?',ownerId);
+  if (!live || Number(live.disabled)) throw httpError(401,'Sign-in or API key required.','AUTH_REQUIRED');
+  const budget = await first(db,'SELECT count FROM write_budget WHERE user_id=? AND window=?',ownerId,window);
+  if (budget && budget.count >= WRITE_BUDGET_PER_HOUR) throw httpError(429,'Too many changes in the last hour. Try again later.','WRITE_RATE_LIMITED');
+  assertClaimed({meta:{changes:0}},'resource');
 }
 
 function mapKeyRow(k) {
