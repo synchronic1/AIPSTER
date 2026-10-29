@@ -97,6 +97,8 @@ scope — the delivered key is heartbeat-scoped and fails every other route.
   on one resource, mapping, budget charge and audit. Replays occur before
   quota admission, including at an exhausted budget. Those writes commit
   atomically; no NULL in-flight mapping survives a failed insert or audit.
+  Legacy NULL claims retain a five-minute read-only grace before atomic recovery;
+  recent pending retries do not consume budget or create state.
   Mappings expire after 24 h; a deleted-resource mapping provisions fresh.
 - `DELETE /api/inventory/:id` (session + CSRF, owner-only, unbilled like
   other teardown): bound keys keep revoked rows with the binding nulled
@@ -159,3 +161,10 @@ Release-owner order: accept the final PR #29 head, then this pairing candidate.
 Do not merge the original PR #28 and the repaired replacement independently.
 No production migration, installer activation, running-worker enrollment or
 inference is authorized by this review evidence.
+
+
+Latest Muse W2 head `0b87808` is preserved in this candidate's ancestry. Its
+uppercase code-entry fix and all five additional regressions are retained,
+including the deterministic wrong-secret fixture. Overlapping rowid-based
+rotation and separate mapping/audit writes are superseded by the reviewed atomic
+operations here. The legacy five-minute NULL-claim grace is preserved.

@@ -61,6 +61,8 @@ const MAX_PAIRING_ATTEMPTS = 10;
 const PAIRING_RECLAIM_MS = 10 * 60 * 1000;
 // POST /api/inventory Idempotency-Key replay horizon.
 const IDEMPOTENCY_TTL_MS = 24 * 3600 * 1000;
+// Compatibility grace for NULL claims written by the pre-atomic registration path.
+const IDEMPOTENT_IN_FLIGHT_MS = 5 * 60 * 1000;
 // Demo auth surface (allowlist): the only /api/auth/* routes a demo session
 // may use are sign-in (both maintained paths), sign-out, and session reads.
 // Everything else — update-user, change-password, link-social, password
@@ -892,6 +894,12 @@ async function registerResource(db, ownerId, key, body, kind, origin) {
   const replay = async () => key ? first(db, `SELECT r.* FROM idempotency_keys i JOIN resources r ON r.id=i.resource_id AND r.owner_id=i.owner_id WHERE i.owner_id=? AND i.key=? AND i.created_at>=?`, ownerId, key, cutoff) : null;
   const existing = await replay();
   if (existing) return { created: false, row: existing };
+  if (prior && prior.resource_id === null) {
+    const claimedAt = Date.parse(prior.created_at);
+    if (!Number.isFinite(claimedAt) || claimedAt + IDEMPOTENT_IN_FLIGHT_MS >= Date.parse(now)) {
+      throw httpError(409, 'A request with this Idempotency-Key is already in flight. Retry shortly.', 'IDEMPOTENT_IN_FLIGHT');
+    }
+  }
   // Reserve the generated resource identity inside the same transaction as
   // admission, insertion and audit. No committed NULL mapping can wedge a
   // retry; concurrent losers read the winner without spending another slot.

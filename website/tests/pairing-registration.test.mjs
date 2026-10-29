@@ -5,6 +5,18 @@ const register=(t,key='same-registration',name='synthetic')=>t.call('/api/invent
 const snapshot=async t=>({resources:(await t.DB.prepare('SELECT * FROM resources ORDER BY id').all()).results,mappings:(await t.DB.prepare('SELECT * FROM idempotency_keys ORDER BY key').all()).results,budget:(await t.DB.prepare('SELECT * FROM write_budget ORDER BY user_id,window').all()).results,audits:(await t.DB.prepare("SELECT * FROM audit WHERE action='resource.register' ORDER BY id").all()).results});
 for(const real of [false,true]){
  const engine=real?'local D1':'sqlite';
+ test(`${engine}: legacy NULL registration claims keep their grace without charging rejected retries`,async c=>{
+  const t=await pairingEnv(c,real);c.mock.timers.enable({apis:['Date'],now:Date.now()});
+  await t.DB.prepare('INSERT INTO idempotency_keys(owner_id,key,resource_id,created_at) VALUES(?,?,NULL,?)').bind(t.alice.id,'legacy-pending',new Date().toISOString()).run();
+  const before=await snapshot(t);
+  for(let n=0;n<3;n++){const r=await register(t,'legacy-pending');assert.equal(r.status,409);assert.equal(r.json.code,'IDEMPOTENT_IN_FLIGHT');}
+  assert.deepEqual(await snapshot(t),before);
+  c.mock.timers.tick(5*60*1000+1);
+  const recovered=await register(t,'legacy-pending');assert.equal(recovered.status,201);
+  assert.equal((await register(t,'legacy-pending')).status,200);
+  const after=await snapshot(t);assert.equal(after.resources.length,1);assert.equal(after.mappings.length,1);assert.equal(after.budget[0].count,1);assert.equal(after.audits.length,1);
+ });
+
  test(`${engine}: registration audit failure rolls back resource, mapping and budget`,async c=>{
   const t=await pairingEnv(c,real),before=await snapshot(t);
   await t.DB.prepare("CREATE TRIGGER registration_fault BEFORE INSERT ON audit WHEN NEW.action='resource.register' BEGIN SELECT RAISE(ABORT,'synthetic registration fault'); END").run();
