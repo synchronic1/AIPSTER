@@ -119,6 +119,15 @@ class WindowsStorageTests(unittest.TestCase):
         self.assertFalse((state / "node-id").exists())
         self.assertEqual([p.name for p in state.iterdir()], [], "no temp litter")
 
+    @unittest.skipUnless(os.name == "nt", "native Windows ACL check")
+    def test_pair_lock_provisions_a_private_data_directory(self):
+        # unpair/heartbeat before the first pair used to create the data
+        # directory with a bare mkdir (inherited ACL, default owner).
+        self.assertFalse(self.data.exists())
+        with pairing.pair_lock(self.data):
+            pass
+        self.assertTrue(protect_path(self.data, directory=True, verify=True))
+
     def test_mkdir_collision_never_claims_another_creators_new_path(self):
         mkdir = Path.mkdir
         collision = False

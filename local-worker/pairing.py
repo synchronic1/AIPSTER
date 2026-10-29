@@ -542,7 +542,11 @@ def pair_lock(data_dir):
     deletion race. Acquisition waits up to PAIR_LOCK_TIMEOUT_SEC and
     then fails cleanly with PAIR_IN_PROGRESS, never by deleting.
     """
-    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    # The mutex may be the first thing to touch the data directory (unpair or
+    # heartbeat before any pair). Provision it privately, not with a bare
+    # mkdir that would leave an inherited ACL or the token's default owner
+    # that no later creator ever repairs.
+    private_dir(data_dir)
     lock = Path(data_dir) / "pair.lock"
     fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
     try:
