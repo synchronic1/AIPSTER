@@ -198,5 +198,36 @@ foreach ($path in $items) {
         self.assertFalse((self.data / "pairing.json").exists())
         self.assertFalse(list(self.data.glob("heartbeat-key*.txt")))
 
+    def test_transient_server_failures_recover_but_auth_rejections_do_not_retry(self):
+        self.legacy()
+        for status in [500, 502, 503, 504]:
+            with self.subTest(status=status), patch.object(pairing, "send_heartbeat", side_effect=[
+                    pairing.PairingError(status,"UPSTREAM","synthetic"), {}, pairing.RePairRequired(401,"KEY_REVOKED","synthetic")]) as beat, \
+                 patch.object(pairing.time,"sleep") as sleep, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pairing.cmd_heartbeat(self.args, loop=True), pairing.EXIT_REPAIR_REQUIRED)
+                self.assertEqual(beat.call_count, 3)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 60])
+        for status in [401, 403, 404]:
+            with self.subTest(status=status), patch.object(pairing,"send_heartbeat",side_effect=pairing.PairingError(status,"REJECTED","synthetic")) as beat, \
+                 patch.object(pairing.time,"sleep") as sleep, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pairing.cmd_heartbeat(self.args, loop=True), pairing.EXIT_PAIRING_REJECTED)
+                self.assertEqual(beat.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_loader_refuses_shared_metadata_and_selected_generation(self):
+        self.assertEqual(self.pair(), pairing.EXIT_OK)
+        meta = json.loads((self.data / "pairing.json").read_text())
+        for path in [self.data / "pairing.json", pairing.pairing_key_path(self.data, meta)]:
+            if os.name == "nt":
+                granted = subprocess.run(["icacls", str(path), "/grant", "*S-1-1-0:R"], capture_output=True)
+                self.assertEqual(granted.returncode, 0)
+            else:
+                path.chmod(0o666)
+            try:
+                with self.assertRaises(pairing.PairingError) as error: pairing.load_pairing(self.data)
+                self.assertEqual(error.exception.code, "BAD_PAIRING_STORE")
+            finally:
+                pairing.restrict_file(path)
+
 
 if __name__ == "__main__": unittest.main()

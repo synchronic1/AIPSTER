@@ -101,6 +101,8 @@ def _restrict_path(path, directory=False):
     if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
         raise PairingError(None, "PRIVATE_STORAGE", "worker state cannot use symbolic links")
     try:
+        if os.name != "nt" and path.stat().st_uid != os.getuid():
+            raise OSError("worker state belongs to another user")
         os.chmod(path, 0o700 if directory else 0o600)
         if os.name == "nt":
             # Use the process identity, not USERNAME or an inherited ACL. A new
@@ -110,6 +112,7 @@ def _restrict_path(path, directory=False):
 $ErrorActionPreference = 'Stop'
 $item = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+if ((Get-Acl -LiteralPath $item.path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 2 }
 if ($item.directory) {
   $acl = [System.Security.AccessControl.DirectorySecurity]::new()
   $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
@@ -215,6 +218,8 @@ def load_or_create_node_id(state_dir):
     private_dir(state_dir)
     node_file = state_dir / "node-id"
     if node_file.exists():
+        if not restrict_file(node_file):
+            raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
         value = node_file.read_text(encoding="utf-8").strip()
         if value and len(value) <= 64 and all(c.isalnum() or c in "-_" for c in value):
             return value
