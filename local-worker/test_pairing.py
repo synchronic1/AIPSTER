@@ -510,10 +510,6 @@ class ConcurrencyAndLoopTests(unittest.TestCase):
 
     def test_concurrent_first_pairs_converge_on_one_node_id(self):
         state = self.data / "state"
-        # The race under test is node-id publication. Directory creation
-        # races fail closed by design (one ownership check, never adopt), so
-        # the private state directory exists before the racers start.
-        pairing.private_dir(state)
         gate = threading.Barrier(8)
         results, errors = [], []
 

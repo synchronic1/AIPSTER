@@ -60,6 +60,7 @@ HEARTBEAT_INTERVAL_SEC = 60
 HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
 STATUS_STALE_SEC = 5 * 60
+PRIVATE_DIR_SETTLE_SEC = 2  # concurrent creator still normalizing its new directory
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -145,9 +146,33 @@ def private_dir(path):
         return private_dir(path)
     except FileExistsError:
         created = False
-    if not _restrict_path(path, directory=True, new=created):
-        raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
-    return path
+    if created:
+        if not _restrict_path(path, directory=True, new=True):
+            raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
+        return path
+    # Another process may have created the directory an instant ago and still
+    # be replacing the token's default owner (e.g. Administrators on an
+    # elevated token) with the user. Only that exact state is waited out,
+    # briefly; any other owner fails on the first check, and the final check
+    # is the same strict one, so nothing is adopted or loosened.
+    deadline = time.monotonic() + PRIVATE_DIR_SETTLE_SEC
+    while True:
+        try:
+            if _restrict_path(path, directory=True, new=False):
+                return path
+            raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
+        except PairingError as exc:
+            if not _creator_still_settling(exc.__cause__) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _creator_still_settling(cause):
+    """True only while a new directory still carries this process's default owner."""
+    default_owner = getattr(cause, "default_owner_sid", "unavailable")
+    return (getattr(cause, "reason", None) == "owner-mismatch"
+            and default_owner not in ("unavailable", getattr(cause, "user_sid", None))
+            and getattr(cause, "owner_sid", None) == default_owner)
 
 
 def write_private(path, text):
@@ -224,6 +249,11 @@ def load_or_create_node_id(state_dir):
             os.link(tmp, node_file)
         except FileExistsError:
             return load_or_create_node_id(state_dir)
+        except OSError as exc:
+            # No hard links here: refuse rather than fall back to a
+            # non-exclusive replace that could overwrite a racer's identity.
+            raise PairingError(None, "PRIVATE_STORAGE",
+                               "worker storage does not support exclusive node-id creation") from exc
     finally:
         try:
             os.unlink(tmp)

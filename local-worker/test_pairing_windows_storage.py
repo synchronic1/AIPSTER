@@ -56,6 +56,69 @@ class WindowsStorageTests(unittest.TestCase):
             claim.assert_not_called()
             self.assertEqual(list(self.data.iterdir()),[])
 
+    def _collide_then(self, boundary):
+        mkdir = Path.mkdir
+        collision = False
+
+        def race(path, *args, **kw):
+            nonlocal collision
+            if path == self.data and not collision:
+                collision = True
+                mkdir(path, *args, **kw)
+                raise FileExistsError("synthetic concurrent creator")
+            return mkdir(path, *args, **kw)
+        return patch.object(Path, "mkdir", new=race), patch.object(pairing, "protect_path", side_effect=boundary, create=True)
+
+    def test_concurrent_creator_still_normalizing_is_waited_out(self):
+        # The racer that created the directory still shows the token's default
+        # owner for an instant; the loser waits for the same strict check.
+        user, default = "S-1-5-21-1-2-3-1001", "S-1-5-32-544"
+        calls = []
+
+        def boundary(path, **flags):
+            calls.append(flags)
+            if len(calls) < 3:
+                raise PrivateStorageError(2, "owner-mismatch", user, default, default)
+        mkdir_patch, protect_patch = self._collide_then(boundary)
+        with mkdir_patch, protect_patch, patch.object(pairing.time, "sleep", lambda s: None):
+            self.assertEqual(pairing.private_dir(self.data), self.data)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(flags["new"] is False for flags in calls), calls)
+
+    def test_foreign_owner_fails_on_first_check_without_waiting(self):
+        user, default = "S-1-5-21-1-2-3-1001", "S-1-5-32-544"
+        calls = []
+
+        def boundary(path, **flags):
+            calls.append(flags)
+            raise PrivateStorageError(2, "owner-mismatch", user, default, "S-1-5-21-9-9-9-2002")
+        mkdir_patch, protect_patch = self._collide_then(boundary)
+        with mkdir_patch, protect_patch, patch.object(pairing.time, "sleep", lambda s: None):
+            with self.assertRaises(pairing.PairingError):
+                pairing.private_dir(self.data)
+        self.assertEqual(len(calls), 1)
+
+    def test_settling_wait_is_bounded(self):
+        user, default = "S-1-5-21-1-2-3-1001", "S-1-5-32-544"
+
+        def boundary(path, **flags):
+            raise PrivateStorageError(2, "owner-mismatch", user, default, default)
+        clock = iter(range(0, 1000))
+        mkdir_patch, protect_patch = self._collide_then(boundary)
+        with mkdir_patch, protect_patch, patch.object(pairing.time, "sleep", lambda s: None), \
+                patch.object(pairing.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(pairing.PairingError):
+                pairing.private_dir(self.data)
+
+    def test_unsupported_hard_links_fail_closed_as_private_storage(self):
+        state = self.data / "state"
+        with patch.object(pairing.os, "link", side_effect=PermissionError(1, "synthetic no hard links")):
+            with self.assertRaises(pairing.PairingError) as caught:
+                pairing.load_or_create_node_id(state)
+        self.assertEqual(caught.exception.code, "PRIVATE_STORAGE")
+        self.assertFalse((state / "node-id").exists())
+        self.assertEqual([p.name for p in state.iterdir()], [], "no temp litter")
+
     def test_mkdir_collision_never_claims_another_creators_new_path(self):
         mkdir = Path.mkdir
         collision = False
