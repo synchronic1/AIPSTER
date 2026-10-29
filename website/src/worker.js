@@ -7,7 +7,8 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
-import { handleFabric } from './fabric/router.mjs';
+import { handleFabric, federationEnabled } from './fabric/router.mjs';
+import { schemaReady } from './lib/schema.js';
 import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
@@ -175,25 +176,7 @@ async function handleApi(request, env, url) {
     const hasDb = !!env.DB;
     const secretOk = (env.BETTER_AUTH_SECRET || '').length >= 32;
     const urlOk = !!env.BETTER_AUTH_URL;
-    let schemaOk = false;
-    if (hasDb) {
-      try {
-        const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
-        const names = new Set(rows.map((r) => r.name));
-        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit', 'write_budget']
-          .every((n) => names.has(n));
-        // Migration contract: required columns must exist, not just tables.
-        // LIMIT 0 probes fail when any column is missing (e.g. 0003/0004
-        // not applied); portable across SQLite/D1 without pragma calls.
-        let colsOk = false;
-        if (tablesOk) {
-          await all(env.DB, 'SELECT username, displayUsername, demo, disabled FROM "user" LIMIT 0');
-          await all(env.DB, 'SELECT id, "key", count, lastRequest FROM rateLimit LIMIT 0');
-          colsOk = true;
-        }
-        schemaOk = tablesOk && colsOk;
-      } catch { schemaOk = false; }
-    }
+    const schemaOk = hasDb && await schemaReady(env.DB, federationEnabled(env));
     const authConfigured = hasDb && secretOk && urlOk;
     return json(200, {
       ok: true, app: 'aipster-app', version: VERSION,
