@@ -596,19 +596,31 @@ async function handleApi(request, env, url) {
       }
       ttlMin = body.ttlMinutes;
     }
-    await checkWriteBudget(db, me());
     const minted = mintPairCode();
     const now = nowIso();
+    const window = budgetWindow(new Date(now));
     const expiresAt = new Date(Date.now() + ttlMin * 60 * 1000).toISOString();
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    const pc = await run(db, `INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts)
-      SELECT ?, ?, ?, ?, ?, ?, NULL, 0 WHERE (SELECT COUNT(*) FROM pairing_codes WHERE owner_id = ? AND used_at IS NULL AND expires_at >= ?) < ${MAX_ACTIVE_PAIRING_CODES}`,
-      minted.id, me(), salt, await verifierFor(minted.secret, salt), now, expiresAt, me(), now);
+    // Admission, one-time secret verifier and history must commit together:
+    // a failed audit cannot strand an undisclosed code or consume its slot.
+    const [pc] = await db.batch([
+      db.prepare(`INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts)
+        SELECT ?, ?, ?, ?, ?, ?, NULL, 0
+        WHERE EXISTS(SELECT 1 FROM "user" WHERE id=? AND disabled=0 AND demo=0)
+        AND (SELECT COUNT(*) FROM pairing_codes WHERE owner_id=? AND used_at IS NULL AND expires_at>=?) < ${MAX_ACTIVE_PAIRING_CODES}
+        AND COALESCE((SELECT count FROM write_budget WHERE user_id=? AND window=?),0) < ${WRITE_BUDGET_PER_HOUR}`)
+        .bind(minted.id, me(), salt, await verifierFor(minted.secret, salt), now, expiresAt, me(), me(), now, me(), window),
+      db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes()=1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(me(),window),
+      db.prepare(`INSERT INTO audit(id,at,actor_id,action,target,detail) SELECT ?,?,?,'pairing.code.create',?,'' WHERE changes()=1`).bind(rid('a_'),now,me(),minted.id)
+    ]);
     if (Number(pc.meta.changes) !== 1) {
+      const live = await first(db, 'SELECT disabled,demo FROM "user" WHERE id=?', me());
+      if (!live || Number(live.disabled) || Number(live.demo)) throw httpError(401, 'Sign-in required.', 'AUTH_REQUIRED');
+      const budget = await first(db, 'SELECT count FROM write_budget WHERE user_id=? AND window=?', me(), window);
+      if (budget && budget.count >= WRITE_BUDGET_PER_HOUR) throw httpError(429, 'Too many changes in the last hour. Try again later.', 'WRITE_RATE_LIMITED');
       return json(409, { error: `Too many unused pairing codes (${MAX_ACTIVE_PAIRING_CODES} per user). Let one expire first.`, code: 'PAIRING_LIMIT' });
     }
-    await audit(db, me(), 'pairing.code.create', minted.id);
     return json(201, { id: minted.id, code: minted.code, expiresAt, oneTime: 'This code is shown once. It cannot be recovered.' });
   }
   if (path === '/api/pairing/claim' && method === 'POST') {
@@ -653,13 +665,22 @@ async function handleApi(request, env, url) {
     let resourceId = resource ? resource.id : rid('r_');
     let name = resource ? resource.name : await uniqueResourceName(db, ownerId, wantName);
     let fresh = await completePairing(db, row, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, now);
-    if (!fresh && created) {
-      // A different code may have enrolled this same owner/node after our
-      // lookup. One bounded retry binds to that winner, never a duplicate.
+    if (!fresh) {
+      // A concurrent claim may have consumed this code or enrolled the node.
+      // Reload consent, preserving its authenticated identity and same-node
+      // reclaim window, before the one bounded transaction retry.
       const winner = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
-      if (winner) {
+      const latest = winner ? await first(db, 'SELECT * FROM pairing_codes WHERE id=?', row.id) : null;
+      const retryAt = nowIso();
+      const eligible = latest && latest.owner_id === ownerId && latest.salt === row.salt && latest.verifier === row.verifier
+        && Number(latest.attempts) < MAX_PAIRING_ATTEMPTS
+        && (latest.used_at
+          ? latest.node_id === nodeId && latest.resource_id === winner.id && Number.isFinite(Date.parse(latest.used_at))
+            && Date.parse(latest.used_at) + PAIRING_RECLAIM_MS >= Date.parse(retryAt)
+          : Number.isFinite(Date.parse(latest.expires_at)) && Date.parse(latest.expires_at) >= Date.parse(retryAt));
+      if (eligible) {
         created = false; resourceId = winner.id; name = winner.name;
-        fresh = await completePairing(db, row, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, nowIso());
+        fresh = await completePairing(db, latest, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, retryAt);
       }
     }
     if (!fresh) {
