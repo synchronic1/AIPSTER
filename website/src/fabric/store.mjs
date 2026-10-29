@@ -11,7 +11,7 @@ import { checkWriteBudget } from '../lib/quotas.js';
 import { admitFabricOperation } from './admission.mjs';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
-import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion, pendingCommit, claimActionForPath, pendingClaim, ledgerFor, ledgerVeto } from './operations.mjs';
+import { opDigest, auditIdFor, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion, pendingCommit, claimActionForPath, pendingClaim, ledgerFor, ledgerVeto } from './operations.mjs';
 import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, acceptRecoverInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
@@ -74,9 +74,29 @@ async function ownNode(db, actor, nodeId) {
   if (!node || node.owner_id !== actor.user.id) throw err(404, 'NOT_FOUND', 'Node not found or not yours.');
   return node;
 }
+function auditVia(actor) {
+  return actor.kind === 'key' ? ` via key ${actor.keyId || 'unknown'}${isAgentKey(actor) ? ' (agent)' : ''}` : ' via session';
+}
+
 async function auditFabric(db, actor, op, action, target, detail = '') {
-  const via = actor.kind === 'key' ? ` via key ${actor.keyId || 'unknown'}${isAgentKey(actor) ? ' (agent)' : ''}` : ' via session';
-  await ensureAudit(db, { op: await opDigest(actor, op), action, actorId: actor.user.id, target, detail: (detail + via).slice(0, 300), now: nowIso() });
+  await ensureAudit(db, { op: await opDigest(actor, op), action, actorId: actor.user.id, target, detail: (detail + auditVia(actor)).slice(0, 300), now: nowIso() });
+}
+
+// Audit row chained to the preceding effect in the same batch: it commits
+// only if that effect changed exactly one row, and rolls back with it.
+function chainedAudit(db, actor, opId, action, target, now, detail = '') {
+  return db.prepare(`INSERT OR IGNORE INTO audit (id, at, actor_id, action, target, detail)
+    SELECT ?, ?, ?, ?, ?, ? WHERE changes() = 1`)
+    .bind(auditIdFor(opId, action), now, actor.user.id, action, target, (detail + auditVia(actor)).slice(0, 300));
+}
+
+// A decision committed by this same operation (its audit row commits in the
+// same batch) is replayed instead of reported as ALREADY_DECIDED.
+async function appliedDecision(db, actor, opId, appr) {
+  if ((appr.decision !== 'approved' && appr.decision !== 'rejected') || appr.approver !== actor.user.id) return null;
+  const audit = await first(db, 'SELECT target, actor_id FROM audit WHERE id = ?', auditIdFor(opId, `fabric.approval.${appr.decision}`));
+  if (!audit || audit.target !== appr.id || audit.actor_id !== actor.user.id) return null;
+  return { status: 200, body: { id: appr.id, decision: appr.decision, reconciled: true } };
 }
 
 // IN-list chunking: every chunked query stays far under D1's
@@ -730,7 +750,12 @@ export async function decideApproval(db, actor, id, input = {}, op = null) {
     exporterOk = !!(grant && await actorExportsGrant(db, actor, grant));
   }
   if (!exporterOk) throw err(403, 'FORBIDDEN', 'Only the exporting owner can decide.');
-  if (appr.decision !== 'requested') throw err(409, 'ALREADY_DECIDED', `Approval is ${appr.decision}.`);
+  const opId = await opDigest(actor, op);
+  if (appr.decision !== 'requested') {
+    const applied = await appliedDecision(db, actor, opId, appr);
+    if (applied) return applied;
+    throw err(409, 'ALREADY_DECIDED', `Approval is ${appr.decision}.`);
+  }
   if (appr.expiry <= nowIso()) {
     const expired = await db.prepare(`UPDATE approvals SET decision = 'expired', decided_at = ?
       WHERE id = ? AND decision = 'requested'
@@ -742,16 +767,24 @@ export async function decideApproval(db, actor, id, input = {}, op = null) {
   const decision = input.decision === 'approve' ? 'approved' : input.decision === 'reject' ? 'rejected' : null;
   if (!decision) throw err(400, 'BAD_DECISION', "Decision must be 'approve' or 'reject'.");
   const now = nowIso();
-  const upd = await db.prepare(`UPDATE approvals SET decision = ?, approver = ?, interaction_ref = ?, decided_at = ? WHERE id = ? AND decision = 'requested' AND expiry > ? AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`)
-    .bind(decision, actor.user.id, `session:${actor.user.id}:${now}`, now, id, now, actor.user.id).run();
+  // The decision and its audit evidence commit together: a failed audit
+  // leaves the approval undecided, and a lost response is replayed above.
+  const [upd] = await db.batch([
+    db.prepare(`UPDATE approvals SET decision = ?, approver = ?, interaction_ref = ?, decided_at = ? WHERE id = ? AND decision = 'requested' AND expiry > ? AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`)
+      .bind(decision, actor.user.id, `session:${actor.user.id}:${now}`, now, id, now, actor.user.id),
+    chainedAudit(db, actor, opId, `fabric.approval.${decision}`, id, now)
+  ]);
   if (!upd.meta.changes) {
-    const cur = await first(db, 'SELECT decision, expiry FROM approvals WHERE id = ?', id);
+    const cur = await first(db, 'SELECT * FROM approvals WHERE id = ?', id);
     if (!cur) throw err(404, 'NOT_FOUND', 'Approval not found.');
-    if (cur.decision !== 'requested') throw err(409, 'ALREADY_DECIDED', `Approval is ${cur.decision}.`);
+    if (cur.decision !== 'requested') {
+      const applied = await appliedDecision(db, actor, opId, cur);
+      if (applied) return applied;
+      throw err(409, 'ALREADY_DECIDED', `Approval is ${cur.decision}.`);
+    }
     if (cur.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
     await throwActorClosed(db, actor);
   }
-  await auditFabric(db, actor, op, `fabric.approval.${decision}`, id);
   return { status: 200, body: { id, decision } };
 }
 
@@ -1306,13 +1339,17 @@ export async function deleteDeny(db, actor, id, op = null) {
   const row = await first(db, 'SELECT * FROM fabric_denies WHERE id = ?', id);
   if (!row || row.owner_id !== actor.user.id) throw err(404, 'NOT_FOUND', 'Deny not found.');
   if (op?.budgeted) await checkWriteBudget(db, actor.user.id);
-  const del = await db.prepare('DELETE FROM fabric_denies WHERE id = ? AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)').bind(id, actor.user.id).run();
+  // Removing a deny expands access, so it never commits without its audit
+  // evidence: the DELETE and the audit row succeed or roll back together.
+  const [del] = await db.batch([
+    db.prepare('DELETE FROM fabric_denies WHERE id = ? AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)').bind(id, actor.user.id),
+    chainedAudit(db, actor, await opDigest(actor, op), 'fabric.deny.delete', id, nowIso())
+  ]);
   if (!del.meta.changes) {
     const gone = await first(db, 'SELECT id FROM fabric_denies WHERE id = ?', id);
     if (!gone) throw err(404, 'NOT_FOUND', 'Deny not found.');
     await throwActorClosed(db, actor);
   }
-  await auditFabric(db, actor, op, 'fabric.deny.delete', id);
   return { status: 200, body: { id, deleted: true } };
 }
 
