@@ -200,7 +200,7 @@ async function loadOverview() {
 // The card renders with no API call and initially holds no credential; the call
 // it ever makes is minting a one-time pairing code when the user clicks Pair,
 // and the code is cleared on Done, tab switch, or sign-out. No verified
-// installer is packaged for any platform yet, so progress honestly stops at
+// installer is downloadable yet; Windows packaging still needs release qualification, so progress stops at
 // "Setup needed" until the worker is installed and paired elsewhere.
 const WORKER_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
 const DOCS_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
@@ -218,14 +218,21 @@ const WORKER_LINKS = {
 };
 const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
 
-// Verified installer availability per platform. Every platform is honestly
+// Verified installer availability per platform. A platform is honestly
 // unavailable until a packaging PR ships a worker-only artifact (the worker
 // plus its install files, licenses and provenance, pinned to a reviewed
 // commit with a checksum) and qualifies it. An available entry is
 // { available: true, url, sha256, version } and renders a real download with
 // its checksum; the repository archive is never offered as an installer.
+// A packaged-but-unpublished entry ({ available: false, packaged: true,
+// version, sha256, built_from }) shows the built version, checksum, and
+// build source with no link: there is nothing to download until the release
+// owner publishes the verified file.
 const INSTALLERS = {
-  windows: { available: false, reason: 'no verified installer package exists yet' },
+  windows: { available: false, packaged: true, version: '0.1.0',
+    sha256: 'ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7',
+    built_from: 'a2ec5e1938436e48de091548aa37f151cf8109e4',
+    reason: 'packaged; release qualification pending; release upload pending' },
   macos: { available: false, reason: 'no verified installer package exists yet' },
   linux: { available: false, reason: 'no verified installer package exists yet' }
 };
@@ -399,6 +406,8 @@ function clearPairingCode() {
 const INSTALLER_URL_OK = /^https:\/\/github\.com\/synchronic1\/AIPSTER\/releases\/download\//;
 const installerUsable = (inst) => !!(inst && inst.available
   && INSTALLER_URL_OK.test(inst.url || '') && /^[0-9a-f]{64}$/.test(inst.sha256 || ''));
+const installerPackaged = (inst) => !!(inst && !inst.available && inst.packaged
+  && /^[0-9a-f]{64}$/.test(inst.sha256 || ''));
 
 function paintConnectCard() {
   const el = $('connect-card');
@@ -412,6 +421,12 @@ function paintConnectCard() {
   const active = (typeof document !== 'undefined' && document.activeElement) || null;
   const focusAction = active && active.dataset ? active.dataset.action || null : null;
   const L = WORKER_LINKS;
+  const osPackaged = installerPackaged(connect.os ? INSTALLERS[connect.os] : null);
+  const installingStage = needsTargetSelection(connect)
+    ? 'Choose a target to check installer availability.'
+    : osPackaged
+    ? 'Pending: the installer is packaged; release qualification pending; the release file is not published yet.'
+    : 'Blocked: no verified installer is packaged yet.';
   const meta = OS_META[connect.os];
   const unpickedTarget = needsTargetSelection(connect);
   const targetLabel = connect.detected === 'mobile' ? 'computer' : 'system';
@@ -424,11 +439,14 @@ function paintConnectCard() {
       : 'Detection unavailable in this browser - pick your system to see target-specific steps.';
   const inst = INSTALLERS[connect.os];
   const usable = installerUsable(inst);
+  const packaged = installerPackaged(inst);
   const primary = unpickedTarget
     ? `<button type="button" class="btn" disabled>Pick a target ${targetLabel} above</button>`
     : usable
       ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
-      : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
+      : packaged
+        ? `<button type="button" class="btn" disabled>Installer pending publication for ${esc(meta.label)}</button>`
+        : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
   const secondary = unpickedTarget ? ''
     : meta.agentQualified
       ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
@@ -453,7 +471,9 @@ function paintConnectCard() {
     ? `<p class="muted">Pick a target ${targetLabel} to check installer availability.</p>`
     : usable
       ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
-      : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
+      : packaged
+        ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)} is packaged; release qualification pending (built from <code>${esc((inst.built_from || '').slice(0, 7))}</code>), but the release file is not published yet, so there is nothing to download. Its SHA-256 is <code>${esc(inst.sha256)}</code> — verify it after downloading.</p>`
+        : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
   let status = '';
   if (connect.phase === 'platforms') {
     status = `<p class="notice" role="status"><strong>Supported platforms:</strong> Windows x64 — tested (mock check only). macOS and Linux are not qualified, so agent setup is offered for Windows only. See Advanced for the pinned manual steps.</p>`;
@@ -489,7 +509,7 @@ function paintConnectCard() {
 <p class="benefit">Prepare the computer you are using now for future sharing. Installing the worker never shares anything or enables inference by itself.</p>
 <ol class="progress" aria-label="Connection progress">
 <li class="now" aria-current="step"><strong>Setup needed</strong><span class="st muted">You are here. Not connected.</span></li>
-<li><strong>Installing</strong><span class="st muted">Blocked: no verified installer is packaged yet.</span></li>
+<li><strong>Installing</strong><span class="st muted">${installingStage}</span></li>
 <li><strong>Pairing</strong><span class="st muted">Available: mint a one-time code below, then type it into the worker's pair step. Start the sender using the manual steps afterward.</span></li>
 <li><strong>Connected</strong><span class="st muted">Needs verified worker evidence. A download or a running worker is not proof.</span></li>
 </ol>
