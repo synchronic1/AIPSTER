@@ -37,7 +37,15 @@ def token_is_strong(value):
 
 
 def restrict_file(path):
-    """Best-effort user-only ACL on Windows; no-op elsewhere (documented)."""
+    """Best-effort user-only ACL on Windows; no-op elsewhere (documented).
+
+    Applies inheritance-removal + explicit grant in one icacls invocation
+    (no window with an empty DACL), then verifies by reading the ACL back.
+    Warns with full diagnostics and continues on failure: the file still
+    sits in the user-profile directory (itself user-ACL'd), so hardening is
+    defense in depth and must never break startup. Callers log the result;
+    tests assert the strict outcome where the OS allows it.
+    """
     if os.name != "nt":
         return True
     user = os.environ.get("USERNAME")
@@ -50,12 +58,26 @@ def restrict_file(path):
         print(f"warning: could not determine the user; {path} keeps inherited ACLs",
               file=sys.stderr)
         return False
-    result = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                            capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        print(f"warning: icacls failed on {path}; it keeps inherited ACLs", file=sys.stderr)
-        return False
-    return True
+    applied = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+                             capture_output=True, text=True, check=False)
+    shown = subprocess.run(["icacls", str(path)], capture_output=True, text=True, check=False)
+    # icacls prints `path FIRST_ACE` on line 0: strip the echoed path, keep the ACE.
+    out_lines = (shown.stdout or "").splitlines()
+    if out_lines and str(path) in out_lines[0]:
+        out_lines[0] = out_lines[0].replace(str(path), "", 1)
+    elif out_lines:
+        out_lines[0] = ""  # unparseable: ignore rather than misread the filename
+    aces = " ".join(line for line in out_lines
+                    if line.strip() and "successfully" not in line.lower()
+                    and "failed processing" not in line.lower())
+    ok = (applied.returncode == 0 and "(F)" in aces and "(I)" not in aces
+          and "BUILTIN" not in aces)
+    if not ok:
+        print(f"warning: token ACL hardening incomplete for {path}: "
+              f"user={user} rc={applied.returncode} "
+              f"apply_err={applied.stderr.strip()[:200]!r} aces={aces[:300]!r}; "
+              "file keeps broader ACLs", file=sys.stderr)
+    return ok
 
 
 def ensure_private_token(path):

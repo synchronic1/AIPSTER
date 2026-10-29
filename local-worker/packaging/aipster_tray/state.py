@@ -121,6 +121,12 @@ def utcnow():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def http_origin(host, port):
+    """http:// origin with brackets around IPv6 literals."""
+    part = f"[{host}]" if ":" in str(host) else host
+    return f"http://{part}:{port}"
+
+
 def write_state(path, state, detail="", worker_pid=None, host="", port=0, restarts=0,
                 version=""):
     header_line(state, detail)  # honesty gate
@@ -151,6 +157,6 @@ def describe(payload):
     if payload.get("worker_pid"):
         line += f" worker_pid={payload['worker_pid']}"
     if payload.get("port"):
-        line += f" endpoint=http://{payload.get('host', '?')}:{payload['port']}"
+        line += f" endpoint={http_origin(payload.get('host') or '?', payload['port'])}"
     line += f" restarts={payload.get('restarts', 0)} updated_at={payload.get('updated_at', '?')}"
     return line

@@ -32,7 +32,7 @@ _ACTIVE = None  # controller owning this process's window (single instance)
 
 def _health_ok(host, port):
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=1.5) as r:
+        with urllib.request.urlopen(st.http_origin(host, port) + "/healthz", timeout=1.5) as r:
             import json
             return json.load(r).get("status") == "ok"
     except Exception:
@@ -59,6 +59,10 @@ class Controller:
         self.last_heartbeat = 0.0
         self.console = log_lines
         self.log_file = None
+        # token_env name -> preset env value (or None): only a token inherited
+        # from the parent environment wins over the file; file-backed tokens
+        # are re-read on every reload so rotation takes effect on restart.
+        self._inherited = {}
 
     # -- logging ---------------------------------------------------------
     def log(self, message):
@@ -95,12 +99,15 @@ class Controller:
             except (OSError, ValueError, ValidationError) as exc:
                 return f"bad config: {exc}"
             self.token_env = self.loaded.node.token_env
-            if not os.environ.get(self.token_env):
-                try:
-                    value, _ = ensure_private_token(self.data / "api-token.txt")
-                except SystemExit as exc:
-                    return str(exc)
-                os.environ[self.token_env] = value
+            if self.token_env not in self._inherited:
+                self._inherited[self.token_env] = os.environ.get(self.token_env) or None
+            if self._inherited[self.token_env]:
+                return ""  # preset in the parent environment: env wins, file untouched
+            try:
+                value, _ = ensure_private_token(self.data / "api-token.txt")
+            except SystemExit as exc:
+                return str(exc)
+            os.environ[self.token_env] = value
             return ""
         except SystemExit as exc:
             return str(exc)
@@ -133,7 +140,7 @@ class Controller:
     def endpoint_label(self):
         if not self.loaded:
             return ""
-        return f"http://{self.loaded.node.host}:{self.loaded.node.port}"
+        return st.http_origin(self.loaded.node.host, self.loaded.node.port)
 
     # -- worker ops ------------------------------------------------------------
     def start_worker(self, manual=True):

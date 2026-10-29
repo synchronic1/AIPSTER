@@ -69,14 +69,35 @@ def dendrite_exe(bundle):
 
 
 def port_busy(host, port):
-    probe = socket.socket()
+    """True when the configured endpoint cannot be bound.
+
+    Resolves like the worker does (IPv4/IPv6/hostnames) and probes every
+    result with a matching family: busy only if ALL fail. An unresolvable
+    host is not "busy" — the worker itself reports the real config error,
+    and the uvicorn output sniff remains the backstop for races.
+    """
     try:
-        probe.bind((host, port))
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OverflowError, ValueError):
         return False
-    except OSError:
-        return True
-    finally:
-        probe.close()
+    if not infos:
+        return False
+    for family, _, _, _, sockaddr in infos:
+        probe = socket.socket(family)
+        if family == socket.AF_INET6:
+            try:
+                probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+        try:
+            # Each address tested independently: busy only if ALL fail.
+            probe.bind(sockaddr)
+            return False
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    return True
 
 
 def looks_like_bind_error(text):

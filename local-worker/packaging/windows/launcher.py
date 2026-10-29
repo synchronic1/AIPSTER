@@ -8,14 +8,15 @@ aipster_tray.firstrun. The token value is never printed or logged.
 import argparse
 import os
 from datetime import datetime, timezone
-import socket
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from aipster_tray.child import port_busy
 from aipster_tray.firstrun import (build_info, data_dir, ensure_private_token,
                                    ensure_setup)
+from aipster_tray.state import http_origin
 
 
 class Tee:
@@ -57,18 +58,13 @@ def run_server(config, data, inspect_only):
         print(f"token {'generated' if fresh else 'loaded'}: {token_path}")
     print(f"config: {config}")
     print(f"data:   {data}")
-    print(f"listen: http://{loaded.node.host}:{loaded.node.port} "
+    print(f"listen: {http_origin(loaded.node.host, loaded.node.port)} "
           f"(loopback only: {loaded.node.host in ('127.0.0.1', 'localhost', '::1')})")
     if not inspect_only:
-        probe = socket.socket()
-        try:
-            probe.bind((loaded.node.host, loaded.node.port))
-        except OSError:
+        if port_busy(loaded.node.host, loaded.node.port):
             print(f"aipster-worker: {loaded.node.host}:{loaded.node.port} is already in use; "
                   "stop the other worker first", file=sys.stderr)
             raise SystemExit(2)
-        finally:
-            probe.close()
     command = "inspect" if inspect_only else "serve"
     sys.argv = ["dendrite", command, "--config", str(config)]
     dendrite_main()
