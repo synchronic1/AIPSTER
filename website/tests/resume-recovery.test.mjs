@@ -25,11 +25,11 @@ async function fixture(c, real) {
   return { ...t, input, op, state, resume: (db = t.db) => core.resumeGrant(db, t.alice, t.grant, input, op) };
 }
 
-async function route(t, { db = t.db, mcp = false, input = t.input, key = t.op.key, action = 'resume', path = t.op.path } = {}) {
+async function route(t, { db = t.db, mcp = false, input = t.input, key = t.op.key, action = 'resume', path = t.op.path, actor = t.alice } = {}) {
   const url = new URL(mcp ? '/v1/fabric/mcp' : path, 'https://synthetic.invalid');
   const body = mcp ? { tool: `fabric.${action}_grant`, params: { id: t.grant, ...input }, idempotencyKey: key } : input;
   const request = new Request(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key }, body: JSON.stringify(body) });
-  const response = await handleFabric({ db, actor: t.alice, url, request, env: { FEDERATION_ENABLED: '1' },
+  const response = await handleFabric({ db, actor, url, request, env: { FEDERATION_ENABLED: '1' },
     json: (status, data) => Response.json(data, { status }),
     needAuthz: () => null, needSession: () => null, needCsrf: () => null, needNotDemo: () => null });
   return { status: response.status, body: await response.json() };
@@ -217,5 +217,34 @@ for (const real of [false, true]) {
     assert.equal((await t.db.prepare('SELECT count(*) n FROM audit WHERE action=? AND target=?').bind(`fabric.grant.${action}`, id).first()).n, 1);
     if (action === 'revise') assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_grant_revisions WHERE grant_id=?').bind(id).first()).n, 1);
     assert.deepEqual(await t.db.prepare('SELECT * FROM fabric_grants WHERE id=?').bind(id).first(), before);
+  });
+
+  for (const [field, deniedStatus] of [['disabled', 401], ['demo', 403]]) {
+    test(`${engine}: takeover ${field} denial stays reconcilable until an older resume effect is known`, async c => {
+      const t = await fixture(c, real), a = holdEffect(t.db); c.after(a.release);
+      const original = route(t, { db: a.db }); await a.ready;
+      await t.db.prepare("UPDATE idempotency_records SET created_at='2000-01-01' WHERE idem_key=?").bind(t.op.key).run();
+      const b = closeAfterGate(t, field), denied = await route(t, { db: b.db });
+      assert.equal(b.fired(), true); assert.equal(denied.status, deniedStatus); assert.equal(denied.body.id, undefined);
+      const pending = await t.db.prepare('SELECT status,response_code FROM idempotency_records WHERE idem_key=?').bind(t.op.key).first();
+      assert.equal(pending.status, 'uncertain'); assert.equal(pending.response_code, null);
+      assert.equal((await t.state()).receipts.length, 0, 'the original batch has not applied yet');
+      await t.db.prepare(`UPDATE "user" SET ${field}=0 WHERE id=?`).bind(t.alice.user.id).run();
+      a.release(); assert.equal((await original).status, 200);
+      await core.revokeGrant(t.db, t.alice, t.grant, { expectedVersion: 3 }); const revoked = await t.state();
+      const retry = await route(t); assert.equal(retry.status, 200);
+      assert.equal((await t.db.prepare('SELECT response_code FROM idempotency_records WHERE idem_key=?').bind(t.op.key).first()).response_code, 200);
+      assert.deepEqual(await t.state(), revoked);
+    });
+  }
+
+  test(`${engine}: ordinary foreign-owner authorization failures remain terminal and charge once`, async c => {
+    const t = await fixture(c, real), before = await t.state();
+    const denied = await route(t, { actor: t.bob }); assert.equal(denied.status, 403); assert.equal(denied.body.code, 'FORBIDDEN');
+    const read = () => t.db.prepare('SELECT * FROM idempotency_records WHERE idem_key=? AND actor=?').bind(t.op.key, `session:${t.bob.user.id}`).first();
+    const saved = await read(); assert.equal(saved.status, 'completed'); assert.equal(saved.response_code, 403);
+    assert.equal((await route(t, { actor: t.bob })).status, 403); assert.deepEqual(await read(), saved);
+    assert.equal((await t.db.prepare('SELECT count FROM write_budget WHERE user_id=? AND window=?').bind(t.bob.user.id, budgetWindow()).first()).count, 1);
+    assert.deepEqual(await t.state(), before);
   });
 }

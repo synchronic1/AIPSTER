@@ -1440,9 +1440,14 @@ export async function storeIdempotency(db, actor, key, status, body, attempt = n
           WHERE a.consumed_by_op = ? AND a.consumed_action = 'grant.commit' AND a.consumed_target IS NULL
           AND a.created_by = ? AND a.approver = ? AND g.exporter_id = ? AND g.connection_id = a.issued_connection`,
           operationId, actor.user.id, actor.user.id, actor.user.id);
-        if (revision || commit) {
-          // Their forensic completion is post-commit: do not cache success
-          // before an authorized retry has repaired missing history/audit.
+        const ownerClosed = (status === 401 && body && body.code === 'AUTH_REQUIRED')
+          || (status === 403 && body && body.code === 'DEMO_RESTRICTED');
+        if (revision || commit || ownerClosed) {
+          // Forensic completion needs an authorized retry. Temporary owner
+          // closure can also precede an older in-flight effect/receipt, so it
+          // cannot prove a terminal outcome even when no receipt exists yet.
+          // Other authorization failures remain terminal; the pre-ledger live
+          // check prevents closed users repeatedly reclaiming this operation.
           await releaseIdempotency(db, actor, key, attempt);
           return;
         }
