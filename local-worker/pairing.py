@@ -24,10 +24,10 @@ import getpass
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -35,13 +35,14 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
 HEARTBEAT_INTERVAL_SEC = 60
 HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
+STATUS_STALE_SEC = 5 * 60
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -94,54 +95,85 @@ def default_data_dir():
     return Path.home() / ".local" / "share" / "aipster-worker"
 
 
-def restrict_file(path):
-    """User-only access: POSIX mode 0600 plus a Windows user-ACL attempt."""
+def _restrict_path(path, directory=False):
+    """Establish private access before publishing state; never silently degrade."""
+    path = Path(path)
+    if path.is_symlink():
+        raise PairingError(None, "PRIVATE_STORAGE", "worker state cannot use symbolic links")
     try:
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    if os.name != "nt":
+        os.chmod(path, 0o700 if directory else 0o600)
+        if os.name == "nt":
+            # Use the process identity, not USERNAME or an inherited ACL. A new
+            # protected DACL also removes any existing explicit broad grants.
+            # The path is JSON data on stdin, never interpolated shell code.
+            script = r'''
+$ErrorActionPreference = 'Stop'
+$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($item.directory) {
+  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+  $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inherit, 'None', 'Allow')
+} else {
+  $acl = [System.Security.AccessControl.FileSecurity]::new()
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'Allow')
+}
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule($rule)
+if ($item.directory) {
+  [System.IO.Directory]::SetAccessControl($item.path, $acl)
+} else {
+  [System.IO.File]::SetAccessControl($item.path, $acl)
+}
+'''
+            powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+                                    input=json.dumps({"path": str(path.resolve()), "directory": directory}),
+                                    capture_output=True, text=True, check=False,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode != 0:
+                raise OSError("could not establish a private ACL")
         return True
-    user = os.environ.get("USERNAME")
-    if not user:
-        try:
-            user = subprocess.check_output(["whoami"], text=True).strip()
-        except (OSError, subprocess.CalledProcessError):
-            user = None
-    if not user:
-        print(f"warning: could not determine the user; {path} keeps inherited ACLs",
-              file=sys.stderr)
-        return False
-    result = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                            capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        print(f"warning: icacls failed on {path}; it keeps inherited ACLs", file=sys.stderr)
-        return False
-    return True
+    except OSError as exc:
+        raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage") from exc
+
+
+def restrict_file(path):
+    return _restrict_path(path)
+
+
+def private_dir(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if not _restrict_path(path, directory=True):
+        raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
+    return path
 
 
 def write_private(path, text):
     """Atomically write a secret-bearing file with user-only permissions."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(path.parent)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if not restrict_file(tmp):
+                raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
             handle.write(text)
-        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-    restrict_file(path)
 
 
 def load_or_create_node_id(state_dir):
     """Stable worker identity (1..64 id chars), created once and kept."""
     state_dir = Path(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    private_dir(state_dir)
     node_file = state_dir / "node-id"
     if node_file.exists():
         value = node_file.read_text(encoding="utf-8").strip()
@@ -244,6 +276,13 @@ def decide_usable(config_path=None):
     return False
 
 
+class NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        # Never forward the bearer or the pairing code, including on a TLS
+        # downgrade or a same-origin redirect. Use the configured API directly.
+        return None
+
+
 def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
     """POST JSON, returning (status, body-dict, retry-after)."""
     data = json.dumps(payload).encode("utf-8")
@@ -252,7 +291,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
         headers["Authorization"] = "Bearer " + secret
     request = Request(url, data=data, headers=headers, method="POST")
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
             status = response.status
             raw = response.read().decode("utf-8", "replace")
             retry_after = response.headers.get("Retry-After")
@@ -263,6 +302,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             raw = ""
         status = exc.code
         retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        exc.close()
     except (URLError, TimeoutError, socket.timeout, OSError) as exc:
         raise PairingError(None, "NETWORK", f"request failed: {exc}")
     try:
@@ -335,14 +375,26 @@ def pairing_files(data_dir):
     }
 
 
+def pairing_key_path(data_dir, meta):
+    generation = meta.get("key_file")
+    if generation is None:
+        return pairing_files(data_dir)["key"]  # read-only legacy compatibility
+    if not isinstance(generation, str) or not re.fullmatch(r"heartbeat-key\.[a-f0-9]{32}\.txt", generation):
+        raise PairingError(None, "BAD_PAIRING_STORE", "invalid pairing key generation; pair again")
+    return Path(data_dir) / generation
+
+
 def load_pairing(data_dir):
     """Load pairing metadata + secret. Raises PairingError when unpaired."""
     files = pairing_files(data_dir)
-    if not files["meta"].exists() or not files["key"].exists():
+    if not files["meta"].exists():
         raise PairingError(None, "NOT_PAIRED", "worker is not paired; run `pair` first")
     try:
         meta = json.loads(files["meta"].read_text(encoding="utf-8"))
-        secret = files["key"].read_text(encoding="utf-8").strip()
+        if not isinstance(meta, dict):
+            raise ValueError("invalid metadata")
+        # Select the key from this one manifest snapshot, never a second read.
+        secret = pairing_key_path(data_dir, meta).read_text(encoding="utf-8").strip()
     except (OSError, ValueError) as exc:
         raise PairingError(None, "BAD_PAIRING_STORE", f"pairing store unreadable: {exc}")
     if not meta.get("resource_id") or not meta.get("api_base") or not secret:
@@ -353,13 +405,13 @@ def load_pairing(data_dir):
 
 def write_status(data_dir, payload):
     files = pairing_files(data_dir)
-    files["status"].parent.mkdir(parents=True, exist_ok=True)
-    files["status"].write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_private(files["status"], json.dumps(payload, indent=2) + "\n")
 
 
 def cmd_pair(args):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+        private_dir(data_dir)
         node_id = load_or_create_node_id(data_dir / "state")
         hardware = probe_hardware(args.config)
         if args.name:
@@ -369,6 +421,26 @@ def cmd_pair(args):
             print("pairing: no code entered", file=sys.stderr)
             return EXIT_USAGE
         result = claim(args.api_base, code, node_id, hardware)
+        files = pairing_files(data_dir)
+        generation = "heartbeat-key." + secrets.token_hex(16) + ".txt"
+        meta = {
+            "api_base": check_api_base(args.api_base),
+            "resource_id": result["resourceId"],
+            "node_id": node_id,
+            "key_id": result.get("keyId"),
+            "key_prefix": result.get("keyPrefix"),
+            "heartbeat_url": result.get("heartbeatUrl"),
+            "created": result.get("created"),
+            "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "key_file": generation,
+        }
+        key_file = data_dir / generation
+        # The manifest is the commit point. A failed/interrupted write leaves
+        # either the old tuple or the complete new tuple, never mixed origins.
+        # Retain old/unpublished private generations until unpair: an in-flight
+        # reader may still hold an older manifest snapshot.
+        write_private(key_file, result["heartbeatKey"].strip() + "\n")
+        write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
     except PairingError as exc:
         print(f"pairing failed [{exc.code}]: {exc}", file=sys.stderr)
         if exc.code == "NETWORK":
@@ -376,21 +448,11 @@ def cmd_pair(args):
         if exc.status is None:
             return EXIT_USAGE
         return EXIT_PAIRING_REJECTED
-    files = pairing_files(data_dir)
-    meta = {
-        "api_base": check_api_base(args.api_base),
-        "resource_id": result["resourceId"],
-        "node_id": node_id,
-        "key_id": result.get("keyId"),
-        "key_prefix": result.get("keyPrefix"),
-        "heartbeat_url": result.get("heartbeatUrl"),
-        "created": result.get("created"),
-        "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    files["meta"].write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    write_private(files["key"], result["heartbeatKey"].strip() + "\n")
+    except OSError:
+        print("pairing failed [PRIVATE_STORAGE]: worker state could not be committed; pair again", file=sys.stderr)
+        return EXIT_USAGE
     print(f"paired: resource {meta['resource_id']} (key {meta['key_prefix']})")
-    print(f"stored: {files['meta']} + {files['key']} (user-only access)")
+    print(f"stored: {files['meta']} + {key_file} (user-only access)")
     print("heartbeat proves reachability only; it never means inference-ready")
     return EXIT_OK
 
@@ -399,13 +461,13 @@ def cmd_heartbeat(args, loop):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
         meta = load_pairing(data_dir)
-        usable = decide_usable(args.config)
     except PairingError as exc:
         print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK
     interval = max(args.interval, HEARTBEAT_MIN_INTERVAL_SEC)
     failures = 0
     while True:
+        usable = decide_usable(args.config)
         try:
             result = send_heartbeat(meta["api_base"], meta["resource_id"],
                                     meta["heartbeat_key"], usable)
@@ -416,6 +478,9 @@ def cmd_heartbeat(args, loop):
                   file=sys.stderr)
             return EXIT_REPAIR_REQUIRED
         except PairingError as exc:
+            state = "rate-limited" if exc.status == 429 else "network-error" if exc.status is None else "failed"
+            write_status(data_dir, {"at": time.time(), "ok": False, "status": state,
+                                    "code": exc.code, "retryAfterSec": exc.retry_after})
             if exc.status == 429:
                 wait = exc.retry_after or interval
                 print(f"heartbeat: rate limited; retrying in {wait}s", file=sys.stderr)
@@ -463,8 +528,13 @@ def cmd_status(args):
     if files["status"].exists():
         try:
             st = json.loads(files["status"].read_text(encoding="utf-8"))
-            print(f"status: last beat ok={st.get('ok')} at={st.get('heartbeatAt')}")
-        except ValueError:
+            if st.get("ok") is True and time.time() - float(st.get("at", 0)) > STATUS_STALE_SEC:
+                print(f"status: stale; last successful beat at={st.get('heartbeatAt')}")
+            elif st.get("ok") is not True:
+                print(f"status: {st.get('status', 'failed')} code={st.get('code')}")
+            else:
+                print(f"status: last beat ok=True at={st.get('heartbeatAt')}")
+        except (OSError, ValueError, TypeError):
             pass
     return EXIT_OK
 
@@ -475,10 +545,12 @@ def cmd_unpair(args):
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     files = pairing_files(data_dir)
     removed = []
-    for key in ("meta", "key"):
+    generations = [path for path in data_dir.glob("heartbeat-key.*.txt")
+                   if re.fullmatch(r"heartbeat-key\.[a-f0-9]{32}\.txt", path.name)]
+    for path in [files["meta"], files["key"], *generations]:
         try:
-            files[key].unlink()
-            removed.append(str(files[key]))
+            path.unlink()
+            removed.append(str(path))
         except OSError:
             pass
     if removed:

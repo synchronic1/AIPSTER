@@ -132,6 +132,9 @@ class PairingE2ETests(unittest.TestCase):
     def pairing_meta(self, data_dir):
         return json.loads((data_dir / "pairing.json").read_text())
 
+    def pairing_secret(self, data_dir):
+        return (data_dir / self.pairing_meta(data_dir)["key_file"]).read_text().strip()
+
     def test_two_users_isolated_repeat_startup(self):
         alice = self.seed_user("e2e-alice@example.com", "E2E Alice")
         bob = self.seed_user("e2e-bob@example.com", "E2E Bob")
@@ -172,7 +175,7 @@ class PairingE2ETests(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         meta = self.pairing_meta(data_dir)
         self.assertEqual(meta["resource_id"], first["resourceId"], "no duplicate row")
-        fresh_key = (data_dir / "heartbeat-key.txt").read_text().strip()
+        fresh_key = self.pairing_secret(data_dir)
         self.assertNotEqual(fresh_key, lost_key, "lost key rotated, not reissued")
         # Lost key is dead; fresh key beats.
         status, _ = self.bridge.api(
@@ -204,13 +207,13 @@ class PairingE2ETests(unittest.TestCase):
         rc, _, err = self.pair(data_dir, self.mint_code(user["cookie"])["code"], node_id="n_rot")
         self.assertEqual(rc, 0, err)
         meta = self.pairing_meta(data_dir)
-        old_key = (data_dir / "heartbeat-key.txt").read_text().strip()
+        old_key = self.pairing_secret(data_dir)
         # Re-pair rotates: same resource, new key, old key dead.
         rc, _, err = self.pair(data_dir, self.mint_code(user["cookie"])["code"], node_id="n_rot")
         self.assertEqual(rc, 0, err)
         meta2 = self.pairing_meta(data_dir)
         self.assertEqual(meta2["resource_id"], meta["resource_id"])
-        new_key = (data_dir / "heartbeat-key.txt").read_text().strip()
+        new_key = self.pairing_secret(data_dir)
         self.assertNotEqual(new_key, old_key)
         status, body = self.bridge.api(
             "POST", f"/api/resources/{meta['resource_id']}/heartbeat", {"usable": False},
@@ -258,7 +261,7 @@ class PairingE2ETests(unittest.TestCase):
         self.assertEqual(rc, 3)
         status, _ = self.bridge.api(
             "POST", f"/api/resources/{meta['resource_id']}/heartbeat", {"usable": False},
-            {"Authorization": "Bearer " + (data_dir / "heartbeat-key.txt").read_text().strip()})
+            {"Authorization": "Bearer " + self.pairing_secret(data_dir)})
         self.assertEqual(status, 401, "disabled owner heartbeat rejected")
 
     def test_cli_never_prints_secrets(self):
@@ -266,7 +269,7 @@ class PairingE2ETests(unittest.TestCase):
         data_dir = self.data_dir("quiet")
         rc, out, err = self.pair(data_dir, self.mint_code(user["cookie"])["code"], node_id="n_q")
         self.assertEqual(rc, 0, err)
-        secret = (data_dir / "heartbeat-key.txt").read_text().strip()
+        secret = self.pairing_secret(data_dir)
         rc2, out2, err2 = self.run_cli("status", data_dir=data_dir)
         self.assertEqual(rc2, 0, err2)
         rc3, out3, err3 = self.run_cli("heartbeat-once", "--config", str(MOCK_CONFIG),

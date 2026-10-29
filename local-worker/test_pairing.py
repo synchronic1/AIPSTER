@@ -139,7 +139,7 @@ class PairingTests(unittest.TestCase):
         meta = json.loads((self.data / "pairing.json").read_text())
         self.assertEqual(meta["resource_id"], "r_fake01")
         self.assertNotIn(FAKE_SECRET, json.dumps(meta), "secret must not be in metadata")
-        key_file = self.data / "heartbeat-key.txt"
+        key_file = self.data / meta["key_file"]
         self.assertEqual(key_file.read_text().strip(), FAKE_SECRET)
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(key_file.stat().st_mode), 0o600)
@@ -241,6 +241,7 @@ class PairingTests(unittest.TestCase):
         self.assertIn("revoke the sender key", out, "honest server-side note")
         self.assertFalse((self.data / "pairing.json").exists())
         self.assertFalse((self.data / "heartbeat-key.txt").exists())
+        self.assertFalse(list(self.data.glob("heartbeat-key.*.txt")))
 
 
 def argparse_namespace(values):
