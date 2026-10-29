@@ -23,7 +23,7 @@ async function seedResources(t, user, n) {
   return ids; // index 0 is the oldest
 }
 
-async function client(t, onFetch) {
+async function client(t, onFetch, fail) {
   const elements = new Map();
   const el = (id) => {
     if (!elements.has(id)) elements.set(id, { id, hidden: false, textContent: '', innerHTML: '', value: '', attrs: {}, listeners: {}, dataset: {},
@@ -37,6 +37,7 @@ async function client(t, onFetch) {
     location: { origin: TEST_URL, pathname: '/app/', search: '' },
     fetch: (path, init = {}) => {
       if (onFetch) onFetch(String(path), el);
+      if (fail && fail(String(path))) return Promise.resolve(new Response('{"error":"injected failure"}', { status: 500 }));
       return t.call(path, { method: init.method || 'GET', headers: { ...t.as(t.alice), ...(init.headers || {}) }, body: init.body });
     },
     setTimeout() { return 0; }, console, URLSearchParams, history: { replaceState() {} },
@@ -90,4 +91,22 @@ test('a stale generation mid-pagination drops the walk without rendering', async
   await context.loadKeys(); // stale walks resolve quietly; nothing renders
   assert.equal(el('key-resource').innerHTML, '', 'stale paged options are never rendered');
   assert.ok(sawPage2, 'pagination was interrupted mid-walk');
+});
+
+test('key management renders when the inventory walk fails', async () => {
+  // Codex P2 round 13: a 50-resource inventory page exceeded D1's
+  // 50-query cap, and loadKeys' Promise.all discarded the keys response
+  // with it — hiding the key list and Revoke. Keys must render
+  // independently; only the resource dropdown may degrade.
+  const t = await createTestEnv();
+  const now = new Date().toISOString();
+  await t.DB.prepare(`INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('k_ui1', 'u_alice', 'my-read-key', 'read', null, 's', 'v', 'aip_live_k_ui1_x', null, '', now, null, null).run();
+  const { context, el } = await client(t, null, (path) => path.startsWith('/api/inventory'));
+  await context.loadKeys();
+  const html = el('key-list').innerHTML;
+  assert.ok(html.includes('my-read-key'), 'key card renders despite inventory failure: ' + html);
+  assert.ok(html.includes('data-revkey'), 'Revoke control stays available');
+  assert.ok(el('key-resource').innerHTML.includes('unavailable'), 'dropdown degrades honestly');
 });

@@ -97,9 +97,14 @@ function renderStatus(el, data) {
     // Only heartbeat-seen rows replace the telemetry-unavailable copy with
     // reachability-only copy. usable=false gets a distinct not-ready
     // attention note and never renders as runnable/ready.
-    const hb = !seen ? '' : r.usable === false
-      ? ' · ATTENTION: reachable but NOT usable for inference'
-      : ' · heartbeat seen (reachability only — not ready to run)';
+    // Present-tense reachability needs a fresh heartbeat (Codex P2
+    // round 13): lastSeenAt survives after a worker goes stale, so the
+    // old timestamp-presence check kept ATTENTION: reachable forever.
+    const hb = !seen ? '' : r.liveness !== 'online'
+      ? ' · not currently reachable'
+      : r.usable === false
+        ? ' · ATTENTION: reachable but NOT usable for inference'
+        : ' · heartbeat seen (reachability only — not ready to run)';
     return `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(age)}${hb}${r.demoFixture ? ' · DEMO' : ''}</p>`;
   }).join('');
   const anySeen = list.some((r) => r.lastSeenAt !== null && r.lastSeenAt !== undefined);
@@ -205,7 +210,7 @@ async function loadOverview() {
 // and the code is cleared on Done, tab switch, or sign-out. No verified
 // installer is packaged for any platform yet, so progress honestly stops at
 // "Setup needed" until the worker is installed and paired elsewhere.
-const WORKER_COMMIT = '3092039327a6fbef0c03a901605385339c34de96';
+const WORKER_COMMIT = 'ed0ab6fdea71ae2805468a9d183ddc96d602e902';
 const DOCS_COMMIT = 'bf0d485495c6a0a5a7ea72fc2b4e1a0b4c62d933';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
@@ -665,8 +670,11 @@ async function loadGrants() {
 async function loadKeys() {
   const el = $('key-list'); loading(el);
   try {
-    const [data, inv] = await Promise.all([api('/api/keys?limit=50'), allInventory()]);
-    $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    // Keys render independently of the inventory walk (Codex P2 round
+    // 13): a large inventory could fail the walk, and the old
+    // Promise.all discarded the keys response with it — hiding the key
+    // list and Revoke. A failed walk now degrades only the dropdown.
+    const data = await api('/api/keys?limit=50');
     el.innerHTML = data.items.filter((k) => !k.revokedAt).map((k) =>
       `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}${k.scope === 'heartbeat' && k.resourceId ? ` · resource: ${esc(k.resourceId)}` : ''}</p>
        <p class="muted">created ${esc(k.createdAt)} · expires ${esc(k.expiresAt || 'never')} · last used ${esc(k.lastUsedAt || 'never')}</p>
@@ -676,6 +684,13 @@ async function loadKeys() {
       try { await api('/api/keys/' + b.dataset.revkey, { method: 'DELETE' }); banner('Key revoked.'); loadKeys(); }
       catch (e) { if (isStale(e)) return; banner(e.message); }
     }));
+    try {
+      const inv = await allInventory();
+      $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    } catch (e) {
+      if (isStale(e)) return;
+      $('key-resource').innerHTML = '<option value="">Resources unavailable — Revoke still works below</option>';
+    }
   } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 

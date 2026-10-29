@@ -23,8 +23,8 @@ From PowerShell in a fresh directory (these commands match the tested Windows x6
 git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
 git sparse-checkout set --no-cone /local-worker/ /LICENSE
-git fetch origin 3092039327a6fbef0c03a901605385339c34de96
-git checkout --detach 3092039327a6fbef0c03a901605385339c34de96
+git fetch origin ed0ab6fdea71ae2805468a9d183ddc96d602e902
+git checkout --detach ed0ab6fdea71ae2805468a9d183ddc96d602e902
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml

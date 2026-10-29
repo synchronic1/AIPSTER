@@ -18,7 +18,7 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Round-10 verified W3 head: pairing client with exclusive node-id, honest unpair, and local token auth.
-const WORKER_COMMIT = '3092039327a6fbef0c03a901605385339c34de96';
+const WORKER_COMMIT = 'ed0ab6fdea71ae2805468a9d183ddc96d602e902';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = 'bf0d485495c6a0a5a7ea72fc2b4e1a0b4c62d933';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
@@ -673,4 +673,27 @@ test('overview reachable count follows fresh liveness, not terminal usability', 
   }
   const text = textOf(ui.el('ov-cards').innerHTML);
   assert.ok(text.includes('2 total \u00b7 1 reachable'), `live-but-unusable worker counted, stale one not: ${text}`);
+});
+
+test('status strip gates reachability wording on fresh liveness', async () => {
+  // Codex P2 round 13: buildStatus retains lastSeenAt after a worker
+  // goes stale, so the timestamp-presence check kept ATTENTION:
+  // reachable forever. Only a fresh (online) heartbeat may carry
+  // present-tense reachability wording.
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  const now = new Date().toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_stripfresh', 'u_alice', 'n_stripfresh', 'strip-fresh', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, now, now).run();
+  const staleAt = new Date(Date.now() - 3600 * 1000).toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_stripstale', 'u_alice', 'n_stripstale', 'strip-stale', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, staleAt, now).run();
+  await ui.clickTab('overview');
+  for (let i = 0; i < 200; i++) {
+    if (ui.el('status-strip').innerHTML.includes('strip-stale')) break;
+    await new Promise(setImmediate);
+  }
+  const text = textOf(ui.el('status-strip').innerHTML);
+  assert.ok(text.includes('strip-fresh') && text.includes('strip-stale'), 'both rows listed: ' + text);
+  assert.equal(text.split('ATTENTION: reachable').length - 1, 1, 'only the fresh row carries ATTENTION: ' + text);
+  assert.ok(text.includes('not currently reachable'), 'stale row says plainly it is not reachable: ' + text);
 });
