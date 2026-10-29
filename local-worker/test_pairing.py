@@ -421,6 +421,68 @@ class Round4Tests(unittest.TestCase):
         self.assertIsNone(cm.exception.status, "transport fault, owned by the backoff")
 
 
+class Round5Tests(unittest.TestCase):
+    """Codex round-5 regressions: fail-closed protection, key fingerprint."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_failed_protection_aborts_before_any_secret_or_claim(self):
+        with patch.object(pairing, "_IS_NT", True), \
+                patch.object(pairing, "restrict_file", return_value=False):
+            out, err, code = run_cli("pair", self.pair_args())
+        self.assertEqual(code, pairing.EXIT_USAGE, err)
+        self.assertIn("STORE_UNPROTECTED", err)
+        self.assertEqual(self.state.claims, [], "no claim attempted")
+        self.assertFalse((self.data / "pairing.json").exists())
+        self.assertFalse((self.data / "heartbeat-key.txt").exists())
+        leftovers = [p for p in self.data.rglob("*") if p.is_file()]
+        self.assertEqual(leftovers, [], "no state or temp fragments written")
+
+    def test_mismatched_generation_is_refused(self):
+        import hashlib
+        out, err, code = run_cli("pair", self.pair_args())
+        self.assertEqual(code, EXIT_OK, err)
+        meta = json.loads((self.data / "pairing.json").read_text())
+        secret = (self.data / "heartbeat-key.txt").read_text().strip()
+        self.assertEqual(meta["key_sha256"], hashlib.sha256(secret.encode()).hexdigest())
+        # Simulate an interrupted re-pair, both orders: new metadata with
+        # the old key, and old metadata with a new key. Either mix is
+        # refused instead of sending a stale key to a new endpoint.
+        meta["api_base"] = "https://pairing.example"
+        meta["resource_id"] = "r_other"
+        meta["key_sha256"] = hashlib.sha256(b"some-other-key").hexdigest()
+        (self.data / "pairing.json").write_text(json.dumps(meta))
+        with self.assertRaises(PairingError) as cm:
+            load_pairing(self.data)
+        self.assertEqual(cm.exception.code, "BAD_PAIRING_STORE")
+        (self.data / "pairing.json").write_text(json.dumps(
+            {**meta, "key_sha256": hashlib.sha256(secret.encode()).hexdigest()}))
+        (self.data / "heartbeat-key.txt").write_text("some-other-key\n")
+        with self.assertRaises(PairingError) as cm:
+            load_pairing(self.data)
+        self.assertEqual(cm.exception.code, "BAD_PAIRING_STORE")
+        hb_out, hb_err = io.StringIO(), io.StringIO()
+        with redirect_stdout(hb_out), redirect_stderr(hb_err):
+            code = pairing.cmd_heartbeat(argparse_namespace(
+                {"api_base": self.base, "data_dir": str(self.data),
+                 "config": None, "interval": 60}), loop=False)
+        self.assertNotEqual(code, EXIT_OK)
+        self.assertEqual(self.state.beats, [], "refused store sends nothing")
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():
