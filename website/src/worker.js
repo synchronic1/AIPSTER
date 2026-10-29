@@ -331,12 +331,24 @@ async function handleApi(request, env, url) {
     if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
+    if (idemKey) {
+      // Free replays (Codex P2 round 8): a completed mapping replays BEFORE
+      // the budget charge, so lost-response recovery works at exhaustion
+      // and retries never burn slots. Live claims wait free the same way;
+      // only fresh, expired, orphaned, or stuck keys proceed to charge.
+      const peeked = await peekIdempotencyKey(db, me(), idemKey);
+      if (peeked === 'in-flight') return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
+      if (peeked) return json(200, cardFor(peeked, await ownerName(db, me())));
+    }
     await checkWriteBudget(db, me());
     // Reservation token (Codex P2 round 7): the created_at this request
     // wrote when it claimed the key. The commit batch below is fenced on
     // it, so a request superseded by a steal cannot commit late.
     let idemToken = null;
     if (idemKey) {
+      // A concurrent completion between the peek and this claim replays
+      // here, charged: both requests attempted a write, so the slot is
+      // honestly spent. Serialization without a write is impossible.
       const claim = await claimIdempotencyKey(db, me(), idemKey);
       if (claim === 'in-flight') return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
       if (claim && typeof claim === 'object') return json(200, cardFor(claim, await ownerName(db, me())));
@@ -371,8 +383,12 @@ async function handleApi(request, env, url) {
           // Cap or a lost reservation (stolen or TTL-swept while we
           // worked): classify by ownership. A superseded request waits
           // like any in-flight collision; its retry replays the winner.
-          const cur = await first(db, 'SELECT created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', me(), idemKey);
-          if (!cur || cur.created_at !== idemToken) {
+          // The stamp alone is not ownership (round 8): two reservations
+          // minted in the same millisecond tie, so a bound row carrying
+          // our stamp is the stealer's — unless it carries our row id,
+          // which is the cap-miss phantom this batch just bound.
+          const cur = await first(db, 'SELECT resource_id, created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', me(), idemKey);
+          if (!cur || cur.created_at !== idemToken || (cur.resource_id && cur.resource_id !== id)) {
             return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
           }
           assertClaimed(ins, 'resource');
@@ -833,6 +849,36 @@ async function handleApi(request, env, url) {
     // Find-or-create by (owner, node): retries and re-pairs never duplicate.
     let resource = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
     let created = false;
+    if (resource) {
+      // Re-pair refresh (Codex P2 round 8): newly discovered hardware
+      // replaces stale descriptors on the reused row; identity (id,
+      // owner, node) and liveness never move. Only explicitly sent,
+      // non-empty, non-placeholder values apply — absent fields and the
+      // documented 'unknown' / 'none recorded' fallbacks never clobber
+      // real data, so a degraded probe cannot wipe what a good probe
+      // recorded. Names are owner-managed and stay put; capabilities
+      // apply only as a non-empty list (pairing.py withholds []).
+      const sets = [];
+      const rparams = [];
+      if (['local', 'cluster', 'provider'].includes(body.kind) && body.kind !== resource.kind) {
+        sets.push('kind = ?'); rparams.push(body.kind);
+      }
+      const cpu = typeof body.cpu === 'string' ? body.cpu.trim().slice(0, 80) : '';
+      if (cpu && cpu !== 'unknown' && cpu !== resource.cpu) { sets.push('cpu = ?'); rparams.push(cpu); }
+      const gpu = typeof body.gpu === 'string' ? body.gpu.trim().slice(0, 80) : '';
+      if (gpu && gpu !== 'none recorded' && gpu !== resource.gpu) { sets.push('gpu = ?'); rparams.push(gpu); }
+      if (Array.isArray(body.capabilities) && body.capabilities.length > 0) {
+        const capsJson = JSON.stringify(body.capabilities.map(String).slice(0, 20));
+        if (capsJson !== resource.capabilities_json) { sets.push('capabilities_json = ?'); rparams.push(capsJson); }
+      }
+      if (sets.length > 0) {
+        await run(db, `UPDATE resources SET ${sets.join(', ')} WHERE id = ?`, ...rparams, resource.id);
+        resource = await first(db, 'SELECT * FROM resources WHERE id = ?', resource.id);
+        // A teardown racing the refresh deletes the row: the code died in
+        // the same batch, so this is the round-6 invalid case, not a 500.
+        if (!resource) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+      }
+    }
     if (!resource) {
       try {
         resource = await insertPairedResource(db, ownerId, nodeId, { name: wantName, kind, cpu, gpu, caps }, now, row.id);
@@ -1080,6 +1126,24 @@ async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now, codeId) 
   await run(db, "UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND rowid < (SELECT rowid FROM key_verifiers WHERE id = ?)", now, resourceId, id);
   await audit(db, ownerId, 'key.create', id, `heartbeat:${resourceId}`);
   return { id, secret, prefix: KEY_PREFIX + id + '_' + short };
+}
+
+async function peekIdempotencyKey(db, ownerId, key) {
+  // Read-only replay check (Codex P2 round 8): NO writes, so it runs
+  // before the budget charge. Returns the resource row for a completed
+  // mapping, 'in-flight' for a live (fresh NULL) claim, or null when the
+  // request must proceed to charge + claim: unknown key, TTL-expired row
+  // (the claim step sweeps it), orphaned mapping (the claim step adopts
+  // it), or a stuck NULL mapping (the claim step may steal it).
+  const prior = await first(db, 'SELECT resource_id, created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
+  if (!prior) return null;
+  const at = Date.parse(prior.created_at);
+  if (Number.isFinite(at) && at + IDEMPOTENCY_TTL_MS < Date.now()) return null;
+  if (prior.resource_id) {
+    return await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', prior.resource_id, ownerId);
+  }
+  if (Number.isFinite(at) && at + IDEMPOTENT_IN_FLIGHT_MS < Date.now()) return null;
+  return 'in-flight';
 }
 
 async function claimIdempotencyKey(db, ownerId, key) {
