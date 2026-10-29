@@ -20,7 +20,7 @@ test('QA SECURITY: revision must reject approval for a different recipient conne
 });
 test('QA SECURITY: revision must reject another owner approval/resources',async()=>{
  const t=await fabricEnv(); const {conn}=await connectPair(t); const {grant}=await commitFlow(t,conn.id);
- t.sqlite.exec("INSERT INTO resources SELECT 'r_bob', 'u_bob', name,kind,origin,cpu,gpu,capabilities_json,configured,authenticated,online,usable,heartbeat_at,limits_json,scope,verification_json,credits_json,created_at,incarnation,imported_from FROM resources WHERE id='r_gpu1'");
+ t.sqlite.exec("INSERT INTO resources(id,owner_id,name,kind,origin,cpu,gpu,capabilities_json,configured,authenticated,online,usable,heartbeat_at,limits_json,scope,verification_json,credits_json,created_at,incarnation,imported_from) SELECT 'r_bob', 'u_bob', name,kind,origin,cpu,gpu,capabilities_json,configured,authenticated,online,usable,heartbeat_at,limits_json,scope,verification_json,credits_json,created_at,incarnation,imported_from FROM resources WHERE id='r_gpu1'");
  const a=await approved(t,t.bob,conn.id,'r_bob');
  const r=await post(t,t.alice,`grants/${grant.id}/revise`,a);
  assert.ok(r.status>=400,`BUG: Alice revised her grant with Bob's approval/resources: ${r.status} ${r.text}`);
