@@ -208,7 +208,7 @@ including an already-existing node, and revalidate the reclaim window and exact
 owner/node/resource binding before the atomic effect.
 
 Worker slice (muse/onboarding-w3-worker): local-worker/test_pairing.py
-(18 unit tests, fake in-thread API; 3 POSIX-permission tests skip honestly
+(unit and security tests, fake in-thread API; 3 POSIX-permission tests skip honestly
 on Windows) and local-worker/test_pairing_e2e.py (6 cross-language
 scenarios, real CLI against real worker.js over loopback): two-user
 isolation, repeat startup + quota, reclaim + rotation, expired/replayed
@@ -225,3 +225,16 @@ logout/replacement fences, CSRF, clipboard exclusion, published sparse source
 pin, anonymous/demo guards, escaped code display and explicit sender/revocation
 instructions. Clearing a code invalidates pending mint work; it does not revoke
 an already minted code, which remains subject to server expiry and limits.
+## Current source reconciliation
+
+The integrated candidate preserves the ancestry of Muse W2 round 5
+(`8d6d174`). Its deleted-code and interrupted-claim findings are covered by
+SQLite and native local D1 regressions. The atomic claim transaction commits
+consumption, resource, key, binding, budget and audit together; it cannot
+create a new consumption-only crash state. A spent code with a NULL binding
+is ambiguous legacy state and remains invalid, including after deletion or
+replacement of that node. The owner can mint a fresh code to recover an
+existing node without duplication. We deliberately do not import the
+alternative `claim_json` reconstruction or its `invalidated_at` migration:
+those fields serve the superseded multi-transaction claim path. Fresh
+consent also covers older NULL records with no trustworthy snapshot.

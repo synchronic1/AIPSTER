@@ -22,6 +22,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+import pairing
+
 ROOT = Path(__file__).resolve().parent
 BRIDGE = ROOT / ".." / "website" / "scripts" / "pairing-e2e-bridge.mjs"
 MOCK_CONFIG = ROOT / "configs" / "mock.toml"
@@ -99,7 +101,7 @@ class PairingE2ETests(unittest.TestCase):
     def data_dir(self, tag):
         self.seq += 1
         path = Path(self.tmp.name) / f"{tag}-{self.seq}-{time.time_ns()}"
-        path.mkdir(parents=True)
+        pairing.private_dir(path)
         return path
 
     def seed_user(self, email, name):
@@ -124,8 +126,8 @@ class PairingE2ETests(unittest.TestCase):
     def pair(self, data_dir, code, node_id=None, extra=()):
         if node_id:
             statedir = data_dir / "state"
-            statedir.mkdir(parents=True, exist_ok=True)
-            (statedir / "node-id").write_text(node_id + "\n")
+            pairing.private_dir(statedir)
+            pairing.write_private(statedir / "node-id", node_id + "\n")
         return self.run_cli("pair", "--code", code, "--config", str(MOCK_CONFIG),
                             *extra, data_dir=data_dir)
 

@@ -487,65 +487,87 @@ export async function disconnectConnection(db, actor, id, input = {}, op = null)
 }
 
 export async function resumeConnection(db, actor, id, input = {}, op = null) {
+  if (!isHuman(actor)) needHuman();
   needId(id, 'Connection');
   const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', id);
   if (!conn) throw err(404, 'NOT_FOUND', 'Connection not found.');
   await ownConnectionSide(db, actor, conn);
-  checkVersion(conn, input);
-  if (conn.state === 'active') throw err(409, 'BAD_STATE', 'Connection is already active.');
-  const veto = await vetoRows(db, id);
-  if (!veto.length) throw err(409, 'BAD_STATE', 'This connection has no recorded consent; re-invite to reconnect.');
-  // Legacy fail-closed: vetoes without a recorded suspender predate
-  // reliable consent tracking; withdrawing is forbidden.
-  if (!conn.suspended_by) throw err(409, 'BAD_STATE', 'This connection predates consent tracking; re-invite to reconnect.');
-  // Own sides only: the caller's owned sides among the veto set.
-  const ownSides = [];
-  for (const nodeId of veto) {
-    const n = await first(db, 'SELECT owner_id FROM fabric_nodes WHERE id = ?', nodeId);
-    if (n && n.owner_id === actor.user.id) ownSides.push(nodeId);
-  }
-  if (!ownSides.length) {
-    return { status: 409, body: { error: 'Your sides hold no veto on this connection.', code: 'NO_OWN_VETO' } };
-  }
-  // Own proof only: each withdrawn side needs that side's own node proof.
-  // A peer proof, however valid, withdraws nothing.
-  const presented = [input.nodeKey, ...(Array.isArray(input.nodeKeys) ? input.nodeKeys : [])].filter((s) => typeof s === 'string' && s);
-  const proven = [];
-  for (const nodeId of ownSides) {
-    const n = await first(db, 'SELECT node_secret_verifier, node_secret_salt FROM fabric_nodes WHERE id = ?', nodeId);
-    for (const s of presented) {
-      if (n && await verifyToken(s, { verifier: n.node_secret_verifier, salt: n.node_secret_salt })) { proven.push(nodeId); break; }
+  let completion;
+  const recover = async () => {
+    const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+    if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
+    return restrictionContext(db, actor, op, 'fabric.connection.resume', id, input, completion);
+  };
+  completion = await recover();
+  if (completion.replay) return completion.replay;
+  try {
+    checkVersion(conn, input);
+    if (conn.state === 'active') throw err(409, 'BAD_STATE', 'Connection is already active.');
+    const veto = await vetoRows(db, id);
+    if (!veto.length) throw err(409, 'BAD_STATE', 'This connection has no recorded consent; re-invite to reconnect.');
+    // Legacy fail-closed: vetoes without a recorded suspender predate
+    // reliable consent tracking; withdrawing is forbidden.
+    if (!conn.suspended_by) throw err(409, 'BAD_STATE', 'This connection predates consent tracking; re-invite to reconnect.');
+    // Own sides only: the caller's owned sides among the veto set.
+    const ownSides = [];
+    for (const nodeId of veto) {
+      const n = await first(db, 'SELECT owner_id FROM fabric_nodes WHERE id = ?', nodeId);
+      if (n && n.owner_id === actor.user.id) ownSides.push(nodeId);
     }
+    if (!ownSides.length) {
+      const recovered = await recover();
+      if (recovered.replay) return recovered.replay;
+      return { status: 409, body: { error: 'Your sides hold no veto on this connection.', code: 'NO_OWN_VETO' } };
+    }
+    // Own proof only: each withdrawn side needs that side's own node proof.
+    // A peer proof, however valid, withdraws nothing.
+    const presented = [input.nodeKey, ...(Array.isArray(input.nodeKeys) ? input.nodeKeys : [])].filter((s) => typeof s === 'string' && s);
+    const proven = [];
+    for (const nodeId of ownSides) {
+      const n = await first(db, 'SELECT node_secret_verifier, node_secret_salt FROM fabric_nodes WHERE id = ?', nodeId);
+      for (const s of presented) {
+        if (n && await verifyToken(s, { verifier: n.node_secret_verifier, salt: n.node_secret_salt })) { proven.push(nodeId); break; }
+      }
+    }
+    if (!proven.length) throw err(403, 'FORBIDDEN', 'Withdrawal requires your own node proof for a vetoing side.');
+    const remaining = veto.filter((v) => !proven.includes(v)).sort();
+    const newState = remaining.length ? conn.state : 'active';
+    const now = nowIso();
+    const body = { id, state: newState, withdrawn: proven.sort(), remainingVetoes: remaining };
+    const res = await runBatch(db, [...vetoWithdraw({
+      connId: id, sides: proven.sort(), version: conn.version, newState,
+      suspendedBy: remaining.length ? conn.suspended_by : null,
+      mirror: remaining.length ? JSON.stringify(remaining) : null,
+      remaining: remaining.length, now, actorId: actor.user.id
+    }), ...restrictionCompletion(actor, completion, 'fabric.connection.resume', id, body, now,
+      `withdrew ${proven.length}, ${remaining.length} remain`)]);
+    if (changes(res, 1) === 1) {
+      return { status: 200, body };
+    }
+    const recovered = await recover();
+    if (recovered.replay) return recovered.replay;
+    // Withdrawal lost: settle by reading.
+    const cur = await first(db, 'SELECT version, state, suspended_by FROM connections WHERE id = ?', id);
+    if (!cur) throw err(404, 'NOT_FOUND', 'Connection not found.');
+    if (cur.version !== conn.version) return lostRace();
+    const curVeto = await vetoRows(db, id);
+    if (!curVeto.length) {
+      if (cur.state === 'active') return { status: 200, body: { id, state: 'active', withdrawn: [], remainingVetoes: [] } };
+      throw err(409, 'BAD_STATE', 'This connection has no recorded consent; re-invite to reconnect.');
+    }
+    if (!curVeto.some((v) => ownSides.includes(v))) {
+      return { status: 200, body: { id, state: cur.state, withdrawn: [], remainingVetoes: curVeto } };
+    }
+    if (!cur.suspended_by) throw err(409, 'BAD_STATE', 'This connection predates consent tracking; re-invite to reconnect.');
+    if (curVeto.length !== veto.length) return lostRace();
+    await throwActorClosed(db, actor);
+  } catch (e) {
+    // An older attempt can publish after the first receipt read, including
+    // before a fresh-state guard or an unknown batch response is observed.
+    const recovered = await recover();
+    if (recovered.replay) return recovered.replay;
+    throw e;
   }
-  if (!proven.length) throw err(403, 'FORBIDDEN', 'Withdrawal requires your own node proof for a vetoing side.');
-  const remaining = veto.filter((v) => !proven.includes(v)).sort();
-  const newState = remaining.length ? conn.state : 'active';
-  const now = nowIso();
-  const res = await runBatch(db, vetoWithdraw({
-    connId: id, sides: proven.sort(), version: conn.version, newState,
-    suspendedBy: remaining.length ? conn.suspended_by : null,
-    mirror: remaining.length ? JSON.stringify(remaining) : null,
-    remaining: remaining.length, now, actorId: actor.user.id
-  }));
-  if (changes(res, 1) === 1) {
-    await auditFabric(db, actor, op, 'fabric.connection.resume', id, `withdrew ${proven.length}, ${remaining.length} remain`);
-    return { status: 200, body: { id, state: newState, withdrawn: proven.sort(), remainingVetoes: remaining } };
-  }
-  // Withdrawal lost: settle by reading.
-  const cur = await first(db, 'SELECT version, state, suspended_by FROM connections WHERE id = ?', id);
-  if (!cur) throw err(404, 'NOT_FOUND', 'Connection not found.');
-  if (cur.version !== conn.version) return lostRace();
-  const curVeto = await vetoRows(db, id);
-  if (!curVeto.length) {
-    if (cur.state === 'active') return { status: 200, body: { id, state: 'active', withdrawn: [], remainingVetoes: [] } };
-    throw err(409, 'BAD_STATE', 'This connection has no recorded consent; re-invite to reconnect.');
-  }
-  if (!curVeto.some((v) => ownSides.includes(v))) {
-    return { status: 200, body: { id, state: cur.state, withdrawn: [], remainingVetoes: curVeto } };
-  }
-  if (!cur.suspended_by) throw err(409, 'BAD_STATE', 'This connection predates consent tracking; re-invite to reconnect.');
-  if (curVeto.length !== veto.length) return lostRace();
-  await throwActorClosed(db, actor);
 }
 
 // ---- previews ----
@@ -758,9 +780,18 @@ async function grantVisibleTo(db, actor, grant) {
 // must first authorize the exporter and validate the supplied preview binding.
 async function completeCommit(db, actor, appr, preview, op, operationId) {
   if (!appr || appr.consumed_by_op !== operationId || appr.consumed_action !== 'grant.commit' || appr.consumed_target !== null) return null;
+  const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+  if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
   const existing = await first(db, 'SELECT id FROM fabric_grants WHERE approval_id = ? AND exporter_id = ? AND connection_id = ?',
     appr.id, actor.user.id, preview.connection_id);
-  if (!existing) return null;
+  if (!existing) {
+    // The exact consuming operation may still have an outstanding grant batch.
+    // Its missing effect is not proof of failure: keep the router lease
+    // reconcilable instead of terminalizing409 before that batch can commit.
+    // Legacy spent claims whose effect never landed also stay fail-closed;
+    // a fresh approved operation is required to authorize another effect.
+    throw err(503, 'COMMIT_UNCERTAIN', 'Commit outcome is not recorded; retry reconciliation or use a fresh approval.');
+  }
   await auditFabric(db, actor, op, 'fabric.grant.commit', existing.id, 'reconciled');
   return { status: 200, body: { id: existing.id, note: 'Approval was already consumed for this grant.' } };
 }
@@ -796,19 +827,30 @@ export async function commitGrant(db, actor, input = {}, op = null) {
     if (completed) return completed;
     return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
   }
-  if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
-  const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', preview.connection_id);
-  if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
-  const vector = parseJson(appr.revision_vector, {});
-  if (vector.connection !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the preview; regenerate it.');
-  if (appr.issued_version !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
-  // Revalidate every snapshot entry against live state (fast-fail; the
-  // batch re-pins the whole snapshot at write time).
-  for (const s of terms.snapshot || []) {
-    const r = await first(db, 'SELECT owner_id, incarnation, imported_from FROM resources WHERE id = ?', s.resourceId);
-    if (!r || r.owner_id !== actor.user.id || r.imported_from || r.incarnation !== s.incarnation) {
-      throw err(412, 'PREVIEW_STALE', `Resource ${s.resourceId} changed since the preview.`);
+  let conn;
+  try {
+    if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
+    conn = await first(db, 'SELECT * FROM connections WHERE id = ?', preview.connection_id);
+    if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
+    const vector = parseJson(appr.revision_vector, {});
+    if (vector.connection !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the preview; regenerate it.');
+    if (appr.issued_version !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
+    // Revalidate every snapshot entry against live state (fast-fail; the
+    // batch re-pins the whole snapshot at write time).
+    for (const s of terms.snapshot || []) {
+      const r = await first(db, 'SELECT owner_id, incarnation, imported_from FROM resources WHERE id = ?', s.resourceId);
+      if (!r || r.owner_id !== actor.user.id || r.imported_from || r.incarnation !== s.incarnation) {
+        throw err(412, 'PREVIEW_STALE', `Resource ${s.resourceId} changed since the preview.`);
+      }
     }
+  } catch (e) {
+    // The approval snapshot may predate an older attempt's claim. A fresh
+    // expiry/state/snapshot failure cannot terminalize that same operation
+    // while its grant batch is outstanding (or its effect already applied).
+    const raced = await first(db, 'SELECT id, consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', appr.id);
+    const recovered = await completeCommit(db, actor, raced, preview, op, opd);
+    if (recovered) return recovered;
+    throw e;
   }
   // The shared claim: exactly one of commit/revise/resume wins this
   // approval. Losers change nothing.
@@ -839,7 +881,7 @@ export async function commitGrant(db, actor, input = {}, op = null) {
   const cur = await first(db, 'SELECT state, version FROM connections WHERE id = ?', conn.id);
   if (!cur || cur.state !== 'active') return { status: 409, body: { error: 'Connection is not active.', code: 'CONNECTION_DOWN' } };
   if (cur.version !== conn.version) return lostRace();
-  const missing = await first(db, 'SELECT 1 AS n FROM json_each(?) AS j LEFT JOIN resources r ON r.id = json_extract(j.value, "$.resourceId") WHERE r.id IS NULL OR r.owner_id != ? OR r.incarnation != json_extract(j.value, "$.incarnation") OR r.imported_from IS NOT NULL', snapshotJson, actor.user.id);
+  const missing = await first(db, `SELECT 1 AS n FROM json_each(?) AS j LEFT JOIN resources r ON r.id = json_extract(j.value, '$.resourceId') WHERE r.id IS NULL OR r.owner_id != ? OR r.incarnation != json_extract(j.value, '$.incarnation') OR r.imported_from IS NOT NULL`, snapshotJson, actor.user.id);
   if (missing) return { status: 412, body: { error: 'A resource changed since the preview.', code: 'PREVIEW_STALE' } };
   const u = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
   if (!u || Number(u.disabled) === 1 || Number(u.demo) === 1) { await throwActorClosed(db, actor); }

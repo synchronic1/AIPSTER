@@ -23,8 +23,8 @@ From PowerShell in a fresh directory (these commands match the tested Windows x6
 git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
 git sparse-checkout set --no-cone /local-worker/ /LICENSE
-git fetch origin 5fd4aba06bd05143a029cf25f8976d3f823b754d
-git checkout --detach 5fd4aba06bd05143a029cf25f8976d3f823b754d
+git fetch origin 15b114edc139b5eee6149de692eb65d49a51335d
+git checkout --detach 15b114edc139b5eee6149de692eb65d49a51335d
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
@@ -55,28 +55,42 @@ that upstream distribution hosts will remain available.
 
 Installing never shares anything. To link this computer to your AIPSTER
 account, sign in to the dashboard, open My Compute, and use Pair this
-computer to mint a one-time code (10-minute expiry, single use). Then,
-from this directory:
+computer to mint a one-time code (10-minute expiry, single use). In a second
+terminal in this same `local-worker` directory, run:
 
 ```powershell
 .\.venv\Scripts\python.exe pairing.py pair
 ```
 
-Type the code when prompted (it is not echoed). Pairing registers this
-computer automatically — hardware and capabilities are discovered, not
-typed — and stores a sender key privately. Then start the sender in a
-second terminal, next to `serve`:
+Type the code when prompted (it is not echoed). Do not paste it or the stored
+sender key into an agent conversation. Pairing registers this computer and
+stores a sender key privately. It exits without starting the sender. Explicitly
+start it in that terminal, next to the daemon's `serve` terminal:
 
 ```powershell
-.\.venv\Scripts\python.exe pairing.py heartbeat-loop
+.\.venv\Scripts\python.exe pairing.py heartbeat-loop --config configs/mock.toml
 ```
 
-Heartbeats prove reachability only, never inference readiness. If the
-sender key is revoked or expires the sender exits asking for a re-pair;
-pair again with a fresh code. `pairing.py status` shows the link state
-without secrets; `pairing.py unpair` forgets locally (revoke the server
-key in the dashboard Keys panel). Protocol details live in
-`docs/pairing.md` in the full AIPSTER checkout.
+Mock always reports `usable=false`. Heartbeats prove reachability only, never
+inference readiness; `/api/jobs` remains disabled. Choose Done or reopen My
+Compute after pairing to refresh the resource list. If the key is revoked or
+expires, the sender exits asking for a fresh pairing code. `pairing.py status`
+shows secret-free local status and marks old success as stale.
+
+To disconnect, stop both sender and daemon terminals with Ctrl+C, discard the
+worker-local daemon token, and revoke this resource's heartbeat key in the
+dashboard Keys panel. Then forget local pairing:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py unpair
+```
+
+Local unpair does not revoke the server key. Deleting `.venv` or `.state` alone
+does not remove private pairing credentials from the worker data directory.
+Preserve unrelated models and engines. This source setup adds no startup task,
+service or automatic update. Packaged launcher integration is still pending.
+See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
+POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
 
 In a second terminal, set `$env:DENDRITE_API_TOKEN` to the same value, then:
 
