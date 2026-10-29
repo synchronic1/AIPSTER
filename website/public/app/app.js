@@ -188,18 +188,26 @@ const OS_META = {
   linux: { label: 'Linux', shell: 'a shell', venvBin: '.venv/bin', posix: true }
 };
 
-// Best-effort OS suggestion; the picker always lets the user correct it.
+// Best-effort OS-family suggestion; the picker always lets the user correct
+// it. Architecture is never inferred: every Windows result is reported as
+// plain "Windows", never "Windows x64". Mobile and tablet platforms (Android,
+// iPadOS reporting a Mac-like platform with touch) are not classified.
 function detectOs() {
   try {
     if (typeof navigator === 'undefined') return null;
     const plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
     const s = String(plat).toLowerCase();
     if (s.includes('win')) return 'windows';
-    if (s.includes('mac')) return 'macos';
-    if (s.includes('linux') || s.includes('android') || s.includes('cros')) return 'linux';
+    if (s.includes('mac')) {
+      const touch = Number(navigator.maxTouchPoints || 0);
+      if (touch > 1) return null;
+      return 'macos';
+    }
+    if (s.includes('linux')) return 'linux';
   } catch { /* detection unavailable */ }
   return null;
 }
+const OS_FAMILY = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 
 // Pinned worker commands per OS: worker-only sparse checkout at WORKER_COMMIT,
 // isolated install, self-test, fresh worker-local token, mock serve.
@@ -291,28 +299,45 @@ function agentInstructions(os) {
     '',
     'Finish by reporting: installed revision, inspect and test results, how to stop',
     '(Ctrl+C, then discard the token) and uninstall (delete local-worker/.venv and',
-    'local-worker/.state if present), and that connection stays pending until',
-    'AIPSTER ships heartbeat and pairing support.'
+    'local-worker/.state if present). There is no automatic update: reinstall from',
+    'scratch at a newer pin only if AIPSTER publishes one. Connection stays pending',
+    'until AIPSTER ships heartbeat and pairing support.'
   ].join('\n');
 }
 
 let connect = null;
 
+// Approved installer origins (dormant: no installer is available yet). A
+// future available entry renders a download only when its URL is an AIPSTER
+// release artifact and its checksum is a full SHA-256 hex digest.
+const INSTALLER_URL_OK = /^https:\/\/github\.com\/synchronic1\/AIPSTER\//;
+const installerUsable = (inst) => !!(inst && inst.available
+  && INSTALLER_URL_OK.test(inst.url || '') && /^[0-9a-f]{64}$/.test(inst.sha256 || ''));
+
 function paintConnectCard() {
   const el = $('connect-card');
   if (!connect) { el.innerHTML = ''; el.hidden = true; return; }
+  // Preserve in-progress reading across repaints: an open Advanced section
+  // stays open, and focus returns to the control the user just used instead
+  // of being dropped. querySelector is real-DOM only; the static test harness
+  // has no live tree, so every access is guarded.
+  const live = el.querySelector ? el.querySelector('details') : null;
+  const advOpen = !!(live && live.open);
+  const active = (typeof document !== 'undefined' && document.activeElement) || null;
+  const focusAction = active && active.dataset ? active.dataset.action || null : null;
   const L = WORKER_LINKS;
   const meta = OS_META[connect.os];
   const options = ['windows', 'macos', 'linux'].map((k) =>
     `<option value="${k}"${k === connect.os ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
   const detectedNote = connect.detected
-    ? `Detected: ${esc(OS_META[connect.detected].label)}. Change it if that is wrong.`
+    ? `Detected: ${esc(OS_FAMILY[connect.detected])}. Change it if that is wrong.`
     : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
   const inst = INSTALLERS[connect.os];
-  const primary = inst.available
+  const usable = installerUsable(inst);
+  const primary = usable
     ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
     : '<button type="button" class="btn" data-action="download">Download installer</button>';
-  const installerLine = inst.available
+  const installerLine = usable
     ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
     : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
   let status = '';
@@ -326,19 +351,19 @@ function paintConnectCard() {
   const commands = workerCommands(connect.os).map(esc).join('\n');
   const advanced = `<details><summary>Advanced: manual install, source and troubleshooting</summary>
 <h3>Manual install (${esc(meta.label)})</h3>
-<p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${L.tested}">tested installation</a> (the clone fetches worker files only via sparse checkout):</p>
+<p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${esc(L.tested)}">tested installation</a> (the clone fetches worker files only via sparse checkout):</p>
 <pre tabindex="0" aria-label="${esc(meta.label)} install commands"><code>${commands}</code></pre>
-<p class="muted"><code>serve</code> refuses to start without <code>DENDRITE_API_TOKEN</code> (32+ characters), even on loopback. This is a <strong>worker-local</strong> token that you generate on this machine. It is not an AIPSTER API key or heartbeat key. Never reuse it, and never paste it into AIPSTER, a URL or a shared config. Local requests other than <code>/healthz</code> need <code>Authorization: Bearer</code> with that token (see the <a href="${L.quickstart}">quickstart</a>).</p>
-<p class="muted">The mock config returns simulated output only. A native engine (llama-server, built separately) and a GGUF model you obtain yourself are separate prerequisites. See <a href="${L.engine}">engine preparation</a>.</p>
+<p class="muted"><code>serve</code> refuses to start without <code>DENDRITE_API_TOKEN</code> (32+ characters), even on loopback. This is a <strong>worker-local</strong> token that you generate on this machine. It is not an AIPSTER API key or heartbeat key. Never reuse it, and never paste it into AIPSTER, a URL or a shared config. Local requests other than <code>/healthz</code> need <code>Authorization: Bearer</code> with that token (see the <a href="${esc(L.quickstart)}">quickstart</a>).</p>
+<p class="muted">The mock config returns simulated output only. A native engine (llama-server, built separately) and a GGUF model you obtain yourself are separate prerequisites. See <a href="${esc(L.engine)}">engine preparation</a>.</p>
 <h3>Platforms and source</h3>
-<ul class="platforms"><li><span class="pill ok">Windows x64: tested</span> <span class="muted">mock check only, from a git clone with CPython 3.12.14 and uv 0.12.12 (<a href="${L.evidence}">evidence</a>). No real engine or model was tested.</span></li>
+<ul class="platforms"><li><span class="pill ok">Windows x64: tested</span> <span class="muted">mock check only, from a git clone with CPython 3.12.14 and uv 0.12.12 (<a href="${esc(L.evidence)}">evidence</a>). No real engine or model was tested.</span></li>
 <li><span class="pill warn">macOS / Linux: not qualified</span> <span class="muted">commands are for adaptation only (use <code>.venv/bin/</code>). They are untested.</span></li></ul>
-<p class="muted">The worker is published as source, pinned to the <a href="${L.securityFix}">security-fixed revision</a> that requires a local token and checks Host/Origin.</p>
+<p class="muted">The worker is published as source, pinned to the <a href="${esc(L.securityFix)}">security-fixed revision</a> that requires a local token and checks Host/Origin.</p>
 <h3>Connect</h3>
 <p>For now, record this computer with <strong>Register resource</strong> below. It is saved as a declared, unverified resource. There is no pairing code or worker credential yet, so the worker never contacts AIPSTER.</p>
-<p>Status: <strong>not connected</strong>. Registered resources show as unverified/offline until heartbeat support ships. A running worker is not proof of readiness. See the <a href="${L.gaps}">execution gaps</a>.</p>
-<details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${L.troubleshoot}">Full troubleshooting table</a></p></details>
-<details><summary>Disconnect and uninstall</summary><p>Stop the worker with Ctrl+C, then close the terminal or run <code>Remove-Item Env:DENDRITE_API_TOKEN</code> to discard the local token. To uninstall, delete only <code>local-worker/.venv</code> (and <code>.state</code> if present). This setup adds no service, startup task or global package. The worker holds no AIPSTER credential, so there is nothing to revoke here. Keep it on loopback and never expose it to a network.</p></details>
+<p>Status: <strong>not connected</strong>. Registered resources show as unverified/offline until heartbeat support ships. A running worker is not proof of readiness. See the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
+<details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
+<details><summary>Disconnect and uninstall</summary><p>Stop the worker with Ctrl+C, then close the terminal or run <code>Remove-Item Env:DENDRITE_API_TOKEN</code> to discard the local token. To uninstall, delete only <code>local-worker/.venv</code> (and <code>.state</code> if present). There is no automatic update; reinstall from scratch at a newer pin only if AIPSTER publishes one. This setup adds no service, startup task or global package. The worker holds no AIPSTER credential, so there is nothing to revoke here. Keep it on loopback and never expose it to a network.</p></details>
 </details>`;
   el.innerHTML = `<div class="connect-grid"><div class="connect-rail">
 <h2>Connect your computer</h2>
@@ -347,19 +372,32 @@ function paintConnectCard() {
 <ol class="progress" aria-label="Connection progress">
 <li class="now" aria-current="step"><strong>Setup needed</strong><span class="st muted">You are here. Not connected.</span></li>
 <li><strong>Installing</strong><span class="st muted">Blocked: no verified installer is packaged yet.</span></li>
-<li><strong>Pairing</strong><span class="st muted">Blocked: <a href="${L.heartbeat}">heartbeat and pairing support</a> is not merged or deployed.</span></li>
+<li><strong>Pairing</strong><span class="st muted">Blocked: <a href="${esc(L.heartbeat)}">heartbeat and pairing support</a> is not merged or deployed.</span></li>
 <li><strong>Connected</strong><span class="st muted">Needs verified worker evidence. A download or a running worker is not proof.</span></li>
 </ol>
 <p><span class="pill warn">Setup needed</span></p>
 </div><div class="connect-body">
-<p class="lede">Connect this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then register it below. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant.</p>
-<div class="osrow"><label for="connect-os">Your system</label><select id="connect-os" data-action="os">${options}</select><span class="muted">${detectedNote}</span></div>
+<p class="lede">Prepare this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then register it below as a declared, unverified resource. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; pairing and dispatch are not available yet, so nothing can run.</p>
+<div class="osrow"><label for="connect-os">Your system</label><select id="connect-os" data-action="os" aria-describedby="connect-os-note">${options}</select><span class="muted" id="connect-os-note">${detectedNote}</span></div>
 <p class="actions">${primary}<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button></p>
 ${installerLine}
 ${status}
 ${advanced}
 </div></div>`;
   el.hidden = false;
+  if (el.querySelector) {
+    if (advOpen) {
+      const adv = el.querySelector('details');
+      if (adv) adv.open = true;
+    }
+    if (connect.phase === 'copy-failed') {
+      const ta = el.querySelector('textarea.copy-fallback');
+      if (ta) ta.focus();
+    } else if (focusAction) {
+      const back = el.querySelector(`[data-action="${focusAction}"]`);
+      if (back) back.focus();
+    }
+  }
 }
 
 function onConnectClick(ev) {
@@ -389,7 +427,12 @@ function onConnectChange(ev) {
 async function copyAgentInstructions() {
   if (!connect) return;
   const gen = generation;
-  const text = agentInstructions(connect.os);
+  // Operation identity: a slow clipboard write must not report success for a
+  // card the user has since re-rendered, switched OS on, or re-clicked.
+  const card = connect;
+  const os = card.os;
+  const op = (card.copyOp = (card.copyOp || 0) + 1);
+  const text = agentInstructions(os);
   let clipboard = null;
   try {
     clipboard = (typeof navigator !== 'undefined' && navigator.clipboard) || null;
@@ -397,13 +440,13 @@ async function copyAgentInstructions() {
   try {
     if (!clipboard || typeof clipboard.writeText !== 'function') throw new Error('clipboard unavailable');
     await clipboard.writeText(text);
-    if (gen !== generation) return;
-    connect.phase = 'copied';
-    connect.fallback = '';
+    if (gen !== generation || connect !== card || card.copyOp !== op || card.os !== os) return;
+    card.phase = 'copied';
+    card.fallback = '';
   } catch {
-    if (gen !== generation) return;
-    connect.phase = 'copy-failed';
-    connect.fallback = text;
+    if (gen !== generation || connect !== card || card.copyOp !== op || card.os !== os) return;
+    card.phase = 'copy-failed';
+    card.fallback = text;
   }
   paintConnectCard();
 }

@@ -33,7 +33,7 @@ const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
 const COPIED_MESSAGE = 'Instructions copied. Open ChatGPT, Claude, or your preferred local agent and paste these instructions.';
 const SECRET_SHAPED = /aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i;
 
-async function makeUi({ anonymous = false, platform, clipboard = 'absent' } = {}) {
+async function makeUi({ anonymous = false, platform, touchPoints = 0, clipboard = 'absent' } = {}) {
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
   const t = await createTestEnv();
   const elements = new Map();
@@ -76,7 +76,7 @@ async function makeUi({ anonymous = false, platform, clipboard = 'absent' } = {}
     URLSearchParams, history: { replaceState() {} }
   };
   if (platform !== undefined || clipboard !== 'absent') {
-    globals.navigator = { platform: platform ?? '', userAgentData: undefined };
+    globals.navigator = { platform: platform ?? '', userAgentData: undefined, maxTouchPoints: touchPoints };
     if (clipboards[clipboard]) globals.navigator.clipboard = clipboards[clipboard];
   }
   const context = vm.createContext(globals);
@@ -133,6 +133,8 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const selects = nodes.filter((n) => n.tagName === 'select');
   assert.equal(selects.length, 1, 'one OS picker');
   assert.equal(attr(selects[0], 'data-action'), 'os');
+  assert.equal(attr(selects[0], 'aria-describedby'), 'connect-os-note');
+  assert.ok(nodes.some((n) => n.attrs && n.attrs.some((x) => x.name === 'id' && x.value === 'connect-os-note')), 'detection note is associated');
   const options = nodes.filter((n) => n.tagName === 'option');
   assert.deepEqual(options.map((o) => attr(o, 'value')), ['windows', 'macos', 'linux']);
   assert.equal(options.filter((o) => o.attrs.some((x) => x.name === 'selected')).map((o) => attr(o, 'value')).join(','), 'windows');
@@ -161,7 +163,7 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
 test('OS is suggested but correctable; wrong OS changes instructions honestly', async () => {
   const win = await makeUi({ platform: 'Win32', clipboard: 'ok' });
   await win.clickTab('compute');
-  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Detected: Windows x64. Change it if that is wrong.'));
+  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Detected: Windows. Change it if that is wrong.'));
   await win.press('copy-agent');
   assert.match(win.captured[0], /\.venv\\Scripts\\python\.exe test_installation\.py/);
   assert.ok(win.captured[0].includes('Windows x64 is the only tested platform'));
@@ -188,6 +190,17 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   const unknown = await makeUi({ clipboard: 'ok' });
   await unknown.clickTab('compute');
   assert.ok(textOf(unknown.el('connect-card').innerHTML).includes('Detection unavailable in this browser'));
+
+  // A bogus picker value changes nothing.
+  await win.chooseOs('bogus');
+  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64: not available'));
+
+  // Mobile and tablet platforms are not classified as desktop systems.
+  for (const opts of [{ platform: 'Android' }, { platform: 'MacIntel', touchPoints: 5 }, { platform: 'CrOS x86_64' }]) {
+    const mob = await makeUi({ ...opts, clipboard: 'ok' });
+    await mob.clickTab('compute');
+    assert.ok(textOf(mob.el('connect-card').innerHTML).includes('Detection unavailable in this browser'), JSON.stringify(opts));
+  }
 });
 
 test('agent setup copies pinned, secret-free instructions and confirms once', async () => {
@@ -205,7 +218,7 @@ test('agent setup copies pinned, secret-free instructions and confirms once', as
     'DENDRITE_API_TOKEN', 'worker-LOCAL token', 'NOT an AIPSTER key',
     'does NOT share this computer', 'does NOT enable inference', 'does NOT contact AIPSTER',
     'no pairing code or worker credential yet', 'A running worker is NOT proof of inference readiness',
-    'delete local-worker/.venv']) {
+    'delete local-worker/.venv', 'There is no automatic update']) {
     assert.ok(flat.includes(phrase), `missing: ${phrase}`);
   }
   assert.ok(!SECRET_SHAPED.test(instructions), 'no credential-shaped material in copied instructions');
@@ -304,6 +317,25 @@ test('interrupted setup restarts cleanly and never paints after sign-out', async
   await slow.resolveDeferred();
   assert.equal(slow.el('connect-card').innerHTML, '', 'late clipboard result never repopulates a signed-out card');
   assert.equal(slow.el('connect-card').hidden, true);
+
+  // A copy still in flight when the OS changes never reports for the new OS.
+  const race = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  await race.clickTab('compute');
+  race.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  await race.chooseOs('linux');
+  await race.resolveDeferred();
+  const raced = textOf(race.el('connect-card').innerHTML);
+  assert.ok(!raced.includes(COPIED_MESSAGE), 'stale clipboard result claims nothing');
+  assert.ok(raced.includes('Installer for Linux: not available'), 'card stays on the newly picked OS');
+
+  // Double-clicking copies once per settled write; the older write wins nothing.
+  const twice = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  await twice.clickTab('compute');
+  twice.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  twice.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  await twice.resolveDeferred();
+  assert.equal(twice.captured.length, 1, 'only the latest write settles');
+  assert.ok(textOf(twice.el('connect-card').innerHTML).includes(COPIED_MESSAGE));
 });
 
 test('logout removes the card and disarms its actions', async () => {
