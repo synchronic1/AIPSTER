@@ -41,12 +41,20 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
+try:
+    import msvcrt
+except ImportError:  # POSIX: flock path below
+    msvcrt = None
+try:
+    import fcntl
+except ImportError:  # Windows: msvcrt path above
+    fcntl = None
+
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
 # Pair-mutex bounds (Codex P2 round 11). A pair holds the lock across one
 # claim (single bounded request above) plus two local writes: seconds.
 PAIR_LOCK_TIMEOUT_SEC = 180
-PAIR_LOCK_STALE_AFTER_SEC = 300
 HEARTBEAT_INTERVAL_SEC = 60
 HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
@@ -535,74 +543,63 @@ def write_status(data_dir, payload):
 
 @contextlib.contextmanager
 def pair_lock(data_dir):
-    """Per-data-directory pair mutex (Codex P2 round 11).
+    """Per-data-directory pair mutex (Codex P2 rounds 11/13).
 
     Serializes the claim plus both credential writes so concurrent pairs
     cannot install an already-revoked credential: without it, a slow
     responder overwrites the winner's files with its dead key, and the
     fingerprint check accepts the internally consistent but obsolete
-    pair. Portable O_EXCL file mutex (fcntl/msvcrt differ per platform);
-    deleted on release so steady state carries no lock footprint.
-    Crash recovery is age-based: a lock older than STALE_AFTER (far
-    beyond any bounded pair) is treated as orphaned and recycled. Clock
-    jumps fail safe — worst case is the old concurrent behavior or a
-    bounded wait ending in a clean retryable error, never corruption.
+    pair. The lock is OS-held (an msvcrt byte-range lock on Windows, a
+    flock elsewhere) on an open descriptor, never existence-based: a
+    dead holder's lock is released by the OS on process death, so there
+    is no stale-lock deletion path and no deletion race (Codex P2 round
+    13: two recoverers could previously observe the same stale lock,
+    then the second deleted the first's live replacement and both
+    entered concurrently). Acquisition waits up to PAIR_LOCK_TIMEOUT_SEC
+    and then fails cleanly with PAIR_IN_PROGRESS, never by deleting.
     """
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     lock = Path(data_dir) / "pair.lock"
-    deadline = time.monotonic() + PAIR_LOCK_TIMEOUT_SEC
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            if _pair_lock_is_stale(lock):
-                try:
-                    os.unlink(lock)
-                except OSError:
-                    pass
-                time.sleep(0.05)
-                continue
-            if time.monotonic() >= deadline:
-                raise PairingError(None, "PAIR_IN_PROGRESS",
-                                   f"another pair is using {data_dir}; "
-                                   "wait for it to finish and retry")
-            time.sleep(0.2)
-            continue
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps({"pid": os.getpid(), "started": time.time()}) + "\n")
-        except OSError:
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + PAIR_LOCK_TIMEOUT_SEC
+        while True:
             try:
-                os.unlink(lock)
+                _fd_lock_exclusive(fd)
+                break
             except OSError:
-                pass
-            raise
-        break
-    try:
-        yield
+                if time.monotonic() >= deadline:
+                    raise PairingError(None, "PAIR_IN_PROGRESS",
+                                       f"another pair is using {data_dir}; "
+                                       "wait for it to finish and retry")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _fd_unlock(fd)
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+        os.close(fd)
 
 
-def _pair_lock_is_stale(lock):
-    """True when the lock holder is certainly gone (age-based)."""
+def _fd_lock_exclusive(fd):
+    """Take a non-blocking exclusive lock on fd. Raises OSError when held."""
+    if _IS_NT:
+        os.lseek(fd, 0, os.SEEK_SET)  # msvcrt locks from the file position
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _fd_unlock(fd):
+    """Release the lock taken by _fd_lock_exclusive. Never raises."""
     try:
-        raw = lock.read_text(encoding="utf-8")
+        if _IS_NT:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
-        return False  # vanished; the next O_EXCL will likely win
-    try:
-        started = json.loads(raw).get("started")
-    except ValueError:
-        started = None
-    if not isinstance(started, (int, float)):
-        try:
-            started = lock.stat().st_mtime  # torn write: fall back to mtime
-        except OSError:
-            return False
-    return (time.time() - started) > PAIR_LOCK_STALE_AFTER_SEC
+        pass
 
 
 def cmd_pair(args):
@@ -667,7 +664,13 @@ def cmd_pair(args):
 def cmd_heartbeat(args, loop):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-        meta = load_pairing(data_dir)
+        # Atomic with pair's writes (Codex P2 round 13): an unlocked
+        # initial read racing pair's key-then-meta writes observes
+        # mismatched fingerprints and mis-exits BAD_PAIRING_STORE,
+        # leaving the sender stopped after a successful pair. The lock
+        # is held for the read only, never across the loop.
+        with pair_lock(data_dir):
+            meta = load_pairing(data_dir)
     except PairingError as exc:
         print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK

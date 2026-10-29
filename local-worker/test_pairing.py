@@ -9,9 +9,11 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -744,6 +746,161 @@ class Round12Tests(unittest.TestCase):
         self.assertEqual(code, EXIT_REPAIR_REQUIRED)
         self.assertEqual(calls, [minted[0], minted[1], minted[1]],
                          "revoked beat retried once with the rotated key, then a genuine revocation exits")
+
+
+class Round13Tests(unittest.TestCase):
+    """Codex round-13 regressions: OS-held mutex, locked sender start."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_stale_decision_never_deletes_a_live_lock(self):
+        # Two recoverers could observe the same stale lock then race the
+        # deletion: the second unlinked the first's live replacement and
+        # both entered. The OS-held mutex has no deletion path: force the
+        # stale decision (create=True: the constant is gone post-fix) while
+        # the lock is held and the contender must fail cleanly instead.
+        lock = self.data / "pair.lock"
+        errors = []
+
+        def contend():
+            try:
+                with pairing.pair_lock(self.data):
+                    errors.append("entered while held")
+            except pairing.PairingError as exc:
+                errors.append(exc.code)
+
+        with pairing.pair_lock(self.data):
+            with patch.object(pairing, "PAIR_LOCK_TIMEOUT_SEC", 2), \
+                    patch.object(pairing, "PAIR_LOCK_STALE_AFTER_SEC", -1, create=True):
+                b = threading.Thread(target=contend)
+                b.start()
+                b.join(30)
+                self.assertFalse(b.is_alive(), "contender hung")
+            self.assertEqual(errors, ["PAIR_IN_PROGRESS"])
+        # Read after release (a held Windows range lock denies even reads):
+        # the OS-held mutex never deletes the lock file, so it survives
+        # contention byte-identical. Pre-fix the contender unlinked it.
+        self.assertEqual(lock.read_bytes(), b"", "live lock file untouched")
+        with pairing.pair_lock(self.data):
+            pass  # the held lock still releases and re-acquires normally
+
+    def test_mutual_exclusion_under_threads(self):
+        # Guard for the rewritten mutex: concurrent holders must serialize.
+        counter = [0]
+
+        def bump():
+            for _ in range(50):
+                with pairing.pair_lock(self.data):
+                    counter[0] += 1
+
+        threads = [threading.Thread(target=bump) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        self.assertFalse(any(thread.is_alive() for thread in threads), "worker hung")
+        self.assertEqual(counter[0], 400)
+
+    def test_lock_released_when_holder_dies(self):
+        # A killed holder's OS lock releases immediately: no stale wait,
+        # no deletion race. Pre-fix the orphaned fresh lock needed the
+        # 300 s stale age, so a short timeout could never acquire it.
+        data = str(self.data)
+        ready = self.data / "ready"
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import pairing, time; from pathlib import Path; "
+             f"d = {data!r}; "
+             "mgr = pairing.pair_lock(d); mgr.__enter__(); "
+             f"Path({str(ready)!r}).write_text('held'); time.sleep(30)"],
+            cwd=Path(pairing.__file__).parent,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        for _ in range(200):
+            if ready.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(ready.exists(), "child never acquired the lock")
+        with patch.object(pairing, "PAIR_LOCK_TIMEOUT_SEC", 2):
+            with self.assertRaises(pairing.PairingError, msg="child holds the lock"):
+                with pairing.pair_lock(self.data):
+                    pass
+            child.kill()
+            child.wait(timeout=30)
+            with pairing.pair_lock(self.data):
+                pass  # OS-released: immediate re-acquire, no stale wait
+
+    def test_sender_start_during_pair_writes_never_sees_torn_store(self):
+        minted = []
+
+        def hook(body):
+            i = len(minted)
+            key = f"synthetic-key-{i:02d}-0123456789abcdef"
+            minted.append(key)
+            return {"resourceId": "r_fake01", "heartbeatKey": key,
+                    "keyId": f"k_fake{i:02d}", "keyPrefix": f"aip_live_k_fake{i:02d}_x",
+                    "heartbeatUrl": "/api/resources/r_fake01/heartbeat", "created": True}
+
+        self.state.claim_hook = hook
+        _, _, code = run_cli("pair", self.pair_args())
+        self.assertEqual(code, EXIT_OK)
+        self.state.live_keys = {minted[0]}
+        key_written = threading.Event()
+        release = threading.Event()
+        real_write = pairing.write_private
+
+        def gated_write(path, content):
+            out = real_write(path, content)
+            if Path(path).name == "heartbeat-key.txt" and not key_written.is_set():
+                key_written.set()
+                release.wait(timeout=10)
+            return out
+
+        results = {}
+
+        def run_pair():
+            with patch.object(pairing, "write_private", side_effect=gated_write):
+                results["pair"] = run_cli(
+                    "pair", self.pair_args(code="pair-99999999-AAAA-BBBB-CCCC"[:27]))
+
+        a = threading.Thread(target=run_pair)
+        a.start()
+        self.assertTrue(key_written.wait(timeout=30), "re-pair reached its key write")
+        self.state.live_keys.add(minted[1])  # both valid: only a torn read can fail
+
+        def run_beat():
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                beat_code = cmd_heartbeat(argparse_namespace(
+                    {"api_base": self.base, "data_dir": str(self.data),
+                     "config": None, "interval": 60}), loop=False)
+            results["beat"] = (out.getvalue(), err.getvalue(), beat_code)
+
+        b = threading.Thread(target=run_beat)
+        b.start()
+        b.join(timeout=8)  # pre-fix the torn read exits fast; post-fix it waits
+        release.set()
+        a.join(30)
+        b.join(30)
+        self.assertFalse(a.is_alive() or b.is_alive(), "pair/beat hung")
+        self.assertEqual(results["pair"][2], EXIT_OK, results["pair"][1])
+        _, err, beat_code = results["beat"]
+        self.assertEqual(beat_code, EXIT_OK, err)
+        self.assertNotIn("BAD_PAIRING_STORE", err, "sender start never observes torn writes")
+        self.assertEqual(self.state.beats[-1]["key"], minted[1], "beat uses the repaired key")
 
 
 def argparse_namespace(values):
