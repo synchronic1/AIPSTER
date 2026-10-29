@@ -17,12 +17,16 @@ hourly ceiling, both enforced atomically.
 | Per owner | `HEARTBEAT_OWNER_PER_HOUR` | `500`/hour (**PLACEHOLDER**) | UTC hour bucket |
 | Deployment-wide | `HEARTBEAT_GLOBAL_PER_HOUR` | `1000`/hour (**PLACEHOLDER**) | UTC hour bucket |
 
-- Both limits count **claimed attempts**: every request that passes the
-  read-only window and global probes is charged, and claims are **never
-  refunded**. An earlier revision refunded claims for rejected requests,
-  which let a spent global bucket or a lost race write rows forever without
-  ever exhausting a bucket (Codex PR #20 r4407568064). Without refunds every
-  row an owner's keys can cause is bounded by that owner's bucket.
+- Both limits count **accepted heartbeats only**, and a rejected heartbeat
+  writes **zero rows**. Admission is one D1 batch (a transaction) that
+  moves the resource row and both counters together or not at all, so
+  there is nothing to claim early and nothing to refund.
+- History: `3d93c31` claimed owner then global and refunded on rejection,
+  which let a spent global bucket loop writes (Codex r4407568064).
+  `1112493` dropped the refunds, but separate owner and global claims still
+  let requests that lost the global race at cap−1 write their owner counter
+  (Codex PRRT_kwDOVYKI0c6xZvYv: owner=10, global=1). The single batch
+  removes both.
 - Constants live in `website/src/lib/quotas.js` with a `PLACEHOLDER` suffix;
   env vars (positive integers, anything else falls back to the constant) let
   the rollout owner tune without a code change.
@@ -38,26 +42,40 @@ hourly ceiling, both enforced atomically.
 Order inside `POST /api/resources/:id/heartbeat` (`website/src/worker.js`):
 
 1. Existing auth/binding/body checks first (unchanged, zero budget impact).
-2. Fast path: a closed 25s window returns `429 HEARTBEAT_TOO_SOON` before any
-   budget write. Optimization only — the conditional `UPDATE` still enforces
-   the window atomically.
-3. Read-only global probe: if the deployment bucket is already spent,
-   return `429 HEARTBEAT_GLOBAL_QUOTA` with `Retry-After` before any
-   budget write.
-4. Claim the per-owner budget (one conditional `UPDATE`, exactly like
-   `checkWriteBudget`). On failure: `429 HEARTBEAT_OWNER_QUOTA` with
-   `Retry-After` (seconds until the next UTC hour) and a matching
-   `retryAfterSec` body field. The resource row is untouched.
-5. Claim the global budget the same way. On failure (a race lost after the
-   probe) the owner claim stays spent and the response is
-   `429 HEARTBEAT_GLOBAL_QUOTA` with `Retry-After`.
-6. Run the existing single conditional resource `UPDATE`. On success: `200`.
-   On a lost race both claims stay spent, then the existing read-only reason
-   mapping applies.
+2. Read-only fast paths, no writes: a closed 25s window returns
+   `429 HEARTBEAT_TOO_SOON`; a spent global bucket returns
+   `429 HEARTBEAT_GLOBAL_QUOTA`; a spent owner bucket returns
+   `429 HEARTBEAT_OWNER_QUOTA`. Each 429 carries `Retry-After` and a matching
+   `retryAfterSec` body field. These are optimizations only; step 4 decides.
+3. While the current hour's global bucket does not exist yet, past `hb/`
+   buckets are pruned (deletes rows only once per hour boundary; zero rows
+   on every later call).
+4. One batch, in order:
+   1. `UPDATE resources SET heartbeat_at, online, usable WHERE …` with every
+      intake check (ownership, owner not disabled, key bound/live, 25s
+      window) **and** both caps (`COALESCE(owner count, 0) < owner cap AND
+      COALESCE(global count, 0) < global cap`).
+   2. Owner counter upsert `… SELECT ?, ?, 1 WHERE changes() = 1 ON CONFLICT
+      DO UPDATE SET count = count + 1`.
+   3. Global counter upsert, same shape, chained on the owner upsert.
+5. If the resource UPDATE changed one row: `200` (the worker also asserts
+   both counters changed). Otherwise nothing was written; read-only probes
+   name the reason (global cap, owner cap, then the existing
+   key/resource/owner/window mapping).
 
-Concurrent racers serialize in SQLite/D1: at cap−1, ten concurrent
-heartbeats produce exactly one accepted heartbeat (covered on real local D1
-in `website/tests/heartbeat-quotas.test.mjs`).
+D1 runs a batch as one transaction, so racers serialize. Real local D1
+tests (`website/tests/heartbeat-admission-d1.test.mjs`) hold every racer at
+the batch until all have passed the read-only probes, then assert both
+counter deltas, resource writes and D1-reported `rows_written`:
+
+- Codex's repro (global cap 1, owner cap 500, ten same-owner resources):
+  owner = global = accepted = 1. On `1112493` the same test records owner 10.
+- Two owners × six resources at global cap−1: one accepted, owner deltas
+  sum to 1, exactly one batch wrote rows (on `1112493`: owner deltas 12).
+- Eight same-owner resources at owner cap−1: one accepted, the global bucket
+  moved by exactly one.
+- Revoked key, expired key, disabled owner, resource moved to another owner:
+  zero rows written over 20 attempts each, no counter moved.
 
 ## Write cost (D1 rows written)
 
@@ -70,27 +88,31 @@ written row; `SELECT` writes zero rows.
 
 | # | Statement | Rows | Why |
 |---|---|---|---|
-| 1 | `UPDATE write_budget` (owner claim) | 1 | `count` is not indexed; the PK lookup does not move the row |
-| 2 | `UPDATE write_budget` (global claim) | 1 | same |
-| 3 | `UPDATE resources SET heartbeat_at, online, usable` | 1 | none of the three columns is indexed (`0002` indexes `owner_id` only) |
+| 1 | `UPDATE resources SET heartbeat_at, online, usable` | 1 | none of the three columns is indexed (`0002` indexes `owner_id` only) |
+| 2 | owner counter upsert (existing bucket) | 1 | `count` is not indexed |
+| 3 | global counter upsert (existing bucket) | 1 | same |
 
-Hourly overhead outside the steady state (each at most once per owner per
-hour, plus once per hour globally): one bucket `INSERT OR IGNORE`, one
-old-bucket cleanup `DELETE`, and the coarse `key_verifiers.last_used_at`
-refresh (at most one per key per hour, shared with all API-key use). A
-handful of rows per active owner per hour — negligible next to beat volume
-and included as ~1k rows/day upper bound in the worst cases below.
+The first accepted heartbeat of the hour per bucket inserts it instead:
+real local D1 reports a new bucket as **3** rows (row, primary-key index
+entry, `idx_write_budget_window` entry), i.e. 2 extra rows per owner per
+hour plus 2 for the global bucket. Pruning past buckets deletes each old
+bucket once. The coarse `key_verifiers.last_used_at` refresh is at most one
+row per key per hour and is shared with all API-key use (it is not a
+heartbeat cost and is not bounded by the heartbeat budgets).
 
 ### Per rejected heartbeat
 
 | Path | Rows written |
 |---|---|
-| Auth / binding / body reject (before claims) | 0 from intake; at most the coarse `last_used_at` refresh (≤1/key/hour) |
-| 25s window closed, sequential (pre-probe `429`) | 0 from intake (same `last_used_at` caveat) |
-| Per-owner cap spent (`HEARTBEAT_OWNER_QUOTA`) | 0 — the failed conditional `UPDATE` matches zero rows (see assumption A) |
-| Global ceiling already spent (`HEARTBEAT_GLOBAL_QUOTA`, read-only probe) | 0 |
-| Global claim lost to a concurrent racer (`HEARTBEAT_GLOBAL_QUOTA`) | 1 — the owner claim, which stays charged |
-| Concurrent resource-race loser (then 404/401/`HEARTBEAT_TOO_SOON`) | 2 — both claims, which stay charged |
+| Auth / binding / body reject | 0 from intake; at most the coarse `last_used_at` refresh (≤1/key/hour) |
+| Read-only fast paths (window, global cap, owner cap) | 0 |
+| Lost admission batch (cap, window, key, owner or resource race) | 0 — measured on real local D1 |
+
+Sustained rejection is measured, not assumed: after the global cap is
+spent, 100 further heartbeats across eight keys add zero `rows_written`,
+and the whole run stays within
+`3 × accepted + 2 × buckets + keys` rows (assertion A below is therefore
+verified for these statements on local D1).
 
 Counting assumptions (no explicit official sentence found for either;
 checked pricing, limits, billing, return-object, metrics-analytics, FAQ,
@@ -103,7 +125,7 @@ release-note, query and index docs):
 
 ### Per owner per day at the placeholder defaults
 
-500/hour × 24 h = 12,000 charged attempts/day max per owner → × 3 rows =
+500/hour × 24 h = 12,000 accepted heartbeats/day max per owner → × 3 rows =
 **≈36,000 rows/day per maxed-out owner** (+ ~300 rows hourly overhead).
 The per-resource 25s window binds small fleets further: one resource can
 accept at most 144/hour (3,456/day) however high the budgets are.
@@ -111,17 +133,25 @@ accept at most 144/hour (3,456/day) however high the budgets are.
 ### Worst case across N accounts
 
 The global ceiling binds before any per-owner sum can: 1,000/hour × 24 h =
-24,000 charged global claims/day deployment-wide → × 3 rows =
-**≈72,000 rows/day (+ ~1k overhead), independent of N**. Owner claims
-that lose the global race add at most one row each and only while the
-global bucket is filling; once it is spent every request is read-only.
+24,000 accepted heartbeats/day deployment-wide → × 3 rows =
+**≈72,000 rows/day, plus 2 rows per active owner per hour for bucket
+creation**. Rejected heartbeats add nothing. Bucket creation is bounded by
+accepted heartbeats too (a bucket only appears with an accepted one): the
+degenerate case is every accepted heartbeat being some owner's first of the
+hour, i.e. 5 rows each, so the hard bound is
+**5 × HEARTBEAT_GLOBAL_PER_HOUR × 24 + 2 × 24 rows/day ≈ 120,000 rows/day at
+the 1,000 placeholder**. A realistic fleet (owners beating every 25–60 s)
+sits near the 3-row figure, ≈72,000.
 (Before this change the total was unbounded in N: only the 25s/resource
 window and the 100-resources/owner cap applied.)
 
-| Tier | Allowance (source) | Worst case ≈73k rows/day |
+| Tier | Allowance (source) | Hard bound at placeholder 1,000/h (≈120k/day) |
 |---|---|---|
-| Workers Free | 100,000 rows written/day, reset 00:00 UTC daily; over-limit queries fail | Fits with ~27% headroom at placeholder defaults — headroom that must also cover non-heartbeat writes (registrations, keys, grants, sessions) |
-| Workers Paid | first 50M rows/month included, then $1.00 per million rows | ≈2.2M rows/month « 50M included → $0 heartbeat overage |
+| Workers Free | 100,000 rows written/day, reset 00:00 UTC daily; over-limit queries fail | **Does not fit** in the degenerate case. Recommendation: set `HEARTBEAT_GLOBAL_PER_HOUR=500` on Free (hard bound 5 × 500 × 24 ≈ 60,000/day, leaving ~40% for registrations, keys, grants and sessions) |
+| Workers Paid | first 50M rows/month included, then $1.00 per million rows | ≈3.6M rows/month « 50M included → $0 heartbeat overage at 1,000/h |
+
+Choosing the cap is an operator decision about tier and fleet size, not a
+correctness question: the bound above holds for any configured value.
 
 Related allowances (same sources): rows read 5M/day Free / 25B/month Paid;
 queries per Worker invocation 50 Free / 1000 Paid (heartbeat intake issues

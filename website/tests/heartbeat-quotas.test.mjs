@@ -107,7 +107,7 @@ test('REAL D1: 10 concurrent heartbeats at cap-1 produce exactly one accepted', 
   assert.equal(row.heartbeat_at, winner.json.heartbeatAt);
   const owner = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, heartbeatWindow()).first();
   const global = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('heartbeat:global', heartbeatWindow()).first();
-  assert.ok(owner.count >= 1 && owner.count <= 10, 'owner claims are never refunded: one per attempt that passed the global probe');
+  assert.equal(owner.count, 1, 'owner bucket moved only with the accepted heartbeat (atomic admission)');
   assert.equal(global.count, 1, 'global bucket holds exactly the accepted heartbeat');
 });
 
@@ -156,15 +156,16 @@ test('spent global ceiling rejects read-only: no owner claim/refund write loop',
   assert.equal(global.count, 1);
 });
 
-test('lost resource races count as attempts: claims are never refunded', async () => {
-  // Without refunds an owner's own bucket bounds every write their keys can
-  // cause, including requests that lose the 25s window race.
+test('a lost resource race writes nothing: counters move only with an accepted heartbeat', async () => {
+  // Admission is one batch: the resource UPDATE and both counter upserts
+  // commit together or not at all, so a request that loses the 25s window
+  // race after passing the read-only probe charges no bucket.
   const t = await createTestEnv({ HEARTBEAT_OWNER_PER_HOUR: '100000', HEARTBEAT_GLOBAL_PER_HOUR: '100000' });
   const r = await register(t, t.alice, 'box');
   const key = await mintHeartbeat(t, t.alice, r.id);
   // Simulate a racer that passed the read-only window probe: open the
-  // window, then let a concurrent winner land before our UPDATE by
-  // stamping heartbeat_at between probe and claim via a patched prepare.
+  // window, then let a concurrent winner land before our admission by
+  // stamping heartbeat_at between probe and batch via a patched prepare.
   const realPrepare = t.DB.prepare.bind(t.DB);
   let armed = true;
   t.DB.prepare = (sql) => {
@@ -180,6 +181,6 @@ test('lost resource races count as attempts: claims are never refunded', async (
   assert.equal(lost.json.code, 'HEARTBEAT_TOO_SOON');
   const owner = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, heartbeatWindow()).first();
   const global = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('heartbeat:global', heartbeatWindow()).first();
-  assert.equal(owner.count, 1, 'the lost attempt stays charged to its owner');
-  assert.equal(global.count, 1, 'the lost attempt stays charged globally');
+  assert.equal(owner, null, 'no owner bucket was created or charged');
+  assert.equal(global, null, 'no global bucket was created or charged');
 });

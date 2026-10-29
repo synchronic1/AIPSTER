@@ -7,7 +7,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, claimHeartbeatBudget, heartbeatBudgetSpent, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
@@ -346,9 +346,8 @@ async function handleApi(request, env, url) {
   // inside ONE conditional UPDATE, never a read-then-write. The server sets
   // heartbeat_at=now and online=1 plus the body's usable bit; no other
   // columns change. Heartbeats never draw the hourly write_budget (they
-  // claim the separate per-owner + global heartbeat budgets instead; claims
-  // are never refunded, so a lost race or a spent global bucket cannot
-  // loop writes). Aggregate ceilings, 429
+  // are charged to separate per-owner + global heartbeat budgets in the same
+  // atomic batch as the resource UPDATE; a rejected heartbeat writes nothing). Aggregate ceilings, 429
   // codes, and the D1 write-cost calculation live in
   // docs/heartbeat-quotas.md.
   {
@@ -394,44 +393,53 @@ async function handleApi(request, env, url) {
           }
         }
       }
-      // Aggregate ceilings (docs/heartbeat-quotas.md). A spent global bucket
-      // rejects read-only before any claim. Then per-owner, then
-      // deployment-wide: each claim is one conditional UPDATE; a failed
-      // claim matches zero rows and writes nothing. Claims are never
-      // refunded (an owner claim stays spent if the global claim then loses
-      // a race), so every rejection after the probes is bounded by the
-      // owner's own bucket. The resource row is untouched when either claim
-      // fails.
+      // Aggregate ceilings (docs/heartbeat-quotas.md). Read-only fast paths
+      // first: a spent global or owner bucket rejects before any write.
+      // Admission is then ONE batch: the resource UPDATE carries every
+      // intake check plus both cap checks, and the owner and global counter
+      // upserts each run only if the statement before changed one row. The
+      // batch is a transaction, so racers serialize: an accepted heartbeat
+      // moves the resource row and both counters by exactly one, and every
+      // loser (cap, window, key, owner or resource) writes zero rows. There
+      // is no claim to refund.
       const budgets = heartbeatBudgets(env);
       const hbWindow = heartbeatWindow();
-      const globalSpent = () => {
+      const quotaSpent = (code, error) => {
         const retrySec = secondsUntilNextHour();
-        return json(429, { error: 'Deployment heartbeat budget is spent for the hour; back off and retry.', code: 'HEARTBEAT_GLOBAL_QUOTA', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+        return json(429, { error, code, retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
       };
-      if (await heartbeatBudgetSpent(db, HEARTBEAT_GLOBAL_ID, hbWindow, budgets.global)) return globalSpent();
-      if (!(await claimHeartbeatBudget(db, actor.key.owner_id, hbWindow, budgets.owner))) {
-        const retrySec = secondsUntilNextHour();
-        return json(429, { error: 'Heartbeat budget for this owner is spent for the hour; back off and retry.', code: 'HEARTBEAT_OWNER_QUOTA', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
-      }
-      if (!(await claimHeartbeatBudget(db, HEARTBEAT_GLOBAL_ID, hbWindow, budgets.global))) return globalSpent();
+      const globalSpent = () => quotaSpent('HEARTBEAT_GLOBAL_QUOTA', 'Deployment heartbeat budget is spent for the hour; back off and retry.');
+      const ownerSpent = () => quotaSpent('HEARTBEAT_OWNER_QUOTA', 'Heartbeat budget for this owner is spent for the hour; back off and retry.');
+      const globalCount = await heartbeatBucketCount(db, HEARTBEAT_GLOBAL_ID, hbWindow);
+      if (globalCount !== null && globalCount >= budgets.global) return globalSpent();
+      if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return ownerSpent();
+      if (globalCount === null) await pruneHeartbeatBuckets(db, hbWindow);
       const now = nowIso();
       const windowStart = new Date(Date.now() - HEARTBEAT_MIN_INTERVAL_MS).toISOString();
-      const claimed = await run(db,
-        `UPDATE resources SET heartbeat_at = ?, online = 1, usable = ?
-         WHERE id = ?
-           AND owner_id = ?
-           AND (heartbeat_at IS NULL OR heartbeat_at < ?)
-           AND EXISTS (SELECT 1 FROM "user" u WHERE u.id = resources.owner_id AND COALESCE(u.disabled, 0) != 1)
-           AND EXISTS (SELECT 1 FROM key_verifiers k WHERE k.id = ? AND k.resource_id = ? AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at >= ?))`,
-        now, usable, resourceId, actor.key.owner_id, windowStart, actor.key.id, resourceId, now);
+      const [claimed, ownerCharge, globalCharge] = await db.batch([
+        db.prepare(
+          `UPDATE resources SET heartbeat_at = ?, online = 1, usable = ?
+           WHERE id = ?
+             AND owner_id = ?
+             AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+             AND EXISTS (SELECT 1 FROM "user" u WHERE u.id = resources.owner_id AND COALESCE(u.disabled, 0) != 1)
+             AND EXISTS (SELECT 1 FROM key_verifiers k WHERE k.id = ? AND k.resource_id = ? AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at >= ?))
+             AND ${HEARTBEAT_CAPS_SQL}`)
+          .bind(now, usable, resourceId, actor.key.owner_id, windowStart, actor.key.id, resourceId, now,
+            actor.key.owner_id, hbWindow, budgets.owner, hbWindow, budgets.global),
+        ...heartbeatCounterStatements(db, actor.key.owner_id, hbWindow),
+      ]);
       if (Number(claimed.meta.changes) === 1) {
+        if (Number(ownerCharge.meta.changes) !== 1 || Number(globalCharge.meta.changes) !== 1) {
+          throw new Error('heartbeat admission batch did not charge both budgets');
+        }
         return json(200, { ok: true, id: resourceId, heartbeatAt: now, online: true, usable: usable === 1 });
       }
-      // Claim lost: both budget claims stay spent (no refunds: refunds let
-      // rejected requests write without ever exhausting a bucket). Map the
-      // reason with read-only probes (the write decision already happened
-      // atomically above). No audit row per heartbeat; the coarse key
-      // last_used_at update in actorFrom is the only trail.
+      // Admission lost: nothing was written. Map the reason with read-only
+      // probes. No audit row per heartbeat; the coarse key last_used_at
+      // update in actorFrom is the only trail.
+      if ((await heartbeatBucketCount(db, HEARTBEAT_GLOBAL_ID, hbWindow) ?? 0) >= budgets.global) return globalSpent();
+      if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return ownerSpent();
       const keyRow = await first(db, 'SELECT revoked_at, expires_at FROM key_verifiers WHERE id = ?', actor.key.id);
       if (!keyRow || keyRow.revoked_at) return json(401, { error: 'API key revoked.', code: 'KEY_REVOKED' });
       if (keyRow.expires_at && Date.parse(keyRow.expires_at) < Date.now()) return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });

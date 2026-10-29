@@ -22,15 +22,15 @@ export function budgetWindow(now = new Date()) {
 }
 
 // ---- heartbeat intake budgets (docs/heartbeat-quotas.md) ----
-// Per-owner AND deployment-wide hourly ceilings on heartbeat ATTEMPTS that
-// pass the read-only window probe (claims are never refunded, so every
-// write an owner's keys can cause stays inside that owner's bucket). Both
-// are enforced with the same atomic-claim pattern as the write budget (one
-// conditional UPDATE, losers mutate nothing), but in SEPARATE buckets: the
+// Per-owner AND deployment-wide hourly ceilings on ACCEPTED heartbeats.
+// Admission is ONE D1 batch (a transaction): the resource UPDATE carries
+// both cap checks, and each counter upsert is conditional on changes() = 1
+// from the statement before it. A request is either accepted and charged to
+// both buckets exactly once, or rejected with zero rows written; nothing is
+// ever claimed and refunded. Counters live in SEPARATE buckets: the
 // window key prefix keeps heartbeat counters apart from the 120/hour
 // write_budget rows even though they share the write_budget TABLE, so no
-// migration is needed and neither budget draws from the other. Rejections
-// are read-only: a failed claim matches zero rows and writes nothing.
+// migration is needed and neither budget draws from the other.
 // PLACEHOLDER defaults: production numbers are chosen by the user +
 // release review, never by this change. Env overrides (positive integers):
 // HEARTBEAT_OWNER_PER_HOUR, HEARTBEAT_GLOBAL_PER_HOUR.
@@ -62,27 +62,35 @@ export function secondsUntilNextHour(nowMs = Date.now()) {
   return Math.max(1, Math.ceil((next.getTime() - nowMs) / 1000));
 }
 
-// Atomic claim: increment and limit test in ONE statement. Returns true
-// when the claim succeeded. Concurrent racers serialize; losers match zero
-// rows and mutate nothing. Bucket creation + old-bucket cleanup run only
-// when opening a fresh hourly bucket (once per id per hour), never on the
-// rejection path.
-export async function claimHeartbeatBudget(db, id, window, limit) {
-  const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, window);
-  if (row && Number(row.count) >= limit) return false; // spent: read-only rejection
-  if (!row) {
-    await run(db, 'INSERT OR IGNORE INTO write_budget (user_id, window, count) VALUES (?, ?, 0)', id, window);
-    await run(db, "DELETE FROM write_budget WHERE window LIKE 'hb/%' AND window < ?", window);
-  }
-  const claim = await run(db, 'UPDATE write_budget SET count = count + 1 WHERE user_id = ? AND window = ? AND count < ?', id, window, limit);
-  return Number(claim.meta.changes) === 1;
+// Cap predicate for the resource UPDATE inside the admission batch. Binds:
+// owner id, window, owner cap, window, global cap.
+export const HEARTBEAT_CAPS_SQL =
+  `COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) < ?
+   AND COALESCE((SELECT count FROM write_budget WHERE user_id = '${HEARTBEAT_GLOBAL_ID}' AND window = ?), 0) < ?`;
+
+// The two counter statements that follow the resource UPDATE in the same
+// batch. Each runs only when the statement before it changed exactly one
+// row, so the counters move together with an accepted heartbeat or not at
+// all. The upsert creates the hourly bucket on first use.
+export function heartbeatCounterStatements(db, ownerId, window) {
+  const upsert = `INSERT INTO write_budget (user_id, window, count) SELECT ?, ?, 1 WHERE changes() = 1
+     ON CONFLICT (user_id, window) DO UPDATE SET count = count + 1`;
+  return [db.prepare(upsert).bind(ownerId, window), db.prepare(upsert).bind(HEARTBEAT_GLOBAL_ID, window)];
 }
 
-// Read-only test for an already spent bucket. Used to reject before any
-// other budget write; the conditional claim still decides races.
-export async function heartbeatBudgetSpent(db, id, window, limit) {
+// Drop past hourly heartbeat buckets. Called only while the current global
+// bucket does not exist yet, i.e. before the first accepted heartbeat of the
+// hour; it deletes zero rows on every later call in that state.
+export async function pruneHeartbeatBuckets(db, window) {
+  await run(db, "DELETE FROM write_budget WHERE window LIKE 'hb/%' AND window < ?", window);
+}
+
+// Read-only bucket count (null when the bucket does not exist yet). Used
+// for fast-path rejections and to name the reason after a lost admission;
+// the batch still decides races.
+export async function heartbeatBucketCount(db, id, window) {
   const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, window);
-  return !!row && Number(row.count) >= limit;
+  return row ? Number(row.count) : null;
 }
 
 export async function checkWriteBudget(db, userId) {
