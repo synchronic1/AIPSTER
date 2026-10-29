@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pairingEnv, mint, claim, paired, snapshot, hookDb } from './pairing-review-fixtures.mjs';
+import { pairingEnv, mint, claim, paired, remove, snapshot, hookDb } from './pairing-review-fixtures.mjs';
 import { budgetWindow } from '../src/lib/quotas.js';
 
 const state = async t => ({ ...await snapshot(t),
@@ -63,5 +63,23 @@ for (const real of [false, true]) {
     assert.deepEqual(results.map(r => r.status).sort(), [201, 404]);
     assert.equal((await db.prepare('SELECT COUNT(*) n FROM resources').first()).n, 1);
     assert.equal((await db.prepare('SELECT COUNT(*) n FROM key_verifiers').first()).n, 1);
+  });
+  test(`${engine}: deleted consent cannot reclaim a replacement resource with the same node`, async c => {
+    const t = await pairingEnv(c, real), old = await paired(t);
+    assert.equal((await remove(t, old.resourceId)).status, 200);
+    const replacement = await paired(t); assert.notEqual(replacement.resourceId, old.resourceId);
+    const before = await state(t);
+    assert.equal((await claim(t, old.code.code)).status, 404);
+    assert.deepEqual(await state(t), before);
+  });
+  test(`${engine}: ambiguous legacy NULL consent requires a new code to recover its node`, async c => {
+    const t = await pairingEnv(c, real), old = await paired(t);
+    // NULL also represents explicit deletion, so it is not proof of a crash.
+    await t.DB.prepare('UPDATE pairing_codes SET resource_id=NULL WHERE id=?').bind(old.code.id).run();
+    const before = await state(t);
+    assert.equal((await claim(t, old.code.code)).status, 404); assert.deepEqual(await state(t), before);
+    const fresh = await mint(t), recovered = await claim(t, fresh.json.code);
+    assert.equal(recovered.status, 200); assert.equal(recovered.json.resourceId, old.resourceId);
+    assert.equal((await t.DB.prepare('SELECT COUNT(*) n FROM resources').first()).n, 1);
   });
 }

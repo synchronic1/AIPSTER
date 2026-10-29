@@ -202,7 +202,7 @@ test('F1R3: late attempt cannot finalize or release a reclaimed operation', asyn
   assert.equal(done.body.attempt, 'new');
 });
 
-test('F1R3: resume reconcile completes the missing audit before reporting success', async () => {
+test('F1R3: failed resume effect rolls consent back before an exact-operation retry', async () => {
   const t = await fabricEnv();
   const { conn } = await connectPair(t);
   const { grant } = await commitFlow(t, conn.id);
@@ -213,9 +213,12 @@ test('F1R3: resume reconcile completes the missing audit before reporting succes
   t.sqlite.exec("CREATE TRIGGER qa_resume BEFORE UPDATE ON fabric_grants WHEN NEW.status = 'enforced' BEGIN SELECT RAISE(ABORT, 'synthetic'); END");
   assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, { expectedVersion: 2, approvalId: pa.json.id }, key)).status, 500);
   t.sqlite.exec('DROP TRIGGER qa_resume');
-  // The claim burned but the effect never landed: fail-closed 409, like revise.
-  assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, { expectedVersion: 2, approvalId: pa.json.id }, key)).status, 409);
-  const fresh = await post(t, t.alice, 'approvals', { action: 'grant.resume', targetId: grant.id });
-  assert.equal((await post(t, t.alice, `approvals/${fresh.json.id}/decide`, { decision: 'approve' })).status, 200);
-  assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, { expectedVersion: 2, approvalId: fresh.json.id })).status, 200);
+  // Approval, effect, receipt and audit now roll back in one batch.
+  assert.equal(t.sqlite.prepare('SELECT consumed_at FROM approvals WHERE id=?').get(pa.json.id).consumed_at, null);
+  assert.equal(t.sqlite.prepare('SELECT status FROM fabric_grants WHERE id=?').get(grant.id).status, 'paused');
+  assert.equal(t.sqlite.prepare("SELECT count(*) n FROM fabric_restriction_receipts WHERE action='fabric.grant.resume'").get().n, 0);
+  const body = { expectedVersion: 2, approvalId: pa.json.id };
+  assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, body, key)).status, 200);
+  assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, body, key)).json.replayed, true);
+  assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, body)).status, 412);
 });
