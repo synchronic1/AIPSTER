@@ -439,9 +439,23 @@ def load_pairing(data_dir):
     return meta
 
 
-def write_status(data_dir, payload):
+def pairing_status_binding(meta):
+    # Bind legacy flat keys as well as immutable generations. No bearer is
+    # persisted in status; its digest also detects a same-resource key rotation.
+    selected = {"api_base": meta["api_base"], "resource_id": meta["resource_id"],
+                "key_file": meta.get("key_file"),
+                "key_sha256": hashlib.sha256(meta["heartbeat_key"].encode("utf-8")).hexdigest()}
+    return hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def write_status(data_dir, payload, meta=None):
+    # Heartbeat callers supply the snapshot they actually sent with. Reading
+    # the latest manifest here would mislabel an old in-flight response after
+    # re-pairing. Two-argument callers bind their current private snapshot.
+    selected = load_pairing(data_dir) if meta is None else meta
     files = pairing_files(data_dir)
-    write_private(files["status"], json.dumps(payload, indent=2) + "\n")
+    record = {**payload, "pairing_generation": pairing_status_binding(selected)}
+    write_private(files["status"], json.dumps(record, indent=2) + "\n")
 
 
 def cmd_pair(args):
@@ -521,14 +535,14 @@ def cmd_heartbeat(args, loop):
                                     meta["heartbeat_key"], usable)
         except RePairRequired as exc:
             write_status(data_dir, {"at": time.time(), "ok": False,
-                                    "status": "repair-required", "code": exc.code})
+                                    "status": "repair-required", "code": exc.code}, meta)
             print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
                   file=sys.stderr)
             return EXIT_REPAIR_REQUIRED
         except PairingError as exc:
             state = "rate-limited" if exc.status == 429 else "network-error" if exc.status is None else "failed"
             write_status(data_dir, {"at": time.time(), "ok": False, "status": state,
-                                    "code": exc.code, "retryAfterSec": exc.retry_after})
+                                    "code": exc.code, "retryAfterSec": exc.retry_after}, meta)
             if exc.status == 429:
                 wait = exc.retry_after or interval
                 print(f"heartbeat: rate limited; retrying in {wait}s", file=sys.stderr)
@@ -557,7 +571,7 @@ def cmd_heartbeat(args, loop):
         failures = 0
         write_status(data_dir, {"at": time.time(), "ok": True, "usable": usable,
                                 "heartbeatAt": result.get("heartbeatAt"),
-                                "note": "reachability only; not inference-ready"})
+                                "note": "reachability only; not inference-ready"}, meta)
         print(f"heartbeat ok: usable={usable} at={result.get('heartbeatAt')}")
         if not loop:
             return EXIT_OK
@@ -571,14 +585,17 @@ def cmd_status(args):
         print("status: not paired")
         return EXIT_OK
     try:
-        meta = json.loads(files["meta"].read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        meta = load_pairing(data_dir)
+    except (PairingError, OSError, ValueError):
         print("status: pairing store unreadable; pair again")
         return EXIT_USAGE
     print(f"status: paired resource={meta.get('resource_id')} key={meta.get('key_prefix')}")
     if files["status"].exists():
         try:
             st = json.loads(files["status"].read_text(encoding="utf-8"))
+            if not isinstance(st, dict) or st.get("pairing_generation") != pairing_status_binding(meta):
+                print("status: awaiting heartbeat for current pairing")
+                return EXIT_OK
             if st.get("ok") is True and time.time() - float(st.get("at", 0)) > STATUS_STALE_SEC:
                 print(f"status: stale; last successful beat at={st.get('heartbeatAt')}")
             elif st.get("ok") is not True:
@@ -595,13 +612,27 @@ def cmd_unpair(args):
     # in the dashboard Keys panel, and the resource row is untouched.
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     files = pairing_files(data_dir)
-    removed = []
-    for path in [files["meta"], *managed_key_files(data_dir)]:
+    removed, failed = [], 0
+    try:
+        paths = [files["meta"], *managed_key_files(data_dir)]
+    except FileNotFoundError:
+        paths = [files["meta"]]
+    except OSError:
+        paths, failed = [], 1
+    for path in paths:
         try:
             path.unlink()
             removed.append(str(path))
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError:
+            failed += 1
+    if failed:
+        print("unpair failed [PRIVATE_STORAGE]: some pairing files could not be removed; stop the sender and retry", file=sys.stderr)
+        if removed:
+            print(f"removed {len(removed)} local pairing file(s); cleanup is incomplete", file=sys.stderr)
+        print("note: revoke the sender key in the dashboard Keys panel; it stays live until then", file=sys.stderr)
+        return EXIT_USAGE
     if removed:
         print("unpaired locally: " + ", ".join(removed))
         print("note: revoke the sender key in the dashboard Keys panel; it stays live until then")
