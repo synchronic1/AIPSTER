@@ -24,7 +24,7 @@ test('job submission stays truthfully disabled and creates nothing', async () =>
 
 test('worker source performs no outbound inference calls', () => {
   // ASSETS.fetch (same-origin static assets) is the only fetch allowed.
-  const files = ['worker.js', 'lib/auth.js', 'lib/store.js', 'lib/keys.js', 'lib/validate.js'];
+  const files = ['worker.js', 'lib/auth.js', 'lib/store.js', 'lib/keys.js', 'lib/validate.js', 'lib/status.mjs'];
   for (const f of files) {
     const src = readFileSync(path.join(SRC, f), 'utf8');
     assert.ok(!/fetch\(\s*['"`]https?:/.test(src), `${f} must not fetch remote URLs`);

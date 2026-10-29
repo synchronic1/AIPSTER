@@ -46,6 +46,77 @@ async function api(path, opts = {}) {
 
 const pill = (ok, label) => `<span class="pill ${ok ? 'ok' : 'bad'}">${esc(label)}: ${ok ? 'yes' : 'no'}</span>`;
 
+// ---- resource-status strip (read-only, bounded polling) ----
+// Polls GET /api/status only while signed in on the Overview tab: a 30s base
+// interval with exponential backoff to 5min on failure, stopping entirely on
+// auth loss or after repeated failures. Token + generation fencing drops
+// late/stale work exactly like every other loader; no timers are cleared
+// because invalidation (not cancellation) is the established pattern here.
+let statusPollToken = 0;
+const STATUS_POLL_BASE_MS = 30000;
+const STATUS_POLL_MAX_MS = 5 * 60 * 1000;
+const STATUS_POLL_MAX_FAILURES = 10;
+
+const formatAge = (ms) => {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+};
+
+function renderStatus(el, data) {
+  const s = data.summary || { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 };
+  const list = data.items || [];
+  const items = list.map((r) =>
+    `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs))}${r.demoFixture ? ' · DEMO' : ''}</p>`).join('');
+  const note = data.demo
+    ? 'DEMO DATA: simulated fixture, not a live node.'
+    : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
+  // Counts always cover every owned resource; only the listed page is capped.
+  const truncated = data.itemsTruncated === true
+    ? `<p class="muted">showing ${list.length} of ${s.total} — older resources omitted from the list; counts cover all resources.</p>`
+    : '';
+  el.innerHTML = `<h2>Resource status</h2>
+    <p class="muted">${s.total} resource(s) · ${s.online} online · ${s.stale} stale · ${s.offline} offline · ${s.unknown} unknown · ${data.sharedWithMe} shared with me</p>
+    ${truncated}
+    ${items || '<p class="muted">No resources yet.</p>'}
+    <p class="muted">${esc(note)}</p>`;
+}
+
+function scheduleStatusPoll(token, gen, delayMs, failures) {
+  if (typeof setTimeout !== 'function') return;
+  setTimeout(() => {
+    if (token !== statusPollToken || gen !== generation) return;
+    refreshStatusStrip(token, gen, failures);
+  }, delayMs);
+}
+
+async function refreshStatusStrip(token, gen, failures) {
+  const strip = $('status-strip');
+  try {
+    const data = await api('/api/status');
+    if (token !== statusPollToken || gen !== generation) return;
+    renderStatus(strip, data);
+    scheduleStatusPoll(token, gen, STATUS_POLL_BASE_MS, 0);
+  } catch (e) {
+    if (isStale(e) || token !== statusPollToken || gen !== generation) return;
+    if (/AUTH_REQUIRED|KEY_EXPIRED/.test(e.message)) {
+      strip.innerHTML = '<h2>Resource status</h2><p class="muted">Sign-in expired — status updates paused.</p>';
+      return;
+    }
+    const next = failures + 1;
+    if (next >= STATUS_POLL_MAX_FAILURES) {
+      strip.innerHTML = '<h2>Resource status</h2><p class="muted">Status unavailable after repeated retries — reopen Overview to try again.</p>';
+      return;
+    }
+    strip.innerHTML = '<h2>Resource status</h2><p class="muted">Status update failed — retrying quietly.</p>';
+    scheduleStatusPoll(token, gen, Math.min(STATUS_POLL_BASE_MS * 2 ** next, STATUS_POLL_MAX_MS), next);
+  }
+}
+
 function resourceCard(r) {
   const s = r.state || {};
   return `<div class="card"><h2>${esc(r.name)}</h2>
@@ -60,6 +131,10 @@ function resourceCard(r) {
 
 async function loadOverview() {
   const el = $('ov-cards'); loading(el);
+  const token = ++statusPollToken;
+  const gen = generation;
+  $('status-strip').innerHTML = '<h2>Resource status</h2><p class="muted">Checking resource status…</p>';
+  refreshStatusStrip(token, gen, 0);
   try {
     const [inv, shared, usage] = await Promise.all([api('/api/inventory?limit=50'), api('/api/shared-with-me?limit=50'), api('/api/usage?limit=1')]);
     const ready = inv.items.filter((r) => r.state.status === 'ready').length;
@@ -156,7 +231,8 @@ function resetState() {
   // Clear every identity-scoped pixel and form field. Runs on logout and on
   // every sign-in before the new identity renders, so a same-document account
   // switch never shows the previous identity's data (incl. revealed secrets).
-  for (const id of ['ov-cards', 'ov-note', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
+  statusPollToken++;
+  for (const id of ['status-strip', 'ov-cards', 'ov-note', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
   $('grant-resource').innerHTML = '';
   $('key-secret').textContent = ''; $('key-reveal').hidden = true;
   $('whoami').textContent = '';
