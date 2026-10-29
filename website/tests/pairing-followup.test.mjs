@@ -10,6 +10,19 @@ const isClaim = stmts => stmts.some(s => /UPDATE pairing_codes SET used_at/.test
 const isMint = stmts => stmts.some(s => /INSERT INTO pairing_codes/.test(s.sql));
 for (const real of [false, true]) {
   const engine = real ? 'local D1' : 'sqlite';
+  test(`${engine}: final owner budget slot publishes a complete pairing with one charge`, async c => {
+    const t = await pairingEnv(c, real), code = await mint(t);
+    await t.DB.prepare('UPDATE write_budget SET count=119 WHERE user_id=? AND window=?').bind(t.alice.id, budgetWindow()).run();
+    const out = await claim(t, code.json.code); assert.equal(out.status, 201, out.text);
+    assert.ok(out.json.heartbeatKey); assert.ok(out.json.resourceId);
+    const after = await state(t); assert.equal(after.resources.length, 1); assert.equal(after.keys.length, 1);
+    assert.equal(after.codes[0].resource_id, out.json.resourceId); assert.equal(after.budget[0].count, 120);
+    const beat = await t.call(`/api/resources/${out.json.resourceId}/heartbeat`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + out.json.heartbeatKey }, body: { usable: false }
+    });
+    assert.equal(beat.status, 200, 'the final-budget operation publishes a working sender');
+    assert.equal((await t.DB.prepare('SELECT count FROM write_budget WHERE user_id=? AND window=?').bind(t.alice.id, budgetWindow()).first()).count, 120);
+  });
   for (const existing of [false, true]) test(`${engine}: overlapping same-code claims recover ${existing ? 'existing' : 'new'} node`, async c => {
     const t = await pairingEnv(c, real); c.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     if (existing) await paired(t);
