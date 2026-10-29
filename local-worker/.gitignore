@@ -2,3 +2,7 @@
 .state/
 __pycache__/
 *.pyc
+packaging/windows/build/
+packaging/windows/dist/
+packaging/icon/previews/
+packaging/icon/previews/
