@@ -203,7 +203,7 @@ async function loadOverview() {
 // installer is packaged for any platform yet, so progress honestly stops at
 // "Setup needed" until the worker is installed and paired elsewhere.
 const WORKER_COMMIT = '91a3bfaa8d1d4e4d9baa15ad6ccb53d2b19ff5a1';
-const DOCS_COMMIT = '1239b7f6ad3adffbc307a00048d3b918d52ff1ba';
+const DOCS_COMMIT = 'bf0d485495c6a0a5a7ea72fc2b4e1a0b4c62d933';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
