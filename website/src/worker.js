@@ -4,7 +4,7 @@
 // API (errors always JSON, never the static 404 page), /app* -> panel assets,
 // everything else -> ASSETS (landing page preserved byte-for-byte).
 import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
-import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
+import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, auditRow, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET } from './lib/validate.js';
 import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
@@ -877,10 +877,19 @@ async function handleApi(request, env, url) {
         if (capsJson !== resource.capabilities_json) { sets.push('capabilities_json = ?'); rparams.push(capsJson); }
       }
       if (sets.length > 0) {
-        await run(db, `UPDATE resources SET ${sets.join(', ')} WHERE id = ?`, ...rparams, resource.id);
+        // Fenced like creation and minting (Codex P2 round 11): without
+        // the validity predicate, a stale claim that found a replacement
+        // row (teardown + re-pair landed after its consumption) would
+        // overwrite the replacement's descriptors before the binding
+        // fence rejects it. Zero changes means the row is gone, the code
+        // died, or both: the round-6 invalid case either way.
+        const refreshed = await run(db, `UPDATE resources SET ${sets.join(', ')} WHERE id = ? AND (SELECT invalidated_at FROM pairing_codes WHERE id = ?) IS NULL`, ...rparams, resource.id, row.id);
+        if (Number(refreshed.meta.changes) !== 1) {
+          return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+        }
         resource = await first(db, 'SELECT * FROM resources WHERE id = ?', resource.id);
-        // A teardown racing the refresh deletes the row: the code died in
-        // the same batch, so this is the round-6 invalid case, not a 500.
+        // A teardown racing between the fenced update and this re-read
+        // deletes the row: still the invalid case, not a 500.
         if (!resource) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
       }
     }
@@ -1073,12 +1082,17 @@ function mintPairCode() {
 async function uniqueResourceName(db, ownerId, base) {
   // Display names stay human-meaningful on collision ("lab", "lab-2", ...).
   // Identity is the row id / node binding, never the name, so a lost rename
-  // race only duplicates a label, never an identity.
+  // race only duplicates a label, never an identity. One bounded read
+  // (Codex P2 round 11): suffixes are chosen locally from the owner's full
+  // name set (at most 100 rows by the owner cap) instead of one query per
+  // candidate, which could exhaust D1's per-invocation query budget long
+  // before the resource cap.
   const clean = String(base || '').trim().slice(0, 80) || 'worker';
+  const rows = await all(db, 'SELECT name FROM resources WHERE owner_id = ?', ownerId);
+  const taken = new Set(rows.map((r) => r.name));
   for (let n = 1; n <= 100; n++) {
     const cand = n === 1 ? clean : `${clean.slice(0, 74)}-${n}`;
-    const hit = await first(db, 'SELECT id FROM resources WHERE owner_id = ? AND name = ?', ownerId, cand);
-    if (!hit) return cand;
+    if (!taken.has(cand)) return cand;
   }
   return `${clean.slice(0, 60)}-${rid('').slice(0, 6)}`;
 }
@@ -1123,19 +1137,30 @@ async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now, codeId) 
   const { id, secret, short } = mintKey(KEY_PREFIX);
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
-    SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL AND (resource_id IS NULL OR resource_id != ? OR scope != 'heartbeat')) < ${MAX_KEYS_PER_USER}
-      AND (SELECT invalidated_at FROM pairing_codes WHERE id = ?) IS NULL`,
-    id, ownerId, `worker heartbeat ${String(nodeId).slice(0, 32)}`, resourceId, salt, await verifierFor(secret, salt),
-    KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId, resourceId, codeId);
+  // Atomic replace (Codex P2 round 11): mint, older-key revocation, and
+  // the audit row commit as one batch. A revocation failure or a crash
+  // between statements can no longer leave an undisclosed live key
+  // consuming a slot. Both followers are gated on the insert itself via
+  // EXISTS on the fresh id (no changes() chaining: unproven on
+  // production D1), so a cap/invalidation trip commits nothing at all.
+  const a = auditRow(ownerId, 'key.create', id, `heartbeat:${resourceId}`);
+  const [kc] = await db.batch([
+    db.prepare(`INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+      SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL AND (resource_id IS NULL OR resource_id != ? OR scope != 'heartbeat')) < ${MAX_KEYS_PER_USER}
+        AND (SELECT invalidated_at FROM pairing_codes WHERE id = ?) IS NULL`)
+      .bind(id, ownerId, `worker heartbeat ${String(nodeId).slice(0, 32)}`, resourceId, salt, await verifierFor(secret, salt),
+        KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId, resourceId, codeId),
+    // Race-safe revocation (Codex P2): only keys OLDER than this insert
+    // (rowid order) are revoked. Two overlapping claims each mint first;
+    // the newer insert revokes the older, the older cannot revoke the
+    // newer, so concurrent claims converge to exactly one live sender and
+    // the loser reclaims. A cap rejection still revokes nothing.
+    db.prepare("UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND rowid < (SELECT rowid FROM key_verifiers WHERE id = ?) AND EXISTS (SELECT 1 FROM key_verifiers WHERE id = ?)")
+      .bind(now, resourceId, id, id),
+    db.prepare('INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM key_verifiers WHERE id = ?)')
+      .bind(a.id, a.at, a.actorId, a.action, a.target, a.detail, id),
+  ]);
   if (Number(kc.meta.changes) !== 1) return null;
-  // Race-safe revocation (Codex P2): only keys OLDER than this insert
-  // (rowid order) are revoked. Two overlapping claims each mint first;
-  // the newer insert revokes the older, the older cannot revoke the
-  // newer, so concurrent claims converge to exactly one live sender and
-  // the loser reclaims. A cap rejection still revokes nothing.
-  await run(db, "UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND rowid < (SELECT rowid FROM key_verifiers WHERE id = ?)", now, resourceId, id);
-  await audit(db, ownerId, 'key.create', id, `heartbeat:${resourceId}`);
   return { id, secret, prefix: KEY_PREFIX + id + '_' + short };
 }
 

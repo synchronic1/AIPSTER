@@ -20,6 +20,7 @@ local tests only).
 """
 
 import argparse
+import contextlib
 import getpass
 import hashlib
 import hmac
@@ -42,6 +43,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
+# Pair-mutex bounds (Codex P2 round 11). A pair holds the lock across one
+# claim (single bounded request above) plus two local writes: seconds.
+PAIR_LOCK_TIMEOUT_SEC = 180
+PAIR_LOCK_STALE_AFTER_SEC = 300
 HEARTBEAT_INTERVAL_SEC = 60
 HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
@@ -528,6 +533,77 @@ def write_status(data_dir, payload):
     files["status"].write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+@contextlib.contextmanager
+def pair_lock(data_dir):
+    """Per-data-directory pair mutex (Codex P2 round 11).
+
+    Serializes the claim plus both credential writes so concurrent pairs
+    cannot install an already-revoked credential: without it, a slow
+    responder overwrites the winner's files with its dead key, and the
+    fingerprint check accepts the internally consistent but obsolete
+    pair. Portable O_EXCL file mutex (fcntl/msvcrt differ per platform);
+    deleted on release so steady state carries no lock footprint.
+    Crash recovery is age-based: a lock older than STALE_AFTER (far
+    beyond any bounded pair) is treated as orphaned and recycled. Clock
+    jumps fail safe — worst case is the old concurrent behavior or a
+    bounded wait ending in a clean retryable error, never corruption.
+    """
+    lock = Path(data_dir) / "pair.lock"
+    deadline = time.monotonic() + PAIR_LOCK_TIMEOUT_SEC
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _pair_lock_is_stale(lock):
+                try:
+                    os.unlink(lock)
+                except OSError:
+                    pass
+                time.sleep(0.05)
+                continue
+            if time.monotonic() >= deadline:
+                raise PairingError(None, "PAIR_IN_PROGRESS",
+                                   f"another pair is using {data_dir}; "
+                                   "wait for it to finish and retry")
+            time.sleep(0.2)
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"pid": os.getpid(), "started": time.time()}) + "\n")
+        except OSError:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+            raise
+        break
+    try:
+        yield
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
+def _pair_lock_is_stale(lock):
+    """True when the lock holder is certainly gone (age-based)."""
+    try:
+        raw = lock.read_text(encoding="utf-8")
+    except OSError:
+        return False  # vanished; the next O_EXCL will likely win
+    try:
+        started = json.loads(raw).get("started")
+    except ValueError:
+        started = None
+    if not isinstance(started, (int, float)):
+        try:
+            started = lock.stat().st_mtime  # torn write: fall back to mtime
+        except OSError:
+            return False
+    return (time.time() - started) > PAIR_LOCK_STALE_AFTER_SEC
+
+
 def cmd_pair(args):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -545,7 +621,39 @@ def cmd_pair(args):
         if not code:
             print("pairing: no code entered", file=sys.stderr)
             return EXIT_USAGE
-        result = claim(args.api_base, code, node_id, hardware)
+        # The mutex spans the claim plus both credential writes (Codex P2
+        # round 11) — and nothing else: node-id creation is already
+        # race-safe, and the human code prompt must never hold the lock.
+        # Moving the writes inside the try is behavior-neutral (the claim
+        # already validated api_base; nothing here raises PairingError).
+        with pair_lock(data_dir):
+            result = claim(args.api_base, code, node_id, hardware)
+            # Key first, then metadata; either order is safe because
+            # load_pairing verifies the fingerprint below (Codex P2
+            # round 5): a crash between the two writes can only produce a
+            # refused mismatch, never a mixed generation that sends an old
+            # key to a new endpoint.
+            secret = result["heartbeatKey"].strip()
+            fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+            files = pairing_files(data_dir)
+            write_private(files["key"], secret + "\n")
+            meta = {
+                "api_base": check_api_base(args.api_base),
+                "resource_id": result["resourceId"],
+                "node_id": node_id,
+                "key_id": result.get("keyId"),
+                "key_prefix": result.get("keyPrefix"),
+                "key_sha256": fingerprint,
+                "heartbeat_url": result.get("heartbeatUrl"),
+                "created": result.get("created"),
+                "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            # Metadata is private too: api_base routes the credential (Codex P2).
+            write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
+            print(f"paired: resource {meta['resource_id']} (key {meta['key_prefix']})")
+            print(f"stored: {files['meta']} + {files['key']} (user-only access)")
+            print("heartbeat proves reachability only; it never means inference-ready")
+            return EXIT_OK
     except PairingError as exc:
         print(f"pairing failed [{exc.code}]: {exc}", file=sys.stderr)
         if exc.code == "NETWORK":
@@ -553,31 +661,6 @@ def cmd_pair(args):
         if exc.status is None:
             return EXIT_USAGE
         return EXIT_PAIRING_REJECTED
-    # Key first, then metadata; either order is safe because load_pairing
-    # verifies the fingerprint below (Codex P2 round 5): a crash between
-    # the two writes can only produce a refused mismatch, never a mixed
-    # generation that sends an old key to a new endpoint.
-    secret = result["heartbeatKey"].strip()
-    fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
-    files = pairing_files(data_dir)
-    write_private(files["key"], secret + "\n")
-    meta = {
-        "api_base": check_api_base(args.api_base),
-        "resource_id": result["resourceId"],
-        "node_id": node_id,
-        "key_id": result.get("keyId"),
-        "key_prefix": result.get("keyPrefix"),
-        "key_sha256": fingerprint,
-        "heartbeat_url": result.get("heartbeatUrl"),
-        "created": result.get("created"),
-        "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    # Metadata is private too: api_base routes the credential (Codex P2).
-    write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
-    print(f"paired: resource {meta['resource_id']} (key {meta['key_prefix']})")
-    print(f"stored: {files['meta']} + {files['key']} (user-only access)")
-    print("heartbeat proves reachability only; it never means inference-ready")
-    return EXIT_OK
 
 
 def cmd_heartbeat(args, loop):
@@ -593,6 +676,26 @@ def cmd_heartbeat(args, loop):
         # Recomputed per beat (Codex P2): installed/removed models and
         # engines change readiness, and a stale true would misreport ready.
         usable = decide_usable(args.config)
+        if loop:
+            # Reload pairing every iteration (Codex P2 round 11): an
+            # unpair during the loop must stop the sender instead of
+            # beating forever on a cached credential. The lock keeps the
+            # reload from racing a concurrent pair's writes (torn reads
+            # would false-exit); a contested lock just delays one beat.
+            try:
+                with pair_lock(data_dir):
+                    meta = load_pairing(data_dir)
+            except PairingError as exc:
+                if exc.code == "PAIR_IN_PROGRESS":
+                    print("heartbeat: pair in progress; rechecking after the interval",
+                          file=sys.stderr)
+                    time.sleep(interval)
+                    continue
+                write_status(data_dir, {"at": time.time(), "ok": False,
+                                        "status": "unpaired", "code": exc.code})
+                print(f"heartbeat: [{exc.code}] local pairing gone; sender stopping "
+                      "(pair again to resume)", file=sys.stderr)
+                return EXIT_REPAIR_REQUIRED
         try:
             result = send_heartbeat(meta["api_base"], meta["resource_id"],
                                     meta["heartbeat_key"], usable)
