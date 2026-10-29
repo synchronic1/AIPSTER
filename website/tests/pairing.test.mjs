@@ -156,7 +156,8 @@ test('claim validation: bad shape, bad node, unknown id', async () => {
 test('wrong secrets burn the code after ten attempts', async () => {
   const t = await createTestEnv();
   const minted = await mintCode(t, t.alice);
-  const wrongSecret = (n) => minted.json.code.slice(0, -1) + (n % 2 === 0 ? '0' : '1');
+  const tail = minted.json.code.slice(-1);
+  const wrongSecret = () => minted.json.code.slice(0, -1) + (tail === '0' ? '1' : '0');
   for (let i = 0; i < 10; i++) {
     const r = await readJson(await claim(t, { code: wrongSecret(i), nodeId: 'n-burn' }));
     assert.equal(r.status, 404, `attempt ${i}`);
@@ -353,4 +354,75 @@ test('claim at the key cap fails without stranding a second sender', async () =>
   assert.equal(out.json.code, 'KEY_LIMIT');
   const keys = await t.DB.prepare("SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL").bind(t.alice.id).first();
   assert.equal(keys.n, 20, 'cap still holds');
+});
+
+test('reclaim verifies the secret: wrong secret rotates nothing', async () => {
+  const t = await createTestEnv();
+  const minted = await mintCode(t, t.alice);
+  const first = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n-sec' }));
+  assert.equal(first.status, 201, first.text);
+  const tail = minted.json.code.slice(-1);
+  const wrong = minted.json.code.slice(0, -1) + (tail === '0' ? '1' : '0');
+  const bad = await readJson(await claim(t, { code: wrong, nodeId: 'n-sec' }));
+  assert.equal(bad.status, 404);
+  assert.equal(bad.json.code, 'PAIRING_INVALID');
+  const beat = await readJson(await t.call(`/api/resources/${first.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + first.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(beat.status, 200, 'legitimate sender key survives the forged reclaim');
+});
+
+test('disabled owners cannot reclaim a spent code', async () => {
+  const t = await createTestEnv();
+  const minted = await mintCode(t, t.alice);
+  const first = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n-drec' }));
+  assert.equal(first.status, 201, first.text);
+  await t.DB.prepare('UPDATE "user" SET disabled = 1 WHERE id = ?').bind(t.alice.id).run();
+  const retry = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n-drec' }));
+  assert.equal(retry.status, 404);
+  assert.equal(retry.json.code, 'PAIRING_INVALID');
+  const keys = await t.DB.prepare('SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(keys.n, 1, 'no credential minted for the disabled owner');
+});
+
+test('DELETE tears down jobs that reference grants', async () => {
+  const t = await createTestEnv();
+  const p = await pair(t, t.alice, 'node-jobdoom', { name: 'jobdoom' });
+  const grant = await readJson(await t.call('/api/grants', {
+    method: 'POST', headers: { ...t.as(t.alice), ...t.csrf },
+    body: { resourceId: p.resourceId, grantee: 'bob@example.com', maxJobs: 100, maxTokens: 100 },
+  }));
+  assert.equal(grant.status, 201, grant.text);
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO jobs (id, owner_id, resource_id, grant_id, adapter, model, status, tokens_in, tokens_out, cost_source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('j_doom1', t.alice.id, p.resourceId, grant.json.id, 'mock', 'mock-summary', 'done', 1, 1, 'measured', now, now).run();
+  const del = await readJson(await t.call(`/api/inventory/${p.resourceId}`, {
+    method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf },
+  }));
+  assert.equal(del.status, 200, del.text);
+  const job = await t.DB.prepare('SELECT id FROM jobs WHERE id = ?').bind('j_doom1').first();
+  assert.equal(job, null, 'dependent job row deleted with its resource');
+});
+
+test('a stuck in-flight mapping is stolen after the grace window', async () => {
+  const t = await createTestEnv();
+  const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  await t.DB.prepare('INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)')
+    .bind(t.alice.id, 'idem-stuck', stale).run();
+  const r = await register(t, t.alice, { name: 'unstuck' }, 'idem-stuck');
+  assert.equal(r.status, 201, r.text);
+  assert.equal(r.json.name, 'unstuck');
+  const fresh = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)')
+    .bind(t.alice.id, 'idem-live', fresh).run();
+  const held = await register(t, t.alice, { name: 'held' }, 'idem-live');
+  assert.equal(held.status, 409);
+  assert.equal(held.json.code, 'IDEMPOTENT_IN_FLIGHT');
+});
+
+test('an all-uppercase code claims (typed-entry contract)', async () => {
+  const t = await createTestEnv();
+  const minted = await mintCode(t, t.alice);
+  const out = await readJson(await claim(t, { code: minted.json.code.toUpperCase(), nodeId: 'n-upper' }));
+  assert.equal(out.status, 201, out.text);
 });

@@ -71,7 +71,7 @@ export const PAIR_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 export function normalizePairCode(v) {
   if (typeof v !== 'string') return null;
   const flat = v.replace(/\s+/g, '');
-  const m = /^pair[-_]([0-9a-fA-F]{8})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})$/.exec(flat);
+  const m = /^pair[-_]([0-9a-fA-F]{8})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})$/i.exec(flat);
   if (!m) return null;
   return { id: 'p_' + m[1].toLowerCase(), secret: (m[2] + m[3] + m[4]).toUpperCase() };
 }
