@@ -666,6 +666,86 @@ class Round11Tests(unittest.TestCase):
         self.assertEqual(status["status"], "unpaired")
 
 
+class Round12Tests(unittest.TestCase):
+    """Codex round-12 regressions: locked unpair, rotation-aware loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_unpair_during_pair_writes_corrupts_nothing(self):
+        real_write = pairing.write_private
+        nested = {}
+
+        def gated_write(path, content):
+            out = real_write(path, content)
+            if Path(path).name == "heartbeat-key.txt" and "code" not in nested:
+                nout, nerr, ncode = run_cli("unpair", argparse_namespace(
+                    {"api_base": self.base, "data_dir": str(self.data)}))
+                nested.update(code=ncode, out=nout, err=nerr)
+            return out
+
+        # Short mutex wait: post-fix the nested unpair must time out
+        # cleanly (the pair holds the lock); pre-fix it slips through
+        # instantly and corrupts the store.
+        with patch.object(pairing, "write_private", side_effect=gated_write), \
+                patch.object(pairing, "PAIR_LOCK_TIMEOUT_SEC", 5):
+            out, err, code = run_cli("pair", self.pair_args())
+        self.assertEqual(code, EXIT_OK, out + err)
+        self.assertEqual(nested["code"], EXIT_USAGE, "locked-out unpair fails cleanly, not silently")
+        self.assertIn("another pair", nested["err"])
+        loaded = load_pairing(self.data)
+        self.assertEqual(loaded["heartbeat_key"], FAKE_SECRET, "store intact and consistent")
+
+    def test_loop_retries_when_repair_lands_mid_beat(self):
+        minted = []
+
+        def hook(body):
+            i = len(minted)
+            key = f"synthetic-key-{i:02d}-0123456789abcdef"
+            minted.append(key)
+            return {"resourceId": "r_fake01", "heartbeatKey": key,
+                    "keyId": f"k_fake{i:02d}", "keyPrefix": f"aip_live_k_fake{i:02d}_x",
+                    "heartbeatUrl": "/api/resources/r_fake01/heartbeat", "created": True}
+
+        self.state.claim_hook = hook
+        run_cli("pair", self.pair_args())
+        self.state.live_keys = {minted[0]}
+        args = argparse_namespace({"api_base": self.base, "data_dir": str(self.data),
+                                   "config": None, "interval": 60})
+        real_send = pairing.send_heartbeat
+        calls = []
+
+        def flaky_beat(api_base, resource_id, secret, usable):
+            calls.append(secret)
+            if len(calls) == 1:
+                # Re-pair lands after our reload but before the beat
+                # reaches the server: new key installed, old revoked.
+                run_cli("pair", self.pair_args(code="pair-99999999-AAAA-BBBB-CCCC"[:27]))
+                self.state.live_keys = {minted[-1]}
+            if len(calls) >= 3:
+                raise RePairRequired(401, "KEY_REVOKED", "test cap: genuine terminal revocation")
+            return real_send(api_base, resource_id, secret, usable)
+
+        with patch.object(pairing, "send_heartbeat", side_effect=flaky_beat), \
+                patch.object(pairing.time, "sleep", side_effect=lambda s: None):
+            code = cmd_heartbeat(args, loop=True)
+        self.assertEqual(code, EXIT_REPAIR_REQUIRED)
+        self.assertEqual(calls, [minted[0], minted[1], minted[1]],
+                         "revoked beat retried once with the rotated key, then a genuine revocation exits")
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():
