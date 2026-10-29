@@ -23,8 +23,8 @@ From PowerShell in a fresh directory (these commands match the tested Windows x6
 git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
 git sparse-checkout set --no-cone /local-worker/ /LICENSE
-git fetch origin 15b114edc139b5eee6149de692eb65d49a51335d
-git checkout --detach 15b114edc139b5eee6149de692eb65d49a51335d
+git fetch origin dbcff60431151e1e4f32293400c38832e9e9f93a
+git checkout --detach dbcff60431151e1e4f32293400c38832e9e9f93a
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
@@ -76,6 +76,9 @@ inference readiness; `/api/jobs` remains disabled. Choose Done or reopen My
 Compute after pairing to refresh the resource list. If the key is revoked or
 expires, the sender exits asking for a fresh pairing code. `pairing.py status`
 shows secret-free local status and marks old success as stale.
+Status belongs to the selected pairing generation: a previous sender's status,
+including an in-flight response finishing after re-pairing, is not attributed
+to the new key or resource. Unbound older status records await a fresh heartbeat.
 
 To disconnect, stop both sender and daemon terminals with Ctrl+C, discard the
 worker-local daemon token, and revoke this resource's heartbeat key in the
@@ -87,6 +90,9 @@ dashboard Keys panel. Then forget local pairing:
 
 Local unpair does not revoke the server key. Deleting `.venv` or `.state` alone
 does not remove private pairing credentials from the worker data directory.
+If any pairing file cannot be removed, unpair exits nonzero and reports
+incomplete cleanup. Stop the sender or other process holding the file, revoke
+the server key, and retry; an already missing file is harmless.
 Preserve unrelated models and engines. This source setup adds no startup task,
 service or automatic update. Packaged launcher integration is still pending.
 See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
