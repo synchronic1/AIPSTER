@@ -194,6 +194,14 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse((self.data / 'api-token.txt').exists())
         self.assertFalse(list(self.data.glob('.api-token-*')))
 
+    def test_windowed_log_bootstrap_provisions_private_data_before_writing(self):
+        with patch.object(controller.sys, 'stdout', None), patch.object(controller.sys, 'stderr', io.StringIO()):
+            self.assertTrue(controller._redirect_to_log(self.data))
+            handle = controller.sys.stdout
+            self.assertTrue(first._private_path(self.data, directory=True, verify=True))
+            self.assertTrue((self.data / 'logs/tray.log').exists())
+            handle.close()
+
     def test_uninstall_list_preserves_unrelated_files_and_data(self):
         payload = self.data / 'payload'
         payload.mkdir(parents=True)
