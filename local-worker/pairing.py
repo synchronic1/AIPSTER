@@ -194,8 +194,28 @@ def load_or_create_node_id(state_dir):
         raise PairingError(None, "BAD_NODE_ID",
                            f"{node_file} does not hold a valid node id; "
                            "delete it to generate a fresh one on next pair")
+    # First-pair creation is exclusive: the id is fully written to a private
+    # temp file, then hard-linked into place, which fails if another racer
+    # already published one. Losers read the winner's complete file, so
+    # concurrent first pairs converge on one identity and never overwrite it.
     value = "n_" + secrets.token_hex(16)
-    write_private(node_file, value + "\n")
+    fd, tmp = tempfile.mkstemp(dir=str(state_dir), prefix="node-id.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if not restrict_file(tmp, new=True):
+                raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
+            handle.write(value + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, node_file)
+        except FileExistsError:
+            return load_or_create_node_id(state_dir)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     return value
 
 
@@ -533,7 +553,22 @@ def cmd_heartbeat(args, loop):
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK
     interval = max(args.interval, HEARTBEAT_MIN_INTERVAL_SEC)
     failures = 0
+    first_beat = True
     while True:
+        if not first_beat:
+            # Reload every beat: unpair stops the sender instead of beating on
+            # a cached credential, and a re-pair switches it to the new key.
+            try:
+                meta = load_pairing(data_dir)
+            except PairingError as exc:
+                if exc.code != "NOT_PAIRED":
+                    print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
+                    return EXIT_USAGE
+                write_status(data_dir, {"at": time.time(), "ok": False, "status": "unpaired",
+                                        "code": exc.code}, meta)
+                print("heartbeat: worker was unpaired; sender stopping", file=sys.stderr)
+                return EXIT_REPAIR_REQUIRED
+        first_beat = False
         # Recomputed per beat (Codex P2): installed/removed models and
         # engines change readiness, and a stale true would misreport ready.
         usable = decide_usable(args.config)
@@ -541,6 +576,18 @@ def cmd_heartbeat(args, loop):
             result = send_heartbeat(meta["api_base"], meta["resource_id"],
                                     meta["heartbeat_key"], usable)
         except RePairRequired as exc:
+            # A re-pair can land between the reload and the beat: the old key
+            # is revoked but a newer credential is already installed. The
+            # sender loop retries with it instead of reporting the fresh
+            # pairing as dead; a one-shot beat reports and exits.
+            try:
+                latest = load_pairing(data_dir)
+            except PairingError:
+                latest = None
+            if loop and latest is not None and latest["heartbeat_key"] != meta["heartbeat_key"]:
+                meta = latest
+                first_beat = True
+                continue
             write_status(data_dir, {"at": time.time(), "ok": False,
                                     "status": "repair-required", "code": exc.code}, meta)
             print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
