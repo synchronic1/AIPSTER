@@ -1,0 +1,38 @@
+# Builds and qualifies the Windows x86-64 local-worker installer on every PR
+# touching the worker. This gates the packaging scripts only: it uploads
+# nothing and publishes no release. The release owner builds the release
+# artifact from the merged commit with the same pinned script and uploads it
+# by hand after independent review; the manifest records the source SHA so any
+# build is verifiable. macOS/Linux jobs land with their staged packaging PRs.
+name: Worker installer build
+on:
+  pull_request:
+    paths:
+      - 'local-worker/**'
+      - 'LICENSE'
+      - '.github/workflows/worker-installer-build.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: worker-installer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-windows:
+    name: Build and qualify Windows installer
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6 verified 2026-10-26
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7 resolved 2026-10-28
+        with:
+          version: '0.12.12'
+          enable-cache: false
+      - run: uv python install 3.12.14
+      - run: choco install nsis --version=3.13 --yes --no-progress
+      - run: uv run --no-project --python 3.12.14 python packaging/windows/build.py
+        working-directory: local-worker
+      - run: uv run --no-project --python 3.12.14 python packaging/windows/qualify.py
+        working-directory: local-worker
