@@ -98,7 +98,7 @@ def default_data_dir():
 def _restrict_path(path, directory=False):
     """Establish private access before publishing state; never silently degrade."""
     path = Path(path)
-    if path.is_symlink():
+    if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
         raise PairingError(None, "PRIVATE_STORAGE", "worker state cannot use symbolic links")
     try:
         os.chmod(path, 0o700 if directory else 0o600)
@@ -170,6 +170,45 @@ def write_private(path, text):
             pass
 
 
+def ensure_private_dir(path):
+    """Compatibility name for the fail-closed private directory writer."""
+    return private_dir(path)
+
+
+def check_private_store(data_dir, key_path=None):
+    """Refuse unsafe credential routing, including a legacy flat-key store."""
+    data = Path(data_dir)
+    paths = [path for path in [data, data / "pairing.json", key_path] if path is not None and path.exists()]
+    try:
+        if any(path.is_symlink() or getattr(path, "is_junction", lambda: False)() for path in paths):
+            raise OSError("linked store")
+        if os.name != "nt":
+            if any(path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077 for path in paths):
+                raise OSError("shared store")
+        elif paths:
+            script = r'''
+$ErrorActionPreference = 'Stop'
+$paths = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+foreach ($path in $paths) {
+  $acl = Get-Acl -LiteralPath $path
+  if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 2 }
+  foreach ($entry in $acl.Access) {
+    $entrySid = $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    if ($entry.AccessControlType -eq 'Allow' -and $entrySid -notin @($sid, 'S-1-5-18', 'S-1-5-32-544')) { exit 3 }
+  }
+}
+'''
+            ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            result = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
+                                    input=json.dumps([str(path.resolve()) for path in paths]),
+                                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode != 0:
+                raise OSError("unsafe store ACL")
+    except OSError as exc:
+        raise PairingError(None, "BAD_PAIRING_STORE", "worker storage is not user-private; fix permissions or re-pair") from exc
+
+
 def load_or_create_node_id(state_dir):
     """Stable worker identity (1..64 id chars), created once and kept."""
     state_dir = Path(state_dir)
@@ -221,11 +260,16 @@ def probe_hardware(config_path=None):
         try:
             from dendrite.config import load_config
             config = load_config(Path(config_path))
-            kinds = {getattr(r, "kind", "") for r in getattr(config, "runtimes", [])}
-            if kinds and kinds <= {"mock"}:
-                return snapshot  # simulated runtimes are not real capacity
+            kinds = {}
+            for runtime in getattr(config, "runtimes", []) or []:
+                kinds[getattr(runtime, "id", None)] = getattr(runtime, "kind", "")
             caps = []
             for model in getattr(config, "models", []) or []:
+                # Per-model filtering (Codex P2): a mixed config must not
+                # advertise mock-backed models as real capacity, and models
+                # on unknown runtimes claim nothing.
+                if kinds.get(getattr(model, "runtime", None), "mock") == "mock":
+                    continue
                 for cap in getattr(model, "capabilities", []) or []:
                     if cap not in caps:
                         caps.append(str(cap))
@@ -386,6 +430,7 @@ def pairing_key_path(data_dir, meta):
 
 def load_pairing(data_dir):
     """Load pairing metadata + secret. Raises PairingError when unpaired."""
+    check_private_store(data_dir)
     files = pairing_files(data_dir)
     if not files["meta"].exists():
         raise PairingError(None, "NOT_PAIRED", "worker is not paired; run `pair` first")
@@ -394,7 +439,9 @@ def load_pairing(data_dir):
         if not isinstance(meta, dict):
             raise ValueError("invalid metadata")
         # Select the key from this one manifest snapshot, never a second read.
-        secret = pairing_key_path(data_dir, meta).read_text(encoding="utf-8").strip()
+        key_file = pairing_key_path(data_dir, meta)
+        check_private_store(data_dir, key_file)
+        secret = key_file.read_text(encoding="utf-8").strip()
     except (OSError, ValueError) as exc:
         raise PairingError(None, "BAD_PAIRING_STORE", f"pairing store unreadable: {exc}")
     if not meta.get("resource_id") or not meta.get("api_base") or not secret:
@@ -467,6 +514,8 @@ def cmd_heartbeat(args, loop):
     interval = max(args.interval, HEARTBEAT_MIN_INTERVAL_SEC)
     failures = 0
     while True:
+        # Recomputed per beat (Codex P2): installed/removed models and
+        # engines change readiness, and a stale true would misreport ready.
         usable = decide_usable(args.config)
         try:
             result = send_heartbeat(meta["api_base"], meta["resource_id"],
@@ -488,14 +537,17 @@ def cmd_heartbeat(args, loop):
                     return EXIT_NETWORK
                 time.sleep(wait)
                 continue
-            if exc.status is None:
+            if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
+                # Transport faults AND transient server failures share the
+                # bounded backoff (Codex P2): a 5xx must not terminate the
+                # sender while the service recovers.
                 failures += 1
                 if failures > MAX_ATTEMPTS_NETWORK:
-                    print(f"heartbeat: network down after {MAX_ATTEMPTS_NETWORK} tries: {exc}",
+                    print(f"heartbeat: giving up after {MAX_ATTEMPTS_NETWORK} tries: [{exc.code}] {exc}",
                           file=sys.stderr)
                     return EXIT_NETWORK
                 wait = min(2 ** failures, 60)
-                print(f"heartbeat: {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
+                print(f"heartbeat: [{exc.code}] {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
                       file=sys.stderr)
                 if not loop:
                     return EXIT_NETWORK
