@@ -20,6 +20,7 @@ local tests only).
 """
 
 import argparse
+import contextlib
 import getpass
 import hashlib
 import hmac
@@ -39,10 +40,22 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
+try:
+    import msvcrt
+except ImportError:  # POSIX: flock path below
+    msvcrt = None
+try:
+    import fcntl
+except ImportError:  # Windows: msvcrt path above
+    fcntl = None
+
 from private_storage_win32 import protect_path
 
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
+# Pair-mutex bound (Muse W3 round 11). A pair holds the lock across one
+# claim (single bounded request) plus two local writes: seconds.
+PAIR_LOCK_TIMEOUT_SEC = 180
 HEARTBEAT_INTERVAL_SEC = 60
 HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
@@ -485,6 +498,64 @@ def write_status(data_dir, payload, meta=None):
     write_private(files["status"], json.dumps(record, indent=2) + "\n")
 
 
+@contextlib.contextmanager
+def pair_lock(data_dir):
+    """Per-data-directory pair mutex (Muse W3 rounds 11/13).
+
+    Serializes the claim plus the generation and manifest writes so
+    concurrent pairs cannot install an already-revoked credential:
+    without it, a slow responder's manifest overwrites the winner's
+    with its dead key. The lock is OS-held (an msvcrt byte-range lock
+    on Windows, a flock elsewhere) on an open descriptor, never
+    existence-based: a dead holder's lock is released by the OS on
+    process death, so there is no stale-lock deletion path and no
+    deletion race. Acquisition waits up to PAIR_LOCK_TIMEOUT_SEC and
+    then fails cleanly with PAIR_IN_PROGRESS, never by deleting.
+    """
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    lock = Path(data_dir) / "pair.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + PAIR_LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                _fd_lock_exclusive(fd)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise PairingError(None, "PAIR_IN_PROGRESS",
+                                       f"another pair is using {data_dir}; "
+                                       "wait for it to finish and retry")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _fd_unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _fd_lock_exclusive(fd):
+    """Take a non-blocking exclusive lock on fd. Raises OSError when held."""
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)  # msvcrt locks from the file position
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _fd_unlock(fd):
+    """Release the lock taken by _fd_lock_exclusive. Never raises."""
+    try:
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
 def cmd_pair(args):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -505,29 +576,35 @@ def cmd_pair(args):
         if not code:
             print("pairing: no code entered", file=sys.stderr)
             return EXIT_USAGE
-        result = claim(args.api_base, code, node_id, hardware)
-        files = pairing_files(data_dir)
-        generation = "heartbeat-key." + secrets.token_hex(16) + ".txt"
-        secret = result["heartbeatKey"].strip()
-        meta = {
-            "api_base": check_api_base(args.api_base),
-            "resource_id": result["resourceId"],
-            "node_id": node_id,
-            "key_id": result.get("keyId"),
-            "key_prefix": result.get("keyPrefix"),
-            "heartbeat_url": result.get("heartbeatUrl"),
-            "created": result.get("created"),
-            "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "key_file": generation,
-            "key_sha256": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
-        }
-        key_file = data_dir / generation
-        # The manifest is the commit point. A failed/interrupted write leaves
-        # either the old tuple or the complete new tuple, never mixed origins.
-        # Retain old/unpublished private generations until unpair: an in-flight
-        # reader may still hold an older manifest snapshot.
-        write_private(key_file, secret + "\n")
-        write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
+        # The claim plus both writes hold the pair mutex (Muse W3 round
+        # 11): without it a slow responder's manifest overwrites the
+        # winner's with an already-revoked key. The mutex spans the claim
+        # plus both credential writes only -- never the human prompt above
+        # and never the success prints below.
+        with pair_lock(data_dir):
+            result = claim(args.api_base, code, node_id, hardware)
+            files = pairing_files(data_dir)
+            generation = "heartbeat-key." + secrets.token_hex(16) + ".txt"
+            secret = result["heartbeatKey"].strip()
+            meta = {
+                "api_base": check_api_base(args.api_base),
+                "resource_id": result["resourceId"],
+                "node_id": node_id,
+                "key_id": result.get("keyId"),
+                "key_prefix": result.get("keyPrefix"),
+                "heartbeat_url": result.get("heartbeatUrl"),
+                "created": result.get("created"),
+                "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "key_file": generation,
+                "key_sha256": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            }
+            key_file = data_dir / generation
+            # The manifest is the commit point. A failed/interrupted write leaves
+            # either the old tuple or the complete new tuple, never mixed origins.
+            # Retain old/unpublished private generations until unpair: an in-flight
+            # reader may still hold an older manifest snapshot.
+            write_private(key_file, secret + "\n")
+            write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
     except PairingError as exc:
         print(f"pairing failed [{exc.code}]: {exc}", file=sys.stderr)
         if exc.code == "NETWORK":
@@ -547,7 +624,13 @@ def cmd_pair(args):
 def cmd_heartbeat(args, loop):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-        meta = load_pairing(data_dir)
+        # Atomic with pair's writes (Muse W3 round 13): an unlocked
+        # initial read racing pair's generation-then-manifest writes can
+        # observe a deleted generation and mis-exit BAD_PAIRING_STORE,
+        # leaving the sender stopped after a successful pair. The lock is
+        # held for the read only, never across the loop.
+        with pair_lock(data_dir):
+            meta = load_pairing(data_dir)
     except PairingError as exc:
         print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK
@@ -558,9 +641,18 @@ def cmd_heartbeat(args, loop):
         if not first_beat:
             # Reload every beat: unpair stops the sender instead of beating on
             # a cached credential, and a re-pair switches it to the new key.
+            # Under the mutex (Muse W3 round 11): the reload must not
+            # race a concurrent pair's writes. A contested lock just
+            # delays one beat; it never stops the sender.
             try:
-                meta = load_pairing(data_dir)
+                with pair_lock(data_dir):
+                    meta = load_pairing(data_dir)
             except PairingError as exc:
+                if exc.code == "PAIR_IN_PROGRESS":
+                    print("heartbeat: pair in progress; rechecking after the interval",
+                          file=sys.stderr)
+                    time.sleep(interval)
+                    continue
                 if exc.code != "NOT_PAIRED":
                     print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
                     return EXIT_USAGE
@@ -580,8 +672,11 @@ def cmd_heartbeat(args, loop):
             # is revoked but a newer credential is already installed. The
             # sender loop retries with it instead of reporting the fresh
             # pairing as dead; a one-shot beat reports and exits.
+            # Under the mutex (Muse W3 round 12): compare against a
+            # store snapshot no concurrent pair is mid-write on.
             try:
-                latest = load_pairing(data_dir)
+                with pair_lock(data_dir):
+                    latest = load_pairing(data_dir)
             except PairingError:
                 latest = None
             if loop and latest is not None and latest["heartbeat_key"] != meta["heartbeat_key"]:
@@ -667,20 +762,29 @@ def cmd_unpair(args):
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     files = pairing_files(data_dir)
     removed, failed = [], 0
+    # Under the same mutex as pair (Muse W3 round 12): an unlocked
+    # deletion racing pair's writes could remove the new generation
+    # before the new manifest lands, leaving a success-reported
+    # NOT_PAIRED store. The scandir-based deletion below is unchanged.
     try:
-        paths = [files["meta"], *managed_key_files(data_dir)]
-    except FileNotFoundError:
-        paths = [files["meta"]]
-    except OSError:
-        paths, failed = [], 1
-    for path in paths:
-        try:
-            path.unlink()
-            removed.append(str(path))
-        except FileNotFoundError:
-            pass
-        except OSError:
-            failed += 1
+        with pair_lock(data_dir):
+            try:
+                paths = [files["meta"], *managed_key_files(data_dir)]
+            except FileNotFoundError:
+                paths = [files["meta"]]
+            except OSError:
+                paths, failed = [], 1
+            for path in paths:
+                try:
+                    path.unlink()
+                    removed.append(str(path))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    failed += 1
+    except PairingError as exc:
+        print(f"unpair failed [{exc.code}]: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     if failed:
         print("unpair failed [PRIVATE_STORAGE]: some pairing files could not be removed; stop the sender and retry", file=sys.stderr)
         if removed:
