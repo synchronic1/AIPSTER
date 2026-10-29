@@ -135,24 +135,36 @@ Function .onInit
       StrCpy $INSTDIR $R0
   ${EndIf}
   ; Refuse to install over running worker processes (tray, console launcher,
-  ; or raw CLI). tasklist output always ends in a newline, so match exe names
-  ; as substrings, never the whole output. Silent installs abort (exit 2).
+  ; or raw CLI). Each tasklist call is filtered to one image: NSIS strings
+  ; truncate at 1023 chars, so an unfiltered process list would hide workers.
+  ; Silent installs abort (exit 2).
   running_check:
-    nsExec::ExecToStack 'tasklist /FO CSV /NH'
+    StrCpy $4 ""
+    nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-tray.exe"'
     Pop $1
     Pop $2
-    ${If} $1 != 0
-      Goto install_anyway
-    ${EndIf}
-    StrCpy $4 ""
-    ${StrStr} $3 $2 "aipster-tray.exe"
-    ${If} $3 != ""
-      StrCpy $4 "aipster-tray.exe"
-    ${Else}
-      ${StrStr} $3 $2 "aipster-worker.exe"
+    ${If} $1 == 0
+      ${StrStr} $3 $2 "aipster-tray.exe"
       ${If} $3 != ""
-        StrCpy $4 "aipster-worker.exe"
-      ${Else}
+        StrCpy $4 "aipster-tray.exe"
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-worker.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
+        ${StrStr} $3 $2 "aipster-worker.exe"
+        ${If} $3 != ""
+          StrCpy $4 "aipster-worker.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq dendrite.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
         ${StrStr} $3 $2 "dendrite.exe"
         ${If} $3 != ""
           StrCpy $4 "dendrite.exe"
