@@ -11,6 +11,7 @@
 !include "StrFunc.nsh"
 !include "nsDialogs.nsh"
 ${Using:StrFunc} StrStr
+${Using:StrFunc} UnStrStr
 
 Var RemoveData
 
@@ -198,15 +199,15 @@ Function un.onInit
       Goto un_proceed
     ${EndIf}
     StrCpy $4 ""
-    ${StrStr} $3 $2 "aipster-tray.exe"
+    ${UnStrStr} $3 $2 "aipster-tray.exe"
     ${If} $3 != ""
       StrCpy $4 "aipster-tray.exe"
     ${Else}
-      ${StrStr} $3 $2 "aipster-worker.exe"
+      ${UnStrStr} $3 $2 "aipster-worker.exe"
       ${If} $3 != ""
         StrCpy $4 "aipster-worker.exe"
       ${Else}
-        ${StrStr} $3 $2 "dendrite.exe"
+        ${UnStrStr} $3 $2 "dendrite.exe"
         ${If} $3 != ""
           StrCpy $4 "dendrite.exe"
         ${EndIf}
