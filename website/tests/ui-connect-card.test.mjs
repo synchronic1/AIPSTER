@@ -19,9 +19,9 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
-const WORKER_COMMIT = 'a8c4285393f5b62bd18e98b414c08d5931d57310';
+const WORKER_COMMIT = 'f3e115e0c42fcd83e8a6f2e769de427710f7acc1';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
-const DOCS_COMMIT = 'a8c4285393f5b62bd18e98b414c08d5931d57310';
+const DOCS_COMMIT = 'bcb2e03e8342af8c2c6ddb5bdea1998c7491e45a';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
