@@ -11,7 +11,7 @@ import { checkWriteBudget } from '../lib/quotas.js';
 import { admitFabricOperation } from './admission.mjs';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
-import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion, isCommitFailure, pendingCommit } from './operations.mjs';
+import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion, pendingCommit, claimActionForPath, pendingClaim, ledgerFor, ledgerVeto } from './operations.mjs';
 import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, acceptRecoverInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
@@ -856,10 +856,8 @@ export async function commitGrant(db, actor, input = {}, op = null) {
   // The shared claim: exactly one of commit/revise/resume wins this
   // approval. Losers change nothing.
   const claimNow = nowIso();
-  // Stable direct callers carry the same terminal fence even without a router
-  // attempt. Calls without any stable op identity are independent operations.
-  const ledger = op && typeof op.key === 'string' && op.key && typeof op.path === 'string' && op.path
-    ? { actor: `${actor.kind}:${actor.user.id}`, key: op.key, path: op.path } : null;
+  // Stable router and direct callers carry the same terminal fence.
+  const ledger = ledgerFor(actor, op);
   if (!(await claimApproval(db, { id: appr.id, action: 'grant.commit', target: null, op: opd, now: claimNow, ledger }))) {
     const raced = await first(db, 'SELECT id, consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', appr.id);
     const recovered = await completeCommit(db, actor, raced, preview, op, opd);
@@ -1019,7 +1017,10 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
   // approval. Losers change nothing. A won claim followed by an
   // effect failure leaves the approval spent (fail-closed reapproval).
   const claimNow = nowIso();
-  if (!(await claimApproval(db, { id: appr.id, action: 'grant.revise', target: id, op: opd, now: claimNow }))) {
+  // The claim half of the paired fence: a recorded terminal failure for
+  // this router operation vetoes even a delayed claim using old timestamps.
+  const ledger = ledgerFor(actor, op);
+  if (!(await claimApproval(db, { id: appr.id, action: 'grant.revise', target: id, op: opd, now: claimNow, ledger }))) {
     const recovered = await completeRevision(db, actor, id, opd, requestHash);
     if (recovered) return recovered;
     return unresolvedRevision(db, appr.id, id, opd, requestHash);
@@ -1154,6 +1155,9 @@ export async function resumeGrant(db, actor, id, input = {}, op = null) {
     // different operation's already-consumed approval.
     status[0][0] += ` AND changes() = 1 AND EXISTS(SELECT 1 FROM approvals WHERE id = ? AND consumed_by_op = ? AND consumed_action = 'grant.resume' AND consumed_target = ?)`;
     status[0].push(appr.id, completion.operationId, id);
+    // The claim half of the paired fence: a recorded terminal failure for
+    // this router operation vetoes even a delayed batch using old timestamps.
+    const claimVeto = ledgerVeto(ledgerFor(actor, op));
     const res = await runBatch(db, [
       [`UPDATE approvals SET consumed_at = ?, consumed_by_op = ?, consumed_action = 'grant.resume', consumed_target = ?
         WHERE id = ? AND consumed_at IS NULL AND decision = 'approved' AND expiry > ?
@@ -1161,9 +1165,9 @@ export async function resumeGrant(db, actor, id, input = {}, op = null) {
         AND bound_grant_id = ? AND bound_grant_version = ? AND issued_connection = ? AND issued_version = ?
         AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0 AND demo = 0)
         AND EXISTS(SELECT 1 FROM fabric_grants WHERE id = ? AND version = ? AND status = 'paused' AND quarantine_reason IS NULL AND exporter_id = ?)
-        AND EXISTS(SELECT 1 FROM connections WHERE id = ? AND version = ? AND state = 'active')`,
+        AND EXISTS(SELECT 1 FROM connections WHERE id = ? AND version = ? AND state = 'active')${claimVeto.clause}`,
         now, completion.operationId, id, appr.id, now, id, actor.user.id, actor.user.id, id, grant.version, conn.id, conn.version,
-        actor.user.id, id, grant.version, actor.user.id, conn.id, conn.version],
+        actor.user.id, id, grant.version, actor.user.id, conn.id, conn.version, ...claimVeto.binds],
       ...status,
       ...restrictionCompletion(actor, completion, 'fabric.grant.resume', id, body, now)
     ]);
@@ -1504,29 +1508,47 @@ export async function storeIdempotency(db, actor, key, status, body, attempt = n
   // Replays return the recorded response (4xx terminal failures included),
   // minus one-time secret fields. Bodies derive from 64 KiB-capped
   // requests, so TEXT stays bounded.
-  const redacted = JSON.stringify(redactForReplay(body));
-  let commitFence = '', commitArgs = [];
+  let claimFence = '', claimArgs = [], fenceAction = null;
   if (status >= 400 && status < 500 && status !== 401 && status !== 403) {
     const rec = await first(db, 'SELECT path FROM idempotency_records WHERE idem_key = ? AND actor = ?', key, actorKey);
-    if (rec && isCommitFailure(rec.path, status)) {
+    const action = rec && claimActionForPath(rec.path);
+    if (action) {
       const operationId = await opDigest(actor, { key, path: rec.path });
-      // Paired with the commit approval-CAS fence: failure first forbids a
+      // Paired with the approval-CAS fence: failure first forbids a
       // delayed claim; claim first forbids a terminal failure. This predicate
       // is evaluated by SQLite/D1 inside the write, never from a stale read.
-      commitFence = ` AND NOT EXISTS(SELECT 1 FROM approvals WHERE consumed_by_op = ?
-        AND consumed_action = 'grant.commit' AND consumed_target IS NULL AND created_by = ? AND approver = ?)`;
-      commitArgs = [operationId, actor.user.id, actor.user.id];
+      if (action === 'grant.commit') {
+        fenceAction = action;
+        claimFence = ` AND NOT EXISTS(SELECT 1 FROM approvals WHERE consumed_by_op = ?
+          AND consumed_action = 'grant.commit' AND consumed_target IS NULL AND created_by = ? AND approver = ?)`;
+        claimArgs = [operationId, actor.user.id, actor.user.id];
+      } else {
+        // A classified post-claim revision outcome is authoritative: record
+        // it, never a stale precondition failure computed over the won claim.
+        const fenced = action === 'grant.revise'
+          ? await first(db, 'SELECT response_code, response_body FROM fabric_revision_failures WHERE operation_id = ?', operationId)
+          : null;
+        if (fenced) {
+          status = fenced.response_code; body = JSON.parse(fenced.response_body);
+        } else {
+          fenceAction = action;
+          claimFence = ` AND NOT EXISTS(SELECT 1 FROM approvals WHERE consumed_by_op = ?
+            AND consumed_action IN ('grant.revise', 'grant.resume') AND created_by = ? AND approver = ?)`;
+          claimArgs = [operationId, actor.user.id, actor.user.id];
+        }
+      }
     }
   }
+  const redacted = JSON.stringify(redactForReplay(body));
   const attemptArgs = attempt === null || attempt === undefined ? [] : [attempt];
   const result = await db.prepare(`UPDATE idempotency_records SET status = ?, response_code = ?, response_body = ?
-    WHERE idem_key = ? AND actor = ? AND status = ?${attemptArgs.length ? ' AND attempt = ?' : ''}${commitFence}`)
-    .bind('completed', status, redacted, key, actorKey, 'processing', ...attemptArgs, ...commitArgs).run();
-  if (commitFence && Number(result.meta.changes) === 0) {
+    WHERE idem_key = ? AND actor = ? AND status = ?${attemptArgs.length ? ' AND attempt = ?' : ''}${claimFence}`)
+    .bind('completed', status, redacted, key, actorKey, 'processing', ...attemptArgs, ...claimArgs).run();
+  if (claimFence && Number(result.meta.changes) === 0) {
     // A consumed claim or a newer attempt owns the unknown outcome. Do not
     // cache the caller's fresh-precondition error over that pending effect.
     await releaseIdempotency(db, actor, key, attempt);
-    return pendingCommit();
+    return pendingClaim(fenceAction);
   }
 }
 
