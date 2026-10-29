@@ -136,7 +136,7 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const primaryBtn = buttons.find((b) => !attr(b, 'data-action'));
   assert.ok(primaryBtn, 'primary action is present');
   assert.ok(primaryBtn.attrs.some((x) => x.name === 'disabled'), 'unavailable installer is a disabled action, not a fake download');
-  assert.equal(nodeText(primaryBtn), 'Installer coming soon for Windows x64');
+  assert.equal(nodeText(primaryBtn), 'Installer pending publication for Windows x64');
   const selects = nodes.filter((n) => n.tagName === 'select');
   assert.equal(selects.length, 1, 'one OS picker');
   assert.equal(attr(selects[0], 'data-action'), 'os');
@@ -156,8 +156,8 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const head = card.innerHTML.slice(0, card.innerHTML.indexOf('<details'));
   assert.ok(!head.includes('<pre') && !head.includes('git clone') && !head.includes('DENDRITE_API_TOKEN'), 'no runbook above Advanced');
   const text = textOf(card.innerHTML);
-  for (const phrase of ['Connect your computer', 'Installer coming soon for Windows x64', 'Set up with my agent',
-    'Installer for Windows x64:', 'not available', 'nothing to download', 'published as source only',
+  for (const phrase of ['Connect your computer', 'Installer pending publication for Windows x64', 'Set up with my agent',
+    'Installer for Windows x64 0.1.0', 'packaged and qualified', 'nothing to download',
     'Setup needed', 'Installing', 'Pairing', 'Connected', 'You are here. Not connected.',
     'AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant',
     'Advanced: manual install, source and troubleshooting', 'ganglion-dendrite 0.1.0', WORKER_COMMIT]) {
@@ -210,7 +210,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
 
   // A bogus picker value changes nothing.
   await win.chooseOs('bogus');
-  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64: not available'));
+  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64 0.1.0 is packaged and qualified'));
 
   // Phones and tablets are directed to the computer they want to connect,
   // with no install action until they explicitly pick a target computer.
@@ -313,19 +313,25 @@ test('clipboard failure shows selectable instructions; retry recovers', async ()
   assert.equal(nodesOf(bare.el('connect-card').innerHTML).filter((n) => n.tagName === 'textarea').length, 1);
 });
 
-test('unavailable installer is a disabled action with an explanation, never a download', async () => {
+test('packaged-but-unpublished installer shows version/checksum with no download link', async () => {
   const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
   await ui.clickTab('compute');
   const before = ui.calls.length;
   const html = ui.el('connect-card').innerHTML;
   const text = textOf(html);
-  assert.ok(text.includes('Installer coming soon for Windows x64'), 'disabled per-platform action');
-  assert.ok(text.includes('not available') && text.includes('nothing to download'), 'visible explanation');
-  assert.ok(!/Download installer/.test(text), 'no live download label while nothing exists');
+  assert.ok(text.includes('Installer pending publication for Windows x64'), 'disabled per-platform action');
+  assert.ok(text.includes('packaged and qualified') && text.includes('nothing to download'), 'visible explanation');
+  assert.ok(text.includes('0.1.0') && text.includes('7f463aae'), 'version + checksum shown');
+  assert.ok(!/Download installer/.test(text), 'no live download label while unpublished');
   const linksBefore = cardLinks(html);
   await ui.press('download');
   assert.deepEqual(cardLinks(ui.el('connect-card').innerHTML), linksBefore, 'stale download action starts nothing');
   assert.deepEqual(ui.calls.slice(before), [], 'no API call');
+  // Unpackaged platforms keep the not-available explanation.
+  await ui.chooseOs('macos');
+  const mac = textOf(ui.el('connect-card').innerHTML);
+  assert.ok(mac.includes('Installer coming soon for macOS'), 'disabled per-platform action');
+  assert.ok(mac.includes('not available') && mac.includes('nothing to download'), 'visible explanation');
 });
 
 test('progress never claims an unverified installed, paired or connected state', async () => {
@@ -342,7 +348,10 @@ test('progress never claims an unverified installed, paired or connected state',
   assert.equal(current.length, 1, 'exactly one current stage');
   assert.ok(nodeText(current[0]).startsWith('Setup needed'), 'Setup needed is the current stage');
   const progressText = textOf(progressHtml);
-  assert.ok(progressText.includes('Blocked: no verified installer is packaged yet.'));
+  assert.ok(progressText.includes('Pending: the installer is packaged and qualified; the release file is not published yet.'));
+  await ui.chooseOs('macos');
+  const macProgress = textOf(ui.el('connect-card').innerHTML.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0]);
+  assert.ok(macProgress.includes('Blocked: no verified installer is packaged yet.'));
   assert.ok(progressText.includes('Blocked:') && progressText.includes('heartbeat intake') && progressText.includes('not merged or deployed'));
   assert.ok(progressText.includes('Pairing is a separate contract and is not implemented.'));
   assert.ok(!/pairing support/i.test(progressText), 'heartbeat intake is never called pairing support');
