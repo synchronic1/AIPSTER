@@ -1,79 +1,108 @@
-# Chain release runbook: migrations 0006–0015 + production deploy
+# Chain release runbook (codex/sprint-* integration chain)
 
-Step-by-step production procedure for landing the integration chain
-(#29 → #31 → #35 → #36) once Claude has merged it to main. The chain
-executor (Claude) runs the merge steps; the release owner runs the
-database and deploy steps below. Muse authored this file only; it has
-not executed any step in it.
+Release owner runbook for merging the integration chain and releasing it
+to production. Merged from two drafts (71f2f32 plus verified specifics);
+either author may extend it, but only the release owner executes it.
 
-Preconditions:
+Database identity (from `website/wrangler.jsonc`): binding `DB`,
+database `aipster-app` (`b91be793-704a-4eae-8b8f-7f4c8b78e4fc`),
+`migrations_dir` `migrations`.
 
-- Chain merged to main in order with merge commits; record the four
-  merge SHAs and the final main SHA before starting.
-- Working tree clean; `main` CI green on the final SHA.
-- Federation stays default-off. Installer downloads stay disabled until
-  a qualified signed artifact is uploaded. No inference activation.
-- A Cloudflare-authenticated shell (the `CLOUDFLARE_API_TOKEN` or login
-  this runbook needs is provisioned by the owner through the approved
-  channel, never pasted into chat or committed).
+## 0. Lanes and staleness
 
-Database identity (from `website/wrangler.jsonc`):
+- The chain moves: Claude owns `codex/sprint-*`, a worker session owns
+  `local-worker/**` and `website/public/app/**` on #35/#36. Never merge
+  from stale SHAs: re-confirm every tip and CI state immediately before
+  acting (step 1). Do not rebase chain branches without their owners.
+- Last verified candidate (takeover, STALE until re-confirmed):
+  #29 `4bd1282`, #31 `c82a028`, #35 `535c35b`, #36 `08d45da`.
+- One operator merges and releases. If another operator is mid-release,
+  stop and hand over instead of doubling up.
 
-- binding `DB`, database `aipster-app`
-  (`b91be793-704a-4eae-8b8f-7f4c8b78e4fc`), `migrations_dir`
-  `migrations`.
+## 1. Preconditions (all must hold)
 
-## 1. Back up production D1 (before anything else)
+1. Each PR in `#29 -> #31 -> #35 -> #36` shows `MERGEABLE` and fully
+   green checks at its current tip.
+2. Independent review is recorded on each PR. The owner's merge review
+   is the final gate; never self-approve your own work.
+3. Peter Medina has signed off migration `0013` (heartbeat reservation;
+   see its header and `docs/heartbeat-intake.md`).
+4. Main is quiet: `git fetch origin main` shows no unexpected new merge.
 
-```sh
-STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-wrangler d1 export aipster-app --remote --output="/private/backups/aipster-app-$STAMP.sql"
-sha256sum "/private/backups/aipster-app-$STAMP.sql" | tee "/private/backups/aipster-app-$STAMP.sha256"
+Record tips and CI:
+
+```powershell
+foreach ($n in 29,31,35,36) {
+  (gh pr view $n --repo synchronic1/AIPSTER --json headRefOid,mergeable,mergeStateStatus |
+    ConvertFrom-Json) | ForEach-Object {
+      "PR$n $($_.headRefOid) mergeable=$($_.mergeable) state=$($_.mergeStateStatus)" } }
 ```
 
-- Store outside the repo. Never commit the dump.
-- Sanity: dump is non-trivially sized and contains the
-  `d1_migrations` table rows.
-- Record the backup path + SHA-256 in the release notes.
-- Also record pre-change `GET https://aipster.net/api/health`
-  (`ready`, `detail.schema`) and
-  `GET https://aipster.net/deployment.json` (`git_commit`).
+## 2. Back up production D1 (read-only, never commit)
 
-## 2. Check the applied journal (read-only)
-
-```sh
-wrangler d1 execute aipster-app --remote \
-  --command "SELECT id, name FROM d1_migrations ORDER BY id;"
+```powershell
+npx wrangler d1 export aipster-app --remote --output <private-dir>\aipster-app-<yyyymmdd>-prechain.sql
+(Get-FileHash <private-dir>\aipster-app-<yyyymmdd>-prechain.sql -Algorithm SHA256).Hash
 ```
 
-Expected: exactly `0001_better_auth` through `0005_write_budget`
-(the numeric prefixes; full filenames end in `.sql`).
+Keep the backup outside every repository. Record path, bytes, and
+sha256 in the release notes. Reference backup: `d1-backups\`
+`aipster-app-20261029-prechain.sql`, 8020 bytes.
 
-Byte-identity of already-applied files: the journal stores names,
-not content hashes, so compare the reviewed tree blobs:
+CAUTION (merge note): the previously quoted reference hash for that
+file was the SHA-256 of the empty string, which cannot be the hash
+of an 8020-byte dump. Whoever holds that file must re-hash and
+re-verify it before anyone relies on it.
 
-```sh
-git rev-parse HEAD:website/migrations/0001_better_auth.sql
-# ... repeat 0002..0005, and confirm the chain branch copies match:
-git rev-parse origin/codex/sprint-onboarding-integration-20261029:website/migrations/<same>
+Also record pre-change `GET https://aipster.net/api/health`
+(`ready`, `detail.schema`) and `deployment.json` (`git_commit`).
+
+## 3. Confirm the production journal
+
+```powershell
+npx wrangler d1 execute aipster-app --remote --command `
+  "SELECT id, name, applied_at FROM d1_migrations ORDER BY id;"
 ```
 
-All five pairs must be identical. (Verified during release prep:
-main and the chain branch agree on 0001–0005.)
+Expected: exactly `0001_better_auth.sql` through
+`0005_write_budget.sql`, in order, no fabric/pairing objects. Confirm the
+five files are byte-identical between main and the chain tip (the
+journal stores names, not content hashes, so compare tree blobs):
 
-STOP and report instead of proceeding if:
-
-- any applied migration filename is missing or unexpected;
-- any file to be applied would alter an already-applied migration;
-- a fix needs a schema change not listed in this runbook.
-
-## 3. Apply pending migrations in order
-
-```sh
-wrangler d1 migrations apply aipster-app --remote
+```powershell
+git diff origin/main <chain-tip> --stat -- `
+  website/migrations/0001_better_auth.sql website/migrations/0002_app.sql `
+  website/migrations/0003_demo_auth.sql website/migrations/0004_disable_flag.sql `
+  website/migrations/0005_write_budget.sql
+# must print nothing
 ```
 
-Expected: exactly ten journals added, in filename order:
+Stop if the journal differs: applied migrations are never edited or
+reordered. Apply nothing in this step. A fix needing a schema change
+not listed here stops the release.
+
+## 4. Merge the chain in order
+
+```powershell
+gh pr merge 29 --repo synchronic1/AIPSTER --merge
+gh pr edit 31 --repo synchronic1/AIPSTER --base main
+gh pr merge 31 --repo synchronic1/AIPSTER --merge
+gh pr edit 35 --repo synchronic1/AIPSTER --base main
+gh pr merge 35 --repo synchronic1/AIPSTER --merge
+gh pr edit 36 --repo synchronic1/AIPSTER --base main
+gh pr merge 36 --repo synchronic1/AIPSTER --merge
+git fetch origin main; git rev-parse origin/main  # = reviewed_sha
+```
+
+Use merge commits (repository process). If any PR shows a conflict, stop:
+resolve only with that branch owner's agreement, re-verify, then resume.
+Never merge overlapping superseded PRs to "complete" the chain.
+
+## 5. Confirm main CI, then apply migrations
+
+Confirm "Public site asset and build checks" success on the merged main
+SHA. Then apply exactly these ten, in filename order (additive only,
+zero DROP statements; ALTERs are not re-runnable):
 
 - `0006_fabric.sql`, `0007_consent.sql`, `0008_repair2.sql`,
   `0009_state_layer.sql`, `0010_revision_receipts.sql`,
@@ -82,71 +111,101 @@ Expected: exactly ten journals added, in filename order:
   `0013_heartbeat_binding.sql`,
   `0014_fabric_restriction_receipts.sql`, `0015_pairing.sql`.
 
-Re-run the journal query: 15 rows, no gaps. Do NOT apply any
-migration.
-
-## 4. Health and readiness
-
-```sh
-curl -s https://aipster.net/api/health
+```powershell
+npx wrangler d1 migrations apply aipster-app --remote
 ```
 
-- After the deploy in step 5, expect `ready: true` and
-  `detail.schema: true`.
-- The readiness probe includes the 0013 contract:
-  `SELECT resource_id FROM key_verifiers LIMIT 0` must succeed;
-  a database at 0005-shape reports `ready: false`, and the
-  deploy workflow's `verify:live` rejects such a state.
-- If `ready` is false after deploy + migration, treat it as a
-  failed release and go to rollback (step 7), not to retries.
+## 6. Readiness probe
 
-## 5. Deploy the reviewed main SHA
+```powershell
+npx wrangler d1 execute aipster-app --remote --command `
+  "SELECT name FROM d1_migrations ORDER BY id;"
+# expect 0001..0015, fifteen rows
+npx wrangler d1 execute aipster-app --remote --command `
+  "PRAGMA table_info(key_verifiers);"
+# must include: resource_id (added by 0013)
+npx wrangler d1 execute aipster-app --remote --command `
+  "SELECT name FROM sqlite_master WHERE type='table' AND name IN
+   ('pairing_codes','idempotency_keys','approvals','idempotency_records');"
+# expect all four rows (0015 + fabric lineage)
+```
 
-Dispatch the `Public site production deploy` workflow on `main`
-with `reviewed_sha` set to the exact final main SHA. Then:
+Anything missing or out of order: stop, do not deploy; decide
+roll-forward vs rollback with Peter.
 
-- Confirm `deployment.json` shows that `git_commit` and the new
-  `site_revision`.
-- Known flake: the workflow's inline `verify:live` sometimes reads
-  stale edge bytes immediately after upload ("Live bytes differ").
-  Wait 2 minutes and re-run the identical check by hand before
-  calling it failed. (Edge-cache fix is tracked separately.)
+Application-level contract (independent of the SQL above):
+`/api/health` probes `SELECT resource_id FROM key_verifiers LIMIT 0`,
+so a database at 0005-shape reports `ready: false` and the deploy
+workflow's `verify:live` rejects it. After deploy + migration,
+expect `ready: true` and `detail.schema: true`.
 
-## 6. Production smoke tests (test account only)
+## 7. Deploy the merged SHA
 
-Use an isolated test account and synthetic fixtures. Never use the
-owner's private inventory, provider credentials, or real compute.
+```powershell
+gh workflow run public-site-production-deploy.yml `
+  --repo synchronic1/AIPSTER --ref main -f reviewed_sha=<merged-main-sha>
+```
 
-1. Login: GitHub sign-in reaches the app; logout ends the session.
-2. Pairing mint: `POST /api/pairing/codes` (session + CSRF) → code.
-3. Pairing claim: `POST /api/pairing/claim` from the test worker →
-   paired; second claim of the same code fails honestly.
-4. Heartbeat: `POST /api/resources/:id/heartbeat` with the
-   heartbeat-scoped key → 200 and a fresh `heartbeat_at` on the
-   owner's dashboard; wrong-resource key is rejected.
-5. Unpair (local worker): unpair exits 0 with keys removed on the
-   happy path; any incomplete cleanup exits nonzero with keys
-   preserved (never exit 0 with a live key on disk).
-6. Delete: `DELETE /api/inventory/:id` (session + CSRF,
-   owner-only) → resource gone, bound keys read `KEY_REVOKED`,
-   `resource.delete` audited; a second delete is 404.
-7. Liveness is not inference readiness: heartbeats and pairing
-   prove reachability only. No model calls in this release.
+Preflight enforces reviewed==built==main plus CI success. `verify:live`
+then checks live bytes, release revision, cache policy, and anonymous
+protections. It does not cover authenticated flows or inference.
 
-Any smoke failure: roll back the deploy (step 7). Do not roll
-back migrations without asking Peter.
+Known flake: the inline verify sometimes reads stale edge bytes
+immediately after upload ("Live bytes differ"). Wait 2 minutes and
+re-run the identical check by hand before calling it failed.
 
-## 7. Rollback
+## 8. Confirm and smoke-test
 
-- Code rollback (preferred, always safe): merge a revert or fix
-  PR to main, wait for green CI, dispatch the deploy workflow
-  with the new reviewed SHA, re-run steps 4–6.
-- Data rollback (destructive, owner-only): restore the step-1
-  backup by re-importing the dump. Prove the procedure first on
-  a throwaway database (create scratch D1, import dump, confirm
-  journal + spot data), then execute against production only on
-  Peter's explicit instruction. Never invent a partial
-  down-migration.
+- `https://aipster.net/deployment.json` shows the merged SHA and the new
+  site revision.
+- Smoke (test account only, never a real user):
+  1. Login via dashboard sign-in; logout ends the session.
+  2. Mint a pairing code: `POST /api/pairing/codes` (session + CSRF).
+  3. Claim on an isolated test worker: `pairing.py pair`, type the code.
+     A second claim of the same code fails honestly.
+  4. Heartbeat: `pairing.py heartbeat-loop` (equivalently
+     `POST /api/resources/:id/heartbeat` with the heartbeat-scoped
+     key) → 200 with fresh `heartbeat_at`; proves reachability
+     only. A wrong-resource key is rejected.
+  5. Unpair: `pairing.py unpair` exits 0 and removes local state on
+     the happy path; any incomplete cleanup exits nonzero with keys
+     preserved (never exit 0 with a live key on disk).
+  6. Delete: `DELETE /api/inventory/:id` (session + CSRF) removes the
+     test resource; bound keys read `KEY_REVOKED`; audit records
+     `resource.delete`. A second delete is 404.
+- Liveness is not inference readiness: heartbeats and pairing prove
+  reachability only.
+- `POST /api/jobs` must stay `501 INFERENCE_DISABLED`. Do not activate
+  live inference or F1P as part of release validation.
+
+Any smoke failure: roll back the deploy (step 9). Do not roll back
+migrations without asking Peter.
+
+## 9. Rollback
+
+- Database: D1 has no down-migrations. Restore via the Cloudflare
+  dashboard (D1 -> aipster-app -> Backups -> point-in-time restore),
+  which creates a restored database; rebind with a reviewed
+  `wrangler.jsonc` change and redeploy; confirm the journal reads
+  `0005` and the readiness probe fails closed as expected pre-chain.
+  Prove any dump-restore procedure on a throwaway database first.
+- Site: preflight pins reviewed==main, so a rollback is always a
+  forward release: `git revert` the chain merges (or merge a fix),
+  wait for green CI, and dispatch the deploy workflow with the NEW
+  reviewed SHA. Re-dispatching an old SHA against a moved main is
+  rejected by design.
+- Roll-forward vs restore is Peter's call; record the decision.
+
+## 10. After release
+
+- Rebuild the Windows installer from the merge commit, re-qualify, and
+  wire that exact verified artifact by hand. Installer download stays
+  disabled until then.
+- Close superseded PRs only after preserving branches and unique work.
+- Keep the D1 backup for the retention window, then destroy it.
+- Federation stays default-off. Installer downloads stay disabled
+  until a qualified signed artifact is uploaded. Don't change
+  product claims.
 
 ## Record
 
