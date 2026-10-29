@@ -675,3 +675,105 @@ test('reclaim-recreate charges the write budget once (round 7)', async () => {
   }));
   assert.equal(beat.status, 200, 'recovered sender key works');
 });
+test('idempotent replays are free at budget exhaustion (round 8)', async () => {
+  const t = await createTestEnv();
+  const first = await register(t, t.alice, { name: 'budget-box' }, 'idem-free');
+  assert.equal(first.status, 201, first.text);
+  // Spend the whole hourly budget after the registration completed.
+  const window = new Date().toISOString().slice(0, 13);
+  await t.DB.prepare('UPDATE write_budget SET count = 120 WHERE user_id = ? AND window = ?').bind(t.alice.id, window).run();
+  // Lost-response retry replays the original card instead of 429ing.
+  const replay = await register(t, t.alice, { name: 'budget-box' }, 'idem-free');
+  assert.equal(replay.status, 200, replay.text);
+  assert.equal(replay.json.id, first.json.id, 'original card, not a duplicate');
+  const budget = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, window).first();
+  assert.equal(budget.count, 120, 'replay consumed no budget');
+  // Fresh registrations still gate on the spent budget.
+  const gated = await register(t, t.alice, { name: 'gated-box' }, 'idem-gated');
+  assert.equal(gated.status, 429);
+  assert.equal(gated.json.code, 'WRITE_RATE_LIMITED');
+  const count = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(count.n, 1, 'gated request wrote nothing');
+});
+
+test('in-flight collisions wait free at exhaustion (round 8)', async () => {
+  const t = await createTestEnv();
+  // A live claim holds this key; the budget is already spent.
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)')
+    .bind(t.alice.id, 'idem-held', now).run();
+  await t.DB.prepare('INSERT INTO write_budget (user_id, window, count) VALUES (?, ?, 120)').bind(t.alice.id, now.slice(0, 13)).run();
+  const out = await register(t, t.alice, { name: 'held-box' }, 'idem-held');
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'IDEMPOTENT_IN_FLIGHT', 'waits, not budget-rejected');
+  const budget = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, now.slice(0, 13)).first();
+  assert.equal(budget.count, 120, 'collision check consumed no budget');
+});
+
+test('re-pair refreshes discovered hardware, keeps the row (round 8)', async () => {
+  const t = await createTestEnv();
+  const one = await pair(t, t.alice, 'n_refresh', { name: 'refresh-box', kind: 'local', cpu: 'old-cpu', gpu: 'old-gpu', capabilities: ['a'] });
+  // New code, new hardware: same row, refreshed descriptors.
+  const two = await mintCode(t, t.alice);
+  const out = await readJson(await claim(t, {
+    code: two.json.code, nodeId: 'n_refresh', kind: 'local', cpu: 'new-cpu', gpu: 'new-gpu', capabilities: ['a', 'b'],
+  }));
+  assert.equal(out.status, 200, out.text);
+  assert.equal(out.json.created, false);
+  assert.equal(out.json.resourceId, one.resourceId, 'same row, no duplicate');
+  assert.equal(out.json.resource.name, 'refresh-box', 'name untouched');
+  assert.equal(out.json.resource.compute.cpu, 'new-cpu');
+  assert.equal(out.json.resource.compute.gpu, 'new-gpu');
+  assert.deepEqual(out.json.resource.capabilities, ['a', 'b']);
+  const row = await t.DB.prepare('SELECT kind, cpu, gpu, capabilities_json, name FROM resources WHERE id = ?').bind(one.resourceId).first();
+  assert.equal(row.cpu, 'new-cpu', 'persisted, not just rendered');
+  assert.equal(row.gpu, 'new-gpu');
+  assert.equal(row.capabilities_json, JSON.stringify(['a', 'b']));
+  // Placeholders and empty lists never clobber real data.
+  const three = await mintCode(t, t.alice);
+  const ph = await readJson(await claim(t, {
+    code: three.json.code, nodeId: 'n_refresh', cpu: 'unknown', gpu: 'none recorded', capabilities: [],
+  }));
+  assert.equal(ph.status, 200, ph.text);
+  assert.equal(ph.json.resource.compute.cpu, 'new-cpu');
+  assert.equal(ph.json.resource.compute.gpu, 'new-gpu');
+  assert.deepEqual(ph.json.resource.capabilities, ['a', 'b']);
+  // Bare re-pair (descriptors absent) keeps everything.
+  const four = await mintCode(t, t.alice);
+  const bare = await readJson(await claim(t, { code: four.json.code, nodeId: 'n_refresh' }));
+  assert.equal(bare.status, 200, bare.text);
+  assert.equal(bare.json.resource.compute.cpu, 'new-cpu');
+  const count = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(count.n, 1, 'three re-pairs, still one row');
+});
+test('a timestamp-tied steal still waits instead of misreporting cap (round 8)', async () => {
+  const t = await createTestEnv();
+  // Same interleaving as the fence test, but the stealer's row is forged
+  // to carry our exact reservation stamp (same-millisecond tie): the
+  // classifier must read the bound row id, not the stamp, and wait.
+  const realBatch = t.DB.batch;
+  let fired = false;
+  t.DB.batch = async (stmts) => {
+    const isCommit = !fired && Array.isArray(stmts) && stmts.length === 2
+      && stmts.some((s) => typeof s.sql === 'string' && s.sql.includes('UPDATE idempotency_keys SET resource_id'));
+    if (!isCommit) return realBatch(stmts);
+    fired = true;
+    const ours = await t.DB.prepare('SELECT created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?').bind(t.alice.id, 'idem-tie').first();
+    const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    await t.DB.prepare('UPDATE idempotency_keys SET created_at = ? WHERE owner_id = ? AND key = ?').bind(stale, t.alice.id, 'idem-tie').run();
+    const retry = await register(t, t.alice, { name: 'retry-box' }, 'idem-tie');
+    assert.equal(retry.status, 201, retry.text);
+    await t.DB.prepare('UPDATE idempotency_keys SET created_at = ? WHERE owner_id = ? AND key = ?').bind(ours.created_at, t.alice.id, 'idem-tie').run();
+    return realBatch(stmts);
+  };
+  try {
+    const out = await register(t, t.alice, { name: 'original-box' }, 'idem-tie');
+    assert.equal(fired, true, 'interleaving engaged the real commit batch');
+    assert.equal(out.status, 409, out.text);
+    assert.equal(out.json.code, 'IDEMPOTENT_IN_FLIGHT', 'tied steal waits; cap is not misreported');
+    const count = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+    assert.equal(count.n, 1, 'stealer row only; the late batch committed nothing');
+  } finally {
+    t.DB.batch = realBatch;
+  }
+});
