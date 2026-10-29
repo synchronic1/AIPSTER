@@ -698,9 +698,19 @@ async function handleApi(request, env, url) {
       // Lost-response retry: the same node re-binds within the reclaim
       // window and gets a fresh sender key; anything else sees the same
       // generic invalid as an unknown code.
-      if (row.node_id === nodeId && row.resource_id
+      if (row.node_id === nodeId
         && Number.isFinite(Date.parse(row.used_at)) && Date.parse(row.used_at) + PAIRING_RECLAIM_MS >= Date.now()) {
-        const again = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', row.resource_id, ownerId);
+        let again = null;
+        if (row.resource_id) {
+          again = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', row.resource_id, ownerId);
+        } else {
+          // Incomplete-claim resume (Codex P2 round 3): a crash between
+          // code consumption and binding left a resource row with no
+          // recorded binding. The same node re-adopts it by (owner, node)
+          // instead of stranding the code permanently.
+          again = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
+          if (again) await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', again.id, row.id);
+        }
         if (again) {
           await checkWriteBudget(db, ownerId);
           const rotated = await rotateHeartbeatKey(db, ownerId, again.id, nodeId, nowIso());

@@ -367,7 +367,7 @@ function agentInstructions(os) {
     '  and stores its heartbeat credential privately; it does not start a sender.',
     '- In that terminal I explicitly start reachability heartbeats with:',
     '  ' + pairing[1],
-    '- Mock reports usable=false. Reopen My Compute to load the paired resource;',
+    '- Mock reports usable=false. Choose Done or reopen My Compute to load the paired resource;',
     '  a heartbeat proves reachability only, never inference readiness.',
     '',
     'Step 7 - disconnect and uninstall (I choose when to do this):',
@@ -441,7 +441,7 @@ function paintConnectCard() {
     if (p.phase === 'error') return `<p class="notice" role="status"><span class="pill warn">Pairing failed</span> ${esc(p.error)} <span class="actions"><button type="button" class="btn secondary" data-action="pair-again">Try again</button></span></p>`;
     return `<div class="reveal" role="status"><p><span class="pill ok">Code minted</span> Type this code into the worker's pair step. Single use — it cannot be shown again.</p>
 <code class="pair-code" aria-label="one-time pairing code" tabindex="0">${esc(p.code)}</code>
-<p class="muted">Expires ${esc(p.expiresAt)}. On the worker: run the pair step and type the code when asked (see Advanced). The worker contacts AIPSTER only after pairing; heartbeats prove reachability only.</p>
+<p class="muted">Expires ${esc(p.expiresAt)}. On the worker: run the pair step, type the code when asked, then start the heartbeat sender (see Advanced). The worker contacts AIPSTER only after pairing; heartbeats prove reachability only.</p>
 <p class="actions"><button type="button" class="btn secondary" data-action="pair-done">Done</button><button type="button" class="btn secondary" data-action="pair-again">Mint a new code</button></p></div>`;
   })();
   const installerLine = unpickedMobile
@@ -473,7 +473,8 @@ function paintConnectCard() {
 <h3>Connect</h3>
 <p>Mint a one-time pairing code above (10-minute expiry, single use). In a second terminal in the same <code>local-worker</code> directory, run <code>${esc(pairingCommands[0])}</code> and type the code locally. Pairing contacts AIPSTER, registers this computer automatically and stores a private heartbeat key. Do not paste the code or key into an agent chat.</p>
 <p>Pairing does not start the sender. In that terminal, run <code>${esc(pairingCommands[1])}</code> to post reachability heartbeats. The mock stays <code>usable=false</code>; no inference is enabled. Keep this sender terminal open. See the <a href="${esc(L.pairing)}">pairing and sender details</a>.</p>
-<p>Status: <strong>not linked until paired</strong>. Reopen My Compute after pairing to load the resource below. Heartbeats prove reachability only, never readiness. Manual entry stays under <strong>Advanced: manual resource registration</strong>. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
+<p>Status: <strong>not linked until paired</strong>. Choose Done or reopen My Compute after pairing to load the resource below. Heartbeats prove reachability only, never readiness. Manual entry stays under <strong>Advanced: manual resource registration</strong>. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
+<p class="muted">If the key is revoked or expires, the sender exits asking for a re-pair with a fresh code. Packaged launcher integration is pending with the installer release.</p>
 <details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
 <details><summary>Disconnect and uninstall</summary><p>Stop both sender and daemon terminals with Ctrl+C, then discard the worker-local token. A paired worker also holds an AIPSTER heartbeat key: revoke this resource's key in AIPSTER Keys. Run <code>${esc(pairingCommands[2])}</code> to forget its local pairing; this does not revoke the server key. Then remove only <code>local-worker/.venv</code> and <code>.state</code> if present. Keep unrelated models and engines. This setup adds no service, startup task, global package or automatic update. Keep the daemon on loopback.</p></details>
 </details>`;
@@ -530,7 +531,9 @@ function onConnectClick(ev) {
     mintPairingCode();
   } else if (action === 'pair-done') {
     clearPairingCode();
-    paintConnectCard();
+    // Preserve the current peer's Done refresh, with explicit cancellation of
+    // any previous mint before replacing its card and inventory snapshot.
+    loadCompute();
   }
 }
 

@@ -413,6 +413,12 @@ def write_status(data_dir, payload):
 def cmd_pair(args):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+        # First, before node state or any claim: the private store must exist
+        # with safe permissions. Creating node state first would mkdir the
+        # data dir under the process umask and strand every later heartbeat
+        # on BAD_PAIRING_STORE (Codex P2 round 3).
+        ensure_private_dir(data_dir)
+        check_private_store(data_dir)
         node_id = load_or_create_node_id(data_dir / "state")
         hardware = probe_hardware(args.config)
         if args.name:
@@ -429,7 +435,6 @@ def cmd_pair(args):
         if exc.status is None:
             return EXIT_USAGE
         return EXIT_PAIRING_REJECTED
-    ensure_private_dir(data_dir)
     files = pairing_files(data_dir)
     meta = {
         "api_base": check_api_base(args.api_base),
