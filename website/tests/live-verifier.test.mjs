@@ -57,3 +57,22 @@ test('verifier refuses a build from a different commit', async t => {
   const options = await fixture(t); options.expectedCommit = '2'.repeat(40);
   await assert.rejects(verifyLive(options), /expected commit/);
 });
+test('verifier waits out stale edge bytes within the propagation window', async t => {
+  let stale = 2, sleeps = 0;
+  const options = await fixture(t, (path, reply) => { if (path === '/app/app.js' && stale > 0) { stale--; reply.body = '/* previous release */'; } });
+  const result = await verifyLive({...options, propagation: {attempts: 3, delayMs: 5}, sleep: async () => { sleeps++; }});
+  assert.equal(result.verified, true);
+  assert.equal(sleeps, 2);
+});
+test('verifier still rejects bytes that stay stale past the window', async t => {
+  let sleeps = 0;
+  const options = await fixture(t, (path, reply) => { if (path === '/app/app.js') reply.body = '/* previous release */'; });
+  await assert.rejects(verifyLive({...options, propagation: {attempts: 3, delayMs: 5}, sleep: async () => { sleeps++; }}), /Live bytes differ: app\/app.js/);
+  assert.equal(sleeps, 2);
+});
+test('verifier does not retry a wrong status or content type', async t => {
+  let calls = 0;
+  const options = await fixture(t, (path, reply) => { if (path === '/app/app.js') { calls++; reply.status = 404; } });
+  await assert.rejects(verifyLive({...options, propagation: {attempts: 5, delayMs: 5}, sleep: async () => {}}), /Expected HTTPS 200/);
+  assert.equal(calls, 1);
+});
