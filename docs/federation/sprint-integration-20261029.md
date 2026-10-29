@@ -1,7 +1,7 @@
 # Integrated review candidate, 2026-10-29
 
 This repair branch combines the unique work from PRs #6, #12, #14, #18,
-#20 and #26 with main `b0d1ea232fd0270690f685db7ccbf41bc8a68ee4`.
+#20, #26 and the concurrent W1 merge #27 with main `b0d1ea232fd0270690f685db7ccbf41bc8a68ee4`.
 It preserves their original branches and commit ancestry. It is a concrete
 replacement review candidate, not a production release or F1/F1P clearance.
 
@@ -37,7 +37,9 @@ A database that used older branch-local federation names needs its own plan.
 
 The release owner should review the final exact candidate and its CI. Once
 accepted as the replacement path, #6/#12/#14/#18 can close as superseded; #20 and
-#26 are also included and must not be independently merged as competing copies.
+#26/#27 are also included and must not be independently merged as competing copies.
+PR #27 is the exact main-plus-#20 merge tree and adds no unique source; preserve
+Muse's later pairing/installer/dashboard branches while choosing one intake path.
 Closed review artifact #21 has no unique implementation; its evidence remains
 available. Do not reopen it or revive the superseded #9 alternative.
 
