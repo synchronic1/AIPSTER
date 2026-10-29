@@ -17,8 +17,8 @@ import { createTestEnv, readJson } from './d1-shim.mjs';
 import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
-// Reviewed #17 head: worker requires a local token and validates Host/Origin.
-const WORKER_COMMIT = '91a3bfaa8d1d4e4d9baa15ad6ccb53d2b19ff5a1';
+// Round-10 verified W3 head: pairing client with exclusive node-id, honest unpair, and local token auth.
+const WORKER_COMMIT = 'c6c8394770037ba756a0227c06772de91f03136e';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = 'bf0d485495c6a0a5a7ea72fc2b4e1a0b4c62d933';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
