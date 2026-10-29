@@ -20,7 +20,7 @@ const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 
 // Reviewed #17 head: worker requires a local token and validates Host/Origin.
 const WORKER_COMMIT = 'ed561cdc5b067e9ef4330667c44af5c0532e70a9';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
-const DOCS_COMMIT = 'e4695f2d5bf4086e315aa5a994ee7e182ac11159';
+const DOCS_COMMIT = '1239b7f6ad3adffbc307a00048d3b918d52ff1ba';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
