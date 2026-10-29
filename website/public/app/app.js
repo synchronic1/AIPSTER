@@ -75,10 +75,12 @@ async function loadOverview() {
 // "Connect your computer" quickstart. Static copy and links only: rendered
 // after a session exists (My Compute), never on the signed-out shell. Every
 // destination is the public AIPSTER repo at the pinned commit whose
-// local-worker/ files were checked against provenance.json. No API call,
-// credential, or pairing token is involved. Heartbeat intake is not deployed,
-// so the only honest status is "connection setup pending".
-const WORKER_COMMIT = '7b38ba071d6a6f1520140486835f9d6a01adafab';
+// local-worker/ files were checked against provenance.json. The pin is the
+// reviewed #17 head (worker requires a local token, validates Host/Origin);
+// re-pin once #17 lands on main. No API call, AIPSTER credential, or pairing
+// token is involved. Heartbeat intake is not deployed, so the only honest
+// status is "connection setup pending".
+const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
 const WORKER_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + WORKER_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   archive: 'https://github.com/synchronic1/AIPSTER/archive/' + WORKER_COMMIT + '.zip',
@@ -88,6 +90,7 @@ const WORKER_LINKS = {
   troubleshoot: WORKER_TREE + 'README.md#stop-uninstall-and-troubleshoot',
   evidence: WORKER_TREE + 'VERIFICATION.md',
   gaps: WORKER_TREE + 'EXECUTION-GAPS.md',
+  securityFix: 'https://github.com/synchronic1/AIPSTER/pull/17',
   heartbeat: 'https://github.com/synchronic1/AIPSTER/pull/20'
 };
 
@@ -99,23 +102,27 @@ function renderConnectCard() {
     <p><span class="pill warn">Connection setup pending</span> <span class="muted">Not connected. AIPSTER cannot see a running worker yet because <a href="${L.heartbeat}">heartbeat support</a> is not merged or deployed.</span></p>
     <ol class="steps">
       <li><h3>Get the worker</h3>
-        <p>There is no installer or binary yet. The worker is published as source.</p>
+        <p>There is no installer or binary yet. The worker is published as source, pinned to the <a href="${L.securityFix}">security-fixed revision</a> that requires a local token and checks Host/Origin.</p>
         <p class="actions"><a class="btn" href="${L.archive}">Get worker source (.zip)</a><a class="btn secondary" href="${L.quickstart}">Open quickstart</a></p>
         <ul class="platforms">
-          <li><span class="pill ok">Windows x64: tested</span> <span class="muted">mock check only, with CPython 3.12.14 and uv 0.12.12 from a public clone (<a href="${L.evidence}">evidence</a>).</span></li>
+          <li><span class="pill ok">Windows x64: tested</span> <span class="muted">mock check only, from a git clone with CPython 3.12.14 and uv 0.12.12 (<a href="${L.evidence}">evidence</a>). No real engine or model was tested.</span></li>
           <li><span class="pill warn">macOS / Linux: not qualified</span> <span class="muted">commands are for adaptation only (use <code>.venv/bin/</code>). They are untested.</span></li>
+          <li><span class="pill warn">.zip install: not tested</span> <span class="muted">the archive's files match this commit, but only the git clone below was installed and tested.</span></li>
         </ul>
       </li>
       <li><h3>Install</h3>
         <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In PowerShell, following the <a href="${L.tested}">tested installation</a>:</p>
         <pre tabindex="0" aria-label="Windows install commands"><code>git clone https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
+git fetch origin ${WORKER_COMMIT}
 git checkout --detach ${WORKER_COMMIT}
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\\.venv\\Scripts\\python.exe test_installation.py
+$env:DENDRITE_API_TOKEN = .\\.venv\\Scripts\\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
 .\\.venv\\Scripts\\dendrite.exe serve --config configs/mock.toml</code></pre>
-        <p class="muted">The mock config returns simulated output only. A native engine (llama-server, built separately) and a GGUF model you obtain yourself are separate prerequisites. See <a href="${L.engine}">engine preparation</a>. No AIPSTER key is needed, and none belongs in the worker config or a URL.</p>
+        <p class="muted"><code>serve</code> refuses to start without <code>DENDRITE_API_TOKEN</code> (32+ characters), even on loopback. This is a <strong>worker-local</strong> token that you generate on this machine. It is not an AIPSTER API key or heartbeat key. Never reuse it, and never paste it into AIPSTER, a URL or a shared config. Local requests other than <code>/healthz</code> need <code>Authorization: Bearer</code> with that token (see the quickstart).</p>
+        <p class="muted">The mock config returns simulated output only. A native engine (llama-server, built separately) and a GGUF model you obtain yourself are separate prerequisites. See <a href="${L.engine}">engine preparation</a>.</p>
       </li>
       <li><h3>Connect</h3>
         <p>For now, record this computer with <strong>Register resource</strong> below. It is saved as a declared, unverified resource. There is no pairing code or worker credential yet, so the worker never contacts AIPSTER.</p>
@@ -127,13 +134,16 @@ uv run --no-project --python 3.12.14 python install.py
             <li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li>
             <li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li>
             <li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li>
+            <li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li>
+            <li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li>
+            <li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li>
             <li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li>
             <li>TLS or package index failure: check access to public PyPI.</li>
           </ul>
           <p><a href="${L.troubleshoot}">Full troubleshooting table</a></p>
         </details>
         <details><summary>Disconnect and uninstall</summary>
-          <p>Stop the worker with Ctrl+C. To uninstall, delete only <code>local-worker/.venv</code> (and <code>.state</code> if present). The installer adds no service, startup task or global package. The worker holds no AIPSTER credential, so there is nothing to revoke here. Keep it on loopback and never expose it to a network.</p>
+          <p>Stop the worker with Ctrl+C, then close the terminal or run <code>Remove-Item Env:DENDRITE_API_TOKEN</code> to discard the local token. To uninstall, delete only <code>local-worker/.venv</code> (and <code>.state</code> if present). The installer adds no service, startup task or global package. The worker holds no AIPSTER credential, so there is nothing to revoke here. Keep it on loopback and never expose it to a network.</p>
         </details>
       </li>
     </ol>`;

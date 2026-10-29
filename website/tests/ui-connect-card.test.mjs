@@ -13,7 +13,8 @@ import { createTestEnv } from './d1-shim.mjs';
 import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
-const COMMIT = '7b38ba071d6a6f1520140486835f9d6a01adafab';
+// Reviewed #17 head: worker requires a local token and validates Host/Origin.
+const COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `https://github.com/synchronic1/AIPSTER/archive/${COMMIT}.zip`,
@@ -23,8 +24,10 @@ const EXPECTED_LINKS = [
   `${TREE}README.md#stop-uninstall-and-troubleshoot`,
   `${TREE}VERIFICATION.md`,
   `${TREE}EXECUTION-GAPS.md`,
+  'https://github.com/synchronic1/AIPSTER/pull/17',
   'https://github.com/synchronic1/AIPSTER/pull/20'
 ].sort();
+const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
 
 async function makeUi({ anonymous = false } = {}) {
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
@@ -122,10 +125,27 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   assert.ok(html.includes('<span class="pill warn">Connection setup pending</span>'));
   assert.equal((html.match(/class="pill ok"/g) || []).length, 1, 'only the Windows platform label is green');
   assert.ok(html.includes('<span class="pill ok">Windows x64: tested</span>'));
-  // Commands are copied from the published quickstart, pinned to the commit.
-  assert.ok(text.includes(`git checkout --detach ${COMMIT}`));
-  assert.ok(text.includes('uv run --no-project --python 3.12.14 python install.py'));
-  assert.ok(text.includes('.\\.venv\\Scripts\\dendrite.exe serve --config configs/mock.toml'));
+  assert.ok(html.includes('<span class="pill warn">.zip install: not tested</span>'), 'zip path is never presented as tested');
+  // Commands follow the security-fixed quickstart, pinned to the commit; the
+  // worker-local token is generated before serve, which refuses to start without it.
+  const commands = nodesOf(html.slice(html.indexOf('<pre'), html.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
+  const lines = commands.split('\n').map((s) => s.trim()).filter(Boolean);
+  assert.deepEqual(lines, [
+    'git clone https://github.com/synchronic1/AIPSTER.git',
+    'cd AIPSTER',
+    `git fetch origin ${COMMIT}`,
+    `git checkout --detach ${COMMIT}`,
+    'cd local-worker',
+    'uv run --no-project --python 3.12.14 python install.py',
+    '.\\.venv\\Scripts\\python.exe test_installation.py',
+    '$env:DENDRITE_API_TOKEN = .\\.venv\\Scripts\\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"',
+    '.\\.venv\\Scripts\\dendrite.exe serve --config configs/mock.toml'
+  ]);
+  for (const phrase of ['refuses to start without DENDRITE_API_TOKEN', 'worker-local token', 'It is not an AIPSTER API key or heartbeat key',
+    'never paste it into AIPSTER, a URL or a shared config', 'security-fixed revision']) {
+    assert.ok(text.includes(phrase), `missing: ${phrase}`);
+  }
+  assert.ok(!/aip_|AIPSTER_(?:API_)?KEY|X-Aipster|\/api\//.test(commands), 'no AIPSTER credential or endpoint in worker commands');
 });
 
 test('card carries no credentials and nothing is logged', async () => {
@@ -133,7 +153,8 @@ test('card carries no credentials and nothing is logged', async () => {
   await ui.clickTab('compute');
   const html = ui.el('connect-card').innerHTML;
   assert.ok(!/aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i.test(html), 'no credential-shaped material or query secrets');
-  assert.ok(!html.includes('?'), 'no query strings in any destination');
+  assert.ok(!/href="[^"]*\?/.test(html), 'no query strings in any destination');
+  assert.ok(!html.includes(VULNERABLE_PIN) && !html.includes(VULNERABLE_PIN.slice(0, 7)), 'never points at the pre-#17 worker without local auth');
   assert.deepEqual(ui.logs, [], 'client logs nothing');
 });
 
