@@ -184,9 +184,10 @@ function renderConnectCard() {
         </ul>
       </li>
       <li><h3>Install</h3>
-        <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In PowerShell, following the <a href="${L.tested}">tested installation</a>:</p>
-        <pre tabindex="0" aria-label="Windows install commands"><code>git clone https://github.com/synchronic1/AIPSTER.git
+        <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In PowerShell, following the <a href="${L.tested}">tested installation</a> (the clone fetches worker files only via sparse checkout):</p>
+        <pre tabindex="0" aria-label="Windows install commands"><code>git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
+git sparse-checkout set --no-cone local-worker
 git fetch origin ${WORKER_COMMIT}
 git checkout --detach ${WORKER_COMMIT}
 cd local-worker

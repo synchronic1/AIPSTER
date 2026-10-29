@@ -118,7 +118,7 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   for (const phrase of ['Connect your computer', 'Connection setup pending', 'Not connected.', 'does not share your resources or enable inference',
     'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified', 'untested', 'separate prerequisites',
     'There is no installer or binary yet', 'There is no pairing code or worker credential yet', 'Disconnect and uninstall', 'Troubleshooting',
-    'ganglion-dendrite 0.1.0', COMMIT]) {
+    'ganglion-dendrite 0.1.0', COMMIT, 'worker files only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   assert.ok(!/\bconnected\b/i.test(text.replace(/not connected/gi, '')), 'never claims a connected state');
@@ -133,8 +133,9 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   const commands = nodesOf(html.slice(html.indexOf('<pre'), html.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
   const lines = commands.split('\n').map((s) => s.trim()).filter(Boolean);
   assert.deepEqual(lines, [
-    'git clone https://github.com/synchronic1/AIPSTER.git',
+    'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
+    'git sparse-checkout set --no-cone local-worker',
     `git fetch origin ${COMMIT}`,
     `git checkout --detach ${COMMIT}`,
     'cd local-worker',
