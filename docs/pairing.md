@@ -139,3 +139,23 @@ actual local-D1 regressions for forged reclaim, closed/demo owners, stale node
 bindings, enrollment/rotation/teardown audit rollback, concurrent rotation and
 same-node pairing, revoked-key/grant-linked-job teardown, registration response
 loss, same-key concurrency, exhausted budgets and closure at the batch boundary.
+
+
+## Consolidated integration candidate
+
+This separately reviewed pairing candidate stacks on the consolidated control-plane
+repair (PR #29). It preserves the original Muse W1/W2 history and keeps the
+pairing backend distinct from an available installer or worker pairing client.
+The worker tree, source pins, licenses and notices remain unchanged.
+
+The unapplied sequence is heartbeat 0013, federation restriction receipts 0014,
+then pairing 0015. Applied 0001-0005 are unchanged. The shared readiness contract
+requires pairing tables and resources.node_id even when federation is disabled,
+because the pairing and registration routes are compiled into the base worker.
+Partial-schema local-D1 tests reproduce the previously false-ready state; complete
+schema, both heartbeat/federation orders, and exhaustion boundaries are tested.
+
+Release-owner order: accept the final PR #29 head, then this pairing candidate.
+Do not merge the original PR #28 and the repaired replacement independently.
+No production migration, installer activation, running-worker enrollment or
+inference is authorized by this review evidence.
