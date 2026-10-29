@@ -73,7 +73,8 @@ rebuild-from-source-SHA + re-qualify, not byte-match.
   the HKCU singletons — covered by the CI full profile) and the strict
   parent-death orphan kill (no job nesting under this sandboxed launcher;
   strict wherever confinement engages).
-- CI full profile (`windows-2025`, runs `40932568817` + `40935178276`):
+- CI full profile (`windows-2025`, runs `40932568817`, `40935178276`,
+  `40936747728`):
   **0 failures** — silent install, registry/shortcuts, autostart
   default-off, console-launcher matrix, tray matrix T1–T12, uninstall
   preserve + `/REMOVEDATA=1`. Both token-ACL checks record `[restricted
@@ -88,17 +89,18 @@ rebuild-from-source-SHA + re-qualify, not byte-match.
 
 ## Screenshots
 
-CI `windows-installer-screenshots` artifact, run `40935178276` (isolated
+CI `windows-installer-screenshots` artifact, run `40936747728` (isolated
 runner desktop, never the owner's screen; all PNGs eyeballed):
 `01-welcome`, `02-license` (Apache text renders), `03-components`
 ("Start when I log in" unchecked by default; desktop shortcut checked),
 `04-directory` (temp path prefilled, editable, Browse offered),
 `05-installing` + `06-finish` (byte-identical: install finished in <3s, both
 show the Finish page; "Start AIPSTER Worker now" unchecked; honest
-"Nothing is shared or paired" copy), `07-start-menu` (caught Explorer's
-"Working on it..." spinner twice — the listing itself is log-verified as
-`['AIPSTER Worker.lnk', 'Uninstall.lnk']`; the driver now waits for the
-entries before shooting), `08-worker-console` (firstrun/config/`listen:`
+"Nothing is shared or paired" copy), `07-start-menu` (populated folder
+showing `AIPSTER Worker` + `Uninstall` shortcuts; earlier runs caught
+Explorer's "Working on it..." spinner, so the driver now waits for the
+entries — the listing is also log-verified),
+`08-worker-console` (firstrun/config/`listen:`
 lines, uvicorn up; the token-ACL warning renders with user/rc/aces and no
 secret; token path only, never the value),
 `09-uninstall-confirm`, `10-uninstall-data-choice` ("Also remove my worker
@@ -127,7 +129,7 @@ wizard before every keystroke, and aborts if it is closed externally.
 1. Signature: builds are unsigned (owner action: code-signing cert + CI).
 2. Tray/menu pixels: owner-VM capture + eyeball review (behavior covered).
 3. ~~CI full-profile result on the PR~~ RESOLVED: 0 failures on
-   `windows-2025` (runs `40932568817`, `40935178276`).
+   `windows-2025` (runs `40932568817`, `40935178276`, `40936747728`).
 4. macOS/Linux installers: staged, visibly pending (portable controller
    core; no backends yet).
 5. Pairing/connected/inference-ready: unimplemented by design; no state,
