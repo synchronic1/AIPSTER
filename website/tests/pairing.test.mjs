@@ -451,3 +451,49 @@ test('same node resumes a claim stranded before binding', async () => {
   const other = await readJson(await claim(t, { code: 'pair-deadbeef-AAAA-AAAA-AAAA', nodeId: 'n_intruder' }));
   assert.equal(other.status, 404, 'other nodes still rejected on the spent code');
 });
+
+test('a deleted-resource code stays invalid after re-pairing', async () => {
+  const t = await createTestEnv();
+  const minted = await mintCode(t, t.alice);
+  const first = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_delrep' }));
+  assert.equal(first.status, 201, first.text);
+  const del = await readJson(await t.call(`/api/inventory/${first.json.resourceId}`, {
+    method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf },
+  }));
+  assert.equal(del.status, 200, del.text);
+  // Same node re-pairs within the reclaim window: new resource, new key.
+  const minted2 = await mintCode(t, t.alice);
+  const second = await readJson(await claim(t, { code: minted2.json.code, nodeId: 'n_delrep' }));
+  assert.equal(second.status, 201, second.text);
+  assert.notEqual(second.json.resourceId, first.json.resourceId);
+  // Replaying the OLD code must not adopt the replacement or rotate its key.
+  const replay = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_delrep' }));
+  assert.equal(replay.status, 404);
+  assert.equal(replay.json.code, 'PAIRING_INVALID');
+  const beat = await readJson(await t.call(`/api/resources/${second.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + second.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(beat.status, 200, 'replacement sender key survives the stale replay');
+});
+
+test('same node recreates after consumption without creation', async () => {
+  const t = await createTestEnv();
+  // Simulate a crash after code consumption but before the resource row
+  // committed: spent code, snapshot recorded, no binding, no row.
+  const now = new Date().toISOString();
+  const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const secret = 'BBBBBBBBBBBB';
+  const salt = 'test-salt-recreate';
+  const snap = JSON.stringify({ name: 'recreated-box', kind: 'local', cpu: 'c', gpu: 'g', caps: ['chat'] });
+  await t.DB.prepare('INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts, node_id, resource_id, invalidated_at, claim_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('p_beefbeef', t.alice.id, salt, await verifierFor(secret, salt), now, future, now, 0, 'n_recreate', null, null, snap).run();
+  const out = await readJson(await claim(t, { code: 'pair-beefbeef-BBBB-BBBB-BBBB', nodeId: 'n_recreate' }));
+  assert.equal(out.status, 200, out.text);
+  assert.ok(out.json.resourceId.startsWith('r_'), 'row rebuilt from the snapshot');
+  assert.equal(out.json.resource.name, 'recreated-box');
+  assert.deepEqual(out.json.resource.capabilities, ['chat']);
+  const beat = await readJson(await t.call(`/api/resources/${out.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + out.json.heartbeatKey }, body: { usable: false },
+  }));
+  assert.equal(beat.status, 200, 'recreated sender key works');
+});
