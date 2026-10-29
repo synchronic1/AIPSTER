@@ -408,8 +408,15 @@ def pairing_key_path(data_dir, meta):
 def managed_key_files(data_dir):
     data = Path(data_dir)
     legacy = data / "heartbeat-key.txt"
-    return ([legacy] if legacy.exists() else []) + [path for path in data.glob("heartbeat-key.*.txt")
-            if re.fullmatch(r"heartbeat-key\.[a-f0-9]{32}\.txt", path.name)]
+    found = [legacy] if legacy.exists() else []
+    # os.scandir (unlike Path.glob) propagates directory access errors, so an
+    # unreadable store fails loudly instead of silently keeping live keys.
+    # Names are filtered exactly before any deletion is attempted.
+    with os.scandir(data) as entries:
+        for entry in entries:
+            if re.fullmatch(r"heartbeat-key\.[a-f0-9]{32}\.txt", entry.name):
+                found.append(data / entry.name)
+    return found
 
 
 def load_pairing(data_dir):

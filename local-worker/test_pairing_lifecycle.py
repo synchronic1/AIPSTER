@@ -83,6 +83,31 @@ class PairingLifecycleTests(unittest.TestCase):
         self.assertNotIn("not paired",out.getvalue());self.assertIn("could not",err.getvalue())
         self.assertTrue((self.data/meta["key_file"]).exists())
 
+    def test_underlying_directory_enumeration_failure_preserves_all_pairing_files(self):
+        meta=self.pair();manifest=self.data/"pairing.json";key=self.data/meta["key_file"]
+        out,err=io.StringIO(),io.StringIO()
+        # Path.glob catches this actual filesystem boundary error internally.
+        # The managed-key enumerator must propagate it before any unlink.
+        with patch.object(os,"scandir",side_effect=PermissionError("synthetic directory read denied")), \
+             contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+            self.assertNotEqual(pairing.cmd_unpair(self.args),pairing.EXIT_OK)
+        self.assertTrue(manifest.exists());self.assertTrue(key.exists())
+        self.assertNotIn("unpaired locally",out.getvalue());self.assertIn("could not",err.getvalue())
+
+    @unittest.skipIf(os.name=="nt","POSIX directory read/search permissions")
+    def test_posix_write_search_only_directory_cannot_claim_complete_cleanup(self):
+        if os.geteuid()==0:self.skipTest("root bypasses POSIX read denial")
+        meta=self.pair();manifest=self.data/"pairing.json";key=self.data/meta["key_file"]
+        sentinel=self.data/"unmanaged.txt";sentinel.write_text("synthetic unrelated file")
+        self.data.chmod(0o300)
+        try:
+            out,err=io.StringIO(),io.StringIO()
+            with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                self.assertNotEqual(pairing.cmd_unpair(self.args),pairing.EXIT_OK)
+            self.assertTrue(manifest.exists());self.assertTrue(key.exists());self.assertTrue(sentinel.exists())
+            self.assertIn("could not",err.getvalue());self.assertNotIn("unpaired locally",out.getvalue())
+        finally:self.data.chmod(0o700)
+
     @unittest.skipUnless(os.name=="nt","Windows sharing semantics")
     def test_native_open_key_handle_reports_unpair_failure(self):
         meta=self.pair();key=self.data/meta["key_file"]
