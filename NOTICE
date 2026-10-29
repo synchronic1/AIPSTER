@@ -5,9 +5,14 @@ Project-owned code is licensed under the Apache License, Version 2.0.
 Peter Medina (GitHub synchronic1) confirmed authority for the original AIPSTER
 and public EIF worker files and selected Apache-2.0 on 2026-10-28.
 
-local-worker/vendor/eif contains unmodified source files from
+local-worker/vendor/eif contains source files from
 https://github.com/synchronic1/elastic-inference-fabric
 commit 536508832b12d993dc272e03d4f09aca53801f68.
+Fourteen are unmodified. dendrite/api.py and dendrite/config.py were modified
+by AIPSTER on 2026-10-28 (local patch 0001: API token required on every bind,
+Host/Origin validation); each carries a change notice, and
+local-worker/patches plus provenance.json record the patch, the upstream hashes
+and the patched hashes. The upstream repository itself is not changed.
 The upstream snapshot contained no root LICENSE and no per-file license notices
 in these files. The license for this copy is an explicit owner grant, not an
 inference from public availability. The accompanying LICENSE/NOTICE are added
