@@ -1074,6 +1074,7 @@ def full_profile(setup):
         check("default data dir removed by /REMOVEDATA=1", not removal_marker.exists())
         check("data dir fully gone when it held only the marker", not real_data.exists())
     skip("uninstall data checkbox", "UI-only path; /REMOVEDATA=1 covers the code path headless")
+    uninstall_failure_matrix(setup, env, work, created, procs)
     check("registry fully clean",
           not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY)
           and not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
@@ -1088,6 +1089,122 @@ def full_profile(setup):
     shutil.rmtree(work, ignore_errors=True)
     print(f"\n{len(FAILURES)} failure(s)" + (": " + ", ".join(FAILURES) if FAILURES else ""))
     return 1 if FAILURES else 0
+
+
+def uninstall_failure_matrix(setup, env, work, created, procs):
+    """Failure paths keep the install registered and retryable; never false success.
+
+    Runs uninstall.exe synchronously with _?=<dir> so its real exit code is
+    observed. Only scratch installs, fixture processes and files this run
+    created are touched.
+    """
+    def sync_uninstall(target):
+        return run_silent([str(target / "uninstall.exe"), "/S", f"_?={target}"], env)
+
+    def payload_left(target):
+        return sorted(str(p.relative_to(target)) for p in target.rglob("*")
+                      if p.is_file() and p.name not in ("uninstall.exe", "partial-sentinel.txt"))
+
+    def registered_to(target):
+        return (reg_value(winreg.HKEY_CURRENT_USER, APP_KEY, "InstallDir") == str(target)
+                and str(target / "uninstall.exe") in (reg_value(
+                    winreg.HKEY_CURRENT_USER, UNINSTALL_KEY, "UninstallString") or ""))
+
+    install = work / "app4"
+    proc = run_silent([str(setup), "/S", f"/D={install}"], env)
+    check("failure-matrix install exits 0", proc.returncode == 0, proc.stderr[-500:])
+    created.append(install)
+    sentinel = install / "partial-sentinel.txt"
+    sentinel.write_text("synthetic preserve-me")
+    full = payload_left(install)
+
+    # Running worker: a fixture process with the worker image name (a copy of
+    # PING.EXE, not the real worker) must abort the uninstall untouched.
+    fixture_dir = work / "running-fixture"
+    fixture_dir.mkdir()
+    fake = fixture_dir / "dendrite.exe"
+    shutil.copy2(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE", fake)
+    runner = subprocess.Popen([str(fake), "-n", "120", "127.0.0.1"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(runner)
+    try:
+        proc = sync_uninstall(install)
+        check("uninstall over a running worker exits 2", proc.returncode == 2, str(proc.returncode))
+        check("running-worker abort removes nothing", payload_left(install) == full)
+        check("running-worker abort keeps registration", registered_to(install))
+    finally:
+        runner.terminate()
+        runner.wait(timeout=15)
+
+    # Locked payload: a held DLL (no delete sharing) survives removal. The
+    # uninstall reports failure, keeps registration AND the uninstaller it
+    # points to, and has already removed dendrite.exe (a partial state).
+    locked = next(p for p in sorted(install.rglob("*.dll")))
+    with open(locked, "rb"):
+        proc = sync_uninstall(install)
+        check("locked-payload uninstall exits 2", proc.returncode == 2, str(proc.returncode))
+        check("locked file survives", locked.exists())
+        check("partial removal took dendrite.exe", not (install / "dendrite.exe").exists())
+        check("uninstaller retained after failed removal", (install / "uninstall.exe").exists())
+        check("registration preserved and still points at a working uninstaller",
+              registered_to(install))
+
+    # A foreign directory holding only a copied uninstaller is never adopted,
+    # even while a retained partial install is registered elsewhere.
+    foreign = work / "foreign"
+    foreign.mkdir()
+    (foreign / "unrelated.txt").write_text("synthetic unrelated")
+    shutil.copy2(install / "uninstall.exe", foreign / "uninstall.exe")
+    proc = sync_uninstall(foreign)
+    check("foreign directory uninstall refused (exit 2)", proc.returncode == 2, str(proc.returncode))
+    check("foreign files untouched", (foreign / "unrelated.txt").read_text() == "synthetic unrelated")
+    check("registration unchanged by refused foreign run", registered_to(install))
+
+    # Retry after the lock is released: the retained partial install (no
+    # dendrite.exe) is still recognized and now removes completely.
+    proc = sync_uninstall(install)
+    check("retry after partial cleanup exits 0", proc.returncode == 0, str(proc.returncode))
+    check("retry removes every payload file", payload_left(install) == [], str(payload_left(install)[:5]))
+    check("retry preserves unrelated files", sentinel.read_text() == "synthetic preserve-me")
+    check("retry unregisters", not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+          and not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
+
+    # Denied deletion: an explicit DELETE deny on one payload file for this
+    # user behaves like a lock; removing the deny makes the retry succeed.
+    install5 = work / "app5"
+    proc = run_silent([str(setup), "/S", f"/D={install5}"], env)
+    check("denied-deletion install exits 0", proc.returncode == 0, proc.stderr[-500:])
+    created.append(install5)
+    denied = next(p for p in sorted(install5.rglob("*.dll")))
+    user = os.environ.get("USERNAME", "")
+    deny = subprocess.run(["icacls", str(denied), "/deny", f"{user}:(D)"], capture_output=True, text=True)
+    check("fixture deny ACL applied", deny.returncode == 0, deny.stdout[-300:] + deny.stderr[-300:])
+    try:
+        proc = sync_uninstall(install5)
+        check("denied-deletion uninstall exits 2", proc.returncode == 2, str(proc.returncode))
+        check("denied file survives", denied.exists())
+        check("denied-deletion keeps working registration", registered_to(install5))
+    finally:
+        subprocess.run(["icacls", str(denied), "/remove:d", user], capture_output=True)
+    proc = sync_uninstall(install5)
+    check("retry after deny removed exits 0", proc.returncode == 0, str(proc.returncode))
+    check("retry removes the denied file and all payload", payload_left(install5) == [])
+    check("registry clean after failure matrix",
+          not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY)
+          and not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
+    # _?= runs in place, so NSIS cannot delete the running uninstaller; remove
+    # the scratch leftovers this matrix created (exact names, never recursive).
+    for target in (install, install5):
+        for leftover in ("uninstall.exe", "partial-sentinel.txt"):
+            try:
+                (target / leftover).unlink()
+            except FileNotFoundError:
+                pass
+        for directory in sorted((p for p in target.rglob("*") if p.is_dir()),
+                                key=lambda p: -len(p.parts)):
+            directory.rmdir()
+        target.rmdir()
+        created.remove(target)
 
 
 def scrubbed_env_with_home(home):

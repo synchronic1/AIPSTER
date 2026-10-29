@@ -97,7 +97,14 @@ def _payload_literal(path):
     value = str(path).replace("/", "\\")
     if any(c in value for c in '\r\n"') or ".." in path.parts or path.is_absolute():
         raise ValueError("unsafe payload path")
-    return value.replace("$", "$")
+    # NSIS reads "$$\x" as "$" + the "$\x" escape, so a directory name that
+    # ends in "$" cannot be written literally; refuse it rather than emit a
+    # removal list that silently misses files.
+    if any(part.endswith("$") for part in path.parts[:-1]):
+        raise ValueError("unsupported payload path: directory name ends with '$'")
+    # NSIS expands $VAR, ${DEFINE} and $\ escapes inside quoted strings; "$$"
+    # is its literal dollar, so payload names reach Delete/IfFileExists intact.
+    return value.replace("$", "$$")
 
 
 def write_uninstall_files(app_dir, destination):

@@ -274,22 +274,28 @@ Function un.DataChoiceLeave
 FunctionEnd
 
 Section "Uninstall"
-  ; Safety: only remove a directory that looks like our install.
-  IfFileExists "$INSTDIR\dendrite.exe" proceed abort
+  ; Safety: only act on a directory that is our install. A retained partial
+  ; install (dendrite.exe already removed, a locked file left behind) stays
+  ; retryable while it is still the registered location and keeps its
+  ; uninstaller. Removal itself is the exact payload list, never recursive.
+  IfFileExists "$INSTDIR\dendrite.exe" proceed
+  ReadRegStr $R1 HKCU "Software\AIPSTER-Worker" "InstallDir"
+  StrCmp $R1 "" abort
+  StrCmp $R1 $INSTDIR 0 abort
+  IfFileExists "$INSTDIR\uninstall.exe" proceed abort
   abort:
     MessageBox MB_OK|MB_ICONSTOP \
-      "Uninstall aborted: $INSTDIR does not look like an AIPSTER Worker install."
+      "Uninstall aborted: $INSTDIR does not look like an AIPSTER Worker install." /SD IDOK
     SetErrorLevel 2
     Abort
   proceed:
   DetailPrint "Removing application files from $INSTDIR..."
   ; User-selected locations may contain unrelated files or worker data.
   !include "${UNINSTALL_FILES}"
-  Delete "$INSTDIR\uninstall.exe"
-  RMDir "$INSTDIR"
   ; Verify every payload file is actually gone before touching any
   ; registration. On incomplete removal the install stays registered and
-  ; retryable; report failure instead of false success.
+  ; retryable, with its uninstaller in place; report failure instead of
+  ; false success.
   !include "${UNINSTALL_VERIFY}"
   Goto uninstall_verified
   uninstall_incomplete:
@@ -300,6 +306,10 @@ Section "Uninstall"
     SetErrorLevel 2
     Abort
   uninstall_verified:
+  ; Only after verification: a failed removal above must keep the
+  ; uninstaller that the preserved registration points to.
+  Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR"
   DetailPrint "Removing autostart entry, shortcuts, and registry keys..."
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "AIPSTER-Worker"
   Delete "$SMPROGRAMS\AIPSTER Worker\AIPSTER Worker.lnk"

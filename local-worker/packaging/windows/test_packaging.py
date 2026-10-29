@@ -25,6 +25,15 @@ build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 
 
+def find_makensis():
+    found = shutil.which('makensis')
+    fallback = Path(r'C:\Program Files (x86)\NSIS\makensis.exe')
+    return found or (str(fallback) if fallback.is_file() else None)
+
+
+DOLLAR_NAMES = ['lib$PLUGINSDIR.dll', 'x${APPDIR}y.txt', '$INSTDIR.txt', 'a$$b.txt', 'tail$', 'd$x/r.txt']
+
+
 class PackagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='aipster-pure-')
@@ -242,6 +251,62 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(line.startswith('IfFileExists "$INSTDIR\\'), line)
             self.assertTrue(line.endswith(f'{name}" uninstall_incomplete'), line)
         self.assertNotIn('/r', verify.read_text())
+
+    def test_payload_dir_ending_in_dollar_is_refused(self):
+        # "$$\r" compiles to "$" + carriage return in NSIS (verified with
+        # makensis), so such a directory could never be removed by name.
+        with self.assertRaises(ValueError):
+            build._payload_literal(Path('$/r.txt'))
+        with self.assertRaises(ValueError):
+            build._payload_literal(Path('lib/cache$/x.bin'))
+        self.assertEqual(build._payload_literal(Path('a$b/$INSTDIR.txt')), 'a$$b\\$$INSTDIR.txt')
+
+    @unittest.skipUnless(os.name == 'nt' and find_makensis(), 'needs NSIS on Windows')
+    def test_compiled_nsis_removes_and_verifies_literal_dollar_payload_names(self):
+        # Real makensis + a silent harness on a scratch directory: no registry,
+        # no shortcuts, no installer UI. The generated lists must delete exactly
+        # the payload (including names NSIS would otherwise expand as $VAR,
+        # ${DEFINE} or the $\r escape) and leave unrelated files alone.
+        payload = self.data / 'payload'
+        for name in DOLLAR_NAMES + ['dendrite.exe']:
+            (payload / name).parent.mkdir(parents=True, exist_ok=True)
+            (payload / name).write_text('synthetic')
+        removal, verify = self.data / 'uninstall.nsh', self.data / 'uninstall-verify.nsh'
+        build.write_uninstall_files(payload, removal)
+        build.write_uninstall_verify(payload, verify)
+
+        def run_harness(target, tag):
+            result = self.data / f'result-{tag}.txt'
+            script = self.data / f'harness-{tag}.nsi'
+            script.write_text('\n'.join([
+                'Unicode true', 'SilentInstall silent', 'RequestExecutionLevel user',
+                f'OutFile "{self.data / f"harness-{tag}.exe"}"',
+                'Section', f'  StrCpy $INSTDIR "{target}"',
+                f'  !include "{removal}"', f'  !include "{verify}"',
+                f'  FileOpen $0 "{result}" w', '  FileWrite $0 "verified"', '  FileClose $0',
+                '  Return', '  uninstall_incomplete:',
+                f'  FileOpen $0 "{result}" w', '  FileWrite $0 "incomplete"', '  FileClose $0',
+                'SectionEnd', '']), encoding='utf-8')
+            compiled = subprocess.run([find_makensis(), '/V2', str(script)], capture_output=True, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout[-2000:] + compiled.stderr[-2000:])
+            subprocess.run([str(self.data / f'harness-{tag}.exe')], check=True, timeout=60)
+            return result.read_text()
+
+        installed = self.data / 'installed'
+        shutil.copytree(payload, installed)
+        (installed / 'unrelated $INSTDIR sentinel.txt').write_text('keep')
+        self.assertEqual(run_harness(installed, 'clean'), 'verified')
+        for name in DOLLAR_NAMES + ['dendrite.exe']:
+            self.assertFalse((installed / name).exists(), name)
+        self.assertEqual((installed / 'unrelated $INSTDIR sentinel.txt').read_text(), 'keep')
+
+        # A payload file that survives removal (held open without delete
+        # sharing) must be reported, not silently verified.
+        locked_dir = self.data / 'locked'
+        shutil.copytree(payload, locked_dir)
+        with open(locked_dir / 'lib$PLUGINSDIR.dll', 'rb'):
+            self.assertEqual(run_harness(locked_dir, 'locked'), 'incomplete')
+        self.assertTrue((locked_dir / 'lib$PLUGINSDIR.dll').exists())
 
     def test_cpython_license_is_byte_exact_and_required(self):
         home = self.data / 'python'
