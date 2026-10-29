@@ -57,6 +57,13 @@ def check_token_acl(name, token_file, scratch_dir, env):
     check(name, private_token_acl(token_file))
 
 
+def private_fixture_directory(path):
+    """Create fresh fixture data through the production owner-provenance contract."""
+    sys.path.insert(0, str(PACKAGING.parent))
+    from aipster_tray.firstrun import private_directory
+    private_directory(Path(path))
+
+
 def free_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -331,7 +338,8 @@ def pure_tests():
         from aipster_tray.firstrun import ensure_private_token
         backend = SimpleNamespace(refresh=lambda *a: None, notify=lambda *a: None)
         with tempfile.TemporaryDirectory(prefix="aipster-reload-") as temp:
-            data = Path(temp)
+            data = Path(temp) / "worker-data"
+            private_fixture_directory(data)
             (data / "config.toml").write_text("[node]\n", encoding="utf-8")
             saved_env = os.environ.get("DENDRITE_API_TOKEN")
             os.environ.pop("DENDRITE_API_TOKEN", None)
@@ -388,7 +396,7 @@ class TrayLab:
 
     def env_for(self, name):
         data = self.work / name
-        data.mkdir(parents=True, exist_ok=True)
+        private_fixture_directory(data)
         env = scrubbed_env()
         env["AIPSTER_WORKER_DATA"] = str(data)
         return env, data
@@ -940,7 +948,7 @@ def full_profile(setup):
         broken_home = work / "broken-home"
         broken_home.mkdir()
         broken_data = broken_home / "AIPSTER-Worker"
-        broken_data.mkdir()
+        private_fixture_directory(broken_data)
         (broken_data / "config.toml").write_text("[node\n", encoding="utf-8")
         broken = run_silent([str(launcher)], scrubbed_env_with_home(broken_home))
         check("broken config exits 2", broken.returncode == 2, f"rc={broken.returncode}")
@@ -950,7 +958,8 @@ def full_profile(setup):
         cpu_home = work / "cpu-home"
         cpu_home.mkdir()
         cpu_data = cpu_home / "AIPSTER-Worker"
-        (cpu_data / "state").mkdir(parents=True)
+        private_fixture_directory(cpu_data)
+        (cpu_data / "state").mkdir()
         (cpu_data / "logs").mkdir()
         (cpu_data / "fixture.gguf").write_bytes(b"GGUF-fixture-not-a-model")
         cpu_port = free_port()

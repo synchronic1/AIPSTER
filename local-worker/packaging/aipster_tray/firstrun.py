@@ -5,10 +5,7 @@ strong API token on first run stored user-ACL-only, and injects it via the
 configured env var. The token value is never printed or logged.
 """
 import os
-import json
-import re
 import secrets
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -39,7 +36,7 @@ def token_is_strong(value):
     return bool(value) and len(value) >= MIN_TOKEN_LENGTH and all("!" <= c <= "~" for c in value)
 
 
-def _private_path(path, directory=False, verify=False):
+def _private_path(path, directory=False, verify=False, created=False):
     """Owned, unlinked storage; Windows ACLs use the process SID, never USERNAME."""
     path = Path(path)
     if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
@@ -51,83 +48,28 @@ def _private_path(path, directory=False, verify=False):
             return not bool(path.stat().st_mode & 0o077)
         path.chmod(0o700 if directory else 0o600)
         return True
-    script = r'''
-$ErrorActionPreference = 'Stop'
-$identity = $null
-$sid = $null
-$owner = ''
-$aclExceptionClass = ''
-function Report-PrivatePath([string]$reason) {
-  [pscustomobject]@{reason=$reason; owner_sid=$owner; process_sid=$sid.Value; default_owner_sid=$identity.Owner.Value; exception_class=$aclExceptionClass} | ConvertTo-Json -Compress
-}
-trap {
-  $aclExceptionClass = $_.Exception.GetType().Name
-  Report-PrivatePath 'acl-exception'
-  exit 1
-}
-$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$sid = $identity.User
-$old = Get-Acl -LiteralPath $item.path
-$owner = $old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-if ($owner -ne $sid.Value) { Report-PrivatePath 'owner-mismatch'; exit 2 }
-if ($item.verify) {
-  if (-not $old.AreAccessRulesProtected) { Report-PrivatePath 'inherited-acl'; exit 3 }
-  $allow = $false
-  foreach ($entry in $old.Access) {
-    if ($entry.AccessControlType -eq 'Allow') {
-      if ($entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { Report-PrivatePath 'foreign-allow'; exit 4 }
-      $allow = $true
-    }
-  }
-  if (-not $allow) { Report-PrivatePath 'missing-user-allow'; exit 5 }
-  Report-PrivatePath 'private'
-  exit 0
-}
-if ($item.directory) {
-  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-  $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inherit, 'None', 'Allow')
-} else {
-  $acl = [System.Security.AccessControl.FileSecurity]::new()
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'Allow')
-}
-$acl.SetAccessRuleProtection($true, $false)
-$acl.AddAccessRule($rule)
-if ($item.directory) { [System.IO.Directory]::SetAccessControl($item.path, $acl) }
-else { [System.IO.File]::SetAccessControl($item.path, $acl) }
-Report-PrivatePath 'private'
-'''
-    ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-    result = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
-                            input=json.dumps({"path": str(path.resolve()), "directory": directory, "verify": verify}),
-                            text=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    if result.returncode != 0:
-        try:
-            detail = json.loads(result.stdout)
-        except (ValueError, TypeError):
-            detail = {}
-        reasons = {"owner-mismatch", "inherited-acl", "foreign-allow", "missing-user-allow", "acl-exception"}
-        reason = detail.get("reason") if detail.get("reason") in reasons else "invalid-diagnostic"
-        def sid(name):
-            value = detail.get(name)
-            return value if isinstance(value, str) and re.fullmatch(r"S-\d+(?:-\d+)+", value) else "unavailable"
-        kind = detail.get("exception_class")
-        kind = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,80}", kind) else "none"
-        raise OSError(f"private ACL rejected: rc={result.returncode} reason={reason} "
-                      f"owner_sid={sid('owner_sid')} process_sid={sid('process_sid')} "
-                      f"default_owner_sid={sid('default_owner_sid')} exception_class={kind}")
-    return True
+    if not getattr(sys, "frozen", False):
+        # The canonical stdlib helper also serves the standalone worker.
+        source_root = str(Path(__file__).resolve().parents[2])
+        if source_root not in sys.path:
+            sys.path.insert(0, source_root)
+    from private_storage_win32 import protect_path
+    return protect_path(path, directory=directory, verify=verify, new=created)
 
 
-def restrict_file(path):
-    return _private_path(path)
+
+def restrict_file(path, *, created=False):
+    return _private_path(path, created=created)
 
 
 def private_directory(path):
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    if not _private_path(path, directory=True):
+    try:
+        path.mkdir(parents=True)  # Exclusive creation proves new-path ownership provenance.
+        created = True
+    except FileExistsError:
+        created = False
+    if not _private_path(path, directory=True, created=created):
         raise OSError("cannot establish private worker directory")
 
 
@@ -163,7 +105,7 @@ def _ensure_private_token(path):
     fd, temp = tempfile.mkstemp(prefix=".api-token-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            if not restrict_file(temp):
+            if not restrict_file(temp, created=True):
                 raise OSError("cannot establish private token ACL")
             handle.write(value + "\n")
             handle.flush()

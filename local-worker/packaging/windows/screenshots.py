@@ -219,7 +219,14 @@ def main():
     subprocess.Popen(["explorer", str(start_menu)])
     explorer = find_window("AIPSTER Worker", timeout=20)
     if explorer:
-        time.sleep(1)
+        # Explorer shows "Working on it..." while populating: wait for the
+        # entries (already log-verified above) before shooting, else the PNG
+        # catches an empty spinner (seen twice on windows-2025).
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            if any(".lnk" in text for text in child_texts(explorer)):
+                break
+            time.sleep(1)
         shot_window(shots, "07-start-menu", explorer)
         send_keys("%{F4}")  # close Explorer
     # Running worker console evidence (temp data home, loopback only).
@@ -251,22 +258,38 @@ def main():
         raise SystemExit("uninstaller window did not appear")
     time.sleep(1)
     shot_window(shots, "09-uninstall-confirm", uninst)
+    send_keys("{ENTER}"); time.sleep(4)  # confirm -> Remove-data page
+    choice = wait_button("AIPSTER Worker", "Also remove my worker data", timeout=60)
+    if choice is None:
+        raise SystemExit("remove-data page did not appear after the confirm page")
+    time.sleep(1)
+    shot_window(shots, "10-uninstall-data-choice", choice)
+    # Keep the box unchecked (preserve is the default; removal is covered by
+    # /REMOVEDATA=1 in qualify) and advance to the progress page.
     send_keys("{ENTER}"); time.sleep(4)
     notice = wait_button("AIPSTER Worker", "preserved", timeout=180)
     if notice:
         # Modal notice first (it blocks the finish page).
         time.sleep(1)
-        shot_window(shots, "10-uninstall-data-notice", notice)
+        shot_window(shots, "11-uninstall-data-notice", notice)
         send_keys("{ENTER}"); time.sleep(2)
     finish = wait_button("AIPSTER Worker", "Close", timeout=60)
     if finish:
-        shot_window(shots, "11-uninstall-finish", finish)
+        shot_window(shots, "12-uninstall-finish", finish)
         send_keys("{ENTER}"); time.sleep(2)
     deadline = time.monotonic() + 180
     while install.exists() and time.monotonic() < deadline:
         time.sleep(0.5)
-    print("install removed:", not install.exists())
-    print("data preserved:", (home / "AIPSTER-Worker/api-token.txt").exists())
+    removed = not install.exists()
+    preserved = (home / "AIPSTER-Worker/api-token.txt").exists()
+    print("install removed:", removed)
+    print("data preserved:", preserved)
+    if not removed or not preserved:
+        stuck = find_window("AIPSTER Worker", timeout=5) or find_window("Uninstall", timeout=5)
+        if stuck:
+            shot_window(shots, "13-uninstall-stuck", stuck)
+            print("stuck dialog texts:", child_texts(stuck)[:8])
+        raise SystemExit(f"GUI uninstall incomplete (removed={removed} preserved={preserved})")
     import shutil
     shutil.rmtree(work, ignore_errors=True)
     print("shots in", shots)

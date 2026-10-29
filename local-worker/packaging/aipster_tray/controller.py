@@ -17,7 +17,7 @@ from pathlib import Path
 from . import state as st
 from .child import WorkerChild, port_busy, looks_like_bind_error
 from .firstrun import (APP_NAME, bundle_dir, build_info, data_dir, ensure_setup,
-                       ensure_private_token)
+                       ensure_private_token, private_directory)
 
 HEALTH_TIMEOUT = 25
 TICK_SECONDS = 1
@@ -430,7 +430,7 @@ def _redirect_to_log(data):
         return False
     try:
         data = Path(data)
-        data.mkdir(parents=True, exist_ok=True)
+        private_directory(data)
         (data / "logs").mkdir(exist_ok=True)
         handle = open(data / "logs" / "tray.log", "a", encoding="utf-8")
         sys.stdout = handle
