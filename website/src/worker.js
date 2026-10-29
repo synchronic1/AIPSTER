@@ -1112,16 +1112,22 @@ async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now, codeId) 
   // Mint-first rotation: the new sender key is cap-checked before any old
   // key is touched, so a lost race never leaves the resource keyless. The
   // mint is fenced on code validity like creation (Codex P2 round 6).
+  // The cap counts the RESULTING total (Codex P2 round 10): this
+  // resource's live sender keys are excluded, because the rotation
+  // revokes them below — a lost-response reclaim at a full cap replaces
+  // instead of requiring a phantom free slot. The exclusion is NULL-safe
+  // (a naive NOT would drop unbound read keys from the count and uncap
+  // them); genuinely new senders still hit KEY_LIMIT.
   // Returns the new {id, secret, prefix}, or null when a gate tripped
   // (cap or mid-flight invalidation); the caller classifies.
   const { id, secret, short } = mintKey(KEY_PREFIX);
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
   const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
-    SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}
+    SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL AND (resource_id IS NULL OR resource_id != ? OR scope != 'heartbeat')) < ${MAX_KEYS_PER_USER}
       AND (SELECT invalidated_at FROM pairing_codes WHERE id = ?) IS NULL`,
     id, ownerId, `worker heartbeat ${String(nodeId).slice(0, 32)}`, resourceId, salt, await verifierFor(secret, salt),
-    KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId, codeId);
+    KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId, resourceId, codeId);
   if (Number(kc.meta.changes) !== 1) return null;
   // Race-safe revocation (Codex P2): only keys OLDER than this insert
   // (rowid order) are revoked. Two overlapping claims each mint first;
