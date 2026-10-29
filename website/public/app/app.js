@@ -149,23 +149,23 @@ async function loadOverview() {
 
 // "Connect your computer" onboarding. Installer-first and OS-aware: a primary
 // installer action, a secondary agent-assisted setup that copies pinned,
-// secret-free instructions, and an OS picker that corrects detection. Every
-// destination is the public AIPSTER repo at the pinned commit whose
-// local-worker/ files were checked against provenance.json. The pin is the
-// reviewed #17 head (merged; worker requires a local token and validates
-// Host/Origin); move it only with a re-verified re-pin. The card makes no API
-// call, holds no credential, and auto-launches nothing. No verified installer
-// is packaged for any platform yet and heartbeat/pairing support (PR #20) is
-// not deployed, so progress honestly stops at "Setup needed".
+// secret-free instructions, and an OS picker that corrects detection. Linked
+// documentation is pinned separately from the worker source, which remains
+// pinned to the reviewed #17 head (merged; worker requires a local token and
+// validates Host/Origin); move either pin only with a re-verified re-pin.
+// The card makes no API call, holds no credential, and auto-launches nothing.
+// No verified installer is packaged for any platform yet and heartbeat intake
+// (PR #20) is not deployed, so progress honestly stops at "Setup needed".
 const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
-const WORKER_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + WORKER_COMMIT + '/local-worker/';
+const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
+const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
-  quickstart: WORKER_TREE + 'README.md',
-  tested: WORKER_TREE + 'README.md#tested-installation',
-  engine: WORKER_TREE + 'README.md#optional-real-engine-preparation-not-needed-for-the-mock-check',
-  troubleshoot: WORKER_TREE + 'README.md#stop-uninstall-and-troubleshoot',
-  evidence: WORKER_TREE + 'VERIFICATION.md',
-  gaps: WORKER_TREE + 'EXECUTION-GAPS.md',
+  quickstart: DOCS_TREE + 'README.md',
+  tested: DOCS_TREE + 'README.md#tested-installation',
+  engine: DOCS_TREE + 'README.md#optional-real-engine-preparation-not-needed-for-the-mock-check',
+  troubleshoot: DOCS_TREE + 'README.md#stop-uninstall-and-troubleshoot',
+  evidence: DOCS_TREE + 'VERIFICATION.md',
+  gaps: DOCS_TREE + 'EXECUTION-GAPS.md',
   securityFix: 'https://github.com/synchronic1/AIPSTER/pull/17',
   heartbeat: 'https://github.com/synchronic1/AIPSTER/pull/20'
 };

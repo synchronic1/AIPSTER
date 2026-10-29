@@ -17,8 +17,10 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed #17 head: worker requires a local token and validates Host/Origin.
-const COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
-const TREE = `https://github.com/synchronic1/AIPSTER/blob/${COMMIT}/local-worker/`;
+const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
+// Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
+const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
+const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
   `${TREE}README.md#tested-installation`,
@@ -376,7 +378,7 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
     'It is not an AIPSTER API key or heartbeat key', 'never paste it into AIPSTER, a URL or a shared config',
     'security-fixed revision', 'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified',
     'untested', 'separate prerequisites', 'There is no pairing code or worker credential yet',
-    'Disconnect and uninstall', 'Troubleshooting', 'not connected']) {
+    'Disconnect and uninstall', 'Troubleshooting', 'not connected', 'worker and its root LICENSE only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   const commands = nodesOf(html.slice(html.indexOf('<pre'), html.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
@@ -384,9 +386,9 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
   assert.deepEqual(lines, [
     'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
-    'git sparse-checkout set --no-cone local-worker',
-    `git fetch origin ${COMMIT}`,
-    `git checkout --detach ${COMMIT}`,
+    'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
+    `git fetch origin ${WORKER_COMMIT}`,
+    `git checkout --detach ${WORKER_COMMIT}`,
     'cd local-worker',
     'uv run --no-project --python 3.12.14 python install.py',
     '.\\.venv\\Scripts\\python.exe test_installation.py',
@@ -394,6 +396,19 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
     '.\\.venv\\Scripts\\dendrite.exe serve --config configs/mock.toml'
   ]);
   assert.ok(!/aip_|AIPSTER_(?:API_)?KEY|X-Aipster|\/api\//.test(commands), 'no AIPSTER credential or endpoint in worker commands');
+});
+
+test('pinned Quick Start README matches the worker-only checkout and includes its required license', async () => {
+  assert.notEqual(DOCS_COMMIT, WORKER_COMMIT, 'documentation and worker source have independent immutable pins');
+  const readme = await readFile(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../local-worker/README.md'), 'utf8');
+  const block = readme.match(/From PowerShell[\s\S]*?```powershell([\s\S]*?)```/);
+  assert.ok(block, 'README has a tested PowerShell installation block');
+  assert.ok(block[1].includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
+  assert.ok(block[1].includes(`git fetch origin ${WORKER_COMMIT}`));
+  assert.ok(block[1].includes(`git checkout --detach ${WORKER_COMMIT}`));
+  assert.match(readme, /sparse checkout contains the worker and the root `LICENSE` only/);
+  assert.match(readme, /required by \[the licensing record\]\(LICENSING\.md\)/);
+  assert.doesNotMatch(block[1], /git clone https:\/\/github\.com\/synchronic1\/AIPSTER\.git\s+cd AIPSTER\/local-worker/);
 });
 
 test('card placeholder sits in My Compute and the public policy still passes', async () => {
