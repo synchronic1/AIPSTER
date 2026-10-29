@@ -48,7 +48,9 @@
     <section id="tab-compute" role="tabpanel" hidden>
       <h1>My Compute</h1>
       <section id="connect-card" class="card connect" aria-label="Connect your computer" hidden></section>
-      <form id="resource-form" class="card">
+      <details class="card"><summary>Advanced: manual resource registration</summary>
+      <p class="muted">Pairing above is the normal path: it discovers hardware automatically. Use this form only to declare a resource by hand.</p>
+      <form id="resource-form">
         <h2>Register resource</h2>
         <p class="muted">Declared resources start unverified: configured, but not authenticated, online, or usable.</p>
         <label>Name <input id="res-name" required maxlength="80"></label>
@@ -60,6 +62,7 @@
         <p id="resource-error" class="error" role="alert" hidden></p>
         <button type="submit">Register</button>
       </form>
+      </details>
       <div id="compute-list" class="grid"></div>
     </section>
     <section id="tab-shared" role="tabpanel" hidden><h1>Shared With Me</h1><div id="shared-list" class="grid"></div></section>

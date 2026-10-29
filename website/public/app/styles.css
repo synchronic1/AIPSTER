@@ -23,6 +23,7 @@ button.danger { background:transparent; color:var(--bad); border:1px solid var(-
 .demo { border-color:var(--warn); }
 .error { color:var(--bad); }
 .reveal code { display:block; word-break:break-all; background:#0b0e12; padding:.75rem; border:1px dashed var(--warn); border-radius:.4rem; }
+.reveal code.pair-code { font-size:1.2rem; letter-spacing:.06em; }
 .banner { position:fixed; bottom:1rem; left:50%; transform:translateX(-50%); background:var(--panel); border:1px solid var(--accent); border-radius:.5rem; padding:.6rem 1rem; }
 .pill { display:inline-block; font-size:.75rem; border:1px solid var(--line); border-radius:1rem; padding:.05rem .55rem; margin:.1rem .15rem .1rem 0; }
 .pill.ok { border-color:var(--ok); color:var(--ok); } .pill.bad { border-color:var(--bad); color:var(--bad); } .pill.warn { border-color:var(--warn); color:var(--warn); }

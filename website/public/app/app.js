@@ -152,6 +152,14 @@ async function refreshStatusStrip(token, gen, failures) {
 
 function resourceCard(r) {
   const s = r.state || {};
+  // Pairing/link state from row fields only. The browser cannot observe an
+  // install, so there is no "installed" state here — only what the server
+  // row proves: needs-link (manual, never paired), linked (paired, never
+  // beaten), reachable (fresh heartbeat, still not inference-ready), stale.
+  const link = !s.authenticated ? 'needs-link — pair this worker to link it'
+    : !r.heartbeatAt ? 'linked — awaiting first heartbeat'
+    : s.online ? 'reachable — heartbeat seen (reachability only, never ready to run)'
+    : 'stale — last beat ' + (r.heartbeatAt || 'unknown') + '; start the worker sender or check its key';
   return `<div class="card"><h2>${esc(r.name)}</h2>
     <p class="muted">${esc(r.id)} · ${esc(r.kind)} · origin: ${esc(r.origin)} · owner: ${esc(r.owner && r.owner.name)}</p>
     <p>${esc(r.compute.cpu)} · ${esc(r.compute.gpu)}</p>
@@ -159,7 +167,8 @@ function resourceCard(r) {
     <p class="muted">status: ${esc(s.status)} · heartbeat: ${esc(r.heartbeatAt || 'unknown')} · scope: ${esc(r.scope)}</p>
     <p class="muted">capabilities: ${esc((r.capabilities || []).join(', ') || 'none recorded')}</p>
     ${r.credits ? `<p>credits: ${esc(r.credits.label)} ${esc(r.credits.amount)} ${esc(r.credits.currency || '')} <span class="muted">(informational only)</span></p>` : '<p class="muted">credits: unknown / none recorded</p>'}
-    <p class="muted">verification: ${esc(r.verification && r.verification.note || 'unknown')}</p></div>`;
+    <p class="muted">verification: ${esc(r.verification && r.verification.note || 'unknown')}</p>
+    <p class="muted">link: ${esc(link)}</p></div>`;
 }
 
 async function loadOverview() {
@@ -176,7 +185,7 @@ async function loadOverview() {
       <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>`;
     $('ov-note').innerHTML = me && me.demo
       ? '<p class="muted">DEMO DATA: simulated fixtures for exploration. Grants and live actions are disabled. Inference dispatch is disabled.</p>'
-      : '<p class="muted">No demo data: only resources you register appear here. Inference dispatch is disabled.</p>';
+      : '<p class="muted">No demo data: only resources you register or pair appear here. Inference dispatch is disabled.</p>';
   } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
@@ -185,14 +194,16 @@ async function loadOverview() {
 // exists), a secondary agent-assisted setup that copies pinned, secret-free
 // instructions on qualified platforms only, and an OS picker that corrects
 // detection. Linked
-// documentation is pinned separately from the worker source, which remains
-// pinned to the reviewed #17 head (merged; worker requires a local token and
-// validates Host/Origin); move either pin only with a re-verified re-pin.
-// The card makes no API call, holds no credential, and auto-launches nothing.
-// No verified installer is packaged for any platform yet and heartbeat intake
-// (PR #20) is not deployed, so progress honestly stops at "Setup needed".
-const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
-const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
+// documentation and worker source have immutable pins. The reviewed pairing
+// client retains the #17 local-token and Host/Origin guards; move either pin
+// only with a re-verified re-pin.
+// The card renders with no API call and initially holds no credential; the call
+// it ever makes is minting a one-time pairing code when the user clicks Pair,
+// and the code is cleared on Done, tab switch, or sign-out. No verified
+// installer is packaged for any platform yet, so progress honestly stops at
+// "Setup needed" until the worker is installed and paired elsewhere.
+const WORKER_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
+const DOCS_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
@@ -201,6 +212,7 @@ const WORKER_LINKS = {
   troubleshoot: DOCS_TREE + 'README.md#stop-uninstall-and-troubleshoot',
   evidence: DOCS_TREE + 'VERIFICATION.md',
   gaps: DOCS_TREE + 'EXECUTION-GAPS.md',
+  pairing: DOCS_TREE + 'PAIRING-INTEGRATION.md',
   securityFix: 'https://github.com/synchronic1/AIPSTER/pull/17',
   heartbeat: 'https://github.com/synchronic1/AIPSTER/pull/20'
 };
@@ -277,12 +289,19 @@ function workerCommands(os) {
   ];
 }
 
+function workerPairingCommands(os) {
+  const meta = OS_META[os] || OS_META.windows;
+  const py = meta.posix ? meta.venvBin + '/python' : meta.venvBin + '\\python.exe';
+  return [py + ' pairing.py pair', py + ' pairing.py heartbeat-loop --config configs/mock.toml', py + ' pairing.py unpair'];
+}
+
 // Complete, version-pinned instructions for the user's own local agent. They
-// contain no credential and no AIPSTER endpoint: the agent generates a fresh
-// worker-local token on the machine, and the worker never contacts AIPSTER.
+// contain no credential: the owner performs pairing locally and explicitly
+// starts the sender. Installation alone never contacts AIPSTER.
 function agentInstructions(os) {
   const meta = OS_META[os] || OS_META.windows;
   const lines = workerCommands(os);
+  const pairing = workerPairingCommands(os);
   const fetch = lines.slice(0, 6).map((l) => '  ' + l).join('\n');
   const tested = os === 'windows'
     ? 'Windows x64 is the only tested platform (mock check only).'
@@ -293,9 +312,9 @@ function agentInstructions(os) {
     'READ FIRST - what this does and does NOT do:',
     '- Install the local Dendrite worker (ganglion-dendrite 0.1.0) from the reviewed',
     '  AIPSTER source revision below, in an isolated folder on this machine.',
-    '- Installing does NOT share this computer, does NOT enable inference, and does',
-    '  NOT contact AIPSTER: the worker gets no AIPSTER credential and there is no',
-    '  pairing step yet. AIPSTER dispatch stays disabled.',
+    '- Installing does NOT share this computer and does NOT enable inference. The',
+    '  worker does not contact AIPSTER until I pair it (my step below): until then',
+    '  it holds no AIPSTER credential. AIPSTER dispatch stays disabled.',
     '- Inspect this machine first, then explain every change BEFORE making it and',
     '  wait for my approval. Do not change system Python, install global packages,',
     '  add services or startup tasks, or expose anything to a network.',
@@ -304,7 +323,8 @@ function agentInstructions(os) {
     '- Repository: https://github.com/synchronic1/AIPSTER',
     '- Commit: ' + WORKER_COMMIT + ' (security-fixed: local token required, Host/Origin checked)',
     '- Worker directory: local-worker/',
-    '- Quickstart (follow its Tested installation exactly): ' + WORKER_LINKS.quickstart,
+    '- Standalone worker background and troubleshooting: ' + WORKER_LINKS.quickstart,
+    '- Use the pinned commands below for pairing; do not substitute an older checkout from background documentation.',
     '',
     'Step 1 - inspect this machine (report, change nothing):',
     '- OS and CPU architecture; Git version; uv 0.12.12 exactly (must match); Python',
@@ -343,20 +363,35 @@ function agentInstructions(os) {
     '  simulated output. A running worker is NOT proof of inference readiness: no',
     '  engine or model is installed by these steps.',
     '',
-    'Step 6 - record this computer in AIPSTER (I do this myself, not you):',
-    '- In AIPSTER My Compute I use Register resource. It is saved as declared and',
-    '  unverified. There is no pairing code or worker credential yet, so this does',
-    '  not connect the worker.',
+    'Step 6 - link this computer in AIPSTER (I do this myself, not you):',
+    '- In a second terminal, open the same local-worker directory. I use Pair this',
+    '  computer in AIPSTER My Compute, then run: ' + pairing[0],
+    '- I type the one-time code into that local prompt. Never ask me to paste the',
+    '  code or stored sender key into this chat. Pairing registers the resource',
+    '  and stores its heartbeat credential privately; it does not start a sender.',
+    '- In that terminal I explicitly start reachability heartbeats with:',
+    '  ' + pairing[1],
+    '- Mock reports usable=false. Choose Done or reopen My Compute to load the paired resource;',
+    '  a heartbeat proves reachability only, never inference readiness.',
     '',
-    'Finish by reporting: installed revision, inspect and test results, how to stop',
-    '(Ctrl+C, then discard the token) and uninstall (delete local-worker/.venv and',
-    'local-worker/.state if present). There is no automatic update: reinstall from',
-    'scratch at a newer pin only if AIPSTER publishes one. Connection stays pending',
-    'until AIPSTER ships heartbeat and pairing support.'
+    'Step 7 - disconnect and uninstall (I choose when to do this):',
+    '- Stop both the sender and daemon terminals with Ctrl+C, then discard the',
+    '  worker-local token. In AIPSTER Keys I revoke this resource\'s heartbeat key.',
+    '- To forget local pairing I run: ' + pairing[2],
+    '  Local unpair does not revoke the server key. Keep it private until revoked.',
+    '- Remove only local-worker/.venv and .state if present. Do not delete other',
+    '  models, engines or files. There is no automatic update; reinstall only',
+    '  from another reviewed pin AIPSTER publishes. Dispatch stays disabled.',
+    'Finish by reporting installed revision, inspect/test results and stop steps;',
+    'never report tokens, pairing codes or private key-file contents.'
   ].join('\n');
 }
 
 let connect = null;
+function clearPairingCode() {
+  if (!connect || !connect.pair) return;
+  Object.assign(connect.pair, { phase: 'idle', code: '', expiresAt: '', error: '', op: (connect.pair.op || 0) + 1 });
+}
 
 // Approved installer origins (dormant: no installer is available yet). A
 // future available entry renders a download only when its URL is an AIPSTER
@@ -398,6 +433,22 @@ function paintConnectCard() {
     : meta.agentQualified
       ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
       : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
+  // Pairing is platform-independent (a browser code mint), so it stays
+  // available even before an OS pick. Demo accounts cannot mint: the server
+  // would 403, so the card says so up front instead of failing on click.
+  const pairBtn = (me && me.demo)
+    ? '<button type="button" class="btn secondary" disabled>Pairing unavailable for demo</button>'
+    : '<button type="button" class="btn secondary" data-action="pair">Pair this computer</button>';
+  const pairBlock = (() => {
+    const p = connect.pair;
+    if (!p || p.phase === 'idle') return '';
+    if (p.phase === 'minting') return '<p class="notice" role="status">Minting a one-time code…</p>';
+    if (p.phase === 'error') return `<p class="notice" role="status"><span class="pill warn">Pairing failed</span> ${esc(p.error)} <span class="actions"><button type="button" class="btn secondary" data-action="pair-again">Try again</button></span></p>`;
+    return `<div class="reveal" role="status"><p><span class="pill ok">Code minted</span> Type this code into the worker's pair step. Single use — it cannot be shown again.</p>
+<code class="pair-code" aria-label="one-time pairing code" tabindex="0">${esc(p.code)}</code>
+<p class="muted">Expires ${esc(p.expiresAt)}. On the worker: run the pair step, type the code when asked, then start the heartbeat sender (see Advanced). The worker contacts AIPSTER only after pairing; heartbeats prove reachability only.</p>
+<p class="actions"><button type="button" class="btn secondary" data-action="pair-done">Done</button><button type="button" class="btn secondary" data-action="pair-again">Mint a new code</button></p></div>`;
+  })();
   const installerLine = unpickedTarget
     ? `<p class="muted">Pick a target ${targetLabel} to check installer availability.</p>`
     : usable
@@ -413,9 +464,10 @@ function paintConnectCard() {
     status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
   }
   const commands = unpickedTarget ? '' : workerCommands(connect.os).map(esc).join('\n');
+  const pairingCommands = workerPairingCommands(connect.os);
   const advanced = unpickedTarget ? '' : `<details><summary>Advanced: manual install, source and troubleshooting</summary>
 <h3>Manual install (${esc(meta.label)})</h3>
-<p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${esc(L.tested)}">tested installation</a> (the sparse checkout contains the worker and its root <code>LICENSE</code> only):</p>
+<p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). Use these pairing-capable commands in ${esc(meta.shell)}. The linked <a href="${esc(L.tested)}">standalone tested installation</a> is background and may name an earlier release. The sparse checkout contains the worker and its root <code>LICENSE</code> only:</p>
 <pre tabindex="0" aria-label="${esc(meta.label)} install commands"><code>${commands}</code></pre>
 <p class="muted"><code>serve</code> refuses to start without <code>DENDRITE_API_TOKEN</code> (32+ characters), even on loopback. This is a <strong>worker-local</strong> token that you generate on this machine. It is not an AIPSTER API key or heartbeat key. Never reuse it, and never paste it into AIPSTER, a URL or a shared config. Local requests other than <code>/healthz</code> need <code>Authorization: Bearer</code> with that token (see the <a href="${esc(L.quickstart)}">quickstart</a>).</p>
 <p class="muted">The mock config returns simulated output only. A native engine (llama-server, built separately) and a GGUF model you obtain yourself are separate prerequisites. See <a href="${esc(L.engine)}">engine preparation</a>.</p>
@@ -424,10 +476,12 @@ function paintConnectCard() {
 <li><span class="pill warn">macOS / Linux: not qualified</span> <span class="muted">commands are for adaptation only (use <code>.venv/bin/</code>). They are untested.</span></li></ul>
 <p class="muted">The worker is published as source, pinned to the <a href="${esc(L.securityFix)}">security-fixed revision</a> that requires a local token and checks Host/Origin.</p>
 <h3>Connect</h3>
-<p>For now, record this computer with <strong>Register resource</strong> below. It is saved as a declared, unverified resource. There is no pairing code or worker credential yet, so the worker never contacts AIPSTER.</p>
-<p>Status: <strong>not connected</strong>. Registered resources show as unverified/offline until heartbeat support ships. A running worker is not proof of readiness. See the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
+<p>Mint a one-time pairing code above (10-minute expiry, single use). In a second terminal in the same <code>local-worker</code> directory, run <code>${esc(pairingCommands[0])}</code> and type the code locally. Pairing contacts AIPSTER, registers this computer automatically and stores a private heartbeat key. Do not paste the code or key into an agent chat.</p>
+<p>Pairing does not start the sender. In that terminal, run <code>${esc(pairingCommands[1])}</code> to post reachability heartbeats. The mock stays <code>usable=false</code>; no inference is enabled. Keep this sender terminal open. See the <a href="${esc(L.pairing)}">pairing and sender details</a>.</p>
+<p>Status: <strong>not linked until paired</strong>. Choose Done or reopen My Compute after pairing to load the resource below. Heartbeats prove reachability only, never readiness. Manual entry stays under <strong>Advanced: manual resource registration</strong>. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
+<p class="muted">If the key is revoked or expires, the sender exits asking for a re-pair with a fresh code. Packaged launcher integration is pending with the installer release.</p>
 <details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
-<details><summary>Disconnect and uninstall</summary><p>Stop the worker with Ctrl+C, then close the terminal or run <code>Remove-Item Env:DENDRITE_API_TOKEN</code> to discard the local token. To uninstall, delete only <code>local-worker/.venv</code> (and <code>.state</code> if present). There is no automatic update; reinstall from scratch at a newer pin only if AIPSTER publishes one. This setup adds no service, startup task or global package. The worker holds no AIPSTER credential, so there is nothing to revoke here. Keep it on loopback and never expose it to a network.</p></details>
+<details><summary>Disconnect and uninstall</summary><p>Stop both sender and daemon terminals with Ctrl+C, then discard the worker-local token. A paired worker also holds an AIPSTER heartbeat key: revoke this resource's key in AIPSTER Keys. Run <code>${esc(pairingCommands[2])}</code> to forget its local pairing; this does not revoke the server key. Then remove only <code>local-worker/.venv</code> and <code>.state</code> if present. Keep unrelated models and engines. This setup adds no service, startup task, global package or automatic update. Keep the daemon on loopback.</p></details>
 </details>`;
   el.innerHTML = `<div class="connect-grid"><div class="connect-rail">
 <h2>Connect your computer</h2>
@@ -436,16 +490,17 @@ function paintConnectCard() {
 <ol class="progress" aria-label="Connection progress">
 <li class="now" aria-current="step"><strong>Setup needed</strong><span class="st muted">You are here. Not connected.</span></li>
 <li><strong>Installing</strong><span class="st muted">Blocked: no verified installer is packaged yet.</span></li>
-<li><strong>Pairing</strong><span class="st muted">Blocked: <a href="${esc(L.heartbeat)}">heartbeat intake</a> is not merged or deployed. Pairing is a separate contract and is not implemented.</span></li>
+<li><strong>Pairing</strong><span class="st muted">Available: mint a one-time code below, then type it into the worker's pair step. Start the sender using the manual steps afterward.</span></li>
 <li><strong>Connected</strong><span class="st muted">Needs verified worker evidence. A download or a running worker is not proof.</span></li>
 </ol>
 <p><span class="pill warn">Setup needed</span></p>
 </div><div class="connect-body">
-<p class="lede">Prepare this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then register it below as a declared, unverified resource. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; pairing and dispatch are not available yet, so nothing can run.</p>
+<p class="lede">Prepare this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then pair it below with a one-time code. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; dispatch is not available, so nothing can run.</p>
 <div class="osrow"><label for="connect-os">Your system</label><select id="connect-os" data-action="os" aria-describedby="connect-os-note">${options}</select><span class="muted" id="connect-os-note">${detectedNote}</span></div>
-<p class="actions">${primary}${secondary}</p>
+<p class="actions">${primary}${secondary}${pairBtn}</p>
 ${installerLine}
 ${status}
+${pairBlock}
 ${advanced}
 </div></div>`;
   el.hidden = false;
@@ -477,6 +532,13 @@ function onConnectClick(ev) {
     copyAgentInstructions();
   } else if (action === 'save-instructions') {
     saveInstructions();
+  } else if (action === 'pair' || action === 'pair-again') {
+    mintPairingCode();
+  } else if (action === 'pair-done') {
+    clearPairingCode();
+    // Preserve the current peer's Done refresh, with explicit cancellation of
+    // any previous mint before replacing its card and inventory snapshot.
+    loadCompute();
   }
 }
 
@@ -509,6 +571,7 @@ function onConnectChange(ev) {
     connect.picked = true;
     connect.phase = 'idle';
     connect.fallback = '';
+    clearPairingCode();
     connect.saveFailed = false;
     connect.copyOp = (connect.copyOp || 0) + 1;
     paintConnectCard();
@@ -546,10 +609,34 @@ async function copyAgentInstructions() {
   paintConnectCard();
 }
 
+async function mintPairingCode() {
+  if (!connect || !me || me.demo) return;
+  const gen = generation;
+  const card = connect;
+  const op = (card.pair.op = (card.pair.op || 0) + 1);
+  card.pair.phase = 'minting';
+  card.pair.error = '';
+  card.pair.code = ''; card.pair.expiresAt = '';
+  paintConnectCard();
+  try {
+    const data = await api('/api/pairing/codes', { method: 'POST', body: JSON.stringify({ ttlMinutes: 10 }) });
+    if (gen !== generation || connect !== card || card.pair.op !== op) return;
+    card.pair.phase = 'shown';
+    card.pair.code = data.code;
+    card.pair.expiresAt = data.expiresAt;
+  } catch (e) {
+    if (isStale(e) || gen !== generation || connect !== card || card.pair.op !== op) return;
+    card.pair.phase = 'error';
+    card.pair.error = e.message;
+  }
+  paintConnectCard();
+}
+
 function renderConnectCard() {
+  clearPairingCode();
   const detected = detectOs();
   const os = detected && detected !== 'mobile' ? detected : 'windows';
-  connect = { os, detected, picked: false, phase: 'idle', fallback: '', saveFailed: false, copyOp: 0 };
+  connect = { os, detected, picked: false, phase: 'idle', fallback: '', saveFailed: false, copyOp: 0, pair: { phase: 'idle', code: '', expiresAt: '', error: '', op: 0 } };
   paintConnectCard();
   const el = $('connect-card');
   el.onclick = onConnectClick;
@@ -562,7 +649,7 @@ async function loadCompute() {
   try {
     const inv = await api('/api/inventory?limit=50');
     el.innerHTML = inv.items.length ? inv.items.map(resourceCard).join('') : '';
-    if (!inv.items.length) state(el, '', 'No resources yet. Register one above.');
+    if (!inv.items.length) state(el, '', 'No resources yet. Pair a worker above, or register one manually under Advanced.');
     $('grant-resource').innerHTML = inv.items.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
   } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
@@ -743,6 +830,8 @@ function resetState() {
   for (const id of ['status-strip', 'ov-cards', 'ov-note', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
   for (const id of ['fab-node-list', 'fab-inv-out', 'fab-inv-in', 'fab-conn-list', 'fab-grant-out', 'fab-grant-in', 'fab-deny-list', 'fab-authz-out']) $(id).innerHTML = '';
   for (const id of ['fab-inv-issuer', 'fab-accept-node', 'fab-authz-node', 'fab-prev-conn']) $(id).innerHTML = '';
+  connect = null;
+  $('connect-card').innerHTML = ''; $('connect-card').hidden = true;
   $('grant-resource').innerHTML = '';
   $('key-secret').textContent = ''; $('key-reveal').hidden = true;
   $('fab-node-secret').textContent = ''; $('fab-node-reveal').hidden = true;
@@ -769,6 +858,8 @@ function resetState() {
 }
 
 document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('click', () => {
+  clearPairingCode();
+  if (connect) paintConnectCard();
   generation++;
   document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', b === btn ? 'true' : 'false'));
   document.querySelectorAll('[role="tabpanel"]').forEach((p) => { p.hidden = p.id !== 'tab-' + btn.dataset.tab; });

@@ -109,20 +109,42 @@ scope — the delivered key is heartbeat-scoped and fails every other route.
 - Manual registration remains available. This API slice does not wire the
   pairing flow into the dashboard; that requires the separate dashboard slice.
 
-## Worker side (installer slice)
+## Worker side and dashboard setup
 
-The planned worker integration needs a `pair` step (packaged launcher + source-install script)
-that takes the typed code, exchanges it, and stores `{resourceId,
-heartbeatKey, nodeId}` in the user-ACL-only data dir — never logs, URLs, or
-shared installers. The sender loop posts `{"usable": bool}` heartbeats with
-the delivered key, honoring `429`/`Retry-After` and surfacing `401
-KEY_REVOKED`/`KEY_EXPIRED` as re-pair prompts. `usable` defaults to false
-unless the local engine is verified runnable: simulated/mock engines report
-reachable-but-not-usable.
+The dashboard's authoritative source commands pin the published, reviewed
+worker `5fd4aba06bd05143a029cf25f8976d3f823b754d`. They retain the sparse
+`/local-worker/` + `/LICENSE` checkout and the pinned installation toolchain.
+The linked standalone README is background documentation and may name an
+older checkout; use the dashboard's explicit pairing commands instead.
+Packaged launcher integration remains pending, and every installer button
+stays unavailable until a verified artifact is published.
 
-That worker step and OS-protected credential storage are requirements, not
-implemented or qualified by this server PR. The current public worker/source
-pin remains standalone and must not be configured to contact AIPSTER from these tests.
+Source setup has two explicit steps in a second terminal in `local-worker`:
+run `.\.venv\Scripts\python.exe pairing.py pair` and type the dashboard
+code locally, then run `.\.venv\Scripts\python.exe pairing.py heartbeat-loop
+--config configs/mock.toml`. Pairing persists private credentials and exits;
+it does not start the sender. The POSIX equivalent uses `.venv/bin/python`,
+but macOS/Linux adaptation is not qualified. Choose Done or reopen My Compute
+after pairing to refresh inventory; the dashboard does not observe installation.
+Do not paste pairing codes or stored heartbeat keys into agent conversations.
+
+The sender posts `{"usable": bool}` with its heartbeat-scoped key, honors
+`429`/`Retry-After` and transient failures, and prompts to re-pair after key
+revocation/expiry. The supplied mock command always reports `usable=false`:
+a heartbeat proves reachability, not inference readiness. For credential
+storage and launcher integration, see the pinned worker's
+[`PAIRING-INTEGRATION.md`](https://github.com/synchronic1/AIPSTER/blob/5fd4aba06bd05143a029cf25f8976d3f823b754d/local-worker/PAIRING-INTEGRATION.md).
+
+To disconnect, stop both sender and daemon terminals, revoke the resource's
+heartbeat key in AIPSTER Keys, then run the same venv Python with
+`pairing.py unpair` to forget local state. Local unpair does not revoke the
+server key, and removing `.venv`/`.state` alone does not remove credentials
+from the private worker data directory. Preserve unrelated models and engines.
+The setup adds no service, startup task or automatic update.
+
+The reviewed Python client and dashboard are included in this integration.
+Their pairing and private-storage qualification uses disposable local fixtures.
+Packaged pairing, hosted migration and production enrollment are not qualified.
 
 ## Test map
 
@@ -148,7 +170,8 @@ loss, same-key concurrency, exhausted budgets and closure at the batch boundary.
 This separately reviewed pairing candidate stacks on the consolidated control-plane
 repair (PR #29). It preserves the original Muse W1/W2 history and keeps the
 pairing backend distinct from an available installer or worker pairing client.
-The worker tree, source pins, licenses and notices remain unchanged.
+The Python core, dependency pins, licenses and notices remain unchanged.
+The reviewed pairing client is added separately from the packaged local daemon.
 
 The unapplied sequence is heartbeat 0013, federation restriction receipts 0014,
 then pairing 0015. Applied 0001-0005 are unchanged. The shared readiness contract
@@ -183,3 +206,22 @@ one transaction. A failed audit cannot strand an undisclosed code or charge.
 Concurrent same-code claims refresh authenticated consent for one bounded retry,
 including an already-existing node, and revalidate the reclaim window and exact
 owner/node/resource binding before the atomic effect.
+
+Worker slice (muse/onboarding-w3-worker): local-worker/test_pairing.py
+(18 unit tests, fake in-thread API; 3 POSIX-permission tests skip honestly
+on Windows) and local-worker/test_pairing_e2e.py (6 cross-language
+scenarios, real CLI against real worker.js over loopback): two-user
+isolation, repeat startup + quota, reclaim + rotation, expired/replayed
+codes, revocation, delete, disabled owner, stale strip.
+
+Dashboard slice (muse/onboarding-w4-dashboard):
+website/tests/ui-connect-card.test.mjs (18 tests, exact checked-in
+client): pair mint/reveal/dismiss/re-mint with no clipboard write and no
+new links, cap-failure retry, demo unavailability, stepper honesty,
+resource link states (needs-link/linked/reachable/stale), manual form
+under Advanced. `website/tests/ui-pairing-repair.test.mjs` adds 8 exact-client
+VM regressions for late mint success/error after target changes, Done/tab/
+logout/replacement fences, CSRF, clipboard exclusion, published sparse source
+pin, anonymous/demo guards, escaped code display and explicit sender/revocation
+instructions. Clearing a code invalidates pending mint work; it does not revoke
+an already minted code, which remains subject to server expiry and limits.

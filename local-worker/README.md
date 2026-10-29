@@ -23,8 +23,8 @@ From PowerShell in a fresh directory (these commands match the tested Windows x6
 git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
 git sparse-checkout set --no-cone /local-worker/ /LICENSE
-git fetch origin 242c5300e0379d25bcb1624c67abc9806271d1df
-git checkout --detach 242c5300e0379d25bcb1624c67abc9806271d1df
+git fetch origin 5fd4aba06bd05143a029cf25f8976d3f823b754d
+git checkout --detach 5fd4aba06bd05143a029cf25f8976d3f823b754d
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
@@ -50,6 +50,33 @@ netrc and keyring lookup for installation. No secrets are needed or requested.
 Network access to public Python distribution/PyPI hosts is required on first use.
 The locks pin dependency artifacts, not a bit-for-bit native build or a promise
 that upstream distribution hosts will remain available.
+
+## Pairing with AIPSTER
+
+Installing never shares anything. To link this computer to your AIPSTER
+account, sign in to the dashboard, open My Compute, and use Pair this
+computer to mint a one-time code (10-minute expiry, single use). Then,
+from this directory:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py pair
+```
+
+Type the code when prompted (it is not echoed). Pairing registers this
+computer automatically — hardware and capabilities are discovered, not
+typed — and stores a sender key privately. Then start the sender in a
+second terminal, next to `serve`:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py heartbeat-loop
+```
+
+Heartbeats prove reachability only, never inference readiness. If the
+sender key is revoked or expires the sender exits asking for a re-pair;
+pair again with a fresh code. `pairing.py status` shows the link state
+without secrets; `pairing.py unpair` forgets locally (revoke the server
+key in the dashboard Keys panel). Protocol details live in
+`docs/pairing.md` in the full AIPSTER checkout.
 
 In a second terminal, set `$env:DENDRITE_API_TOKEN` to the same value, then:
 
