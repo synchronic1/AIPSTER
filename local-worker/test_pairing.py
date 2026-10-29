@@ -331,6 +331,19 @@ class Round2Tests(unittest.TestCase):
         self.assertEqual(hw["cpu"], "stub-cpu")
 
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_fresh_pair_under_loose_umask_stays_private(self):
+        old = os.umask(0o002)
+        try:
+            out, err, code = run_cli("pair", self.pair_args())
+        finally:
+            os.umask(old)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o700)
+        meta = load_pairing(self.data)
+        self.assertEqual(meta["resource_id"], "r_fake01")
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():
