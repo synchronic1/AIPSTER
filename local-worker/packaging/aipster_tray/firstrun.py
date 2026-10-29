@@ -6,6 +6,7 @@ configured env var. The token value is never printed or logged.
 """
 import os
 import json
+import re
 import secrets
 import subprocess
 import sys
@@ -52,20 +53,35 @@ def _private_path(path, directory=False, verify=False):
         return True
     script = r'''
 $ErrorActionPreference = 'Stop'
+$identity = $null
+$sid = $null
+$owner = ''
+$aclExceptionClass = ''
+function Report-PrivatePath([string]$reason) {
+  [pscustomobject]@{reason=$reason; owner_sid=$owner; process_sid=$sid.Value; default_owner_sid=$identity.Owner.Value; exception_class=$aclExceptionClass} | ConvertTo-Json -Compress
+}
+trap {
+  $aclExceptionClass = $_.Exception.GetType().Name
+  Report-PrivatePath 'acl-exception'
+  exit 1
+}
 $item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
 $old = Get-Acl -LiteralPath $item.path
-if ($old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 2 }
+$owner = $old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($owner -ne $sid.Value) { Report-PrivatePath 'owner-mismatch'; exit 2 }
 if ($item.verify) {
-  if (-not $old.AreAccessRulesProtected) { exit 3 }
+  if (-not $old.AreAccessRulesProtected) { Report-PrivatePath 'inherited-acl'; exit 3 }
   $allow = $false
   foreach ($entry in $old.Access) {
     if ($entry.AccessControlType -eq 'Allow') {
-      if ($entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 4 }
+      if ($entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { Report-PrivatePath 'foreign-allow'; exit 4 }
       $allow = $true
     }
   }
-  if (-not $allow) { exit 5 }
+  if (-not $allow) { Report-PrivatePath 'missing-user-allow'; exit 5 }
+  Report-PrivatePath 'private'
   exit 0
 }
 if ($item.directory) {
@@ -80,12 +96,28 @@ $acl.SetAccessRuleProtection($true, $false)
 $acl.AddAccessRule($rule)
 if ($item.directory) { [System.IO.Directory]::SetAccessControl($item.path, $acl) }
 else { [System.IO.File]::SetAccessControl($item.path, $acl) }
+Report-PrivatePath 'private'
 '''
     ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     result = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
                             input=json.dumps({"path": str(path.resolve()), "directory": directory, "verify": verify}),
                             text=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    return result.returncode == 0
+    if result.returncode != 0:
+        try:
+            detail = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            detail = {}
+        reasons = {"owner-mismatch", "inherited-acl", "foreign-allow", "missing-user-allow", "acl-exception"}
+        reason = detail.get("reason") if detail.get("reason") in reasons else "invalid-diagnostic"
+        def sid(name):
+            value = detail.get(name)
+            return value if isinstance(value, str) and re.fullmatch(r"S-\d+(?:-\d+)+", value) else "unavailable"
+        kind = detail.get("exception_class")
+        kind = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,80}", kind) else "none"
+        raise OSError(f"private ACL rejected: rc={result.returncode} reason={reason} "
+                      f"owner_sid={sid('owner_sid')} process_sid={sid('process_sid')} "
+                      f"default_owner_sid={sid('default_owner_sid')} exception_class={kind}")
+    return True
 
 
 def restrict_file(path):
