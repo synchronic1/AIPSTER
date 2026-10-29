@@ -485,3 +485,31 @@ test('a genuinely new sender still hits the key cap', async () => {
   const rows = await t.DB.prepare("SELECT COUNT(*) AS n FROM resources WHERE owner_id = ? AND node_id = 'n_overcap'").bind(t.alice.id).first();
   assert.equal(rows.n, 0, 'no resource created over the cap');
 });
+test('display-name search costs one query however many collide', async () => {
+  const t = await createTestEnv();
+  const now = new Date().toISOString();
+  for (let i = 0; i < 10; i++) {
+    const name = i === 0 ? 'lab' : `lab-${i + 1}`;
+    await t.DB.prepare('INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(`r_seed_${i}`, t.alice.id, name, 'local', 'declared', 'c', 'g', now).run();
+  }
+  const seen = { perCandidate: 0, bulk: 0 };
+  const realPrepare = t.DB.prepare;
+  t.DB.prepare = (sql) => {
+    if (typeof sql === 'string') {
+      if (sql.includes('SELECT id FROM resources WHERE owner_id = ? AND name = ?')) seen.perCandidate++;
+      if (sql.includes('SELECT name FROM resources WHERE owner_id = ?')) seen.bulk++;
+    }
+    return realPrepare(sql);
+  };
+  try {
+    const minted = await mintCode(t, t.alice);
+    const out = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_names', name: 'lab' }));
+    assert.equal(out.status, 201, out.text);
+    assert.equal(out.json.resource.name, 'lab-11', 'same suffix sequence');
+    assert.equal(seen.perCandidate, 0, 'no per-candidate loop');
+    assert.equal(seen.bulk, 1, 'one bounded name read');
+  } finally {
+    t.DB.prepare = realPrepare;
+  }
+});

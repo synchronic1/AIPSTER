@@ -863,11 +863,13 @@ async function uniqueResourceName(db, ownerId, base) {
   // Display names stay human-meaningful on collision ("lab", "lab-2", ...).
   // Identity is the row id / node binding, never the name, so a lost rename
   // race only duplicates a label, never an identity.
+  // The owner's names are read once (bounded by the per-owner resource cap)
+  // and candidates are checked locally, not one query per collision.
   const clean = String(base || '').trim().slice(0, 80) || 'worker';
+  const taken = new Set((await all(db, 'SELECT name FROM resources WHERE owner_id = ?', ownerId)).map((r) => r.name));
   for (let n = 1; n <= 100; n++) {
     const cand = n === 1 ? clean : `${clean.slice(0, 74)}-${n}`;
-    const hit = await first(db, 'SELECT id FROM resources WHERE owner_id = ? AND name = ?', ownerId, cand);
-    if (!hit) return cand;
+    if (!taken.has(cand)) return cand;
   }
   return `${clean.slice(0, 60)}-${rid('').slice(0, 6)}`;
 }
