@@ -525,7 +525,12 @@ class ConcurrencyAndLoopTests(unittest.TestCase):
             thread.start()
         for thread in threads:
             thread.join(timeout=60)
-        self.assertEqual(errors, [])
+        # Report the native cause (reason + owner/default/user SIDs) so a
+        # failure on the elevated runner names the exact transient state.
+        self.assertEqual(errors, [], [
+            (exc, getattr(exc.__cause__, "reason", None), getattr(exc.__cause__, "owner_sid", None),
+             getattr(exc.__cause__, "default_owner_sid", None), getattr(exc.__cause__, "user_sid", None),
+             repr(exc.__cause__)) for exc in errors])
         self.assertEqual(len(results), 8)
         self.assertEqual(len(set(results)), 1,
                          "all racers share the winning identity")
