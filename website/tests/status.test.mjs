@@ -241,3 +241,71 @@ test('status counts come from the aggregate, not the listed page', async () => {
   const inv = await readJson(await t.call('/api/inventory?limit=1', { headers: t.as(t.alice) }));
   assert.equal(out.json.total, inv.json.total, 'status total must equal the Overview inventory total');
 });
+test('inventory list stays under the D1 per-invocation query cap at 50 resources', async () => {
+  // Codex P2 round 13: one ownerName() query per resource plus count,
+  // list, and auth pushed a full 50-resource page past D1's 50-query
+  // limit, 500ing the inventory the overview and keys tab depend on.
+  // Every row is caller-owned, so one lookup must serve the whole page.
+  const t = await createTestEnv();
+  await seedResources(t, t.alice, Array.from({ length: 50 }, () => ({ online: false, hb: null })));
+  let queries = 0;
+  const origPrepare = t.DB.prepare.bind(t.DB);
+  t.DB.prepare = (sql) => { queries++; return origPrepare(sql); };
+  try {
+    const inv = await readJson(await t.call('/api/inventory?limit=50', { headers: t.as(t.alice) }));
+    assert.equal(inv.status, 200, inv.text);
+    assert.equal(inv.json.items.length, 50);
+    assert.ok(inv.json.items.every((c) => c.owner && c.owner.name === 'Alice'), 'owner name still resolved');
+    assert.ok(queries < 50, `${queries} queries issued for one 50-resource page (D1 cap is 50)`);
+  } finally {
+    t.DB.prepare = origPrepare;
+  }
+});
+
+test('shared-with-me resolves names in batched queries, not per grant', async () => {
+  // Same round-13 finding: per-grant resource + owner lookups broke the
+  // page past ~20 grants. Query count must not grow with the grant list.
+  const t = await createTestEnv();
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, demo, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('u_carol', 'Carol', 'carol@example.com', 1, null, 0, now, now).run();
+  let n = 0;
+  const addGrants = async (ownerId, count) => {
+    for (let i = 0; i < count; i++) {
+      const r = `r_sh_${n}`;
+      const g = `g_sh_${n}`;
+      n++;
+      await t.DB.prepare(`INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+        VALUES (?, ?, ?, 'local', 'seed', 'x', 'y', '[]', 1, 1, 0, 0, NULL, '{}', 'owner only', '{}', NULL, ?)`)
+        .bind(r, ownerId, `shared-${r}`, now).run();
+      await t.DB.prepare('INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL)')
+        .bind(g, r, ownerId, 'u_bob', 5, 500, now).run();
+    }
+  };
+  await addGrants('u_alice', 3);
+  await addGrants('u_carol', 2);
+  const origPrepare = t.DB.prepare.bind(t.DB);
+  let queries = 0;
+  t.DB.prepare = (sql) => { queries++; return origPrepare(sql); };
+  const fetchAsBob = async () => {
+    queries = 0;
+    const out = await readJson(await t.call('/api/shared-with-me?limit=50', { headers: t.as(t.bob) }));
+    assert.equal(out.status, 200, out.text);
+    return { out, queries };
+  };
+  try {
+    // Warm the per-isolate auth cache so both measurements exclude it.
+    await fetchAsBob();
+    const first = await fetchAsBob();
+    assert.equal(first.out.json.total, 5);
+    await addGrants('u_alice', 5);
+    const second = await fetchAsBob();
+    assert.equal(second.out.json.total, 10);
+    assert.equal(second.queries, first.queries, `queries grew with the grant list: ${first.queries} -> ${second.queries}`);
+    const owners = new Set(second.out.json.items.map((g) => g.ownerName));
+    assert.deepEqual([...owners].sort(), ['Alice', 'Carol']);
+    assert.ok(second.out.json.items.every((g) => g.resourceName && g.resourceName.startsWith('shared-')), 'resource names resolved');
+  } finally {
+    t.DB.prepare = origPrepare;
+  }
+});

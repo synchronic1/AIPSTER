@@ -314,8 +314,12 @@ async function handleApi(request, env, url) {
     const d = needAuthz('read'); if (d) return deny(d);
     const q = pagination(url);
     const page = await pageQuery(db, { select: 'SELECT *', from: 'FROM resources WHERE owner_id = ?', params: [me()], order: 'ORDER BY created_at DESC', ...q });
-    const cards = [];
-    for (const r of page.items) cards.push(cardFor(r, await ownerName(db, r.owner_id)));
+    // Every row here is caller-owned (WHERE owner_id = ?), so one name
+    // lookup serves the whole page (Codex P2 round 13): per-row lookups
+    // pushed a full 50-resource page to ~70 queries, past D1's 50-query
+    // per-invocation cap, 500ing the inventory.
+    const owner = await ownerName(db, me());
+    const cards = page.items.map((r) => cardFor(r, owner));
     return json(200, { ...page, items: cards });
   }
   if (path === '/api/inventory' && method === 'POST') {
@@ -646,11 +650,17 @@ async function handleApi(request, env, url) {
     const d = needAuthz('read'); if (d) return deny(d);
     const q = pagination(url);
     const page = await pageQuery(db, { select: 'SELECT g.*', from: 'FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.grantee_id = ? AND g.revoked_at IS NULL AND o.demo = r.demo', params: [me()], order: 'ORDER BY g.created_at DESC', ...q });
-    const items = [];
-    for (const g of page.items) {
-      const r = await first(db, 'SELECT name FROM resources WHERE id = ?', g.resource_id);
-      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'server-enforced', policyNote: 'Inference-only; bounded quotas checked before every dispatch.' });
-    }
+    // Batched names (Codex P2 round 13): per-grant resource + owner
+    // lookups grew queries with the list and broke the page past ~20
+    // grants on D1's 50-query cap. Empty pages skip the IN queries.
+    const rids = [...new Set(page.items.map((g) => g.resource_id))];
+    const oids = [...new Set(page.items.map((g) => g.owner_id))];
+    const placeholders = (ids) => `(${ids.map(() => '?').join(',')})`;
+    const rRows = rids.length ? await all(db, `SELECT id, name FROM resources WHERE id IN ${placeholders(rids)}`, ...rids) : [];
+    const oRows = oids.length ? await all(db, `SELECT id, name FROM "user" WHERE id IN ${placeholders(oids)}`, ...oids) : [];
+    const rNames = new Map(rRows.map((r) => [r.id, r.name]));
+    const oNames = new Map(oRows.map((u) => [u.id, u.name]));
+    const items = page.items.map((g) => ({ ...mapGrantLite(g), resourceName: rNames.get(g.resource_id) ?? '(removed)', ownerName: oNames.get(g.owner_id) ?? 'Unknown', enforcement: 'server-enforced', policyNote: 'Inference-only; bounded quotas checked before every dispatch.' }));
     return json(200, { ...page, items });
   }
   if (path === '/api/grants' && method === 'GET') {
