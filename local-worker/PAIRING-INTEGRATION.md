@@ -31,6 +31,11 @@ can land without a pairing-session edit.
   - `status` (secret-free) / `unpair` (local forget; server key stays
     live until revoked in the dashboard — printed every time). Failed attempts
     replace success status; `status` derives staleness after five minutes.
+    Every heartbeat status binds the sender's captured pairing snapshot
+    (origin, resource and selected key generation). Re-pairing ignores older,
+    unbound or mismatched status, even when an old in-flight beat writes last.
+    Unpair ignores only missing files; any other deletion/enumeration failure
+    reports incomplete cleanup and returns nonzero, without a success claim.
 - `local-worker/test_pairing.py` — 22 standard-library unit tests (fake
   in-thread API; 3 POSIX-only tests skip on Windows). The qualified runtime is
   Python 3.12.14; source declares Python ≥ 3.11.
@@ -46,9 +51,13 @@ can land without a pairing-session edit.
 - `local-worker/test_pairing_windows_storage.py` — 6 Windows tests for exclusive
   mkdir/mkstemp provenance, empty-temp ACL rejection, existing foreign owners,
   concurrent mkdir collisions, read-only verification and refused replacement.
-  With 14 installation tests and 6 E2Es the matrix has 63 tests (60 runnable
+  With 14 installation tests, 8 lifecycle tests and 6 E2Es the matrix has 71 tests (68 runnable
   and 3 POSIX skips on Windows). Fixtures provision only their own new paths;
   no test relaxes existing-path ownership policy.
+- `local-worker/test_pairing_lifecycle.py` — 8 regressions covering whole/partial
+  unpair failure, missing-file idempotence, enumeration failure, actual Windows
+  locked-file deletion, fresh-generation status, old in-flight success/failure,
+  and safe legacy status/key rotation.
 - Protocol: `docs/pairing.md` (claim) + `docs/heartbeat-intake.md`
   (sender). Claim request/response shapes are fixed by
   `website/tests/pairing.test.mjs`; do not invent a second endpoint.
