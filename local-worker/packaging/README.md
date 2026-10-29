@@ -128,6 +128,15 @@ a clear message instead of pretending.
 
 ## Build & qualify (Windows x86-64)
 
+Windows storage uses `local-worker/private_storage_win32.py`, a stdlib ctypes
+helper with typed native APIs and strict descriptor read-back, avoiding a
+PowerShell subprocess on each start. Existing paths must be owned by the
+process user. Only an exclusively created directory or mkstemp file may have
+the process token's default owner (Administrators on elevated runners)
+normalized to that user. This never changes privileges or takes over an
+existing foreign-owned directory/key. Tests provision their fresh private
+data paths through the same creation contract.
+
 The token directory and existing/new token files must belong to the current
 process user. First run establishes a protected DACL containing only that
 user's SID and fails closed if it cannot; token publication is atomic and a

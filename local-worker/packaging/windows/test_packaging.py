@@ -1,5 +1,6 @@
 """Controlled packaging regressions. No installer, tray, registry, or inference runs."""
 import importlib.util
+from contextlib import contextmanager
 import io
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ ROOT = WINDOWS.parent.parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / 'vendor/eif'))
 sys.path.insert(0, str(WINDOWS.parent))
+sys.path.insert(0, str(ROOT))
+import private_storage_win32 as native
 from aipster_tray import firstrun as first, child, controller, state
 spec = importlib.util.spec_from_file_location('packaging_build', WINDOWS / 'build.py')
 build = importlib.util.module_from_spec(spec)
@@ -26,7 +29,7 @@ class PackagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='aipster-pure-')
         self.addCleanup(self.temp.cleanup)
-        self.data = Path(self.temp.name)
+        self.data = Path(self.temp.name) / 'worker-data'
 
     def test_acl_failure_never_publishes_token(self):
         token = self.data / 'api-token.txt'
@@ -36,13 +39,15 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse(list(self.data.glob('.api-token-*')))
 
     def test_restrict_process_failure_is_terminal(self):
-        with patch.object(first.subprocess, 'run', side_effect=OSError('synthetic missing ACL executable')):
+        with patch.object(native, '_api', side_effect=OSError('synthetic unavailable ACL interface')):
             with self.assertRaises(SystemExit): first.ensure_private_token(self.data / 'api-token.txt')
         self.assertFalse((self.data / 'api-token.txt').exists())
 
     def test_native_acl_removes_explicit_grants_and_ignores_username(self):
         token = self.data / 'api-token.txt'
+        first.private_directory(self.data)
         token.write_text('synthetic-token-' + 'x' * 40)
+        first._private_path(token, created=True)  # This fixture just exclusively created the file.
         if os.name == 'nt':
             self.assertEqual(subprocess.run(['icacls', str(token), '/grant', '*S-1-1-0:R'], capture_output=True).returncode, 0)
         else:
@@ -65,6 +70,7 @@ class PackagingTests(unittest.TestCase):
         winner = 'synthetic-other-writer-' + 'z' * 40
         def race(src, dest):
             Path(dest).write_text(winner)
+            first._private_path(dest, created=True)  # Simulate the other writer's private publication.
             raise FileExistsError('synthetic publication race')
         with patch.object(first.os, 'link', side_effect=race):
             self.assertEqual(first.ensure_private_token(path), (winner, False))
@@ -73,8 +79,10 @@ class PackagingTests(unittest.TestCase):
 
     def test_file_token_is_refreshed_without_environment_pollution(self):
         config = self.data / 'config.toml'
+        first.private_directory(self.data)
         config.write_text((WINDOWS / 'default.toml').read_text())
         token = self.data / 'api-token.txt'
+        first.ensure_private_token(token)
         token.write_text('synthetic-before-' + 'x' * 40)
         ctl = controller.Controller(self.data, None)
         ctl.config = config
@@ -87,6 +95,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_inherited_token_remains_authoritative(self):
         config = self.data / 'config.toml'
+        first.private_directory(self.data)
         config.write_text((WINDOWS / 'default.toml').read_text())
         ctl = controller.Controller(self.data, None)
         ctl.config = config
@@ -131,9 +140,63 @@ class PackagingTests(unittest.TestCase):
             worker.stop()
         close.assert_called_once()
 
+    def test_only_exclusively_created_directories_get_new_path_authority(self):
+        with patch.object(first, '_private_path', return_value=True) as protect:
+            first.private_directory(self.data)
+            self.assertTrue(protect.call_args.kwargs['created'])
+            first.private_directory(self.data)
+            self.assertFalse(protect.call_args.kwargs['created'])
+
+    def test_default_group_owner_is_normalized_only_for_a_proven_new_path(self):
+        token = self.data / 'api-token.txt'
+        first.ensure_private_token(token)
+        user, _ = native._identity()
+        real_security = native._security
+        adv, _ = native._api()
+        for owner, new, allowed in [('S-1-5-32-544', False, False),
+                                    ('S-1-5-18', True, False),
+                                    ('S-1-5-32-544', True, True)]:
+            calls = 0
+            @contextmanager
+            def snapshot(path):
+                nonlocal calls
+                calls += 1
+                with real_security(path) as (actual, descriptor, dacl):
+                    yield (owner if calls == 1 else actual), descriptor, dacl
+            with self.subTest(owner=owner, new=new), patch.object(native, '_identity', return_value=(user, 'S-1-5-32-544')), \
+                 patch.object(native, '_security', side_effect=snapshot), \
+                 patch.object(adv, 'SetNamedSecurityInfoW', wraps=adv.SetNamedSecurityInfoW) as write:
+                if allowed:
+                    self.assertTrue(native.protect_path(token, new=True))
+                    self.assertTrue(write.call_args.args[2] & native.OWNER_SECURITY_INFORMATION)
+                else:
+                    with self.assertRaises(native.PrivateStorageError) as error:
+                        native.protect_path(token, new=new)
+                    self.assertEqual(error.exception.reason, 'owner-mismatch')
+                    write.assert_not_called()
+
+    def test_existing_foreign_owned_secret_is_never_read_or_changed(self):
+        token = self.data / 'api-token.txt'
+        first.ensure_private_token(token)
+        before = token.read_bytes()
+        real_security = native._security
+        @contextmanager
+        def snapshot(path):
+            with real_security(path) as (owner, descriptor, dacl):
+                yield ('S-1-5-32-544' if Path(path) == token else owner), descriptor, dacl
+        with patch.object(native, '_security', side_effect=snapshot), patch.object(Path, 'read_text', side_effect=AssertionError('secret read before owner check')):
+            with self.assertRaises(SystemExit): first.ensure_private_token(token)
+        self.assertEqual(token.read_bytes(), before)
+
+    def test_readback_failure_aborts_before_token_publication(self):
+        with patch.object(native, '_assert_private', side_effect=native.PrivateStorageError(0, 'synthetic-readback')):
+            with self.assertRaises(SystemExit): first.ensure_private_token(self.data / 'api-token.txt')
+        self.assertFalse((self.data / 'api-token.txt').exists())
+        self.assertFalse(list(self.data.glob('.api-token-*')))
+
     def test_uninstall_list_preserves_unrelated_files_and_data(self):
         payload = self.data / 'payload'
-        payload.mkdir()
+        payload.mkdir(parents=True)
         (payload / 'dendrite.exe').write_bytes(b'synthetic')
         (payload / 'licenses').mkdir()
         (payload / 'licenses/LICENSE.txt').write_text('synthetic license')
@@ -159,7 +222,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_cpython_license_is_byte_exact_and_required(self):
         home = self.data / 'python'
-        home.mkdir()
+        home.mkdir(parents=True)
         source = home / 'LICENSE.txt'
         source.write_bytes(b'synthetic CPython notice\r\n')
         build.copy_python_license(home, self.data)
