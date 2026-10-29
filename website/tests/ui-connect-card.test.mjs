@@ -221,8 +221,13 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
     await mob.clickTab('compute');
     const mobHtml = mob.el('connect-card').innerHTML;
     assert.ok(textOf(mobHtml).includes('Open AIPSTER on the computer you want to connect'), JSON.stringify(opts));
-    assert.ok(nodesOf(mobHtml).some((n) => n.tagName === 'select'), 'picker stays available');
-    assert.deepEqual(nodesOf(mobHtml).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [], 'no install action before an explicit pick');
+    const mobNodes = nodesOf(mobHtml);
+    assert.ok(mobNodes.some((n) => n.tagName === 'select'), 'picker stays available');
+    const picked = mobNodes.filter((n) => n.tagName === 'option' && n.attrs.some((x) => x.name === 'selected'));
+    assert.deepEqual(picked.map((o) => attr(o, 'value')), [''], 'placeholder preselected so any pick fires');
+    assert.ok(textOf(mobHtml).includes('Pick a target computer above'), 'primary gated too');
+    assert.ok(textOf(mobHtml).includes('Pick a target computer to check installer availability.'));
+    assert.deepEqual(mobNodes.filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [], 'no install action before an explicit pick');
     await mob.press('copy-agent');
     assert.deepEqual(mob.captured, [], 'fabricated copy on an unpicked phone writes nothing');
   }

@@ -341,8 +341,9 @@ function paintConnectCard() {
   const focusAction = active && active.dataset ? active.dataset.action || null : null;
   const L = WORKER_LINKS;
   const meta = OS_META[connect.os];
-  const options = ['windows', 'macos', 'linux'].map((k) =>
-    `<option value="${k}"${k === connect.os ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
+  const unpickedMobile = connect.detected === 'mobile' && !connect.picked;
+  const options = (unpickedMobile ? '<option value="" selected>Choose a computer…</option>' : '') + ['windows', 'macos', 'linux'].map((k) =>
+    `<option value="${k}"${k === connect.os && !unpickedMobile ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
   const detectedNote = connect.detected === 'mobile'
     ? MOBILE_NOTE + (connect.picked ? ` You picked ${esc(meta.label)} as the target computer.` : '')
     : connect.detected
@@ -350,16 +351,20 @@ function paintConnectCard() {
       : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
   const inst = INSTALLERS[connect.os];
   const usable = installerUsable(inst);
-  const primary = usable
-    ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
-    : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
-  const secondary = connect.detected === 'mobile' && !connect.picked ? ''
+  const primary = unpickedMobile
+    ? '<button type="button" class="btn" disabled>Pick a target computer above</button>'
+    : usable
+      ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
+      : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
+  const secondary = unpickedMobile ? ''
     : meta.agentQualified
       ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
       : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
-  const installerLine = usable
-    ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
-    : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
+  const installerLine = unpickedMobile
+    ? '<p class="muted">Pick a target computer to check installer availability.</p>'
+    : usable
+      ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
+      : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
   let status = '';
   if (connect.phase === 'platforms') {
     status = `<p class="notice" role="status"><strong>Supported platforms:</strong> Windows x64 — tested (mock check only). macOS and Linux are not qualified, so agent setup is offered for Windows only. See Advanced for the pinned manual steps.</p>`;
