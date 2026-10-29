@@ -18,7 +18,7 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Round-10 verified W3 head: pairing client with exclusive node-id, honest unpair, and local token auth.
-const WORKER_COMMIT = 'c6c8394770037ba756a0227c06772de91f03136e';
+const WORKER_COMMIT = '3092039327a6fbef0c03a901605385339c34de96';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = 'bf0d485495c6a0a5a7ea72fc2b4e1a0b4c62d933';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
