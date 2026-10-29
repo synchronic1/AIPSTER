@@ -33,7 +33,7 @@ earlier source commits are historical and must not identify this repair.
 
 ## Review and repair
 
-Current Muse PR32 head `f73a3e7ae25c1f2fdcebc4af5578938b794fe218`
+Current Muse PR32 head `22d4d31c0cd18c1090b61c8c22503519e165cb7b`
 is preserved as an ancestor. Its file-token rotation, multi-address port
 resolver, IPv6 URL helper, expanded qualification and CI review-artifact
 workflow are retained. The repair adds fail-closed process-SID private
@@ -118,3 +118,12 @@ installed=True/install removed=True/data preserved=True. This is attributed
 historical evidence, not a new visual review of the native repaired build.
 Actual tray/menu pixels, desktop opt-out and the checked removal box still
 need owner review. No screenshot driver was run on the current desktop.
+
+
+Muse22d4d31 adds attributed later evidence: full-profile run40936747728
+again passed with the earlier restricted-ACL-context exception; it does not
+qualify this stricter native storage implementation. Its screenshots artifact
+40936747728 reportedly shows the populated Start Menu folder containing
+AIPSTER Worker and Uninstall rather than the prior spinner. Earlier wizard,
+console and uninstall preservation observations remain historical evidence.
+No runtime/build/test source changed between f73a3e7 and22d4d31.
