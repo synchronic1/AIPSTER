@@ -1169,8 +1169,9 @@ def uninstall_failure_matrix(setup, env, work, created, procs):
     check("retry unregisters", not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
           and not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
 
-    # Denied deletion: an explicit DELETE deny on one payload file for this
-    # user behaves like a lock; removing the deny makes the retry succeed.
+    # Denied deletion: Windows lets "delete child" on the parent override a
+    # file's own DELETE deny, so the fixture denies both (file D, parent DC)
+    # for this user. Removing both denies makes the retry succeed.
     install5 = work / "app5"
     proc = run_silent([str(setup), "/S", f"/D={install5}"], env)
     check("denied-deletion install exits 0", proc.returncode == 0, proc.stderr[-500:])
@@ -1178,13 +1179,17 @@ def uninstall_failure_matrix(setup, env, work, created, procs):
     denied = next(p for p in sorted(install5.rglob("*.dll")))
     user = os.environ.get("USERNAME", "")
     deny = subprocess.run(["icacls", str(denied), "/deny", f"{user}:(D)"], capture_output=True, text=True)
-    check("fixture deny ACL applied", deny.returncode == 0, deny.stdout[-300:] + deny.stderr[-300:])
+    deny_parent = subprocess.run(["icacls", str(denied.parent), "/deny", f"{user}:(DC)"],
+                                 capture_output=True, text=True)
+    check("fixture deny ACLs applied", deny.returncode == 0 and deny_parent.returncode == 0,
+          deny.stdout[-300:] + deny.stderr[-300:] + deny_parent.stdout[-300:] + deny_parent.stderr[-300:])
     try:
         proc = sync_uninstall(install5)
         check("denied-deletion uninstall exits 2", proc.returncode == 2, str(proc.returncode))
         check("denied file survives", denied.exists())
         check("denied-deletion keeps working registration", registered_to(install5))
     finally:
+        subprocess.run(["icacls", str(denied.parent), "/remove:d", user], capture_output=True)
         subprocess.run(["icacls", str(denied), "/remove:d", user], capture_output=True)
     proc = sync_uninstall(install5)
     check("retry after deny removed exits 0", proc.returncode == 0, str(proc.returncode))
