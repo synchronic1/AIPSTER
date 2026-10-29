@@ -8,19 +8,22 @@ new paths have owner and token-default-owner S-1-5-32-544, distinct from its
 user SID; the old strict helper rejected them before writing any token.
 The native helper normalizes only exclusively created paths, retains
 existing-foreign-owner denial, verifies the exact protected user-only DACL
-and avoids the measured 23-35s PowerShell startup cost. All16 source tests
-pass locally in0.209s. Lead independent review passed5 additional native
-cases and4 retained installer cases. New frozen build/elevated CI evidence
-is pending; the artifact below belongs to the preceding source.
+and avoids the measured 23-35s PowerShell startup cost. All17 source tests
+pass locally in0.343s, including windowed log bootstrap before data use.
+Lead independent review passed5 additional native cases and4 retained
+installer cases. Elevated CI run40938858027/job123676553779 passed all17
+tests in0.526s, clean frozen build, strict full-profile qualification with
+0 failures, screenshots and artifact upload. Both native token-ACL assertions
+pass without a restricted-context exception.
 
-## Earlier repaired artifact (local, unsigned, unpublished)
+## Current native repaired artifact (local, unsigned, unpublished)
 
 | Field | Value |
 |---|---|
 | Artifact | `AIPSTER-Worker-0.1.0-win64-setup.exe` |
-| Size | 13,083,766 bytes |
-| SHA-256 | `ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7` |
-| Built from | `a2ec5e1938436e48de091548aa37f151cf8109e4`, clean tree (`source_dirty=false`) |
+| Size | 13,087,550 bytes |
+| SHA-256 | `81f60828bcc89f038f7a0ded16db76bb06f0c64c42942fa9c52b24cb7f503688` |
+| Built from | `cee3390bda28ac70ee75f6e432fd633e4f76a9f0`, clean tree (`source_dirty=false`) |
 | Payload | 98 files; complete hashes in generated `dist/manifest.json` |
 | Worker | ganglion-dendrite 0.1.0; original vendor tree and patches verified unchanged |
 | Toolchain | CPython 3.12.14, uv 0.12.12, NSIS 3.13, PyInstaller 6.22.3 |
@@ -50,7 +53,7 @@ supervises local worker state only; default runtime remains simulated.
 
 - Clean pinned build, vendor/patch verification, hash-locked dependency
   installation and dependency consistency checks: PASS.
-- 12 controlled packaging regressions: PASS, also gated by `build.py`.
+- 17 controlled packaging regressions: PASS, also gated by `build.py`.
 - 5 independent review fixtures: original ffbe 5 failures; current Muse801
   3 failures and 2 passes; repaired candidate 5 passes.
 - Frozen CLI help, simulated inspect, and tray help/status under temporary
@@ -67,18 +70,31 @@ supervises local worker state only; default runtime remains simulated.
   failed existing-token hardening, escaped exact payload plans and mandatory
   verbatim interpreter notice. No additional source blocker was found.
 
-This report is a documentation-only follow-up to the clean a2ec5e1 artifact
-build. Its eventual documentation commit is not the source SHA embedded in
-that artifact. Runtime and build/test source are unchanged by this report.
+This report is a documentation-only follow-up to the clean cee3390 artifact
+build. The subsequent c287a33 merge preserved the latest Muse22d4d31 report
+history and changed no runtime/build/test source. The documentation commit
+is not the source SHA embedded in this artifact.
 
-## External qualification remains HOLD
+## Remaining external qualification
 
-Full install/uninstall, HKCU/shortcuts/autostart, wizard consent paths,
-actual tray/menu pixels and strict parent-death job confinement must be
-qualified on fresh CI/owner Windows environments. No installer or uninstaller
-was run against the current user profile. Headless mock behavior does not
-replace these external checks. Signing is still absent; macOS/Linux remain
-unavailable; no installer release or download link is published.
+Full install/uninstall, HKCU/shortcuts/autostart, preservation of unrelated
+install-directory files, explicit default-data removal and native private
+storage now pass on the fresh elevated CI runner. Screenshots captured the
+wizard/console/uninstall flows; logs report installed=True,
+install removed=True and data preserved=True. This records capture, not a
+new human visual review. CI explicitly skips desktop opt-out UI, strict
+parent-death kill when job confinement is unavailable, and the data-removal
+checkbox UI (the scripted removal path passes). Actual tray/menu pixels,
+the remaining UI paths and strict parent-death confinement still require
+owner qualification before release/installer availability. No installer or
+uninstaller was run against the current user profile. Signing is absent;
+macOS/Linux remain unavailable; no installer release or download is published.
+
+CI built its temporary merge commit76443dd51364618a16ff321baaae061a3ad03302
+with source_dirty=false and artifact SHA-256
+44d5bb854cd52b9dcb00c5897b7779adc728b24b063fb5377fed8287d0128566.
+That CI build is distinct from the local cee3390 artifact listed above;
+neither checksum should be substituted for a future merge-commit release.
 
 The original ffbe CI build succeeded, but qualification run40929040335 failed
 two token ACL checks. Latest Muse801's attempt to classify failed ACL
@@ -87,6 +103,12 @@ verification: inability to establish private token storage is terminal.
 That old run is not evidence of passing repaired full-profile CI.
 
 ## Historical owner artifacts
+
+The preceding PowerShell-based repaired a2ec5e1 artifact had98files,
+13,083,766bytes andSHA-256
+`ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7`.
+It passed local unprivileged verification but its strict ownership handling
+failed elevated CI. It is superseded by the native artifact above.
 
 The earlier owner artifact from d689d2e was 13,073,826 bytes with SHA-256
 `b7e2b27668d3b659114dee11da442acccdac51fcd291aa9fb5682e7181b611fe`.
