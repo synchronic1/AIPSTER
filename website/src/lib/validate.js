@@ -61,7 +61,7 @@ export function parseJson(text, maxFields = 40) {
 
 export const isId = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v);
 export const isName = (v, max = 80) => typeof v === 'string' && v.trim().length >= 1 && v.length <= max;
-export const isScope = (v) => v === 'read' || v === 'inference';
+export const isScope = (v) => v === 'read' || v === 'inference' || v === 'heartbeat';
 export const isEmail = (v) => typeof v === 'string' && v.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 
 export function pagination(url) {

@@ -6,9 +6,11 @@
 // `nodeStatus` (connected flag + staleAfterMs window -> online|stale|offline)
 // and contracts.ts `FabricState`/`FabricNode` summary shapes, inspected at
 // upstream SHA f5223d39a4346a3fb2726be5e9b0f007861c9f0c. AIPSTER differs
-// deliberately: there is no heartbeat writer yet, so a fourth `unknown` arm
-// covers "flag says online but no telemetry exists", and this module never
-// reports readiness for execution. AIPSTER base 7b38ba071d6a6f1520140486835f9d6a01adafab.
+// deliberately: the owner-confined heartbeat writer (POST
+// /api/resources/:id/heartbeat, docs/heartbeat-intake.md) proves reachability
+// only, never inference acceptance, so a fourth `unknown` arm covers "flag
+// says online but no telemetry exists", and this module never reports
+// readiness for execution. AIPSTER base 7b38ba071d6a6f1520140486835f9d6a01adafab.
 //
 // Server enforcement lives in the worker route: owner-scoped SELECT of the
 // minimal columns below plus a same-side shared-grant count. This module only
@@ -25,6 +27,7 @@
  * @property {AipsterLiveness} liveness
  * @property {string|null} lastSeenAt
  * @property {number|null} lastSeenAgeMs
+ * @property {boolean|null} usable
  * @property {boolean} demoFixture
  */
 /**
@@ -41,8 +44,10 @@
  * @property {StatusItem[]} items
  */
 
-// Wider than the upstream 30s LAN-fabric window: AIPSTER heartbeats (when a
-// writer exists) will be sparse owner-pushed updates, not a <=10s socket.
+// Wider than the upstream 30s LAN-fabric window: AIPSTER heartbeats are sparse
+// owner-pushed updates through POST /api/resources/:id/heartbeat, not a
+// <=10s socket. Offline/stale derivation stays here; the intake endpoint
+// only ever writes heartbeat_at/online/usable and never redefines this rule.
 export const STALE_AFTER_MS = 5 * 60 * 1000;
 export const MAX_STATUS_ITEMS = 50;
 
@@ -67,13 +72,16 @@ export function parseStatusRow(row) {
     kind: row.kind,
     online: Number(row.online) === 1,
     heartbeatAt: heartbeat,
+    usable: row.usable === null || row.usable === undefined ? null : Number(row.usable) === 1,
   };
 }
 
 /**
- * Derive liveness for one trusted row. No heartbeat writer exists yet, so any
- * row whose flag claims online without parseable telemetry reports `unknown`,
- * never `online`: absence of evidence must not render as readiness.
+ * Derive liveness for one trusted row. Any row whose flag claims online
+ * without parseable telemetry reports `unknown`, never `online`: absence of
+ * evidence must not render as readiness. Liveness derives from heartbeat_at
+ * freshness only; the writer's usable bit (reachability vs inference
+ * acceptance, docs/heartbeat-intake.md) never promotes a row to `online`.
  */
 export function resourceLiveness(trusted, nowMs) {
   if (!trusted.online) return 'offline';
@@ -139,6 +147,7 @@ export function buildStatus({ rows, summary, total, sharedWithMe, demo, nowMs })
       liveness,
       lastSeenAt: (liveness === 'online' || liveness === 'stale') ? trusted.heartbeatAt : null,
       lastSeenAgeMs: ageMs(trusted, liveness, now),
+      usable: trusted.usable,
       demoFixture: demo === true,
     });
   }
