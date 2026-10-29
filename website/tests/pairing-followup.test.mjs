@@ -96,3 +96,21 @@ for (const real of [false, true]) {
     assert.equal((await claim(t, old.code.code)).status, 404); assert.deepEqual(await state(t), replacement);
   });
 }
+
+for (const real of [false, true]) for (const replacement of [false, true]) {
+  test(`${real ? 'local D1' : 'sqlite'}: teardown during a held reclaim fences the old consent${replacement ? ' after a fresh replacement' : ''}`, async c => {
+    const t = await pairingEnv(c, real), old = await paired(t), db = t.DB;
+    let fired = false, afterTeardown;
+    t.env.DB = hookDb(db, { beforeBatch: async stmts => {
+      if (!fired && isClaim(stmts)) {
+        fired = true;
+        assert.equal((await remove(t, old.resourceId)).status, 200);
+        if (replacement) { const fresh = await paired(t); assert.notEqual(fresh.resourceId, old.resourceId); }
+        afterTeardown = await state(t);
+      }
+    } });
+    const out = await claim(t, old.code.code);
+    assert.ok(fired); assert.equal(out.status, 404); assert.equal(out.json.code, 'PAIRING_INVALID');
+    assert.deepEqual(await state(t), afterTeardown, 'the delayed transaction cannot revive a resource or rotate a replacement key');
+  });
+}

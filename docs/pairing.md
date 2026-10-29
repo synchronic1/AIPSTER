@@ -227,8 +227,8 @@ instructions. Clearing a code invalidates pending mint work; it does not revoke
 an already minted code, which remains subject to server expiry and limits.
 ## Current source reconciliation
 
-The integrated candidate preserves the ancestry of Muse W2 round 5
-(`8d6d174`). Its deleted-code and interrupted-claim findings are covered by
+The integrated candidate preserves the ancestry of Muse W2 round 6
+(`2162187`). Its deleted-code and interrupted-claim findings are covered by
 SQLite and native local D1 regressions. The atomic claim transaction commits
 consumption, resource, key, binding, budget and audit together; it cannot
 create a new consumption-only crash state. A spent code with a NULL binding
@@ -238,3 +238,5 @@ existing node without duplication. We deliberately do not import the
 alternative `claim_json` reconstruction or its `invalidated_at` migration:
 those fields serve the superseded multi-transaction claim path. Fresh
 consent also covers older NULL records with no trustworthy snapshot.
+
+The round-6 mid-flight teardown case is additionally exercised before the native claim batch, both with and without a fresh replacement resource. The rejected delayed transaction leaves the complete post-teardown resource/key/code/budget/audit snapshot unchanged.

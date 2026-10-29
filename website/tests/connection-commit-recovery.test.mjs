@@ -166,7 +166,7 @@ for(const real of [false,true]){
  test(`${engine}: zero-effect old commit cannot finalize over newer uncertainty; fresh consent recovers safely`,async c=>{
   const t=await fixture(c,real),a=hold(t.db,/INSERT INTO fabric_grants/);c.after(a.release);
   const original=route(t,{db:a.db});await a.ready;await expire(t);assert.equal((await route(t)).status,503);await assertPending(t);
-  await t.db.prepare("UPDATE resources SET incarnation='after-claim-generation' WHERE id='r_gpu1'").run();a.release();assert.equal((await original).status,412);
+  await t.db.prepare("UPDATE resources SET incarnation='after-claim-generation' WHERE id='r_gpu1'").run();a.release();assert.equal((await original).status,503);await assertPending(t);
   const before=await snapshot(t);for(let i=0;i<3;i++){assert.equal((await route(t)).status,503);await assertPending(t)}assert.deepEqual(await snapshot(t),before);
   const input=await t.approval(75),fresh=await route(t,{input,key:'fresh-consent-after-zero'});assert.equal(fresh.status,201);
   assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first()).n,0);
@@ -188,16 +188,16 @@ for(const real of [false,true]){
   if(boundary==='zero-effect'){
    const zero=faultOnce(t.db,/INSERT INTO fabric_grants/,'before',true,async()=>{await t.db.prepare("UPDATE resources SET incarnation='changed-generation' WHERE id='r_gpu1'").run()});first=await route(t,{db:zero});
   }
-  assert.equal(first.status,boundary==='zero-effect'?412:500);const before=await snapshot(t);
+  assert.equal(first.status,boundary==='zero-effect'?503:500);const before=await snapshot(t);
   const applied=before.fabric_grants.filter(g=>g.approval_id===t.input.approvalId);
   assert.equal(applied.length,boundary==='lost-result'?1:0);
   if(boundary==='lost-result'){
    await core.revokeGrant(t.db,t.alice,applied[0].id,{expectedVersion:1});const revoked=await t.db.prepare('SELECT * FROM fabric_grants WHERE id=?').bind(applied[0].id).first();
    const retry=await route(t);assert.equal(retry.status,200);assert.equal(retry.body.id,applied[0].id);assert.deepEqual(await t.db.prepare('SELECT * FROM fabric_grants WHERE id=?').bind(applied[0].id).first(),revoked);
   }else{
-   // A terminal zero-effect result may already be known to this router
-   // attempt; legacy spent claims with unknown SQL outcomes remain503.
-   for(let i=0;i<3;i++){const retry=await route(t);assert.equal(retry.status,boundary==='zero-effect'?412:503)}
+   // The direct effect's observed zero rows are not a durable failure
+   // witness for the shared ledger; a spent claim remains uncertain.
+   for(let i=0;i<3;i++){const retry=await route(t);assert.equal(retry.status,503);await assertPending(t)}
    assert.deepEqual(await snapshot(t),before);
    const freshInput=await t.approval(75);assert.equal((await route(t,{input:freshInput,key:'fresh-approved-commit'})).status,201);
   }
@@ -218,7 +218,7 @@ for(const real of [false,true]){
   });
   const takeover=await route(t,{db:b});assert.equal(takeover.status,503);assert.equal(takeover.body.code,'COMMIT_UNCERTAIN');await assertPending(t);
   const foreign=await core.commitGrant(t.db,t.alice,t.input,{key:'different-operation',path:t.path});assert.equal(foreign.status,409);assert.equal(foreign.body.code,'APPROVAL_CONSUMED');
-  a.release();assert.equal((await original).status,boundary==='expiry'?201:boundary==='connection-state'?409:412);
+  a.release();assert.equal((await original).status,boundary==='expiry'?201:503);
   const applied=await t.db.prepare('SELECT * FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first();
   if(boundary==='expiry'){
    assert.ok(applied);await core.revokeGrant(t.db,t.alice,applied.id,{expectedVersion:1});const before=await snapshot(t);
@@ -245,5 +245,77 @@ for(const real of [false,true]){
   const denied=await route(t,{db:watched});assert.equal(denied.status,status);assert.equal(denied.body.id,undefined);assert.equal(auditWrites,0);await assertPending(t);
   const before=await snapshot(t);await t.db.prepare(`UPDATE "user" SET ${field}=0 WHERE id=?`).bind(t.alice.user.id).run();
   const replay=await route(t);assert.equal(replay.status,200);assert.equal(replay.body.id,applied.id);assert.deepEqual(await snapshot(t),before);
+ });
+ for(const mcp of [false,true])for(const order of ['failure-first','claim-first','effect-first'])test(`${engine}: ${mcp?'MCP':'REST'} terminal ledger and delayed commit ${order} serialize without a false outcome`,async c=>{
+  const t=await fixture(c,real),a=hold(t.db,/INSERT INTO fabric_grants/);c.after(a.release);
+  let entered,releaseClaim;const claimReady=new Promise(r=>entered=r),claimGate=new Promise(r=>releaseClaim=r);c.after(releaseClaim);
+  const held=faultOnce(a.db,/UPDATE approvals SET consumed_at/,'before',false,async()=>{entered();await claimGate});
+  const original=route(t,{db:held,mcp});await claimReady;
+  const before=await snapshot(t),generation=(await t.db.prepare('SELECT grant_gen FROM connections WHERE id=?').bind(t.conn).first()).grant_gen;
+  const budgets=(await t.db.prepare('SELECT * FROM write_budget ORDER BY rowid').all()).results;
+  const admissions=(await t.db.prepare('SELECT * FROM fabric_operation_admissions ORDER BY rowid').all()).results;
+  await expire(t);c.mock.timers.tick(61*60e3);let winner,revoked;
+  const db=order==='failure-first'?t.db:faultOnce(t.db,/UPDATE idempotency_records SET status = \?, response_code/,'before',false,async()=>{
+   // The store has already read "no claim" in its precondition catch. The
+   // SQL finalizer must itself observe this now-winning claim.
+   releaseClaim();await a.ready;
+   if(order==='effect-first'){
+    a.release();winner=await original;assert.equal(winner.status,201);
+    const grant=await t.db.prepare('SELECT id FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first();
+    await core.revokeGrant(t.db,t.alice,grant.id,{expectedVersion:1});revoked=await snapshot(t);
+   }
+  });
+  const takeover=await route(t,{db,mcp});
+  if(order==='failure-first'){
+   assert.equal(takeover.status,410);assert.equal(takeover.body.code,'APPROVAL_EXPIRED');assert.equal((await ledger(t)).response_code,410);
+   // Terminal records do not expire/re-admit. Even a much later delayed
+   // SQL claim using its old timestamp must remain fenced.
+   c.mock.timers.tick(24*60*60e3);releaseClaim();const old=await original;assert.equal(old.status,503);
+   assert.equal((await t.db.prepare('SELECT consumed_at FROM approvals WHERE id=?').bind(t.input.approvalId).first()).consumed_at,null);
+   assert.deepEqual(await snapshot(t),before);assert.equal((await t.db.prepare('SELECT grant_gen FROM connections WHERE id=?').bind(t.conn).first()).grant_gen,generation);
+   for(let i=0;i<3;i++){const replay=await route(t,{mcp});assert.equal(replay.status,410);assert.equal(replay.body.id,undefined)}
+  }else{
+   assert.equal(takeover.status,503);assert.equal(takeover.body.code,'COMMIT_UNCERTAIN');await assertPending(t);
+   if(order==='claim-first'){a.release();winner=await original;assert.equal(winner.status,201)}
+   const grant=await t.db.prepare('SELECT * FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first();assert.ok(grant);
+   assert.equal((await t.db.prepare("SELECT count(*) n FROM audit WHERE action='fabric.grant.commit' AND target=?").bind(grant.id).first()).n,1);
+   if(!revoked){await core.revokeGrant(t.db,t.alice,grant.id,{expectedVersion:1});revoked=await snapshot(t)}
+   for(let i=0;i<3;i++){const replay=await route(t,{mcp});assert.equal(replay.status,200);assert.equal((mcp?replay.body.result:replay.body).id,grant.id)}
+   assert.equal((await ledger(t)).response_code,200);assert.deepEqual(await snapshot(t),revoked);
+  }
+  assert.deepEqual((await t.db.prepare('SELECT * FROM write_budget ORDER BY rowid').all()).results,budgets);
+  assert.deepEqual((await t.db.prepare('SELECT * FROM fabric_operation_admissions ORDER BY rowid').all()).results,admissions);
+  assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first()).n,order==='failure-first'?0:1);
+ });
+ test(`${engine}: stable direct commit without router attempt cannot bypass a terminal failure fence`,async c=>{
+  const t=await fixture(c,real);let entered,release;const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);c.after(release);
+  const held=faultOnce(t.db,/UPDATE approvals SET consumed_at/,'before',false,async()=>{entered();await gate});
+  const original=core.commitGrant(held,t.alice,t.input,{key:t.key,path:t.path});await ready;c.mock.timers.tick(61*60e3);
+  const before=await snapshot(t),denied=await route(t);assert.equal(denied.status,410);release();assert.equal((await original).status,409);
+  assert.deepEqual(await snapshot(t),before);assert.equal((await ledger(t)).response_code,410);
+ });
+ test(`${engine}: legacy finalizer without an attempt cannot cache failure over a winning claim`,async c=>{
+  const t=await fixture(c,real),a=hold(t.db,/INSERT INTO fabric_grants/);c.after(a.release);let entered,release;const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);c.after(release);
+  const held=faultOnce(a.db,/UPDATE approvals SET consumed_at/,'before',false,async()=>{entered();await gate});
+  const original=route(t,{db:held});await ready;
+  const db=faultOnce(t.db,/UPDATE idempotency_records SET status = \?, response_code/,'before',false,async()=>{release();await a.ready});
+  const pending=await core.storeIdempotency(db,t.alice,t.key,410,{error:'Approval expired.',code:'APPROVAL_EXPIRED'});assert.equal(pending.status,503);await assertPending(t);
+  a.release();assert.equal((await original).status,201);const retry=await route(t);assert.equal(retry.status,200);assert.equal((await ledger(t)).response_code,200);
+ });
+ for(const mcp of [false,true])for(const phase of ['before','after'])test(`${engine}: ${mcp?'MCP':'REST'} ${phase} terminal-fence SQL failure reports uncertainty and preserves one outcome`,async c=>{
+  const t=await fixture(c,real);let entered,release;const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);c.after(release);
+  const held=faultOnce(t.db,/UPDATE approvals SET consumed_at/,'before',false,async()=>{entered();await gate});
+  const original=route(t,{db:held,mcp});await ready;const before=await snapshot(t);
+  await expire(t);c.mock.timers.tick(61*60e3);
+  const failed=faultOnce(t.db,/UPDATE idempotency_records SET status = \?, response_code/,phase);
+  const takeover=await route(t,{db:failed,mcp});release();const old=await original;
+  assert.equal(takeover.status,503);assert.equal(takeover.body.code,'COMMIT_UNCERTAIN');
+  const grant=await t.db.prepare('SELECT id FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first();
+  if(phase==='before'){
+   assert.equal(old.status,201);assert.ok(grant);await core.revokeGrant(t.db,t.alice,grant.id,{expectedVersion:1});const revoked=await snapshot(t);
+   const replay=await route(t,{mcp});assert.equal(replay.status,200);assert.equal((mcp?replay.body.result:replay.body).id,grant.id);assert.deepEqual(await snapshot(t),revoked);assert.equal((await ledger(t)).response_code,200);
+  }else{
+   assert.equal(old.status,503);assert.equal(grant,null);assert.deepEqual(await snapshot(t),before);assert.equal((await route(t,{mcp})).status,410);assert.equal((await ledger(t)).response_code,410);
+  }
  });
 }

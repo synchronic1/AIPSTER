@@ -7,6 +7,7 @@ import { readJson } from '../lib/validate.js';
 import { digestJson } from './canonical.mjs';
 import * as S from './store.mjs';
 import { restrictionOf } from './admission.mjs';
+import { isCommitFailure, pendingCommit } from './operations.mjs';
 
 export function federationEnabled(env) {
   return !!env && env.FEDERATION_ENABLED === '1';
@@ -45,6 +46,19 @@ function sendErr(ctx, e) {
 
 // Mutations require an Idempotency-Key; safe replays return the recorded
 // response instead of re-executing. bodyHash binds the key to one request.
+async function finalizeMutation(ctx, actor, key, status, body, op) {
+  try {
+    return await S.storeIdempotency(ctx.db, actor, key, status, body, op.attempt);
+  } catch (e) {
+    // A commit denial is terminal only if its SQL fence is durable. Failed
+    // writes or lost responses leave the old claim's outcome unknown too.
+    // Preserve closed-owner401/403 and all other operations' error handling.
+    if (!isCommitFailure(op.path, status)) throw e;
+    try { await S.releaseIdempotency(ctx.db, actor, key, op.attempt); } catch { /* binding remains retained */ }
+    return pendingCommit();
+  }
+}
+
 async function mutate(ctx, fn) {
   const { request, url, db } = ctx;
   let body;
@@ -70,14 +84,18 @@ async function mutate(ctx, fn) {
     const status = Number(e && e.status) || 500;
     if (status < 500) {
       const failure = { error: (e && e.message) || 'Request failed.', code: (e && e.code) || 'INTERNAL' };
-      try { await S.storeIdempotency(db, factor, key, status, failure, op.attempt); } catch { /* fall through to error */ }
+      try {
+        const pending = await finalizeMutation(ctx, factor, key, status, failure, op);
+        if (pending) return ctx.json(pending.status, pending.body);
+      } catch { /* fall through to error */ }
       return ctx.json(status, failure);
     }
     try { await S.releaseIdempotency(db, factor, key, op.attempt); } catch { /* fall through to error */ }
     return sendErr(ctx, e);
   }
   try {
-    await S.storeIdempotency(db, factor, key, out.status, out.body, op.attempt);
+    const pending = await finalizeMutation(ctx, factor, key, out.status, out.body, op);
+    if (pending) return ctx.json(pending.status, pending.body);
   } catch (e) { return sendErr(ctx, e); }
   return send(ctx, out);
 }
@@ -358,14 +376,18 @@ export async function handleMcp(ctx) {
     const mop = { key, path: ipath, attempt: await S.readAttempt(db, `${f.kind}:${f.user.id}`, key) };
     try {
       const out = await spec.run(db, f, params, mop);
-      await S.storeIdempotency(db, f, key, out.status, out.body, mop.attempt);
+      const pending = await finalizeMutation(ctx, f, key, out.status, out.body, mop);
+      if (pending) return ctx.json(pending.status, pending.body);
       if (out.status >= 400) return ctx.json(out.status, out.body);
       return ctx.json(out.status, { ok: true, tool, result: out.body });
     } catch (e) {
       const status = Number(e && e.status) || 500;
       if (status < 500) {
         const failure = { error: (e && e.message) || 'Request failed.', code: (e && e.code) || 'INTERNAL' };
-        try { await S.storeIdempotency(db, f, key, status, failure, mop.attempt); } catch { /* fall through */ }
+        try {
+          const pending = await finalizeMutation(ctx, f, key, status, failure, mop);
+          if (pending) return ctx.json(pending.status, pending.body);
+        } catch { /* fall through */ }
         return ctx.json(status, failure);
       }
       try { await S.releaseIdempotency(db, f, key, mop.attempt); } catch { /* fall through */ }

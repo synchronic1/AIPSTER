@@ -11,7 +11,7 @@ import { checkWriteBudget } from '../lib/quotas.js';
 import { admitFabricOperation } from './admission.mjs';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
-import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion } from './operations.mjs';
+import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion, isCommitFailure, pendingCommit } from './operations.mjs';
 import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, acceptRecoverInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
@@ -790,7 +790,8 @@ async function completeCommit(db, actor, appr, preview, op, operationId) {
     // reconcilable instead of terminalizing409 before that batch can commit.
     // Legacy spent claims whose effect never landed also stay fail-closed;
     // a fresh approved operation is required to authorize another effect.
-    throw err(503, 'COMMIT_UNCERTAIN', 'Commit outcome is not recorded; retry reconciliation or use a fresh approval.');
+    const pending = pendingCommit();
+    throw err(pending.status, pending.body.code, pending.body.error);
   }
   await auditFabric(db, actor, op, 'fabric.grant.commit', existing.id, 'reconciled');
   return { status: 200, body: { id: existing.id, note: 'Approval was already consumed for this grant.' } };
@@ -855,7 +856,11 @@ export async function commitGrant(db, actor, input = {}, op = null) {
   // The shared claim: exactly one of commit/revise/resume wins this
   // approval. Losers change nothing.
   const claimNow = nowIso();
-  if (!(await claimApproval(db, { id: appr.id, action: 'grant.commit', target: null, op: opd, now: claimNow }))) {
+  // Stable direct callers carry the same terminal fence even without a router
+  // attempt. Calls without any stable op identity are independent operations.
+  const ledger = op && typeof op.key === 'string' && op.key && typeof op.path === 'string' && op.path
+    ? { actor: `${actor.kind}:${actor.user.id}`, key: op.key, path: op.path } : null;
+  if (!(await claimApproval(db, { id: appr.id, action: 'grant.commit', target: null, op: opd, now: claimNow, ledger }))) {
     const raced = await first(db, 'SELECT id, consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', appr.id);
     const recovered = await completeCommit(db, actor, raced, preview, op, opd);
     if (recovered) return recovered;
@@ -1500,12 +1505,28 @@ export async function storeIdempotency(db, actor, key, status, body, attempt = n
   // minus one-time secret fields. Bodies derive from 64 KiB-capped
   // requests, so TEXT stays bounded.
   const redacted = JSON.stringify(redactForReplay(body));
-  if (attempt === null || attempt === undefined) {
-    await db.prepare('UPDATE idempotency_records SET status = ?, response_code = ?, response_body = ? WHERE idem_key = ? AND actor = ? AND status = ?')
-      .bind('completed', status, redacted, key, actorKey, 'processing').run();
-  } else {
-    await db.prepare('UPDATE idempotency_records SET status = ?, response_code = ?, response_body = ? WHERE idem_key = ? AND actor = ? AND status = ? AND attempt = ?')
-      .bind('completed', status, redacted, key, actorKey, 'processing', attempt).run();
+  let commitFence = '', commitArgs = [];
+  if (status >= 400 && status < 500 && status !== 401 && status !== 403) {
+    const rec = await first(db, 'SELECT path FROM idempotency_records WHERE idem_key = ? AND actor = ?', key, actorKey);
+    if (rec && isCommitFailure(rec.path, status)) {
+      const operationId = await opDigest(actor, { key, path: rec.path });
+      // Paired with the commit approval-CAS fence: failure first forbids a
+      // delayed claim; claim first forbids a terminal failure. This predicate
+      // is evaluated by SQLite/D1 inside the write, never from a stale read.
+      commitFence = ` AND NOT EXISTS(SELECT 1 FROM approvals WHERE consumed_by_op = ?
+        AND consumed_action = 'grant.commit' AND consumed_target IS NULL AND created_by = ? AND approver = ?)`;
+      commitArgs = [operationId, actor.user.id, actor.user.id];
+    }
+  }
+  const attemptArgs = attempt === null || attempt === undefined ? [] : [attempt];
+  const result = await db.prepare(`UPDATE idempotency_records SET status = ?, response_code = ?, response_body = ?
+    WHERE idem_key = ? AND actor = ? AND status = ?${attemptArgs.length ? ' AND attempt = ?' : ''}${commitFence}`)
+    .bind('completed', status, redacted, key, actorKey, 'processing', ...attemptArgs, ...commitArgs).run();
+  if (commitFence && Number(result.meta.changes) === 0) {
+    // A consumed claim or a newer attempt owns the unknown outcome. Do not
+    // cache the caller's fresh-precondition error over that pending effect.
+    await releaseIdempotency(db, actor, key, attempt);
+    return pendingCommit();
   }
 }
 

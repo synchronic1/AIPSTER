@@ -202,8 +202,8 @@ async function loadOverview() {
 // and the code is cleared on Done, tab switch, or sign-out. No verified
 // installer is downloadable yet; Windows packaging still needs release qualification, so progress stops at
 // "Setup needed" until the worker is installed and paired elsewhere.
-const WORKER_COMMIT = '15b114edc139b5eee6149de692eb65d49a51335d';
-const DOCS_COMMIT = '2184dd80487734b244ea285930ab0871ec22c51a';
+const WORKER_COMMIT = '055df699d04fe9f9ca0275da2e93ff8dccb9032c';
+const DOCS_COMMIT = '8ce77129f6565f8765345a6d8906c650dd28205c';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
