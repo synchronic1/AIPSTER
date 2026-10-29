@@ -1356,6 +1356,11 @@ export async function discoverResources(db, actor) {
 const IDEM_TTL_MS = 10 * 60e3;
 export async function checkIdempotency(db, actor, method, path, key, bodyHash, restriction = null) {
   if (!key || typeof key !== 'string' || key.length > 128) throw err(400, 'IDEMPOTENCY_REQUIRED', 'Idempotency-Key header is required for this mutation.');
+  // Existing outcomes are still owner-authenticated reads. Check current DB
+  // authority before returning a replay or taking its processing lease, not
+  // only when admitting a new operation.
+  const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+  if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
   const actorKey = `${actor.kind}:${actor.user.id}`;
   const existing = await first(db, 'SELECT * FROM idempotency_records WHERE idem_key = ? AND actor = ?', key, actorKey);
   if (!existing) {
@@ -1415,6 +1420,35 @@ export { readAttempt };
 // claimed; legacy direct callers omit it (status-only fencing).
 export async function storeIdempotency(db, actor, key, status, body, attempt = null) {
   const actorKey = `${actor.kind}:${actor.user.id}`;
+  if (status === 401 || status === 403) {
+    // Authority can change after the router gate and before store execution.
+    // Deny that caller, but never replace a proved applied outcome with its
+    // temporary authorization error. The HTTP/MCP caller keeps its 401/403;
+    // these local arguments only control durable operation bookkeeping.
+    const rec = await first(db, 'SELECT * FROM idempotency_records WHERE idem_key = ? AND actor = ?', key, actorKey);
+    if (rec && rec.status === 'processing' && (attempt === null || attempt === undefined || rec.attempt === attempt)) {
+      const operationId = await opDigest(actor, { key, path: rec.path });
+      const applied = await first(db, `SELECT response_body FROM fabric_restriction_receipts
+        WHERE operation_id = ? AND actor_id = ? AND request_hash = ?`, operationId, actor.user.id, rec.request_hash);
+      if (applied) {
+        // Status effects, exact response and audit are one transaction.
+        status = 200; body = JSON.parse(applied.response_body);
+      } else {
+        const revision = await first(db, `SELECT operation_id FROM fabric_revision_receipts
+          WHERE operation_id = ? AND actor_id = ? AND request_hash = ?`, operationId, actor.user.id, rec.request_hash);
+        const commit = !revision && await first(db, `SELECT g.id FROM approvals a JOIN fabric_grants g ON g.approval_id = a.id
+          WHERE a.consumed_by_op = ? AND a.consumed_action = 'grant.commit' AND a.consumed_target IS NULL
+          AND a.created_by = ? AND a.approver = ? AND g.exporter_id = ? AND g.connection_id = a.issued_connection`,
+          operationId, actor.user.id, actor.user.id, actor.user.id);
+        if (revision || commit) {
+          // Their forensic completion is post-commit: do not cache success
+          // before an authorized retry has repaired missing history/audit.
+          await releaseIdempotency(db, actor, key, attempt);
+          return;
+        }
+      }
+    }
+  }
   // Replays return the recorded response (4xx terminal failures included),
   // minus one-time secret fields. Bodies derive from 64 KiB-capped
   // requests, so TEXT stays bounded.
