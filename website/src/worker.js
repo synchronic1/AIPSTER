@@ -188,6 +188,7 @@ async function handleApi(request, env, url) {
         if (tablesOk) {
           await all(env.DB, 'SELECT username, displayUsername, demo, disabled FROM "user" LIMIT 0');
           await all(env.DB, 'SELECT id, "key", count, lastRequest FROM rateLimit LIMIT 0');
+          await all(env.DB, 'SELECT resource_id FROM key_verifiers LIMIT 0');
           colsOk = true;
         }
         schemaOk = tablesOk && colsOk;
