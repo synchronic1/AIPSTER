@@ -208,7 +208,7 @@ review and Peter — deliberately untouched here.
 ## Follow-ups (not in this slice)
 
 - The `grant-resource` selector, the Compute list, and the Overview
-  ready-count still render a single 50-item page — the same pre-existing
+  reachable-count still render a single 50-item page — the same pre-existing
   main-branch limit the review noted. Only the `key-resource` selector was
   moved to `allInventory()` here.
 - Production quota tuning for real sender fleets (cadence guidance: senders
