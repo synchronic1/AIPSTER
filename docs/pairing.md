@@ -126,7 +126,7 @@ pin remains standalone and must not be configured to contact AIPSTER from these 
 
 ## Test map
 
-`website/tests/pairing.test.mjs` (18 tests): mint auth/CSRF/key-denial, code
+`website/tests/pairing.test.mjs` (23 tests): mint auth/CSRF/key-denial, code
 shape/TTL/storage, demo denial, mint cap, claim happy path incl. a real beat
 with the delivered key plus inventory auto-appear, claim validation, attempt
 burn, expiry, spent-code cross-node denial + same-node reclaim with key
