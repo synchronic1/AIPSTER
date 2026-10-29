@@ -187,8 +187,8 @@ const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or
 // owner publishes the verified file.
 const INSTALLERS = {
   windows: { available: false, packaged: true, version: '0.1.0',
-    sha256: 'b7e2b27668d3b659114dee11da442acccdac51fcd291aa9fb5682e7181b611fe',
-    built_from: 'd689d2e7c1982bf843a5ec477a3be821c1948588',
+    sha256: '7f463aae8ac1e620f8794335810a0959e039e5f7d2a1f0b955f0b4613eae0e5d',
+    built_from: 'cd715b3daf4acad24e527f6946ea380fa991a1bc',
     reason: 'packaged and qualified; release upload pending' },
   macos: { available: false, reason: 'no verified installer package exists yet' },
   linux: { available: false, reason: 'no verified installer package exists yet' }

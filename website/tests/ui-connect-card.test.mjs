@@ -321,7 +321,7 @@ test('packaged-but-unpublished installer shows version/checksum with no download
   const text = textOf(html);
   assert.ok(text.includes('Installer pending publication for Windows x64'), 'disabled per-platform action');
   assert.ok(text.includes('packaged and qualified') && text.includes('nothing to download'), 'visible explanation');
-  assert.ok(text.includes('0.1.0') && text.includes('b7e2b276'), 'version + checksum shown');
+  assert.ok(text.includes('0.1.0') && text.includes('7f463aae'), 'version + checksum shown');
   assert.ok(!/Download installer/.test(text), 'no live download label while unpublished');
   const linksBefore = cardLinks(html);
   await ui.press('download');
