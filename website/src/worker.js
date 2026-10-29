@@ -876,6 +876,11 @@ async function completePairing(db, code, nodeId, resourceId, meta, now) {
   // One transaction re-pins the authenticated consent, live owner and exact
   // resource identity, then creates the sender before revoking older keys.
   // No partial enrollment/rotation survives an audit or persistence failure.
+  // The key cap counts the RESULTING total: this resource's live sender keys
+  // are revoked by the same batch, so a lost-response reclaim at a full cap
+  // replaces its sender instead of needing a phantom free slot. The
+  // exclusion is NULL-safe, so unbound keys still count; genuinely new
+  // senders still hit KEY_LIMIT.
   const ownerId = code.owner_id;
   const { id, secret, short } = mintKey(KEY_PREFIX);
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
@@ -889,11 +894,12 @@ async function completePairing(db, code, nodeId, resourceId, meta, now) {
       AND ((? = 1 AND NOT EXISTS(SELECT 1 FROM resources WHERE owner_id = ? AND node_id = ?)
         AND (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER})
         OR (? = 0 AND EXISTS(SELECT 1 FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?)))
-      AND (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}
+      AND (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL
+        AND (resource_id IS NULL OR resource_id != ? OR scope != 'heartbeat')) < ${MAX_KEYS_PER_USER}
       AND COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?),0) < ${WRITE_BUDGET_PER_HOUR}`)
       .bind(now, nodeId, code.id, ownerId, code.salt, code.verifier, code.used_at, code.resource_id, MAX_PAIRING_ATTEMPTS,
         now, nodeId, resourceId, new Date(Date.parse(now) - PAIRING_RECLAIM_MS).toISOString(), ownerId,
-        meta.created ? 1 : 0, ownerId, nodeId, ownerId, meta.created ? 1 : 0, resourceId, ownerId, nodeId, ownerId, ownerId, budgetWindow(new Date(now))),
+        meta.created ? 1 : 0, ownerId, nodeId, ownerId, meta.created ? 1 : 0, resourceId, ownerId, nodeId, ownerId, resourceId, ownerId, budgetWindow(new Date(now))),
     db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes() = 1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(ownerId,budgetWindow(new Date(now))),
     ...(meta.created ? [db.prepare(`INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
       SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, '{}', 'owner only', ?, NULL, ? WHERE changes() = 1`)
