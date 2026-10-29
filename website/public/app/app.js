@@ -353,7 +353,8 @@ function agentInstructions(os) {
     'Step 6 - link this computer in AIPSTER (I do this myself, not you):',
     '- In AIPSTER My Compute I use Pair this computer, then type the one-time',
     '  code into `python pairing.py pair` on this machine. That registers the',
-    '  worker automatically; manual Register resource under Advanced stays a fallback.',
+    '  worker automatically; then I start `python pairing.py heartbeat-loop` so',
+    '  reachability is reported. Manual Register resource under Advanced stays a fallback.',
     '',
     'Finish by reporting: installed revision, inspect and test results, how to stop',
     '(Ctrl+C, then discard the token) and uninstall (delete local-worker/.venv and',
@@ -418,7 +419,7 @@ function paintConnectCard() {
     if (p.phase === 'error') return `<p class="notice" role="status"><span class="pill warn">Pairing failed</span> ${esc(p.error)} <span class="actions"><button type="button" class="btn secondary" data-action="pair-again">Try again</button></span></p>`;
     return `<div class="reveal" role="status"><p><span class="pill ok">Code minted</span> Type this code into the worker's pair step. Single use — it cannot be shown again.</p>
 <code class="pair-code" aria-label="one-time pairing code" tabindex="0">${esc(p.code)}</code>
-<p class="muted">Expires ${esc(p.expiresAt)}. On the worker: run the pair step and type the code when asked (see Advanced). The worker contacts AIPSTER only after pairing; heartbeats prove reachability only.</p>
+<p class="muted">Expires ${esc(p.expiresAt)}. On the worker: run the pair step, type the code when asked, then start the heartbeat sender (see Advanced). The worker contacts AIPSTER only after pairing; heartbeats prove reachability only.</p>
 <p class="actions"><button type="button" class="btn secondary" data-action="pair-done">Done</button><button type="button" class="btn secondary" data-action="pair-again">Mint a new code</button></p></div>`;
   })();
   const installerLine = unpickedMobile
@@ -449,6 +450,9 @@ function paintConnectCard() {
 <h3>Connect</h3>
 <p>Mint a one-time pairing code above (10-minute expiry, single use), then on this computer run the worker's pair step (<code>python pairing.py pair</code> for source installs) and type the code when asked. Pairing registers this computer automatically — hardware and capabilities are discovered, not typed — and delivers a sender key the worker stores privately. The worker contacts AIPSTER only after pairing.</p>
 <p>Status: <strong>not linked until paired</strong>. Paired workers appear below on their own; heartbeats prove reachability only, never readiness. Prefer pairing over typing: manual entry stays available under <strong>Advanced: manual resource registration</strong> below. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
+<p>Source installs only: pairing saves the credential and exits — the worker does not start its own sender. In a second terminal, next to <code>serve</code>, run:</p>
+<pre tabindex="0" aria-label="start the heartbeat sender"><code>python pairing.py heartbeat-loop</code></pre>
+<p class="muted">Leave it running. If its key is revoked or expires it exits asking for a re-pair; pair again with a fresh code. Packaged launcher integration is pending with the installer release.</p>
 <details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
 <details><summary>Disconnect and uninstall</summary><p>Stop the worker with Ctrl+C, then close the terminal or run <code>Remove-Item Env:DENDRITE_API_TOKEN</code> to discard the local token. To uninstall, delete only <code>local-worker/.venv</code> (and <code>.state</code> if present). There is no automatic update; reinstall from scratch at a newer pin only if AIPSTER publishes one. This setup adds no service, startup task or global package. The worker holds no AIPSTER credential, so there is nothing to revoke here. Keep it on loopback and never expose it to a network.</p></details>
 </details>`;
@@ -504,8 +508,11 @@ function onConnectClick(ev) {
   } else if (action === 'pair' || action === 'pair-again') {
     mintPairingCode();
   } else if (action === 'pair-done') {
-    if (connect.pair) { connect.pair.phase = 'idle'; connect.pair.code = ''; connect.pair.error = ''; }
-    paintConnectCard();
+    // Refresh, don't just repaint (Codex P2 round 3): the worker may have
+    // claimed while My Compute sat open, and the pre-pairing inventory
+    // would otherwise keep saying "No resources yet". If nothing claimed
+    // yet the list truthfully stays empty.
+    loadCompute();
   }
 }
 

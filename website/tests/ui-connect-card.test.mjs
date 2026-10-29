@@ -107,6 +107,13 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
   const chooseOs = async (value) => { card().onchange({ target: { dataset: { action: 'os' }, value } }); await flush(); };
   // Bounded settle: async mint work (WebCrypto + DB + fenced api) can outrun
   // the fixed flush, so pair tests wait for a terminal phase instead.
+  const settleList = async (marker, label) => {
+    for (let i = 0; i < 200; i++) {
+      if (el('compute-list').innerHTML.includes(marker)) return;
+      await new Promise(setImmediate);
+    }
+    assert.fail('inventory never rendered: ' + label);
+  };
   const settle = async (label) => {
     for (let i = 0; i < 200; i++) {
       const text = textOf(el('connect-card').innerHTML);
@@ -116,7 +123,7 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
     assert.fail('pair never settled: ' + label);
   };
   return {
-    el, calls, logs, clickTab, flush, press, chooseOs, captured, db: t.DB, settle,
+    el, calls, logs, clickTab, flush, press, chooseOs, captured, db: t.DB, settle, settleList,
     resolveDeferred: async () => { deferred(); deferred = null; await flush(); },
     setClipboard: (mode) => { context.navigator.clipboard = clipboards[mode]; },
     logout: async () => { await el('logout').listeners.click(); await flush(); }
@@ -482,6 +489,7 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
     'security-fixed revision', 'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified',
     'untested', 'separate prerequisites', 'Mint a one-time pairing code above',
     'not linked until paired', 'Advanced: manual resource registration',
+    'pairing.py heartbeat-loop', 'Packaged launcher integration is pending',
     'Disconnect and uninstall', 'Troubleshooting', 'worker and its root LICENSE only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
@@ -537,6 +545,7 @@ test('pairing mints a typed one-time code with no clipboard or new links', async
   assert.ok(text.includes('Code minted'), 'mint confirmation');
   assert.ok(text.includes('Single use'), 'one-time note');
   assert.ok(text.includes('Expires '), 'expiry shown');
+  assert.ok(text.includes('start the heartbeat sender'), 'sender step referenced');
   const code = nodesOf(html).filter((n) => n.tagName === 'code' && (attr(n, 'class') || '').includes('pair-code'));
   assert.equal(code.length, 1, 'one displayed code');
   assert.match(nodeText(code[0]), /^pair-[0-9a-f]{8}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
@@ -580,6 +589,20 @@ test('demo accounts see pairing as unavailable, never a mint', async () => {
   assert.deepEqual(ui.calls.slice(before), [], 'disabled demo pair mints nothing');
 });
 
+test('done refreshes inventory so a paired worker appears', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  await ui.press('pair');
+  await ui.settle('mint for done');
+  const now = new Date().toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_done', 'u_alice', 'n_done', 'done-box', 'local', 'paired', 'c', 'g', 1, 1, 0, 0, now).run();
+  await ui.press('pair-done');
+  await ui.settleList('done-box', 'done refresh');
+  assert.ok(textOf(ui.el('compute-list').innerHTML).includes('done-box'), 'paired worker visible without navigation');
+  assert.ok(!ui.el('connect-card').innerHTML.includes('Code minted'), 'reveal still cleared');
+});
+
 test('resource cards show derivable link states, never installed/ready', async () => {
   const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
   await ui.clickTab('compute');
@@ -594,6 +617,7 @@ test('resource cards show derivable link states, never installed/ready', async (
   await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .bind('r_stale', 'u_alice', 'n_uistale', 'stale-box', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, staleAt, now).run();
   await ui.clickTab('compute');
+  await ui.settleList('manual-box', 'link states render');
   const text = textOf(ui.el('compute-list').innerHTML);
   assert.ok(text.includes('needs-link'), 'manual row needs a link');
   assert.ok(text.includes('linked'), 'paired row awaits its beat');
