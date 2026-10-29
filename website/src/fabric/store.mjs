@@ -1064,66 +1064,89 @@ export async function resumeGrant(db, actor, id, input = {}, op = null) {
   const grant = await first(db, 'SELECT * FROM fabric_grants WHERE id = ?', id);
   if (!grant || !(await grantVisibleTo(db, actor, grant))) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (grant.quarantine_reason) throw err(409, 'GRANT_QUARANTINED', 'Grant is quarantined; re-issue it.');
-  // Same-operation retry of a resume whose effect already committed
-  // (e.g. its audit write failed and the router released the key): the
-  // effect advanced version and status, so the fresh-mutation checks
-  // below would reject it terminally. Recognise it first by the
-  // approval this very operation consumed, and repair the audit.
-  if (typeof input.approvalId === 'string' && input.approvalId && grant.status === 'enforced' && grant.last_approval_id === input.approvalId
-    && await actorExportsGrant(db, actor, grant)) {
-    const prior = await first(db, 'SELECT action, target_id, consumed_at, consumed_by_op FROM approvals WHERE id = ?', input.approvalId);
-    if (prior && prior.action === 'grant.resume' && prior.target_id === id && prior.consumed_at && prior.consumed_by_op === await opDigest(actor, op)) {
-      await auditFabric(db, actor, op, 'fabric.grant.resume', id, 'reconciled');
-      return { status: 200, body: { id, status: 'enforced', note: 'This approval was already applied to this grant.' } };
-    }
-  }
-  const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', grant.connection_id);
-  if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
   if (!await actorExportsGrant(db, actor, grant)) throw err(403, 'FORBIDDEN', 'Only the exporting owner can resume.');
-  checkVersion(grant, input);
-  if (grant.status !== 'paused') throw err(409, 'BAD_STATE', `Grant is ${grant.status}.`);
-  if (typeof input.approvalId !== 'string' || !input.approvalId) throw err(409, 'NOT_APPROVED', 'A fresh approved resume approval is required.');
-  const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', input.approvalId);
-  if (!appr || appr.action !== 'grant.resume' || appr.target_id !== id || appr.decision !== 'approved' || appr.consumed_at) {
-    if (appr && appr.consumed_at && appr.action === 'grant.resume' && appr.target_id === id && grant.last_approval_id === appr.id && grant.status === 'enforced') {
-      await auditFabric(db, actor, op, 'fabric.grant.resume', id, 'reconciled');
-      return { status: 200, body: { id, status: 'enforced', note: 'This approval was already applied to this grant.' } };
+  // The shared status receipt ledger is action-bound, not an admission grant:
+  // resumes remain charged expansions and require a fresh owner approval.
+  // Its immutable response survives later pause/revoke, revision or disconnect.
+  const recover = async () => {
+    const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+    if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
+    return restrictionContext(db, actor, op, 'fabric.grant.resume', id, input);
+  };
+  const completion = await recover();
+  if (completion.replay) return completion.replay;
+  const body = { id, status: 'enforced' };
+  try {
+    const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', grant.connection_id);
+    if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
+    checkVersion(grant, input);
+    if (grant.status !== 'paused') throw err(409, 'BAD_STATE', `Grant is ${grant.status}.`);
+    if (typeof input.approvalId !== 'string' || !input.approvalId) throw err(409, 'NOT_APPROVED', 'A fresh approved resume approval is required.');
+    const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', input.approvalId);
+    if (!appr || appr.action !== 'grant.resume' || appr.target_id !== id || appr.decision !== 'approved') {
+      throw err(409, 'NOT_APPROVED', 'A fresh approved resume approval is required.');
     }
-    throw err(409, 'NOT_APPROVED', 'A fresh approved resume approval is required.');
+    if (appr.created_by !== actor.user.id || appr.approver !== actor.user.id) throw err(403, 'FORBIDDEN', 'This approval belongs to a different owner.');
+    if (appr.consumed_at) {
+      if (appr.consumed_by_op === completion.operationId && appr.consumed_action === 'grant.resume' && appr.consumed_target === id) {
+        throw err(503, 'RESUME_UNCERTAIN', 'Resume outcome is not recorded; retry reconciliation or re-approve a fresh operation.');
+      }
+      throw err(409, 'NOT_APPROVED', 'A fresh approved resume approval is required.');
+    }
+    if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
+    if (appr.bound_grant_id !== id || appr.bound_grant_version !== grant.version) throw err(412, 'PREVIEW_STALE', 'Grant changed since the approval.');
+    if (!appr.issued_connection || appr.issued_connection !== grant.connection_id || appr.issued_version !== conn.version) {
+      throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
+    }
+    const vector = parseJson(appr.revision_vector, {});
+    if (vector.grant !== grant.version) throw err(412, 'PREVIEW_STALE', 'Grant changed since the approval.');
+    const now = nowIso();
+    const status = grantStatus({ id, version: grant.version, to: 'enforced', from: 'paused', apprId: appr.id, connId: conn.id, connVersion: conn.version, grantConnId: conn.id, now, actorId: actor.user.id });
+    // The approval CAS and all effects commit together. A lost/failed batch
+    // cannot spend consent without its exact effect/receipt, or apply a
+    // different operation's already-consumed approval.
+    status[0][0] += ` AND changes() = 1 AND EXISTS(SELECT 1 FROM approvals WHERE id = ? AND consumed_by_op = ? AND consumed_action = 'grant.resume' AND consumed_target = ?)`;
+    status[0].push(appr.id, completion.operationId, id);
+    const res = await runBatch(db, [
+      [`UPDATE approvals SET consumed_at = ?, consumed_by_op = ?, consumed_action = 'grant.resume', consumed_target = ?
+        WHERE id = ? AND consumed_at IS NULL AND decision = 'approved' AND expiry > ?
+        AND action = 'grant.resume' AND target_id = ? AND created_by = ? AND approver = ?
+        AND bound_grant_id = ? AND bound_grant_version = ? AND issued_connection = ? AND issued_version = ?
+        AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0 AND demo = 0)
+        AND EXISTS(SELECT 1 FROM fabric_grants WHERE id = ? AND version = ? AND status = 'paused' AND quarantine_reason IS NULL AND exporter_id = ?)
+        AND EXISTS(SELECT 1 FROM connections WHERE id = ? AND version = ? AND state = 'active')`,
+        now, completion.operationId, id, appr.id, now, id, actor.user.id, actor.user.id, id, grant.version, conn.id, conn.version,
+        actor.user.id, id, grant.version, actor.user.id, conn.id, conn.version],
+      ...status,
+      ...restrictionCompletion(actor, completion, 'fabric.grant.resume', id, body, now)
+    ]);
+    if (changes(res, 1) === 1) return { status: 200, body };
+    const recovered = await recover();
+    if (recovered.replay) return recovered.replay;
+    const prior = await first(db, 'SELECT consumed_at, consumed_by_op, consumed_action, consumed_target, expiry FROM approvals WHERE id = ?', appr.id);
+    if (prior && prior.consumed_at) {
+      if (prior.consumed_by_op === completion.operationId && prior.consumed_action === 'grant.resume' && prior.consumed_target === id) {
+        throw err(503, 'RESUME_UNCERTAIN', 'Resume outcome is not recorded; retry reconciliation or re-approve a fresh operation.');
+      }
+      return { status: 409, body: { error: 'A fresh approved resume approval is required.', code: 'NOT_APPROVED' } };
+    }
+    const cur = await first(db, 'SELECT status, version, quarantine_reason FROM fabric_grants WHERE id = ?', id);
+    if (!cur) throw err(404, 'NOT_FOUND', 'Grant not found.');
+    if (cur.quarantine_reason) return { status: 409, body: { error: 'Grant is quarantined; re-issue it.', code: 'GRANT_QUARANTINED' } };
+    if (cur.status === 'revoked') return { status: 409, body: { error: 'Grant is revoked.', code: 'BAD_STATE' } };
+    if (cur.version !== grant.version) return lostRace();
+    const curConn = await first(db, 'SELECT state, version FROM connections WHERE id = ?', grant.connection_id);
+    if (!curConn || curConn.state !== 'active') return { status: 409, body: { error: 'Connection is not active.', code: 'CONNECTION_DOWN' } };
+    if (curConn.version !== conn.version) return lostRace();
+    if (prior && prior.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
+    await throwActorClosed(db, actor);
+  } catch (e) {
+    // An overlapping original attempt can publish its receipt after our first
+    // read, even before a fresh-state precheck or after a zero-row CAS.
+    const recovered = await recover();
+    if (recovered.replay) return recovered.replay;
+    throw e;
   }
-  if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
-  // Exact binding: this approval reviewed this paused revision on this connection.
-  if (appr.bound_grant_id !== id || appr.bound_grant_version !== grant.version) {
-    throw err(412, 'PREVIEW_STALE', 'Grant changed since the approval.');
-  }
-  if (!appr.issued_connection || appr.issued_connection !== grant.connection_id || appr.issued_version !== conn.version) {
-    throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
-  }
-  const vector = parseJson(appr.revision_vector, {});
-  if (vector.grant !== grant.version) throw err(412, 'PREVIEW_STALE', 'Grant changed since the approval.');
-  const opd = await opDigest(actor, op);
-  const claimNow = nowIso();
-  if (!(await claimApproval(db, { id: appr.id, action: 'grant.resume', target: id, op: opd, now: claimNow }))) {
-    return { status: 409, body: { error: 'A fresh approved resume approval is required.', code: 'NOT_APPROVED' } };
-  }
-  const now = nowIso();
-  const res = await runBatch(db, grantStatus({ id, version: grant.version, to: 'enforced', from: 'paused', apprId: appr.id, connId: conn.id, connVersion: conn.version, grantConnId: conn.id, now, actorId: actor.user.id }));
-  if (changes(res, 0) === 1) {
-    await auditFabric(db, actor, op, 'fabric.grant.resume', id);
-    return { status: 200, body: { id, status: 'enforced' } };
-  }
-  const cur = await first(db, 'SELECT status, version, quarantine_reason, last_approval_id FROM fabric_grants WHERE id = ?', id);
-  if (!cur) throw err(404, 'NOT_FOUND', 'Grant not found.');
-  if (cur.quarantine_reason) return { status: 409, body: { error: 'Grant is quarantined; re-issue it.', code: 'GRANT_QUARANTINED' } };
-  if (cur.status === 'revoked') return { status: 409, body: { error: 'Grant is revoked.', code: 'BAD_STATE' } };
-  if (cur.status === 'enforced' && cur.last_approval_id === appr.id) {
-    await auditFabric(db, actor, op, 'fabric.grant.resume', id, 'reconciled');
-    return { status: 200, body: { id, status: 'enforced', note: 'This approval was already applied to this grant.' } };
-  }
-  const curConn = await first(db, 'SELECT state, version FROM connections WHERE id = ?', grant.connection_id);
-  if (!curConn || curConn.state !== 'active') return { status: 409, body: { error: 'Connection is not active.', code: 'CONNECTION_DOWN' } };
-  if (cur.version !== grant.version || curConn.version !== conn.version) return lostRace();
-  await throwActorClosed(db, actor);
 }
 
 export async function revokeGrant(db, actor, id, input = {}, op = null) {
