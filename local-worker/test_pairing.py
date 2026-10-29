@@ -331,6 +331,159 @@ class Round2Tests(unittest.TestCase):
         self.assertEqual(hw["cpu"], "stub-cpu")
 
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_fresh_pair_under_loose_umask_stays_private(self):
+        old = os.umask(0o002)
+        try:
+            out, err, code = run_cli("pair", self.pair_args())
+        finally:
+            os.umask(old)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o700)
+        meta = load_pairing(self.data)
+        self.assertEqual(meta["resource_id"], "r_fake01")
+
+
+class Round4Tests(unittest.TestCase):
+    """Codex round-4 regressions: redirect blocking, truncated reads."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+
+    def test_redirect_is_blocked_and_credential_never_forwarded(self):
+        evil_hits = []
+
+        class EvilHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                evil_hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        evil = ThreadingHTTPServer(("127.0.0.1", 0), EvilHandler)
+        evil_thread = threading.Thread(target=evil.serve_forever, daemon=True)
+        evil_thread.start()
+        self.addCleanup(evil.server_close)
+        self.addCleanup(evil.shutdown)
+        evil_base = f"http://127.0.0.1:{evil.server_port}"
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(302)
+                self.send_header("Location", evil_base + "/collect")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        main = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        main_thread = threading.Thread(target=main.serve_forever, daemon=True)
+        main_thread.start()
+        self.addCleanup(main.server_close)
+        self.addCleanup(main.shutdown)
+        with self.assertRaises(PairingError) as cm:
+            pairing.post_json(f"http://127.0.0.1:{main.server_port}/x", {}, FAKE_SECRET)
+        self.assertEqual(cm.exception.code, "REDIRECT_BLOCKED")
+        self.assertEqual(evil_hits, [], "sender key never reaches the redirect target")
+
+    def test_truncated_response_is_a_retryable_network_fault(self):
+        class TruncHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true,"heartbeatAt":"x"}')
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TruncHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with self.assertRaises(PairingError) as cm:
+            pairing.post_json(f"http://127.0.0.1:{server.server_port}/hb", {"usable": False}, FAKE_SECRET)
+        self.assertEqual(cm.exception.code, "NETWORK")
+        self.assertIsNone(cm.exception.status, "transport fault, owned by the backoff")
+
+
+class Round5Tests(unittest.TestCase):
+    """Codex round-5 regressions: fail-closed protection, key fingerprint."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_failed_protection_aborts_before_any_secret_or_claim(self):
+        with patch.object(pairing, "restrict_file", return_value=False):
+            out, err, code = run_cli("pair", self.pair_args())
+        self.assertEqual(code, pairing.EXIT_USAGE, err)
+        self.assertIn("PRIVATE_STORAGE", err)
+        self.assertEqual(self.state.claims, [], "no claim attempted")
+        self.assertFalse((self.data / "pairing.json").exists())
+        self.assertFalse((self.data / "heartbeat-key.txt").exists())
+        leftovers = [p for p in self.data.rglob("*") if p.is_file()]
+        self.assertEqual(leftovers, [], "no state or temp fragments written")
+
+    def test_mismatched_generation_is_refused(self):
+        import hashlib
+        out, err, code = run_cli("pair", self.pair_args())
+        self.assertEqual(code, EXIT_OK, err)
+        meta = json.loads((self.data / "pairing.json").read_text())
+        key_file = self.data / meta["key_file"]
+        secret = key_file.read_text().strip()
+        self.assertEqual(meta["key_sha256"], hashlib.sha256(secret.encode()).hexdigest())
+        # Simulate an interrupted re-pair, both orders: new metadata with
+        # the old key, and old metadata with a new key. Either mix is
+        # refused instead of sending a stale key to a new endpoint.
+        meta["api_base"] = "https://pairing.example"
+        meta["resource_id"] = "r_other"
+        meta["key_sha256"] = hashlib.sha256(b"some-other-key").hexdigest()
+        (self.data / "pairing.json").write_text(json.dumps(meta))
+        with self.assertRaises(PairingError) as cm:
+            load_pairing(self.data)
+        self.assertEqual(cm.exception.code, "BAD_PAIRING_STORE")
+        (self.data / "pairing.json").write_text(json.dumps(
+            {**meta, "key_sha256": hashlib.sha256(secret.encode()).hexdigest()}))
+        key_file.write_text("some-other-key\n")
+        with self.assertRaises(PairingError) as cm:
+            load_pairing(self.data)
+        self.assertEqual(cm.exception.code, "BAD_PAIRING_STORE")
+        hb_out, hb_err = io.StringIO(), io.StringIO()
+        with redirect_stdout(hb_out), redirect_stderr(hb_err):
+            code = pairing.cmd_heartbeat(argparse_namespace(
+                {"api_base": self.base, "data_dir": str(self.data),
+                 "config": None, "interval": 60}), loop=False)
+        self.assertNotEqual(code, EXIT_OK)
+        self.assertEqual(self.state.beats, [], "refused store sends nothing")
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():

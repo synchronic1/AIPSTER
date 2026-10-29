@@ -21,6 +21,9 @@ local tests only).
 
 import argparse
 import getpass
+import hashlib
+import hmac
+import http.client
 import json
 import os
 import platform
@@ -28,7 +31,6 @@ import re
 import secrets
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import time
@@ -36,6 +38,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
+
+from private_storage_win32 import protect_path
 
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
@@ -95,72 +99,54 @@ def default_data_dir():
     return Path.home() / ".local" / "share" / "aipster-worker"
 
 
-def _restrict_path(path, directory=False):
-    """Establish private access before publishing state; never silently degrade."""
+def _restrict_path(path, directory=False, *, new=False):
+    """Establish private access; only exclusive creation permits new ownership."""
     path = Path(path)
-    if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
-        raise PairingError(None, "PRIVATE_STORAGE", "worker state cannot use symbolic links")
     try:
-        if os.name != "nt" and path.stat().st_uid != os.getuid():
-            raise OSError("worker state belongs to another user")
-        os.chmod(path, 0o700 if directory else 0o600)
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            raise OSError("linked worker state")
+        if path.is_dir() != directory:
+            raise OSError("unexpected worker state type")
         if os.name == "nt":
-            # Use the process identity, not USERNAME or an inherited ACL. A new
-            # protected DACL also removes any existing explicit broad grants.
-            # The path is JSON data on stdin, never interpolated shell code.
-            script = r'''
-$ErrorActionPreference = 'Stop'
-$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-if ((Get-Acl -LiteralPath $item.path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 2 }
-if ($item.directory) {
-  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-  $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inherit, 'None', 'Allow')
-} else {
-  $acl = [System.Security.AccessControl.FileSecurity]::new()
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'Allow')
-}
-$acl.SetAccessRuleProtection($true, $false)
-$acl.AddAccessRule($rule)
-if ($item.directory) {
-  [System.IO.Directory]::SetAccessControl($item.path, $acl)
-} else {
-  [System.IO.File]::SetAccessControl($item.path, $acl)
-}
-'''
-            powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-            result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
-                                    input=json.dumps({"path": str(path.resolve()), "directory": directory}),
-                                    capture_output=True, text=True, check=False,
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
-            if result.returncode != 0:
-                raise OSError("could not establish a private ACL")
+            protect_path(path, directory=directory, new=new)
+        else:
+            if path.stat().st_uid != os.getuid():
+                raise OSError("worker state belongs to another user")
+            os.chmod(path, 0o700 if directory else 0o600)
         return True
     except OSError as exc:
         raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage") from exc
 
 
-def restrict_file(path):
-    return _restrict_path(path)
+def restrict_file(path, *, new=False):
+    return _restrict_path(path, new=new)
 
 
 def private_dir(path):
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    if not _restrict_path(path, directory=True):
+    try:
+        path.mkdir(mode=0o700)
+        created = True
+    except FileNotFoundError:
+        private_dir(path.parent)
+        return private_dir(path)
+    except FileExistsError:
+        created = False
+    if not _restrict_path(path, directory=True, new=created):
         raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
     return path
 
 
 def write_private(path, text):
-    """Atomically write a secret-bearing file with user-only permissions."""
+    """Atomic publication: protect an exclusively new empty file before bytes."""
     path = Path(path)
     private_dir(path.parent)
+    if path.exists() and not restrict_file(path):
+        raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            if not restrict_file(tmp):
+            if not restrict_file(tmp, new=True):
                 raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
             handle.write(text)
             handle.flush()
@@ -179,35 +165,17 @@ def ensure_private_dir(path):
 
 
 def check_private_store(data_dir, key_path=None):
-    """Refuse unsafe credential routing, including a legacy flat-key store."""
+    """Verify without repairing a credential-routing manifest or selected key."""
     data = Path(data_dir)
     paths = [path for path in [data, data / "pairing.json", key_path] if path is not None and path.exists()]
     try:
-        if any(path.is_symlink() or getattr(path, "is_junction", lambda: False)() for path in paths):
-            raise OSError("linked store")
-        if os.name != "nt":
-            if any(path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077 for path in paths):
+        for path in paths:
+            if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+                raise OSError("linked store")
+            if os.name == "nt":
+                protect_path(path, directory=path == data, verify=True)
+            elif path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
                 raise OSError("shared store")
-        elif paths:
-            script = r'''
-$ErrorActionPreference = 'Stop'
-$paths = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-foreach ($path in $paths) {
-  $acl = Get-Acl -LiteralPath $path
-  if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 2 }
-  foreach ($entry in $acl.Access) {
-    $entrySid = $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-    if ($entry.AccessControlType -eq 'Allow' -and $entrySid -notin @($sid, 'S-1-5-18', 'S-1-5-32-544')) { exit 3 }
-  }
-}
-'''
-            ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-            result = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
-                                    input=json.dumps([str(path.resolve()) for path in paths]),
-                                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            if result.returncode != 0:
-                raise OSError("unsafe store ACL")
     except OSError as exc:
         raise PairingError(None, "BAD_PAIRING_STORE", "worker storage is not user-private; fix permissions or re-pair") from exc
 
@@ -346,14 +314,18 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             retry_after = response.headers.get("Retry-After")
     except HTTPError as exc:
         try:
+            if 300 <= exc.code < 400:
+                raise PairingError(None, "REDIRECT_BLOCKED", "API redirects are refused")
             raw = exc.read().decode("utf-8", "replace")
-        except Exception:
-            raw = ""
-        status = exc.code
-        retry_after = exc.headers.get("Retry-After") if exc.headers else None
-        exc.close()
-    except (URLError, TimeoutError, socket.timeout, OSError) as exc:
-        raise PairingError(None, "NETWORK", f"request failed: {exc}")
+            status = exc.code
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        except (http.client.HTTPException, OSError) as fault:
+            raise PairingError(None, "NETWORK", "incomplete API response") from fault
+        finally:
+            exc.close()
+    except (URLError, TimeoutError, socket.timeout, OSError, http.client.HTTPException) as exc:
+        # A truncated response belongs to the same bounded transport backoff.
+        raise PairingError(None, "NETWORK", "API transport failed") from exc
     try:
         body = json.loads(raw) if raw.strip() else {}
     except ValueError:
@@ -458,6 +430,11 @@ def load_pairing(data_dir):
         raise PairingError(None, "BAD_PAIRING_STORE", f"pairing store unreadable: {exc}")
     if not meta.get("resource_id") or not meta.get("api_base") or not secret:
         raise PairingError(None, "BAD_PAIRING_STORE", "pairing store is incomplete; pair again")
+    fingerprint = meta.get("key_sha256")
+    if fingerprint is not None and (not isinstance(fingerprint, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+            or not hmac.compare_digest(fingerprint, hashlib.sha256(secret.encode("utf-8")).hexdigest())):
+        raise PairingError(None, "BAD_PAIRING_STORE", "credential files disagree; pair again")
     meta["heartbeat_key"] = secret
     return meta
 
@@ -477,6 +454,8 @@ def cmd_pair(args):
         for key_file in managed_key_files(data_dir):
             if not restrict_file(key_file):
                 raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
+        if (data_dir / "pairing.json").exists() and not restrict_file(data_dir / "pairing.json"):
+            raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
         node_id = load_or_create_node_id(data_dir / "state")
         hardware = probe_hardware(args.config)
         if args.name:
@@ -488,6 +467,7 @@ def cmd_pair(args):
         result = claim(args.api_base, code, node_id, hardware)
         files = pairing_files(data_dir)
         generation = "heartbeat-key." + secrets.token_hex(16) + ".txt"
+        secret = result["heartbeatKey"].strip()
         meta = {
             "api_base": check_api_base(args.api_base),
             "resource_id": result["resourceId"],
@@ -498,13 +478,14 @@ def cmd_pair(args):
             "created": result.get("created"),
             "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "key_file": generation,
+            "key_sha256": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
         }
         key_file = data_dir / generation
         # The manifest is the commit point. A failed/interrupted write leaves
         # either the old tuple or the complete new tuple, never mixed origins.
         # Retain old/unpublished private generations until unpair: an in-flight
         # reader may still hold an older manifest snapshot.
-        write_private(key_file, result["heartbeatKey"].strip() + "\n")
+        write_private(key_file, secret + "\n")
         write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
     except PairingError as exc:
         print(f"pairing failed [{exc.code}]: {exc}", file=sys.stderr)

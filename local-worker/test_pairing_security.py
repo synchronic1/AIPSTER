@@ -23,6 +23,9 @@ class PairingSecurityTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.data = Path(self.tmp.name)
+        if os.name == "nt":
+            # TemporaryDirectory just exclusively created this fixture root.
+            pairing.protect_path(self.data, directory=True, new=True)
         self.args = argparse.Namespace(data_dir=str(self.data), api_base="https://new.synthetic.invalid",
                                        name=None, config=None, code="synthetic-one-time-code", interval=60)
 
