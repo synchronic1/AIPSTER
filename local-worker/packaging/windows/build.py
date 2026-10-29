@@ -89,6 +89,27 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
+def write_uninstall_files(app_dir, destination):
+    """Compile exact payload removal; never recursively delete the chosen directory."""
+    files = sorted(p.relative_to(app_dir) for p in app_dir.rglob("*") if p.is_file())
+    def literal(path):
+        value = str(path).replace("/", "\\")
+        if any(c in value for c in '\r\n"') or ".." in path.parts or path.is_absolute():
+            raise ValueError("unsafe payload path")
+        return value.replace("$", "$$")
+    lines = [f'Delete "$INSTDIR\\{literal(p)}"' for p in files]
+    dirs = {parent for p in files for parent in p.parents if parent != Path(".")}
+    lines += [f'RMDir "$INSTDIR\\{literal(p)}"' for p in sorted(dirs, key=lambda p: (-len(p.parts), str(p)))]
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def copy_python_license(python_home, license_dir):
+    source = Path(python_home) / "LICENSE.txt"
+    if not source.is_file():
+        raise SystemExit("pinned CPython distribution is missing LICENSE.txt")
+    shutil.copy2(source, license_dir / "CPYTHON-LICENSE.txt")
+
+
 def write_version_info(path, display, vi):
     numbers = tuple(int(p) for p in vi.split("."))
     path.write_text(
@@ -126,6 +147,8 @@ def main():
         raise SystemExit("NSIS makensis is required on PATH (winget install NSIS.NSIS)")
     nsis_version = subprocess.check_output(
         [makensis, "-VERSION"], text=True).strip().lstrip("v")
+    if nsis_version != "3.13":
+        raise SystemExit(f"pinned to NSIS 3.13; found {nsis_version}")
     version = worker_version()
     vi_version = f"{version}.{INSTALLER_BUILD}"
     artifact = f"AIPSTER-Worker-{version}-win64-setup.exe"
@@ -140,6 +163,8 @@ def main():
 
     step(2, total, "fresh build directories")
     for directory in (build_dir, dist_dir):
+        if not directory.resolve().is_relative_to(PACKAGING.resolve()):
+            raise SystemExit("refusing build cleanup outside packaging/windows")
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True)
@@ -172,6 +197,7 @@ def main():
         pyinstaller_version = next(
             line.split("==", 1)[1] for line in freeze.splitlines()
             if line.startswith("pyinstaller=="))
+        run([str(python), str(PACKAGING / "test_packaging.py")], env)
 
     step(5, total, "stage freeze inputs")
     stage = build_dir / "stage"
@@ -246,6 +272,8 @@ def main():
     shutil.copy2(ROOT / "vendor/eif/LICENSE", license_dir / "DENDRITE-LICENSE")
     shutil.copy2(ROOT / "vendor/eif/NOTICE", license_dir / "DENDRITE-NOTICE")
     shutil.copy2(ROOT / "DEPENDENCIES.json", license_dir / "DEPENDENCIES.json")
+    python_home = subprocess.check_output([str(python), "-c", "import sys; print(sys.base_prefix)"], text=True, env=clean_env()).strip()
+    copy_python_license(python_home, license_dir)
     (license_dir / "PYINSTALLER-BOOTLOADER-NOTE.txt").write_text(
         "This application was frozen with PyInstaller, which is distributed under\n"
         "GPL-2.0-or-later WITH a bootloader exception. The exception permits the\n"
@@ -259,7 +287,7 @@ def main():
     for dist_info in sorted(site_packages.glob("*.dist-info")):
         target = license_dir / "python" / dist_info.name
         for candidate in list(dist_info.glob("licenses/**/*")) + \
-                [p for p in dist_info.iterdir() if p.suffix == "" and
+                [p for p in dist_info.iterdir() if
                  p.name.upper().startswith(("LICENSE", "NOTICE", "COPYING"))]:
             if not candidate.is_file():
                 continue
@@ -273,9 +301,11 @@ def main():
     step(9, total, "compile NSIS installer")
     payload_files = [p for p in app_dir.rglob("*") if p.is_file()]
     size_kb = (sum(p.stat().st_size for p in payload_files) + 1023) // 1024
+    uninstall_files = stage / "uninstall-files.nsh"
+    write_uninstall_files(app_dir, uninstall_files)
     run([makensis, f"/DAPP_VERSION={version}", f"/DVI_VERSION={vi_version}",
          f"/DBUILD={INSTALLER_BUILD}", f"/DAPPDIR={app_dir}", f"/DSIZE_KB={size_kb}",
-         f"/DLICENSE={REPO / 'LICENSE'}", f"/DOUTFILE={dist_dir / artifact}",
+         f"/DLICENSE={REPO / 'LICENSE'}", f"/DUNINSTALL_FILES={uninstall_files}", f"/DOUTFILE={dist_dir / artifact}",
          str(PACKAGING / "worker.nsi")],
         clean_env())
     installer = dist_dir / artifact

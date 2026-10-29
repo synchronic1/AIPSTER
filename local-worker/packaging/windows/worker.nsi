@@ -32,6 +32,9 @@ Var RemoveData
 !ifndef OUTFILE
   !define OUTFILE "AIPSTER-Worker-setup.exe"
 !endif
+!ifndef UNINSTALL_FILES
+  !error "build.py must pass /DUNINSTALL_FILES=<exact payload removal list>"
+!endif
 !ifndef SIZE_KB
   !define SIZE_KB "0"
 !endif
@@ -220,8 +223,10 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\AIPSTER-Worker"
   DeleteRegKey HKCU "Software\AIPSTER-Worker"
   DetailPrint "Removing application files from $INSTDIR..."
+  ; User-selected locations may contain unrelated files or worker data.
+  !include "${UNINSTALL_FILES}"
   Delete "$INSTDIR\uninstall.exe"
-  RMDir /r "$INSTDIR"
+  RMDir "$INSTDIR"
   ${If} $RemoveData == 1
     DetailPrint "Removing the default data directory as chosen..."
     RMDir /r "$LOCALAPPDATA\AIPSTER-Worker"

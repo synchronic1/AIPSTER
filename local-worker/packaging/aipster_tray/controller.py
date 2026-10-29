@@ -17,7 +17,7 @@ from pathlib import Path
 from . import state as st
 from .child import WorkerChild, port_busy, looks_like_bind_error
 from .firstrun import (APP_NAME, bundle_dir, build_info, data_dir, ensure_setup,
-                       ensure_private_token)
+                       ensure_private_token, endpoint_url)
 
 HEALTH_TIMEOUT = 25
 TICK_SECONDS = 1
@@ -32,7 +32,7 @@ _ACTIVE = None  # controller owning this process's window (single instance)
 
 def _health_ok(host, port):
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=1.5) as r:
+        with urllib.request.urlopen(endpoint_url(host, port) + "/healthz", timeout=1.5) as r:
             import json
             return json.load(r).get("status") == "ok"
     except Exception:
@@ -48,6 +48,7 @@ class Controller:
         self.config = None
         self.loaded = None
         self.token_env = "DENDRITE_API_TOKEN"
+        self.token_value = ""
         self.child = None
         self.state = st.STOPPED
         self.detail = ""
@@ -95,12 +96,13 @@ class Controller:
             except (OSError, ValueError, ValidationError) as exc:
                 return f"bad config: {exc}"
             self.token_env = self.loaded.node.token_env
-            if not os.environ.get(self.token_env):
+            self.token_value = os.environ.get(self.token_env, "")
+            if not self.token_value:
                 try:
                     value, _ = ensure_private_token(self.data / "api-token.txt")
                 except SystemExit as exc:
                     return str(exc)
-                os.environ[self.token_env] = value
+                self.token_value = value
             return ""
         except SystemExit as exc:
             return str(exc)
@@ -111,7 +113,7 @@ class Controller:
                "WINDIR": os.environ.get("WINDIR", r"C:\Windows"),
                "COMSPEC": os.environ.get("COMSPEC", system32 + r"\cmd.exe"),
                "TEMP": os.environ.get("TEMP", ""), "TMP": os.environ.get("TMP", ""),
-               "PATH": system32, self.token_env: os.environ.get(self.token_env, "")}
+               "PATH": system32, self.token_env: self.token_value}
         return {k: v for k, v in env.items() if v}
 
     # -- state ---------------------------------------------------------------
@@ -133,7 +135,7 @@ class Controller:
     def endpoint_label(self):
         if not self.loaded:
             return ""
-        return f"http://{self.loaded.node.host}:{self.loaded.node.port}"
+        return endpoint_url(self.loaded.node.host, self.loaded.node.port)
 
     # -- worker ops ------------------------------------------------------------
     def start_worker(self, manual=True):

@@ -151,6 +151,7 @@ def describe(payload):
     if payload.get("worker_pid"):
         line += f" worker_pid={payload['worker_pid']}"
     if payload.get("port"):
-        line += f" endpoint=http://{payload.get('host', '?')}:{payload['port']}"
+        from .firstrun import endpoint_url
+        line += " endpoint=" + endpoint_url(payload.get('host', '?'), payload['port'])
     line += f" restarts={payload.get('restarts', 0)} updated_at={payload.get('updated_at', '?')}"
     return line

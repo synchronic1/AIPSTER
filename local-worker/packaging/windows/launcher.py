@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aipster_tray.firstrun import (build_info, data_dir, ensure_private_token,
-                                   ensure_setup)
+                                   ensure_setup, endpoint_url)
 
 
 class Tee:
@@ -57,10 +57,10 @@ def run_server(config, data, inspect_only):
         print(f"token {'generated' if fresh else 'loaded'}: {token_path}")
     print(f"config: {config}")
     print(f"data:   {data}")
-    print(f"listen: http://{loaded.node.host}:{loaded.node.port} "
+    print(f"listen: {endpoint_url(loaded.node.host, loaded.node.port)} "
           f"(loopback only: {loaded.node.host in ('127.0.0.1', 'localhost', '::1')})")
     if not inspect_only:
-        probe = socket.socket()
+        probe = socket.socket(socket.AF_INET6 if ":" in loaded.node.host else socket.AF_INET)
         try:
             probe.bind((loaded.node.host, loaded.node.port))
         except OSError:

@@ -128,6 +128,22 @@ a clear message instead of pretending.
 
 ## Build & qualify (Windows x86-64)
 
+The token directory and existing/new token files must belong to the current
+process user. First run establishes a protected DACL containing only that
+user's SID and fails closed if it cannot; token publication is atomic and a
+concurrent first-run winner is retained. File-backed tokens are re-read for
+every tray child start; explicitly inherited environment tokens keep priority.
+IPv6 loopback probes and displayed URLs use the configured address family.
+Crash restart closes the old job handle before launching the next child.
+
+Uninstall removes only files listed in the build's generated payload include
+and empty directories. An install location containing unrelated user files
+remains on disk with those files preserved. Explicit `/REMOVEDATA=1` remains
+the separate default-data removal choice. Builds include the exact pinned
+CPython distribution's `LICENSE.txt`, alongside dependency notices, and run
+`windows/test_packaging.py` before freezing. Qualification verifies native ACLs
+by SID and protection state rather than localized `icacls` display strings.
+
 Prerequisites: Windows 10 1809+ / 11 x86-64, `uv 0.12.12` on PATH,
 NSIS 3.13 (`makensis` on PATH; `winget install NSIS.NSIS`), network to PyPI.
 

@@ -69,7 +69,7 @@ def dendrite_exe(bundle):
 
 
 def port_busy(host, port):
-    probe = socket.socket()
+    probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
     try:
         probe.bind((host, port))
         return False
@@ -107,6 +107,7 @@ class WorkerChild:
     def start(self, config, env):
         if self.running():
             return self.proc.pid
+        self.stop()  # Reap the previous process/job before replacing either handle.
         cmd = [dendrite_exe(self.bundle), "serve", "--config", str(config)]
         kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
                   "stdin": subprocess.DEVNULL, "env": env, "cwd": str(Path(config).parent)}
@@ -214,6 +215,7 @@ class WorkerChild:
     def stop(self, timeout=10):
         proc, self.proc = self.proc, None
         if proc is None:
+            self._close_job()
             return
         if proc.poll() is None:
             proc.terminate()

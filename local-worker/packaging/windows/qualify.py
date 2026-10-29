@@ -165,6 +165,12 @@ def ico_entries(path):
     return entries
 
 
+def private_token_acl(path):
+    sys.path.insert(0, str(PACKAGING.parent))
+    from aipster_tray.firstrun import private_token_acl as verify
+    return verify(path)
+
+
 def read_state_file(data):
     try:
         return json.loads((Path(data) / "state.json").read_text(encoding="utf-8"))
@@ -491,10 +497,8 @@ def tray_matrix(app_dir, work):
         check("fresh tray run generates config + strong token",
               (data / "config.toml").exists() and len(token) == 43
               and all("!" <= c <= "~" for c in token))
-        icacls = subprocess.run(["icacls", str(token_file)], capture_output=True, text=True,
-                                env=env, timeout=60)
         check("fresh token file is user-ACL-only",
-              "BUILTIN" not in icacls.stdout and "(F)" in icacls.stdout, icacls.stdout[:200])
+              private_token_acl(token_file))
         if payload and payload["state"] == "port_busy":
             # Coexistence: default 8090 is taken; reconfigure and start.
             text = (data / "config.toml").read_text(encoding="utf-8")
@@ -638,6 +642,7 @@ def full_profile(setup):
     check("tray is windowed, launcher+cli are console",
           pe_subsystem(tray) == 2 and pe_subsystem(launcher) == 3 and pe_subsystem(cli) == 3,
           f"{pe_subsystem(tray)}/{pe_subsystem(launcher)}/{pe_subsystem(cli)}")
+    check("CPython license ships", (install / "licenses" / "CPYTHON-LICENSE.txt").exists())
     check("licenses ship", (install / "licenses" / "AIPSTER-APACHE-LICENSE.txt").exists()
           and (install / "licenses" / "DENDRITE-LICENSE").exists()
           and (install / "licenses" / "PYINSTALLER-BOOTLOADER-NOTE.txt").exists()
@@ -709,10 +714,8 @@ def full_profile(setup):
         check("config + state + logs created",
               (data / "config.toml").exists() and (data / "state").is_dir()
               and (data / "logs").is_dir())
-        icacls = subprocess.run(["icacls", str(token_file)], capture_output=True, text=True,
-                                env=env, timeout=60)
         check("token file is user-ACL-only",
-              "BUILTIN" not in icacls.stdout and "(F)" in icacls.stdout, icacls.stdout[:300])
+              private_token_acl(token_file))
         payload = json.dumps({"capability": "summarize", "model_id": "mock-summary",
                               "prompt": "SYNTHETIC QUAL FIXTURE", "max_tokens": 8}).encode()
         json_headers = {"Content-Type": "application/json"}
@@ -826,10 +829,17 @@ def full_profile(setup):
     check("reinstall preserves token + marker",
           (home / "AIPSTER-Worker/api-token.txt").read_text(encoding="utf-8").strip() == token_again
           and (home / "AIPSTER-Worker/qual-marker.txt").read_text(encoding="utf-8") == "preserve-me")
+    unrelated = install / "unrelated-user-file.txt"
+    unrelated.write_text("synthetic preserve-me")
     proc = run_silent([str(install / "uninstall.exe"), "/S"], env)
     check("silent uninstall exits 0", proc.returncode == 0, proc.stderr[-500:])
-    check("uninstall completes (async self-copy)", wait_gone(install))
-    check("install dir removed", not install.exists())
+    check("uninstall completes (async self-copy)", wait_gone(install / "uninstall.exe"))
+    check("uninstall removes payload but preserves unrelated user files",
+          not launcher.exists() and unrelated.exists()
+          and unrelated.read_text() == "synthetic preserve-me")
+    unrelated.unlink()
+    install.rmdir()  # Empty test directory only; the uninstaller never recurses here.
+    check("empty install directory can be removed", not install.exists())
     check("Start Menu entry removed", not start_menu.exists())
     check("desktop shortcut removed", not desktop_lnk.exists())
     check("app registry removed", not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
