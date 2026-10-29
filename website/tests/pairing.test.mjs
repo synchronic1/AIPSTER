@@ -790,3 +790,32 @@ test('a beating usable resource reports reachable, never ready (round 9)', async
   assert.equal(card.state.usable, true, 'heartbeat attestation preserved');
   assert.ok(!JSON.stringify(card).includes('ready'), 'no ready claim anywhere on the card');
 });
+test('lost-response reclaim succeeds at the key cap (round 10)', async () => {
+  const t = await createTestEnv();
+  for (let i = 0; i < 19; i++) {
+    const k = await readJson(await t.call('/api/keys', {
+      method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name: `filler-${i}`, scope: 'read' },
+    }));
+    assert.equal(k.status, 201, `filler ${i}: ${k.text}`);
+  }
+  const minted = await mintCode(t, t.alice);
+  const first = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_caploss' }));
+  assert.equal(first.status, 201, first.text, 'claim mints the twentieth key');
+  // Response lost: the same-code retry replaces the never-delivered sender
+  // instead of demanding a free slot that will never open.
+  const retry = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_caploss' }));
+  assert.equal(retry.status, 200, retry.text);
+  assert.equal(retry.json.resourceId, first.json.resourceId);
+  assert.notEqual(retry.json.heartbeatKey, first.json.heartbeatKey, 'fresh sender key');
+  const live = await t.DB.prepare("SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL").bind(t.alice.id).first();
+  assert.equal(live.n, 20, 'net-zero replacement: the cap still holds');
+  const stale = await readJson(await t.call(`/api/resources/${first.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + first.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(stale.status, 401);
+  assert.equal(stale.json.code, 'KEY_REVOKED', 'superseded sender is dead');
+  const fresh = await readJson(await t.call(`/api/resources/${retry.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + retry.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(fresh.status, 200, 'recovered sender key works');
+});
