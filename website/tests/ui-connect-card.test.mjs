@@ -740,8 +740,12 @@ test('overview reachable count follows fresh liveness, not terminal usability', 
   await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .bind('r_mockstale', 'u_alice', 'n_mockstale', 'mock-stale', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, staleAt, now).run();
   await ui.clickTab('overview');
-  for (let i = 0; i < 200; i++) {
-    if (ui.el('ov-cards').innerHTML.includes('2 total')) break;
+  // Deadline-based settle, not a fixed round count: 200 bare
+  // setImmediate rounds lose to a loaded CI runner (observed once as
+  // a stuck "Loading…" in 40 ms). Fast when green, patient on load.
+  const deadline = Date.now() + 10000;
+  while (!ui.el('ov-cards').innerHTML.includes('2 total')) {
+    if (Date.now() > deadline) break;
     await new Promise(setImmediate);
   }
   const text = textOf(ui.el('ov-cards').innerHTML);
@@ -758,9 +762,13 @@ test('key management renders when the inventory walk fails', async () => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind('k_ui1', 'u_alice', 'my-read-key', 'read', null, 's', 'v', 'aip_live_k_ui1_x', null, '', now, null, null).run();
   await ui.clickTab('keys');
-  for (let i = 0; i < 200; i++) {
+  // Same deadline-based settle as the overview count: fixed round
+  // counts flake under CI load.
+  const keyDeadline = Date.now() + 10000;
+  for (;;) {
     const html = ui.el('key-list').innerHTML;
     if (html.includes('my-read-key') || html.includes('injected failure')) break;
+    if (Date.now() > keyDeadline) break;
     await new Promise(setImmediate);
   }
   const html = ui.el('key-list').innerHTML;
