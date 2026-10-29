@@ -722,3 +722,25 @@ test('pair and sender commands use the installed interpreter', async () => {
   assert.ok(mhtml.includes('.venv/bin/python pairing.py pair'), 'posix pair via venv');
   assert.ok(mhtml.includes('.venv/bin/python pairing.py heartbeat-loop'), 'posix sender via venv');
 });
+
+test('overview reachable count follows fresh liveness, not terminal usability', async () => {
+  // Codex P2 round 12: the documented mock-worker setup beats usable:false,
+  // so cardFor reports online:true with status unusable. The overview count
+  // must include it (as the status strip does), not filter on the terminal
+  // usability status — "1 total · 0 reachable" next to one online resource
+  // is a self-contradiction. A stale flag-online row must stay excluded.
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  const now = new Date().toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_mocklive', 'u_alice', 'n_mocklive', 'mock-live', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, now, now).run();
+  const staleAt = new Date(Date.now() - 3600 * 1000).toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_mockstale', 'u_alice', 'n_mockstale', 'mock-stale', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, staleAt, now).run();
+  await ui.clickTab('overview');
+  for (let i = 0; i < 200; i++) {
+    if (ui.el('ov-cards').innerHTML.includes('2 total')) break;
+    await new Promise(setImmediate);
+  }
+  const text = textOf(ui.el('ov-cards').innerHTML);
+  assert.ok(text.includes('2 total \u00b7 1 reachable'), `live-but-unusable worker counted, stale one not: ${text}`);
+});

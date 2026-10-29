@@ -179,7 +179,10 @@ async function loadOverview() {
   refreshStatusStrip(token, gen, 0);
   try {
     const [inv, shared, usage] = await Promise.all([api('/api/inventory?limit=50'), api('/api/shared-with-me?limit=50'), api('/api/usage?limit=1')]);
-    const reachable = inv.items.filter((r) => r.state.status === 'reachable').length;
+    // Reachability is fresh liveness, not terminal usability (Codex P2
+    // round 12): a mock worker beating usable:false is online but
+    // unusable, and the status strip counts it — so must this count.
+    const reachable = inv.items.filter((r) => r.state.online).length;
     el.innerHTML = `<div class="card"><h2>My resources</h2><p>${inv.total} total · ${reachable} reachable</p></div>
       <div class="card"><h2>Shared with me</h2><p>${shared.total} active grant(s)</p></div>
       <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>`;
