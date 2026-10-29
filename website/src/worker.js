@@ -59,6 +59,9 @@ const MAX_PAIRING_ATTEMPTS = 10;
 const PAIRING_RECLAIM_MS = 10 * 60 * 1000;
 // POST /api/inventory Idempotency-Key replay horizon.
 const IDEMPOTENCY_TTL_MS = 24 * 3600 * 1000;
+// A NULL-mapping older than this is a crashed owner, not an active request:
+// a retry steals it instead of waiting out the TTL (Codex P2).
+const IDEMPOTENT_IN_FLIGHT_MS = 5 * 60 * 1000;
 // Demo auth surface (allowlist): the only /api/auth/* routes a demo session
 // may use are sign-in (both maintained paths), sign-out, and session reads.
 // Everything else — update-user, change-password, link-social, password
@@ -370,21 +373,26 @@ async function handleApi(request, env, url) {
       const r = await first(db, 'SELECT id FROM resources WHERE id = ? AND owner_id = ?', m[1], me());
       if (!r) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       // Unbilled like key/grant revocation: teardown must work at a spent
-      // budget. Bound keys keep revoked rows with the binding nulled, so a
-      // deleted resource's sender key still reads KEY_REVOKED (rotate, not
-      // wrong credential) instead of vanishing into AUTH_REQUIRED. Grants
-      // and jobs cannot dangle (NOT NULL references), so their rows are
-      // deleted; the audit trail (grant.create, resource.delete) records
-      // what existed. Pairing claims keep their history with resource_id
-      // nulled, which the reclaim path treats as invalid. The heartbeat
-      // intake's row-existence check rejects further beats either way.
+      // budget. One batch (a transaction): teardown is all-or-nothing,
+      // never the partial state an FK failure used to leave (Codex P2).
+      // Children die before parents — jobs before grants (jobs.grant_id),
+      // everything before the resource row. EVERY bound key, live or
+      // long-revoked, drops its binding (Codex P2) while existing
+      // revocation timestamps stand, so a deleted resource's sender key
+      // still reads KEY_REVOKED instead of vanishing into AUTH_REQUIRED.
+      // Grants/jobs cannot dangle (NOT NULL references), so their rows go;
+      // the audit trail (grant.create, resource.delete) records what
+      // existed. Pairing history keeps resource_id nulled, which reclaim
+      // treats as invalid. Heartbeat intake rejects further beats either way.
       const now = nowIso();
-      await run(db, 'UPDATE key_verifiers SET revoked_at = ?, resource_id = NULL WHERE resource_id = ? AND revoked_at IS NULL', now, r.id);
-      await run(db, 'DELETE FROM grants WHERE resource_id = ?', r.id);
-      await run(db, 'DELETE FROM jobs WHERE resource_id = ?', r.id);
-      await run(db, 'UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ?', r.id);
-      await run(db, 'DELETE FROM idempotency_keys WHERE resource_id = ?', r.id);
-      await run(db, 'DELETE FROM resources WHERE id = ?', r.id);
+      await db.batch([
+        db.prepare('UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ?').bind(now, r.id),
+        db.prepare('DELETE FROM jobs WHERE resource_id = ?').bind(r.id),
+        db.prepare('DELETE FROM grants WHERE resource_id = ?').bind(r.id),
+        db.prepare('UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ?').bind(r.id),
+        db.prepare('DELETE FROM idempotency_keys WHERE resource_id = ?').bind(r.id),
+        db.prepare('DELETE FROM resources WHERE id = ?').bind(r.id),
+      ]);
       await audit(db, me(), 'resource.delete', r.id);
       return json(200, { ok: true });
     }
@@ -658,6 +666,22 @@ async function handleApi(request, env, url) {
     if (!row) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
     const ownerId = row.owner_id;
     const nodeId = body.nodeId;
+    // Secret first on EVERY path (Codex P1): the reclaim branch below used
+    // to issue sender keys on code-id + nodeId alone. The attempt gate and
+    // burn apply to live codes only; guesses at a spent code cannot mint
+    // anything new, so they verify but neither gate nor burn.
+    if (!row.used_at && Number(row.attempts) >= MAX_PAIRING_ATTEMPTS) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    const expect = await verifierFor(norm.secret, row.salt);
+    if (!timingSafeEqualStr(expect, row.verifier)) {
+      if (!row.used_at) await run(db, 'UPDATE pairing_codes SET attempts = attempts + 1 WHERE id = ?', row.id);
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
+    // Owner eligibility before EITHER path mutates or discloses (Codex P2):
+    // a disabled, demo, or deleted owner cannot claim or reclaim.
+    const owner = await first(db, 'SELECT id, demo, disabled FROM "user" WHERE id = ?', ownerId);
+    if (!owner || Number(owner.disabled) === 1 || Number(owner.demo) === 1) {
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
     if (row.used_at) {
       // Lost-response retry: the same node re-binds within the reclaim
       // window and gets a fresh sender key; anything else sees the same
@@ -680,18 +704,10 @@ async function handleApi(request, env, url) {
       }
       return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
     }
-    if (Number(row.attempts) >= MAX_PAIRING_ATTEMPTS) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    // Fresh codes only past this point (used codes returned above): the
+    // reclaim window runs from used_at, not from the mint TTL.
     if (!Number.isFinite(Date.parse(row.expires_at)) || Date.parse(row.expires_at) < Date.now()) {
       return json(410, { error: 'Pairing code expired. Mint a new one.', code: 'PAIRING_EXPIRED' });
-    }
-    const expect = await verifierFor(norm.secret, row.salt);
-    if (!timingSafeEqualStr(expect, row.verifier)) {
-      await run(db, 'UPDATE pairing_codes SET attempts = attempts + 1 WHERE id = ?', row.id);
-      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
-    }
-    const owner = await first(db, 'SELECT id, demo, disabled FROM "user" WHERE id = ?', ownerId);
-    if (!owner || Number(owner.disabled) === 1 || Number(owner.demo) === 1) {
-      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
     }
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const cpu = typeof body.cpu === 'string' && body.cpu.trim() ? body.cpu.slice(0, 80) : 'unknown';
@@ -710,15 +726,30 @@ async function handleApi(request, env, url) {
     if (!resource) {
       const name = await uniqueResourceName(db, ownerId, wantName);
       const id = rid('r_');
-      const rc = await run(db, `INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-        SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, ?, 'owner only', ?, NULL, ?
-        WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
-        id, ownerId, nodeId, name, kind, cpu, gpu, JSON.stringify(caps),
-        JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId);
-      assertClaimed(rc, 'resource');
-      await audit(db, ownerId, 'resource.register', id, name);
-      resource = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
-      created = true;
+      let won = true;
+      try {
+        const rc = await run(db, `INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+          SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, ?, 'owner only', ?, NULL, ?
+          WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
+          id, ownerId, nodeId, name, kind, cpu, gpu, JSON.stringify(caps),
+          JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId);
+        assertClaimed(rc, 'resource');
+      } catch (error) {
+        if (error && error.status) throw error; // cap errors are final
+        // Lost a same-node race: the unique (owner, node) index rejected
+        // this insert after the pre-check saw nothing. Adopt the winner
+        // instead of failing an already-consumed code (Codex P2); a
+        // genuine DB fault finds no winner and rethrows below.
+        const winner = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
+        if (!winner) throw error;
+        resource = winner;
+        won = false;
+      }
+      if (won) {
+        await audit(db, ownerId, 'resource.register', id, name);
+        resource = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
+        created = true;
+      }
     }
     await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', resource.id, row.id);
     const fresh = await rotateHeartbeatKey(db, ownerId, resource.id, nodeId, now);
@@ -900,7 +931,12 @@ async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now) {
     id, ownerId, `worker heartbeat ${String(nodeId).slice(0, 32)}`, resourceId, salt, await verifierFor(secret, salt),
     KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId);
   if (Number(kc.meta.changes) !== 1) return null;
-  await run(db, "UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND id != ?", now, resourceId, id);
+  // Race-safe revocation (Codex P2): only keys OLDER than this insert
+  // (rowid order) are revoked. Two overlapping claims each mint first;
+  // the newer insert revokes the older, the older cannot revoke the
+  // newer, so concurrent claims converge to exactly one live sender and
+  // the loser reclaims. A cap rejection still revokes nothing.
+  await run(db, "UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND rowid < (SELECT rowid FROM key_verifiers WHERE id = ?)", now, resourceId, id);
   await audit(db, ownerId, 'key.create', id, `heartbeat:${resourceId}`);
   return { id, secret, prefix: KEY_PREFIX + id + '_' + short };
 }
@@ -915,7 +951,21 @@ async function claimIdempotencyKey(db, ownerId, key) {
       ownerId, key, nowIso());
     return null;
   } catch {
-    const prior = await first(db, 'SELECT resource_id FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
+    const prior = await first(db, 'SELECT resource_id, created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
+    if (prior && !prior.resource_id && prior.created_at
+      && Number.isFinite(Date.parse(prior.created_at)) && Date.parse(prior.created_at) + IDEMPOTENT_IN_FLIGHT_MS < Date.now()) {
+      // Stuck mapping: the owner crashed between insert and completion
+      // (Codex P2). Steal it after a grace window instead of wedging the
+      // key for the full TTL.
+      try {
+        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL', ownerId, key);
+        await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
+          ownerId, key, nowIso());
+        return null;
+      } catch {
+        return 'in-flight';
+      }
+    }
     if (prior && prior.resource_id) {
       const row = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', prior.resource_id, ownerId);
       if (row) return row;

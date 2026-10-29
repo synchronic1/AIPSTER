@@ -53,10 +53,14 @@ POST /api/pairing/claim                           # code-authenticated ONLY
   never leaves two live senders. Mint-first ordering means a lost race at
   the key cap (`409 KEY_LIMIT`) never leaves the resource keyless — the old
   key keeps working until the owner revokes a stale one and re-pairs.
+  Revocation is rowid-scoped (older inserts only), so overlapping claims
+  converge to exactly one live sender and the loser reclaims.
 - **Lost-response reclaim:** if the claim response never arrives, the same
   node may re-submit the spent code within 10 minutes and receive a fresh
-  sender key for the same resource. Any other node, or a later retry, sees
-  the generic `404 PAIRING_INVALID`.
+  sender key for the same resource — after the secret and owner eligibility
+  are re-verified, exactly like a fresh claim. Any other node, a wrong
+  secret, a disabled owner, or a later retry sees the generic
+  `404 PAIRING_INVALID` and rotates nothing.
 - **Display-name collisions** suffix (`lab`, `lab-2`, …). Identity is the row
   id / node binding, never the name.
 - New rows are `configured=1, authenticated=1, online=0, usable=0` with
@@ -89,14 +93,17 @@ scope — the delivered key is heartbeat-scoped and fails every other route.
 
 - `POST /api/inventory` accepts `Idempotency-Key` (1–64 id chars). Replays
   return the original card (`200`); concurrent same-key requests serialize
-  on the mapping row (`409 IDEMPOTENT_IN_FLIGHT` for the loser); mappings
+  on the mapping row (`409 IDEMPOTENT_IN_FLIGHT` for the loser — a
+  NULL-mapping older than 5 minutes is a crashed owner and is stolen, so
+  a failed completion never wedges the key for the full TTL); mappings
   expire after 24 h; a mapping whose resource was deleted provisions fresh.
 - `DELETE /api/inventory/:id` (session + CSRF, owner-only, unbilled like
-  other teardown): bound keys keep revoked rows with the binding nulled
-  (senders read `KEY_REVOKED`, not a vanishing credential); grant and job
-  rows for the resource are deleted; pairing history is kept with
-  `resource_id` nulled; idempotency mappings are deleted; the resource row
-  is deleted; `resource.delete` is audited. A second delete is `404`.
+  other teardown): one all-or-nothing batch — every bound key, live or
+  long-revoked, drops its binding with revocation timestamps preserved
+  (senders read `KEY_REVOKED`, not a vanishing credential); jobs die
+  before grants (`jobs.grant_id`), then the resource row; pairing history
+  is kept with `resource_id` nulled; idempotency mappings are deleted;
+  `resource.delete` is audited. A second delete is `404`.
 - Manual registration stays available as the Advanced/expert path; pairing
   is the default onboarding flow in the UI (dashboard slice).
 
@@ -113,7 +120,7 @@ reachable-but-not-usable.
 
 ## Test map
 
-`website/tests/pairing.test.mjs` (18 tests): mint auth/CSRF/key-denial, code
+`website/tests/pairing.test.mjs` (23 tests): mint auth/CSRF/key-denial, code
 shape/TTL/storage, demo denial, mint cap, claim happy path incl. a real beat
 with the delivered key plus inventory auto-appear, claim validation, attempt
 burn, expiry, spent-code cross-node denial + same-node reclaim with key
