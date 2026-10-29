@@ -717,14 +717,19 @@ async function handleApi(request, env, url) {
         && Number.isFinite(Date.parse(row.used_at)) && Date.parse(row.used_at) + PAIRING_RECLAIM_MS >= Date.now()) {
         let again = null;
         let how = 'reclaim';
+        let made = null; // row WE created (voided if a later fence trips)
         if (row.resource_id) {
           again = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', row.resource_id, ownerId);
         } else {
           again = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
           if (again) {
             // Crash between consumption and binding with the row committed:
-            // re-adopt it instead of stranding the code (round 3).
-            await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', again.id, row.id);
+            // re-adopt it instead of stranding the code (round 3) — fenced
+            // on validity (round 6): teardown may have invalidated mid-flight.
+            const bound = await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ? AND invalidated_at IS NULL', again.id, row.id);
+            if (Number(bound.meta.changes) !== 1) {
+              return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+            }
             how = 'resume';
           } else {
             // Crash between consumption and creation with NO row committed:
@@ -742,15 +747,28 @@ async function handleApi(request, env, url) {
               caps: Array.isArray(snap.caps) ? snap.caps.map(String).slice(0, 20) : [],
             };
             await checkWriteBudget(db, ownerId);
-            again = await insertPairedResource(db, ownerId, nodeId, fields, nowIso());
-            await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', again.id, row.id);
+            again = await insertPairedResource(db, ownerId, nodeId, fields, nowIso(), row.id);
+            made = again.id;
+            const bound = await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ? AND invalidated_at IS NULL', again.id, row.id);
+            if (Number(bound.meta.changes) !== 1) {
+              await run(db, 'DELETE FROM resources WHERE id = ?', made);
+              return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+            }
             how = 'recreated';
           }
         }
         if (again) {
           await checkWriteBudget(db, ownerId);
-          const rotated = await rotateHeartbeatKey(db, ownerId, again.id, nodeId, nowIso());
-          if (!rotated) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
+          const rotated = await rotateHeartbeatKey(db, ownerId, again.id, nodeId, nowIso(), row.id);
+          if (!rotated) {
+            const inv = await first(db, 'SELECT invalidated_at FROM pairing_codes WHERE id = ?', row.id);
+            if (made) {
+              await run(db, 'UPDATE pairing_codes SET resource_id = NULL WHERE id = ?', row.id);
+              await run(db, 'DELETE FROM resources WHERE id = ?', made);
+            }
+            if (inv && inv.invalidated_at) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+            return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
+          }
           await audit(db, ownerId, 'pairing.claim', row.id, `${nodeId} -> ${again.id} (${how})`);
           return json(200, {
             resourceId: again.id, created: false, resource: cardFor(again, await ownerName(db, ownerId)),
@@ -785,10 +803,10 @@ async function handleApi(request, env, url) {
     let created = false;
     if (!resource) {
       try {
-        resource = await insertPairedResource(db, ownerId, nodeId, { name: wantName, kind, cpu, gpu, caps }, now);
+        resource = await insertPairedResource(db, ownerId, nodeId, { name: wantName, kind, cpu, gpu, caps }, now, row.id);
         created = true;
       } catch (error) {
-        if (error && error.status) throw error; // cap errors are final
+        if (error && error.status) throw error; // cap AND invalidation are final
         // Lost a same-node race (or the audit after a committed insert
         // failed): adopt the winner instead of failing a consumed code. A
         // genuine DB fault finds no winner and rethrows below; the retry
@@ -798,9 +816,25 @@ async function handleApi(request, env, url) {
         resource = winner;
       }
     }
-    await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', resource.id, row.id);
-    const fresh = await rotateHeartbeatKey(db, ownerId, resource.id, nodeId, now);
-    if (!fresh) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
+    // Binding AND mint fenced on validity (round 6): an in-flight claim
+    // must not complete after teardown invalidates its code. A row WE
+    // created is voided on any trip (unbind first, then drop; nothing else
+    // can reference a keyless fresh row).
+    const bound = await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ? AND invalidated_at IS NULL', resource.id, row.id);
+    if (Number(bound.meta.changes) !== 1) {
+      if (created) await run(db, 'DELETE FROM resources WHERE id = ?', resource.id);
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
+    const fresh = await rotateHeartbeatKey(db, ownerId, resource.id, nodeId, now, row.id);
+    if (!fresh) {
+      const inv = await first(db, 'SELECT invalidated_at FROM pairing_codes WHERE id = ?', row.id);
+      if (created) {
+        await run(db, 'UPDATE pairing_codes SET resource_id = NULL WHERE id = ?', row.id);
+        await run(db, 'DELETE FROM resources WHERE id = ?', resource.id);
+      }
+      if (inv && inv.invalidated_at) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+      return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
+    }
     await audit(db, ownerId, 'pairing.claim', row.id, `${nodeId} -> ${resource.id}`);
     return json(created ? 201 : 200, {
       resourceId: resource.id, created, resource: cardFor(resource, await ownerName(db, ownerId)),
@@ -966,32 +1000,45 @@ async function uniqueResourceName(db, ownerId, base) {
   return `${clean.slice(0, 60)}-${rid('').slice(0, 6)}`;
 }
 
-async function insertPairedResource(db, ownerId, nodeId, fields, now) {
+async function insertPairedResource(db, ownerId, nodeId, fields, now, codeId) {
   // Single shape for paired-row creation (fresh claims and snapshot
   // recreates): unique display name, atomic owner cap, audit, re-read.
+  // Creation is fenced on the code staying valid (Codex P2 round 6): a
+  // teardown invalidating the code mid-flight must not gain a row.
   const name = await uniqueResourceName(db, ownerId, fields.name);
   const id = rid('r_');
   const rc = await run(db, `INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
     SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, ?, 'owner only', ?, NULL, ?
-    WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
+    WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}
+      AND (SELECT invalidated_at FROM pairing_codes WHERE id = ?) IS NULL`,
     id, ownerId, nodeId, name, fields.kind, fields.cpu, fields.gpu, JSON.stringify(fields.caps),
-    JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId);
-  assertClaimed(rc, 'resource');
+    JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId, codeId);
+  if (Number(rc.meta.changes) !== 1) {
+    // Tripped gate: cap or mid-flight invalidation. Classify (a concurrent
+    // invalidation landing after a cap-miss mislabels 409 as 404; the next
+    // attempt reports correctly, so the error is self-healing).
+    const inv = await first(db, 'SELECT invalidated_at FROM pairing_codes WHERE id = ?', codeId);
+    if (inv && inv.invalidated_at) throw httpError(404, 'Pairing code invalid or expired.', 'PAIRING_INVALID');
+    assertClaimed(rc, 'resource');
+  }
   await audit(db, ownerId, 'resource.register', id, name);
   return first(db, 'SELECT * FROM resources WHERE id = ?', id);
 }
 
-async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now) {
+async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now, codeId) {
   // Mint-first rotation: the new sender key is cap-checked before any old
-  // key is touched, so a lost race never leaves the resource keyless.
-  // Returns the new {id, secret, prefix} or null at the key cap.
+  // key is touched, so a lost race never leaves the resource keyless. The
+  // mint is fenced on code validity like creation (Codex P2 round 6).
+  // Returns the new {id, secret, prefix}, or null when a gate tripped
+  // (cap or mid-flight invalidation); the caller classifies.
   const { id, secret, short } = mintKey(KEY_PREFIX);
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
   const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
-    SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
+    SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}
+      AND (SELECT invalidated_at FROM pairing_codes WHERE id = ?) IS NULL`,
     id, ownerId, `worker heartbeat ${String(nodeId).slice(0, 32)}`, resourceId, salt, await verifierFor(secret, salt),
-    KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId);
+    KEY_PREFIX + id + '_' + short, `pairing node ${String(nodeId).slice(0, 64)}`, now, ownerId, codeId);
   if (Number(kc.meta.changes) !== 1) return null;
   // Race-safe revocation (Codex P2): only keys OLDER than this insert
   // (rowid order) are revoked. Two overlapping claims each mint first;
