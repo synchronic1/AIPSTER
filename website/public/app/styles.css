@@ -37,6 +37,14 @@ button.danger { background:transparent; color:var(--bad); border:1px solid var(-
 .connect ul.platforms li { margin:.3rem 0; }
 .connect details { margin:.5rem 0; border:1px solid var(--line); border-radius:.4rem; padding:.4rem .75rem; }
 .connect summary { cursor:pointer; font-weight:600; padding:.3rem 0; }
+.connect-grid { display:grid; grid-template-columns:250px minmax(0,1fr); gap:1.25rem; }
+.connect-rail { min-width:0; border-right:1px solid var(--line); padding-right:1.25rem; }
+.connect-rail h2 { margin:0 0 .35rem; font-size:1.35rem; }
+.connect-rail .benefit { font-size:.92rem; }
+.connect-illus { width:100%; height:auto; margin:.25rem 0 .5rem; }
+.connect-body { min-width:0; }
+.connect-body .steps { margin-top:.2rem; }
+@media (max-width:820px){ .connect-grid{grid-template-columns:1fr;} .connect-rail{border-right:0;border-bottom:1px solid var(--line);padding:0 0 .9rem;} .connect-illus{width:190px;} }
 .actions { display:flex; flex-wrap:wrap; gap:.5rem; margin:.5rem 0; }
 a.btn { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:.5rem 1rem; border:1px solid var(--accent); border-radius:.4rem; background:var(--accent); color:#0b0e12; font-weight:600; text-decoration:none; }
 a.btn.secondary { background:transparent; color:var(--accent); }
