@@ -183,3 +183,17 @@ one transaction. A failed audit cannot strand an undisclosed code or charge.
 Concurrent same-code claims refresh authenticated consent for one bounded retry,
 including an already-existing node, and revalidate the reclaim window and exact
 owner/node/resource binding before the atomic effect.
+
+## Current source reconciliation
+
+The integrated candidate preserves the ancestry of Muse W2 round 5
+(`8d6d174`). Its deleted-code and interrupted-claim findings are covered by
+SQLite and native local D1 regressions. The atomic claim transaction commits
+consumption, resource, key, binding, budget and audit together; it cannot
+create a new consumption-only crash state. A spent code with a NULL binding
+is ambiguous legacy state and remains invalid, including after deletion or
+replacement of that node. The owner can mint a fresh code to recover an
+existing node without duplication. We deliberately do not import the
+alternative `claim_json` reconstruction or its `invalidated_at` migration:
+those fields serve the superseded multi-transaction claim path. Fresh
+consent also covers older NULL records with no trustworthy snapshot.

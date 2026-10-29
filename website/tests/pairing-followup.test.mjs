@@ -83,3 +83,16 @@ for (const real of [false, true]) {
     assert.equal((await t.DB.prepare('SELECT COUNT(*) n FROM resources').first()).n, 1);
   });
 }
+
+for (const real of [false, true]) {
+  test(`${real ? 'local D1' : 'sqlite'}: deleting a legacy unbound claim cannot revive it or rotate a replacement key`, async c => {
+    const t = await pairingEnv(c, real), old = await paired(t);
+    await t.DB.prepare('UPDATE pairing_codes SET resource_id=NULL WHERE id=?').bind(old.code.id).run();
+    assert.equal((await remove(t, old.resourceId)).status, 200);
+    const before = await state(t);
+    assert.equal((await claim(t, old.code.code)).status, 404); assert.deepEqual(await state(t), before);
+    const fresh = await paired(t); assert.notEqual(fresh.resourceId, old.resourceId);
+    const replacement = await state(t);
+    assert.equal((await claim(t, old.code.code)).status, 404); assert.deepEqual(await state(t), replacement);
+  });
+}

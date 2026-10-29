@@ -49,8 +49,10 @@ export async function ensureAudit(db, { op, action, actorId, target, detail, now
 // its own receipt precedes fresh version/state checks: a later transition must
 // not erase the outcome of an already-applied operation. The router also binds
 // its ledger request; this digest protects direct callers carrying an op context.
-export async function restrictionContext(db, actor, op, action, target, input) {
-  const operationId = await opDigest(actor, op), requestHash = await digestJson(input);
+export async function restrictionContext(db, actor, op, action, target, input, prior = null) {
+  // A direct call has a fresh random identity, but its own unknown batch
+  // response still reconciles against that same identity within this call.
+  const operationId = prior ? prior.operationId : await opDigest(actor, op), requestHash = await digestJson(input);
   const row = await first(db, 'SELECT * FROM fabric_restriction_receipts WHERE operation_id = ?', operationId);
   if (row && (row.actor_id !== actor.user.id || row.action !== action || row.target_id !== target || row.request_hash !== requestHash)) {
     throw httpError(409, 'Restriction operation was already applied to a different request.', 'IDEMPOTENCY_CONFLICT');
@@ -61,7 +63,7 @@ export async function restrictionContext(db, actor, op, action, target, input) {
 // Append immediately after a successful chained effect (changes() = 1).
 // A receipt collision is an error and rolls back the whole effect; do not
 // ignore it. A lost batch response is recovered solely from this receipt.
-export function restrictionCompletion(actor, ctx, action, target, body, now) {
+export function restrictionCompletion(actor, ctx, action, target, body, now, detail = '') {
   const via = actor.kind === 'key' ? ` via key ${actor.keyId || 'unknown'}${actor.delegate?.length ? ' (agent)' : ''}` : ' via session';
   return [
     [`INSERT INTO fabric_restriction_receipts (operation_id, actor_id, action, target_id, request_hash, response_body, applied_at)
@@ -69,7 +71,7 @@ export function restrictionCompletion(actor, ctx, action, target, body, now) {
       ctx.operationId, actor.user.id, action, target, ctx.requestHash, JSON.stringify(body), now],
     [`INSERT OR IGNORE INTO audit (id, at, actor_id, action, target, detail)
       SELECT ?, ?, ?, ?, ?, ? WHERE changes() = 1`,
-      auditIdFor(ctx.operationId, action), now, actor.user.id, action, target, via.slice(0, 300)]
+      auditIdFor(ctx.operationId, action), now, actor.user.id, action, target, (detail + via).slice(0, 300)]
   ];
 }
 
