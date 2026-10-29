@@ -107,16 +107,38 @@ scope — the delivered key is heartbeat-scoped and fails every other route.
 - Manual registration stays available as the Advanced/expert path; pairing
   is the default onboarding flow in the UI (dashboard slice).
 
-## Worker side (installer slice)
+## Worker side and dashboard setup
 
-The worker ships a `pair` step (packaged launcher + source-install script)
-that takes the typed code, exchanges it, and stores `{resourceId,
-heartbeatKey, nodeId}` in the user-ACL-only data dir — never logs, URLs, or
-shared installers. The sender loop posts `{"usable": bool}` heartbeats with
-the delivered key, honoring `429`/`Retry-After` and surfacing `401
-KEY_REVOKED`/`KEY_EXPIRED` as re-pair prompts. `usable` defaults to false
-unless the local engine is verified runnable: simulated/mock engines report
-reachable-but-not-usable.
+The dashboard's authoritative source commands pin the published, reviewed
+worker `5fd4aba06bd05143a029cf25f8976d3f823b754d`. They retain the sparse
+`/local-worker/` + `/LICENSE` checkout and the pinned installation toolchain.
+The linked standalone README is background documentation and may name an
+older checkout; use the dashboard's explicit pairing commands instead.
+Packaged launcher integration remains pending, and every installer button
+stays unavailable until a verified artifact is published.
+
+Source setup has two explicit steps in a second terminal in `local-worker`:
+run `.\.venv\Scripts\python.exe pairing.py pair` and type the dashboard
+code locally, then run `.\.venv\Scripts\python.exe pairing.py heartbeat-loop
+--config configs/mock.toml`. Pairing persists private credentials and exits;
+it does not start the sender. The POSIX equivalent uses `.venv/bin/python`,
+but macOS/Linux adaptation is not qualified. Choose Done or reopen My Compute
+after pairing to refresh inventory; the dashboard does not observe installation.
+Do not paste pairing codes or stored heartbeat keys into agent conversations.
+
+The sender posts `{"usable": bool}` with its heartbeat-scoped key, honors
+`429`/`Retry-After` and transient failures, and prompts to re-pair after key
+revocation/expiry. The supplied mock command always reports `usable=false`:
+a heartbeat proves reachability, not inference readiness. For credential
+storage and launcher integration, see the pinned worker's
+[`PAIRING-INTEGRATION.md`](https://github.com/synchronic1/AIPSTER/blob/5fd4aba06bd05143a029cf25f8976d3f823b754d/local-worker/PAIRING-INTEGRATION.md).
+
+To disconnect, stop both sender and daemon terminals, revoke the resource's
+heartbeat key in AIPSTER Keys, then run the same venv Python with
+`pairing.py unpair` to forget local state. Local unpair does not revoke the
+server key, and removing `.venv`/`.state` alone does not remove credentials
+from the private worker data directory. Preserve unrelated models and engines.
+The setup adds no service, startup task or automatic update.
 
 ## Test map
 
@@ -142,4 +164,9 @@ website/tests/ui-connect-card.test.mjs (18 tests, exact checked-in
 client): pair mint/reveal/dismiss/re-mint with no clipboard write and no
 new links, cap-failure retry, demo unavailability, stepper honesty,
 resource link states (needs-link/linked/reachable/stale), manual form
-under Advanced.
+under Advanced. `website/tests/ui-pairing-repair.test.mjs` adds 8 exact-client
+VM regressions for late mint success/error after target changes, Done/tab/
+logout/replacement fences, CSRF, clipboard exclusion, published sparse source
+pin, anonymous/demo guards, escaped code display and explicit sender/revocation
+instructions. Clearing a code invalidates pending mint work; it does not revoke
+an already minted code, which remains subject to server expiry and limits.

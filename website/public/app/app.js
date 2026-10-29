@@ -194,10 +194,10 @@ async function loadOverview() {
 // exists), a secondary agent-assisted setup that copies pinned, secret-free
 // instructions on qualified platforms only, and an OS picker that corrects
 // detection. Linked
-// documentation is pinned separately from the worker source, which remains
-// pinned to the reviewed #17 head (merged; worker requires a local token and
-// validates Host/Origin); move either pin only with a re-verified re-pin.
-// The card renders with no API call and holds no credential; the only call
+// documentation and worker source have immutable pins. The reviewed pairing
+// client retains the #17 local-token and Host/Origin guards; move either pin
+// only with a re-verified re-pin.
+// The card renders with no API call and initially holds no credential; the call
 // it ever makes is minting a one-time pairing code when the user clicks Pair,
 // and the code is cleared on Done, tab switch, or sign-out. No verified
 // installer is packaged for any platform yet, so progress honestly stops at

@@ -17,7 +17,7 @@ import { createTestEnv, readJson } from './d1-shim.mjs';
 import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
-// Reviewed #17 head: worker requires a local token and validates Host/Origin.
+// Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
 const WORKER_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
