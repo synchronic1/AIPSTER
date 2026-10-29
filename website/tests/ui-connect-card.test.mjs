@@ -35,7 +35,7 @@ const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
 const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
 const SECRET_SHAPED = /aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i;
 
-async function makeUi({ anonymous = false, platform, touchPoints = 0, clipboard = 'absent' } = {}) {
+async function makeUi({ anonymous = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent' } = {}) {
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
   const t = await createTestEnv();
   const elements = new Map();
@@ -78,7 +78,10 @@ async function makeUi({ anonymous = false, platform, touchPoints = 0, clipboard 
     URLSearchParams, history: { replaceState() {} }
   };
   if (platform !== undefined || clipboard !== 'absent') {
-    globals.navigator = { platform: platform ?? '', userAgentData: undefined, maxTouchPoints: touchPoints };
+    globals.navigator = {
+      platform: platform ?? '', userAgent, maxTouchPoints: touchPoints,
+      userAgentData: uaMobile === undefined ? undefined : { platform: undefined, mobile: uaMobile }
+    };
     if (clipboards[clipboard]) globals.navigator.clipboard = clipboards[clipboard];
   }
   const context = vm.createContext(globals);
@@ -209,14 +212,38 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   await win.chooseOs('bogus');
   assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64: not available'));
 
-  // Phones and tablets are directed to the computer they want to connect.
-  for (const opts of [{ platform: 'Android' }, { platform: 'iPhone' }, { platform: 'MacIntel', touchPoints: 5 }]) {
+  // Phones and tablets are directed to the computer they want to connect,
+  // with no install action until they explicitly pick a target computer.
+  for (const opts of [{ platform: 'Android' }, { platform: 'iPhone' }, { platform: 'MacIntel', touchPoints: 5 },
+    { platform: 'Linux armv8l', uaMobile: true },
+    { platform: 'Linux x86_64', userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36' }]) {
     const mob = await makeUi({ ...opts, clipboard: 'ok' });
     await mob.clickTab('compute');
-    const mobText = textOf(mob.el('connect-card').innerHTML);
-    assert.ok(mobText.includes('Open AIPSTER on the computer you want to connect'), JSON.stringify(opts));
-    assert.ok(nodesOf(mob.el('connect-card').innerHTML).some((n) => n.tagName === 'select'), 'picker stays available');
+    const mobHtml = mob.el('connect-card').innerHTML;
+    assert.ok(textOf(mobHtml).includes('Open AIPSTER on the computer you want to connect'), JSON.stringify(opts));
+    assert.ok(nodesOf(mobHtml).some((n) => n.tagName === 'select'), 'picker stays available');
+    assert.deepEqual(nodesOf(mobHtml).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [], 'no install action before an explicit pick');
+    await mob.press('copy-agent');
+    assert.deepEqual(mob.captured, [], 'fabricated copy on an unpicked phone writes nothing');
   }
+  const phone = await makeUi({ platform: 'iPhone', clipboard: 'ok' });
+  await phone.clickTab('compute');
+  await phone.chooseOs('windows');
+  assert.ok(textOf(phone.el('connect-card').innerHTML).includes('You picked Windows x64 as the target computer.'));
+  await phone.press('copy-agent');
+  assert.equal(phone.captured.length, 1, 'explicit target pick enables the copy');
+  assert.ok(phone.captured[0].startsWith('Target computer: Windows x64 (these steps run on that computer, not on this phone or tablet).'));
+
+  // Desktop Linux user agents still classify as Linux.
+  const desk = await makeUi({ platform: 'Linux x86_64', userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36', clipboard: 'ok' });
+  await desk.clickTab('compute');
+  assert.ok(textOf(desk.el('connect-card').innerHTML).includes('Detected: Linux. Change it if that is wrong.'));
+
+  // Agent setup refuses unqualified platforms even when invoked directly.
+  await mac.chooseOs('macos');
+  await mac.press('copy-agent');
+  assert.deepEqual(mac.captured, [], 'no clipboard write on an unqualified platform');
+  assert.ok(!textOf(mac.el('connect-card').innerHTML).includes(COPIED_MESSAGE));
 });
 
 test('agent setup copies pinned, secret-free instructions and confirms once', async () => {
@@ -356,6 +383,24 @@ test('interrupted setup restarts cleanly and never paints after sign-out', async
   const raced = textOf(race.el('connect-card').innerHTML);
   assert.ok(!raced.includes(COPIED_MESSAGE), 'stale clipboard result claims nothing');
   assert.ok(raced.includes('Installer for Linux: not available'), 'card stays on the newly picked OS');
+
+  // An OS round-trip still invalidates the pending copy.
+  const round = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  await round.clickTab('compute');
+  round.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  await round.chooseOs('linux');
+  await round.chooseOs('windows');
+  await round.resolveDeferred();
+  assert.ok(!textOf(round.el('connect-card').innerHTML).includes(COPIED_MESSAGE), 'round-tripped copy claims nothing');
+
+  // A pending copy never overwrites a later platforms notice.
+  const over = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  await over.clickTab('compute');
+  over.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  await over.chooseOs('macos');
+  await over.press('platforms');
+  await over.resolveDeferred();
+  assert.ok(textOf(over.el('connect-card').innerHTML).includes('Supported platforms:'), 'platforms notice survives the stale write');
 
   // Double-clicking copies once per settled write; the older write wins nothing.
   const twice = await makeUi({ platform: 'Win32', clipboard: 'deferred' });

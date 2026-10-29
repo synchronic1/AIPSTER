@@ -198,8 +198,11 @@ const OS_META = {
 function detectOs() {
   try {
     if (typeof navigator === 'undefined') return null;
-    const plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
-    const s = String(plat).toLowerCase();
+    const uaData = navigator.userAgentData || null;
+    if (uaData && uaData.mobile === true) return 'mobile';
+    const plat = (uaData && uaData.platform) || navigator.platform || '';
+    const ua = typeof navigator.userAgent === 'string' ? navigator.userAgent : '';
+    const s = (String(plat) + ' ' + ua).toLowerCase();
     if (s.includes('android') || s.includes('iphone') || s.includes('ipad') || s.includes('mobile')) return 'mobile';
     if (s.includes('win')) return 'windows';
     if (s.includes('mac')) {
@@ -320,8 +323,8 @@ let connect = null;
 
 // Approved installer origins (dormant: no installer is available yet). A
 // future available entry renders a download only when its URL is an AIPSTER
-// release artifact and its checksum is a full SHA-256 hex digest.
-const INSTALLER_URL_OK = /^https:\/\/github\.com\/synchronic1\/AIPSTER\//;
+// release download and its checksum is a full SHA-256 hex digest.
+const INSTALLER_URL_OK = /^https:\/\/github\.com\/synchronic1\/AIPSTER\/releases\/download\//;
 const installerUsable = (inst) => !!(inst && inst.available
   && INSTALLER_URL_OK.test(inst.url || '') && /^[0-9a-f]{64}$/.test(inst.sha256 || ''));
 
@@ -340,17 +343,20 @@ function paintConnectCard() {
   const meta = OS_META[connect.os];
   const options = ['windows', 'macos', 'linux'].map((k) =>
     `<option value="${k}"${k === connect.os ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
-  const detectedNote = connect.detected === 'mobile' ? MOBILE_NOTE : connect.detected
-    ? `Detected: ${esc(OS_FAMILY[connect.detected])}. Change it if that is wrong.`
-    : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
+  const detectedNote = connect.detected === 'mobile'
+    ? MOBILE_NOTE + (connect.picked ? ` You picked ${esc(meta.label)} as the target computer.` : '')
+    : connect.detected
+      ? `Detected: ${esc(OS_FAMILY[connect.detected])}. Change it if that is wrong.`
+      : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
   const inst = INSTALLERS[connect.os];
   const usable = installerUsable(inst);
   const primary = usable
     ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
     : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
-  const secondary = meta.agentQualified
-    ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
-    : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
+  const secondary = connect.detected === 'mobile' && !connect.picked ? ''
+    : meta.agentQualified
+      ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
+      : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
   const installerLine = usable
     ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
     : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
@@ -360,7 +366,8 @@ function paintConnectCard() {
   } else if (connect.phase === 'copied') {
     status = `<p class="notice" role="status"><span class="pill ok">Copied</span> ${esc(COPIED_MESSAGE)} The agent needs authorized access to this computer — a browser-only chat cannot install software by itself.</p>`;
   } else if (connect.phase === 'copy-failed') {
-    status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
+    const saveNote = connect.saveFailed ? ' The file download failed in this browser, so use the selectable text.' : '';
+    status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
   }
   const commands = workerCommands(connect.os).map(esc).join('\n');
   const advanced = `<details><summary>Advanced: manual install, source and troubleshooting</summary>
@@ -421,6 +428,7 @@ function onConnectClick(ev) {
   const action = (near && near.dataset && near.dataset.action) || (t && t.dataset && t.dataset.action);
   if (action === 'platforms') {
     connect.phase = 'platforms';
+    connect.copyOp = (connect.copyOp || 0) + 1;
     paintConnectCard();
   } else if (action === 'copy-agent') {
     copyAgentInstructions();
@@ -431,18 +439,23 @@ function onConnectClick(ev) {
 
 function saveInstructions() {
   if (!connect || !connect.fallback) return;
+  if (typeof Blob === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
+  if (typeof document === 'undefined' || !document.createElement || !document.body) return;
+  let url = null;
   try {
-    if (typeof Blob === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
-    if (typeof document === 'undefined' || !document.createElement || !document.body) return;
-    const url = URL.createObjectURL(new Blob([connect.fallback], { type: 'text/plain' }));
+    url = URL.createObjectURL(new Blob([connect.fallback], { type: 'text/plain' }));
     const a = document.createElement('a');
     a.href = url;
     a.download = 'aipster-worker-setup.txt';
     document.body.appendChild(a);
     a.click();
     a.remove();
-    if (typeof setTimeout === 'function') setTimeout(() => URL.revokeObjectURL(url), 4000);
-  } catch { /* the selectable text remains; nothing else to offer */ }
+    if (typeof setTimeout === 'function') setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* already gone */ } }, 4000);
+  } catch {
+    if (url) { try { URL.revokeObjectURL(url); } catch { /* already gone */ } }
+    connect.saveFailed = true;
+    paintConnectCard();
+  }
 }
 
 function onConnectChange(ev) {
@@ -450,8 +463,11 @@ function onConnectChange(ev) {
   const t = ev && ev.target;
   if (t && t.dataset && t.dataset.action === 'os' && OS_META[t.value]) {
     connect.os = t.value;
+    connect.picked = true;
     connect.phase = 'idle';
     connect.fallback = '';
+    connect.saveFailed = false;
+    connect.copyOp = (connect.copyOp || 0) + 1;
     paintConnectCard();
   }
 }
@@ -463,8 +479,12 @@ async function copyAgentInstructions() {
   // card the user has since re-rendered, switched OS on, or re-clicked.
   const card = connect;
   const os = card.os;
+  if (!OS_META[os].agentQualified) return;
+  if (card.detected === 'mobile' && !card.picked) return;
   const op = (card.copyOp = (card.copyOp || 0) + 1);
-  const text = agentInstructions(os);
+  const text = card.detected === 'mobile'
+    ? `Target computer: ${OS_META[os].label} (these steps run on that computer, not on this phone or tablet).\n` + agentInstructions(os)
+    : agentInstructions(os);
   let clipboard = null;
   try {
     clipboard = (typeof navigator !== 'undefined' && navigator.clipboard) || null;
@@ -479,6 +499,7 @@ async function copyAgentInstructions() {
     if (gen !== generation || connect !== card || card.copyOp !== op || card.os !== os) return;
     card.phase = 'copy-failed';
     card.fallback = text;
+    card.saveFailed = false;
   }
   paintConnectCard();
 }
@@ -486,7 +507,7 @@ async function copyAgentInstructions() {
 function renderConnectCard() {
   const detected = detectOs();
   const os = detected && detected !== 'mobile' ? detected : 'windows';
-  connect = { os, detected, phase: 'idle', fallback: '' };
+  connect = { os, detected, picked: false, phase: 'idle', fallback: '', saveFailed: false, copyOp: 0 };
   paintConnectCard();
   const el = $('connect-card');
   el.onclick = onConnectClick;
