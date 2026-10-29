@@ -1,7 +1,19 @@
 <!-- Built with Meta Muse; isolated Codex review and repair evidence below. -->
 # Windows worker build report
 
-## Current repaired artifact (local, unsigned, unpublished)
+## Native ownership follow-up
+
+Diagnostic CI run40935794359/job123665871201 confirmed the elevated runner's
+new paths have owner and token-default-owner S-1-5-32-544, distinct from its
+user SID; the old strict helper rejected them before writing any token.
+The native helper normalizes only exclusively created paths, retains
+existing-foreign-owner denial, verifies the exact protected user-only DACL
+and avoids the measured 23-35s PowerShell startup cost. All16 source tests
+pass locally in0.209s. Lead independent review passed5 additional native
+cases and4 retained installer cases. New frozen build/elevated CI evidence
+is pending; the artifact below belongs to the preceding source.
+
+## Earlier repaired artifact (local, unsigned, unpublished)
 
 | Field | Value |
 |---|---|
@@ -21,7 +33,7 @@ earlier source commits are historical and must not identify this repair.
 
 ## Review and repair
 
-Current Muse PR32 head `801f1df7ff4140dd65f1a22d318762491884744d`
+Current Muse PR32 head `f73a3e7ae25c1f2fdcebc4af5578938b794fe218`
 is preserved as an ancestor. Its file-token rotation, multi-address port
 resolver, IPv6 URL helper, expanded qualification and CI review-artifact
 workflow are retained. The repair adds fail-closed process-SID private
@@ -86,3 +98,23 @@ base_library.zip and BUILD.json. That observation is historical owner
 evidence; byte reproducibility of the repaired build is not claimed.
 Earlier wizard screenshots and coexistence results likewise qualify their
 recorded source/artifacts, not the repaired artifact above.
+
+
+## Preserved Muse visual/CI history
+
+Muse f73a3e7 adds uninstall data-choice/preserve-notice capture and waits for
+Start Menu links before taking the screenshot; those driver changes are
+preserved. Owner reports for runs40932568817 and40935178276 describe passing
+full-profile install/registry/shortcut/autostart/control/uninstall checks,
+but token ACL failures were accepted as restricted-context PASS. That
+leniency is absent here, so these runs do not qualify strict private storage.
+
+The owner reported reviewing CI artifact windows-installer-screenshots from
+40935178276: welcome, license, default-off autostart component, editable temp
+directory, finish with Start now unchecked, Start Menu spinner with links
+log-verified, local worker console without token value, uninstall confirm,
+unchecked Remove data, data-preserved notice and finish. It reported
+installed=True/install removed=True/data preserved=True. This is attributed
+historical evidence, not a new visual review of the native repaired build.
+Actual tray/menu pixels, desktop opt-out and the checked removal box still
+need owner review. No screenshot driver was run on the current desktop.
