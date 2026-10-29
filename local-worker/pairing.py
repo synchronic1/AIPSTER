@@ -433,6 +433,13 @@ def pairing_key_path(data_dir, meta):
     return Path(data_dir) / generation
 
 
+def managed_key_files(data_dir):
+    data = Path(data_dir)
+    legacy = data / "heartbeat-key.txt"
+    return ([legacy] if legacy.exists() else []) + [path for path in data.glob("heartbeat-key.*.txt")
+            if re.fullmatch(r"heartbeat-key\.[a-f0-9]{32}\.txt", path.name)]
+
+
 def load_pairing(data_dir):
     """Load pairing metadata + secret. Raises PairingError when unpaired."""
     check_private_store(data_dir)
@@ -464,6 +471,12 @@ def cmd_pair(args):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
         private_dir(data_dir)
+        # Retained keys may still authenticate to a previous API origin or be
+        # held by an older reader. Keep them, but establish privacy before a
+        # claim or success message, not just for the newly published generation.
+        for key_file in managed_key_files(data_dir):
+            if not restrict_file(key_file):
+                raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
         node_id = load_or_create_node_id(data_dir / "state")
         hardware = probe_hardware(args.config)
         if args.name:
@@ -602,9 +615,7 @@ def cmd_unpair(args):
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     files = pairing_files(data_dir)
     removed = []
-    generations = [path for path in data_dir.glob("heartbeat-key.*.txt")
-                   if re.fullmatch(r"heartbeat-key\.[a-f0-9]{32}\.txt", path.name)]
-    for path in [files["meta"], files["key"], *generations]:
+    for path in [files["meta"], *managed_key_files(data_dir)]:
         try:
             path.unlink()
             removed.append(str(path))
