@@ -128,7 +128,7 @@ test('UI repair: pairing checkout uses the published reviewed source pin and qua
   const t = await ui();
   const commands = t.context.workerCommands('windows').join('\n');
   const pin = /git checkout --detach ([a-f0-9]{40})/.exec(commands)[1];
-  assert.equal(pin,'5fd4aba06bd05143a029cf25f8976d3f823b754d');
+  assert.equal(pin,'15b114edc139b5eee6149de692eb65d49a51335d');
   assert.match(commands,/sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
   assert.ok(!commands.includes('git clone https://'), 'no full checkout replaces the qualified sparse flow');
   assert.match(t.context.agentInstructions('windows'), /Use the pinned commands below for pairing/);

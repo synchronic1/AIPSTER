@@ -18,9 +18,9 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
-const WORKER_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
+const WORKER_COMMIT = '15b114edc139b5eee6149de692eb65d49a51335d';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
-const DOCS_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
+const DOCS_COMMIT = '2184dd80487734b244ea285930ab0871ec22c51a';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
@@ -395,7 +395,7 @@ test('packaged-but-unpublished installer shows version/checksum with no download
   const text = textOf(html);
   assert.ok(text.includes('Installer pending publication for Windows x64'), 'disabled per-platform action');
   assert.ok(text.includes('packaged; release qualification pending') && text.includes('nothing to download'), 'visible explanation');
-  assert.ok(text.includes('0.1.0') && text.includes('ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7'), 'reviewed build version + exact checksum shown');
+  assert.ok(text.includes('0.1.0') && text.includes('81f60828bcc89f038f7a0ded16db76bb06f0c64c42942fa9c52b24cb7f503688'), 'reviewed build version + exact checksum shown');
   assert.ok(!/Download installer/.test(text), 'no live download label while unpublished');
   const linksBefore = cardLinks(html);
   await ui.press('download');

@@ -202,8 +202,8 @@ async function loadOverview() {
 // and the code is cleared on Done, tab switch, or sign-out. No verified
 // installer is downloadable yet; Windows packaging still needs release qualification, so progress stops at
 // "Setup needed" until the worker is installed and paired elsewhere.
-const WORKER_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
-const DOCS_COMMIT = '5fd4aba06bd05143a029cf25f8976d3f823b754d';
+const WORKER_COMMIT = '15b114edc139b5eee6149de692eb65d49a51335d';
+const DOCS_COMMIT = '2184dd80487734b244ea285930ab0871ec22c51a';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
@@ -230,8 +230,8 @@ const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or
 // owner publishes the verified file.
 const INSTALLERS = {
   windows: { available: false, packaged: true, version: '0.1.0',
-    sha256: 'ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7',
-    built_from: 'a2ec5e1938436e48de091548aa37f151cf8109e4',
+    sha256: '81f60828bcc89f038f7a0ded16db76bb06f0c64c42942fa9c52b24cb7f503688',
+    built_from: 'cee3390bda28ac70ee75f6e432fd633e4f76a9f0',
     reason: 'packaged; release qualification pending; release upload pending' },
   macos: { available: false, reason: 'no verified installer package exists yet' },
   linux: { available: false, reason: 'no verified installer package exists yet' }

@@ -112,7 +112,7 @@ scope — the delivered key is heartbeat-scoped and fails every other route.
 ## Worker side and dashboard setup
 
 The dashboard's authoritative source commands pin the published, reviewed
-worker `5fd4aba06bd05143a029cf25f8976d3f823b754d`. They retain the sparse
+worker `15b114edc139b5eee6149de692eb65d49a51335d`. They retain the sparse
 `/local-worker/` + `/LICENSE` checkout and the pinned installation toolchain.
 The linked standalone README is background documentation and may name an
 older checkout; use the dashboard's explicit pairing commands instead.
@@ -133,7 +133,7 @@ The sender posts `{"usable": bool}` with its heartbeat-scoped key, honors
 revocation/expiry. The supplied mock command always reports `usable=false`:
 a heartbeat proves reachability, not inference readiness. For credential
 storage and launcher integration, see the pinned worker's
-[`PAIRING-INTEGRATION.md`](https://github.com/synchronic1/AIPSTER/blob/5fd4aba06bd05143a029cf25f8976d3f823b754d/local-worker/PAIRING-INTEGRATION.md).
+[`PAIRING-INTEGRATION.md`](https://github.com/synchronic1/AIPSTER/blob/2184dd80487734b244ea285930ab0871ec22c51a/local-worker/PAIRING-INTEGRATION.md).
 
 To disconnect, stop both sender and daemon terminals, revoke the resource's
 heartbeat key in AIPSTER Keys, then run the same venv Python with
