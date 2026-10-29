@@ -310,7 +310,14 @@ export async function acceptInvitation(db, actor, input = {}, op = null) {
 // recoverers converge.
 async function recoverAcceptance(db, actor, inv, acceptor, op = null) {
   const done = await insertAcceptance(db, actor, inv, acceptor);
-  if (!done.created) return { status: 200, body: { id: done.id, state: 'active', note: 'Connection already existed for this invitation.' } };
+  if (!done.created) {
+    // The acceptance batch may have committed while its audit insert failed.
+    // Repair that missing evidence once; an existing audit row is never
+    // duplicated by later retries or other operations.
+    const audited = await first(db, "SELECT id FROM audit WHERE action = 'fabric.invitation.accept' AND target = ?", inv.id);
+    if (!audited) await auditFabric(db, actor, op, 'fabric.invitation.accept', inv.id, `connection ${done.id} (audit recovered)`);
+    return { status: 200, body: { id: done.id, state: 'active', note: 'Connection already existed for this invitation.' } };
+  }
   await auditFabric(db, actor, op, 'fabric.invitation.accept', inv.id, `connection ${done.id} (recovered)`);
   return { status: 201, body: { id: done.id, aNode: inv.issuer_node, bNode: acceptor.id, state: 'active' } };
 }
