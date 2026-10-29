@@ -184,3 +184,26 @@ test('a lost resource race writes nothing: counters move only with an accepted h
   assert.equal(owner, null, 'no owner bucket was created or charged');
   assert.equal(global, null, 'no global bucket was created or charged');
 });
+
+test('a committed heartbeat whose counter upsert did not register is still charged once', async () => {
+  // Independent review P3: if production D1 ever failed to chain changes()
+  // into a counter upsert, the accepted heartbeat must not stay uncharged.
+  const t = await createTestEnv({ HEARTBEAT_OWNER_PER_HOUR: '100000', HEARTBEAT_GLOBAL_PER_HOUR: '100000' });
+  const r = await register(t, t.alice, 'box');
+  const key = await mintHeartbeat(t, t.alice, r.id);
+  const realBatch = t.DB.batch.bind(t.DB);
+  t.DB.batch = async (stmts) => {
+    if (!/UPDATE resources SET heartbeat_at/.test(stmts[0].sql || '')) return realBatch(stmts);
+    // Drop the owner upsert: the batch commits the resource write and the
+    // global charge, and reports zero changes for the owner statement.
+    const [resource, global] = await realBatch([stmts[0], stmts[2]]);
+    return [resource, { success: true, meta: { changes: 0 } }, global];
+  };
+  const out = await readJson(await beat(t, key.secret, r.id));
+  t.DB.batch = realBatch;
+  assert.equal(out.status, 200, out.text);
+  const owner = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, heartbeatWindow()).first();
+  const global = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('heartbeat:global', heartbeatWindow()).first();
+  assert.equal(owner.count, 1, 'the missing owner charge was completed');
+  assert.equal(global.count, 1, 'the global charge was not doubled');
+});

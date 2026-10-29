@@ -71,9 +71,11 @@ export const HEARTBEAT_CAPS_SQL =
 // The two counter statements that follow the resource UPDATE in the same
 // batch. Each runs only when the statement before it changed exactly one
 // row, so the counters move together with an accepted heartbeat or not at
-// all. The upsert creates the hourly bucket on first use.
-export function heartbeatCounterStatements(db, ownerId, window) {
-  const upsert = `INSERT INTO write_budget (user_id, window, count) SELECT ?, ?, 1 WHERE changes() = 1
+// all. The upsert creates the hourly bucket on first use. `unconditional`
+// drops the changes() gate; the worker uses it only to complete the charge
+// of a heartbeat the batch has already committed.
+export function heartbeatCounterStatements(db, ownerId, window, { unconditional = false } = {}) {
+  const upsert = `INSERT INTO write_budget (user_id, window, count) SELECT ?, ?, 1 WHERE ${unconditional ? '1' : 'changes() = 1'}
      ON CONFLICT (user_id, window) DO UPDATE SET count = count + 1`;
   return [db.prepare(upsert).bind(ownerId, window), db.prepare(upsert).bind(HEARTBEAT_GLOBAL_ID, window)];
 }

@@ -58,8 +58,11 @@ Order inside `POST /api/resources/:id/heartbeat` (`website/src/worker.js`):
    2. Owner counter upsert `… SELECT ?, ?, 1 WHERE changes() = 1 ON CONFLICT
       DO UPDATE SET count = count + 1`.
    3. Global counter upsert, same shape, chained on the owner upsert.
-5. If the resource UPDATE changed one row: `200` (the worker also asserts
-   both counters changed). Otherwise nothing was written; read-only probes
+5. If the resource UPDATE changed one row: `200`. Should a counter upsert in
+   that committed batch not report its change (never observed on local D1,
+   where every bucket-state combination chains correctly; production D1 is
+   unverified), the worker completes that charge with an unconditional
+   upsert, so an accepted heartbeat is never left uncharged. Otherwise nothing was written; read-only probes
    name the reason (global cap, owner cap, then the existing
    key/resource/owner/window mapping).
 
@@ -108,11 +111,19 @@ heartbeat cost and is not bounded by the heartbeat budgets).
 | Read-only fast paths (window, global cap, owner cap) | 0 |
 | Lost admission batch (cap, window, key, owner or resource race) | 0 — measured on real local D1 |
 
+Two writes are not gated by the admission and can land on a request that
+is then rejected: the hourly prune of past buckets (it runs before the
+batch while the current global bucket does not exist yet; it deletes each
+old bucket once, see the bound below) and the coarse `last_used_at` refresh
+for any live key (≤1 per key per hour, shared with all API-key use, and
+growing with the number of keys rather than with the heartbeat caps).
+
 Sustained rejection is measured, not assumed: after the global cap is
 spent, 100 further heartbeats across eight keys add zero `rows_written`,
 and the whole run stays within
 `3 × accepted + 2 × buckets + keys` rows (assertion A below is therefore
-verified for these statements on local D1).
+verified for these statements on local D1; the prune deletes nothing in
+that test because no past-hour buckets exist).
 
 Counting assumptions (no explicit official sentence found for either;
 checked pricing, limits, billing, return-object, metrics-analytics, FAQ,
@@ -138,20 +149,29 @@ The global ceiling binds before any per-owner sum can: 1,000/hour × 24 h =
 creation**. Rejected heartbeats add nothing. Bucket creation is bounded by
 accepted heartbeats too (a bucket only appears with an accepted one): the
 degenerate case is every accepted heartbeat being some owner's first of the
-hour, i.e. 5 rows each, so the hard bound is
-**5 × HEARTBEAT_GLOBAL_PER_HOUR × 24 + 2 × 24 rows/day ≈ 120,000 rows/day at
-the 1,000 placeholder**. A realistic fleet (owners beating every 25–60 s)
+hour: 5 rows each (resource, owner bucket insert = 3, global upsert), plus 1
+more when the next hour's prune deletes that bucket. Hard bound:
+**6 × HEARTBEAT_GLOBAL_PER_HOUR × 24 + 3 × 24 rows/day ≈ 144,000 rows/day at
+the 1,000 placeholder** (excluding the per-key `last_used_at` refresh,
+which is not a heartbeat cost). A realistic fleet (owners beating every 25–60 s)
 sits near the 3-row figure, ≈72,000.
 (Before this change the total was unbounded in N: only the 25s/resource
 window and the 100-resources/owner cap applied.)
 
-| Tier | Allowance (source) | Hard bound at placeholder 1,000/h (≈120k/day) |
+| Tier | Allowance (source) | Hard bound at placeholder 1,000/h (≈144k/day) |
 |---|---|---|
-| Workers Free | 100,000 rows written/day, reset 00:00 UTC daily; over-limit queries fail | **Does not fit** in the degenerate case. Recommendation: set `HEARTBEAT_GLOBAL_PER_HOUR=500` on Free (hard bound 5 × 500 × 24 ≈ 60,000/day, leaving ~40% for registrations, keys, grants and sessions) |
-| Workers Paid | first 50M rows/month included, then $1.00 per million rows | ≈3.6M rows/month « 50M included → $0 heartbeat overage at 1,000/h |
+| Workers Free | 100,000 rows written/day, reset 00:00 UTC daily; over-limit queries fail | **Does not fit** in the degenerate case. Recommendation: set `HEARTBEAT_GLOBAL_PER_HOUR=400` on Free (hard bound 6 × 400 × 24 ≈ 57,700/day, leaving ~42% for registrations, keys, grants, sessions and `last_used_at`) |
+| Workers Paid | first 50M rows/month included, then $1.00 per million rows | ≈4.3M rows/month « 50M included → $0 heartbeat overage at 1,000/h |
 
 Choosing the cap is an operator decision about tier and fleet size, not a
 correctness question: the bound above holds for any configured value.
+
+Known edges (accepted, documented): `hbWindow` is computed once per
+request, so a request in flight across the UTC hour boundary is admitted
+against the previous hour's bucket (bounded by in-flight requests; that
+bucket is pruned an hour later). A request that loses its batch for a
+window/key reason while a cap fills at the same moment reports the quota
+429, i.e. a longer Retry-After; it discloses nothing.
 
 Related allowances (same sources): rows read 5M/day Free / 25B/month Paid;
 queries per Worker invocation 50 Free / 1000 Paid (heartbeat intake issues

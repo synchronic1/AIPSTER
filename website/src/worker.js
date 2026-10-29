@@ -430,9 +430,13 @@ async function handleApi(request, env, url) {
         ...heartbeatCounterStatements(db, actor.key.owner_id, hbWindow),
       ]);
       if (Number(claimed.meta.changes) === 1) {
-        if (Number(ownerCharge.meta.changes) !== 1 || Number(globalCharge.meta.changes) !== 1) {
-          throw new Error('heartbeat admission batch did not charge both budgets');
-        }
+        // The batch has committed the heartbeat. If a counter upsert did not
+        // register its change (local D1 always chains changes(); production
+        // D1 is not yet verified), complete the charge rather than leave an
+        // accepted heartbeat uncharged. This charges, never refunds.
+        const [ownerUpsert, globalUpsert] = heartbeatCounterStatements(db, actor.key.owner_id, hbWindow, { unconditional: true });
+        if (Number(ownerCharge.meta.changes) !== 1) await ownerUpsert.run();
+        if (Number(globalCharge.meta.changes) !== 1) await globalUpsert.run();
         return json(200, { ok: true, id: resourceId, heartbeatAt: now, online: true, usable: usable === 1 });
       }
       // Admission lost: nothing was written. Map the reason with read-only
