@@ -8,13 +8,18 @@ can land without a pairing-session edit.
 
 ## What the pairing slice provides (this branch)
 
-- `local-worker/pairing.py` — stdlib-only (`argparse, getpass, json, ssl`
-  via urllib, `secrets, subprocess, time`). No new third-party
+- `local-worker/pairing.py` and `private_storage_win32.py` — standard library
+  only (urllib/TLS, hashlib and native Win32 ctypes). No new third-party
   dependency, so no `requirements.lock` / `installer-build.lock` change.
   - `pair`: exchanges a dashboard code for `{resource_id, heartbeat key}`,
     stored user-private (`pairing.json` manifest + the private
     `heartbeat-key.<generation>.txt` it names). File permissions are 0600,
-    directories 0700, and Windows uses a protected current-user DACL.
+    directories 0700, and Windows uses a protected current-user DACL, verified
+    by native read-back. Only immediately exclusive-created directories and
+    empty temp files may normalize the process's default owner to its user SID.
+    Existing foreign-owned paths, including Administrators-owned paths, fail
+    closed. The helper is shared byte-for-byte with the installer; no PowerShell
+    ACL process, privilege change or elevated fallback is used.
     Permission failures stop pairing before the claim or secret publication.
     Honors `AIPSTER_WORKER_DATA` and the installed
     `%LOCALAPPDATA%/AIPSTER-Worker` layout.
@@ -26,8 +31,9 @@ can land without a pairing-session edit.
   - `status` (secret-free) / `unpair` (local forget; server key stays
     live until revoked in the dashboard — printed every time). Failed attempts
     replace success status; `status` derives staleness after five minutes.
-- `local-worker/test_pairing.py` — 17 stdlib-only unit tests (fake
-  in-thread API). Run: `python test_pairing.py` with any Python ≥ 3.11.
+- `local-worker/test_pairing.py` — 22 standard-library unit tests (fake
+  in-thread API; 3 POSIX-only tests skip on Windows). The qualified runtime is
+  Python 3.12.14; source declares Python ≥ 3.11.
 - `local-worker/test_pairing_e2e.py` + `website/scripts/pairing-e2e-bridge.mjs`
   — 6 cross-language scenarios (real CLI against real `worker.js` over
   loopback): two-user isolation, repeat startup + quota, lost-response
@@ -37,6 +43,12 @@ can land without a pairing-session edit.
 - `local-worker/test_pairing_security.py` — 15 controlled security/storage
   regressions: redirect refusal, private ACLs, failed/interrupted publication,
   concurrent manifest snapshots, safe legacy reads, truthful status and retries.
+- `local-worker/test_pairing_windows_storage.py` — 6 Windows tests for exclusive
+  mkdir/mkstemp provenance, empty-temp ACL rejection, existing foreign owners,
+  concurrent mkdir collisions, read-only verification and refused replacement.
+  With 14 installation tests and 6 E2Es the matrix has 63 tests (60 runnable
+  and 3 POSIX skips on Windows). Fixtures provision only their own new paths;
+  no test relaxes existing-path ownership policy.
 - Protocol: `docs/pairing.md` (claim) + `docs/heartbeat-intake.md`
   (sender). Claim request/response shapes are fixed by
   `website/tests/pairing.test.mjs`; do not invent a second endpoint.
@@ -47,7 +59,11 @@ Credential-reader contract: use `pairing.load_pairing(data_dir)`, not a hardcode
 key filename. The loader reads one atomic `pairing.json` snapshot, validates its
 `key_file` basename, checks directory/manifest/key ownership and permissions, then
 reads that immutable key generation. Legacy private stores without `key_file`
-still read `heartbeat-key.txt`. Pairing writes/protects the new key first and only
+still read `heartbeat-key.txt`. New manifests also contain a SHA-256 key
+fingerprint, checked with constant-time comparison before sending. Older
+manifests without a fingerprint retain private-store compatibility; fingerprints
+are an additional consistency check, not an alternative to atomic publication.
+Pairing writes/protects the new key first and only
 then atomically publishes the manifest. Interrupted writes retain an old or a
 complete new origin/resource/key tuple. Earlier/private orphan generations are
 retained for in-flight readers and removed only by explicit `unpair`; no automatic
@@ -56,7 +72,8 @@ legacy/generation keys are made private too; a hardening failure stops the claim
 and leaves the existing origin/resource/key selection intact. No secret is stored in the manifest. HTTP
 redirects are refused, including same-origin redirects and TLS downgrades.
 
-1. Freeze `pairing.py` with the bundle (a launcher import picks it up;
+1. Freeze `pairing.py` and its imported `private_storage_win32.py` with the bundle
+   (a launcher import picks them up;
    no hidden-import or data-file changes expected — verify with the
    frozen smoke test).
 2. Launcher/tray UX (exact surface is the installer session's call):
