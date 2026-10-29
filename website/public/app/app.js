@@ -663,15 +663,20 @@ function renderConnectCard() {
   el.onchange = onConnectChange;
 }
 
+let computeLoad = 0;
 async function loadCompute() {
+  // Done can refresh within the same navigation generation. Only the latest
+  // inventory request may update either the cards or the grant selector.
+  const load = ++computeLoad;
   renderConnectCard();
   const el = $('compute-list'); loading(el);
   try {
     const inv = await api('/api/inventory?limit=50');
+    if (load !== computeLoad) return;
     el.innerHTML = inv.items.length ? inv.items.map(resourceCard).join('') : '';
     if (!inv.items.length) state(el, '', 'No resources yet. Pair a worker above, or register one manually under Advanced.');
     $('grant-resource').innerHTML = inv.items.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
-  } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
+  } catch (e) { if (isStale(e) || load !== computeLoad) return; state(el, 'error', e.message); }
 }
 
 async function loadShared() {

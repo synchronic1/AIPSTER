@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 
-async function ui({ deferred = false } = {}) {
-  const elements = new Map(), calls = [], pending = [], copied = [], logs = [];
+async function ui({ deferred = false, holdInventory = false } = {}) {
+  const elements = new Map(), calls = [], pending = [], inventory = [], copied = [], logs = [];
+  let holdInventoryNow = false;
   const el = id => {
     if (!elements.has(id)) elements.set(id, { id, hidden:true, innerHTML:'', textContent:'', value:'', dataset:{}, listeners:{},
       addEventListener(type, fn) { this.listeners[type] = fn; }, setAttribute() {}, querySelectorAll() { return []; } });
@@ -26,6 +27,9 @@ async function ui({ deferred = false } = {}) {
         if(deferred) return new Promise(resolve => pending.push((data,status) => resolve(response(data,status))));
         return response({code:'SYNTHETIC-PAIR-CODE',expiresAt:'2100-01-01T00:00:00Z'},201);
       }
+      if(path === '/api/inventory?limit=50' && holdInventoryNow) {
+        return new Promise(resolve => inventory.push((data,status = 200) => resolve(response(data,status))));
+      }
       if(path.startsWith('/api/usage')) return response({items:[],totals:{requests:0,tokensIn:0,tokensOut:0,modelCostUsd:0,executionCostUsd:0}});
       if(path.startsWith('/api/status')) return response({items:[],summary:{total:0,online:0,stale:0,offline:0,unknown:0},source:'declared-resources',telemetry:'unavailable'});
       return response({items:[],total:0,displayName:'Alice'});
@@ -34,12 +38,50 @@ async function ui({ deferred = false } = {}) {
   new vm.Script(await readFile(new URL('../public/app/app.js', import.meta.url),'utf8')).runInContext(context);
   const flush = async () => { for(let i=0;i<8;i++) await new Promise(setImmediate); };
   await flush();
+  holdInventoryNow = holdInventory;
   const tab = async name => { tabs.find(t => t.dataset.tab === name).listeners.click(); await flush(); };
   await tab('compute');
   const press = async action => { el('connect-card').onclick({target:{dataset:{action}}}); await flush(); };
   const choose = async value => { el('connect-card').onchange({target:{dataset:{action:'os'},value}}); await flush(); };
-  return {context,el,calls,pending,copied,logs,flush,tab,press,choose};
+  return {context,el,calls,pending,inventory,copied,logs,flush,tab,press,choose};
 }
+
+const pairedResource = {
+  id:'synthetic-paired-row',name:'NEWEST-PAIRED-INVENTORY',kind:'local',origin:'paired',
+  owner:{name:'Alice'},compute:{cpu:'synthetic',gpu:'none'},
+  state:{configured:true,authenticated:true,online:false,usable:false,status:'unverified'},
+  heartbeatAt:null,scope:'heartbeat',capabilities:[],
+};
+
+test('UI repair: Done inventory refresh wins over older success or failure in the same generation', async () => {
+  for (const oldFailure of [false,true]) {
+    const t = await ui({holdInventory:true});
+    assert.equal(t.inventory.length,1);
+    await t.press('pair'); await t.press('pair-done');
+    assert.equal(t.inventory.length,2);
+    t.inventory[1]({items:[pairedResource],total:1}); await t.flush();
+    const cards = t.el('compute-list').innerHTML, selector = t.el('grant-resource').innerHTML;
+    assert.match(cards,/NEWEST-PAIRED-INVENTORY/);
+    assert.match(selector,/synthetic-paired-row/);
+    t.inventory[0](oldFailure ? {error:'OLD-INVENTORY-FAILURE'} : {items:[],total:0},oldFailure ? 500 : 200);
+    await t.flush();
+    assert.equal(t.el('compute-list').innerHTML,cards);
+    assert.equal(t.el('grant-resource').innerHTML,selector);
+  }
+});
+
+test('UI repair: newest inventory failure stays visible after older successful snapshots', async () => {
+  const t = await ui({holdInventory:true});
+  await t.press('pair-done'); await t.press('pair-done');
+  assert.equal(t.inventory.length,3);
+  t.inventory[2]({error:'NEWEST-INVENTORY-FAILURE'},503); await t.flush();
+  assert.match(t.el('compute-list').innerHTML,/NEWEST-INVENTORY-FAILURE/);
+  for (const index of [1,0]) {
+    t.inventory[index]({items:[pairedResource],total:1}); await t.flush();
+    assert.match(t.el('compute-list').innerHTML,/NEWEST-INVENTORY-FAILURE/);
+    assert.equal(t.el('grant-resource').innerHTML,'');
+  }
+});
 
 test('INDEPENDENT UI: target change discards a late pairing-code success', async () => {
   const t = await ui({deferred:true});
