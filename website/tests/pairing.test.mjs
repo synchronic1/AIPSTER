@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
+import { verifierFor } from '../src/lib/keys.js';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 
 async function mintCode(t, user, body = {}, extraHeaders = {}) {
@@ -425,4 +426,28 @@ test('an all-uppercase code claims (typed-entry contract)', async () => {
   const minted = await mintCode(t, t.alice);
   const out = await readJson(await claim(t, { code: minted.json.code.toUpperCase(), nodeId: 'n-upper' }));
   assert.equal(out.status, 201, out.text);
+});
+
+test('same node resumes a claim stranded before binding', async () => {
+  const t = await createTestEnv();
+  // Simulate a crash between code consumption and resource binding: the
+  // resource row exists, the code is spent, but no binding was recorded.
+  const now = new Date().toISOString();
+  const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await t.DB.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_strand', t.alice.id, 'n_strand', 'strand-box', 'local', 'paired', 'c', 'g', 1, 1, 0, 0, now).run();
+  const secret = 'AAAAAAAAAAAA';
+  const salt = 'test-salt-strand';
+  await t.DB.prepare('INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts, node_id, resource_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('p_deadbeef', t.alice.id, salt, await verifierFor(secret, salt), now, future, now, 0, 'n_strand', null).run();
+  const out = await readJson(await claim(t, { code: 'pair-deadbeef-AAAA-AAAA-AAAA', nodeId: 'n_strand' }));
+  assert.equal(out.status, 200, out.text);
+  assert.equal(out.json.resourceId, 'r_strand', 'stranded row re-adopted, not duplicated');
+  assert.equal(out.json.created, false);
+  const beat = await readJson(await t.call(`/api/resources/r_strand/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + out.json.heartbeatKey }, body: { usable: false },
+  }));
+  assert.equal(beat.status, 200, 'resumed sender key works');
+  const other = await readJson(await claim(t, { code: 'pair-deadbeef-AAAA-AAAA-AAAA', nodeId: 'n_intruder' }));
+  assert.equal(other.status, 404, 'other nodes still rejected on the spent code');
 });
