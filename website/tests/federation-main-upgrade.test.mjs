@@ -15,7 +15,7 @@ test('real local D1: federation upgrade preserves main signup budget and identit
     '0006_fabric.sql', '0007_consent.sql', '0008_repair2.sql',
     '0009_state_layer.sql', '0010_revision_receipts.sql',
     '0011_fabric_admission.sql', '0012_fabric_restriction_admission.sql',
-    '0013_heartbeat_binding.sql'
+    '0013_heartbeat_binding.sql', '0014_fabric_restriction_receipts.sql'
   ]);
   const mf = new Miniflare(convertV4MiniflareOptions({ modules: true,
     script: 'export default {fetch(){return new Response("synthetic upgrade")}}',
@@ -38,7 +38,7 @@ test('real local D1: federation upgrade preserves main signup budget and identit
     assert.deepEqual(await db.prepare('SELECT * FROM "user" WHERE id = ?').bind('upgrade-user').first(), before);
     assert.deepEqual(await db.prepare('SELECT * FROM write_budget').first(),
       { user_id: 'upgrade-user', window: '2026-10-28T00', count: 17 });
-    for (const table of ['fabric_revision_receipts', 'fabric_revision_failures']) {
+    for (const table of ['fabric_revision_receipts', 'fabric_revision_failures', 'fabric_restriction_receipts']) {
       assert.equal((await db.prepare(`SELECT COUNT(*) n FROM ${table}`).first()).n, 0);
     }
     assert.deepEqual((await db.prepare('PRAGMA foreign_key_check').all()).results, []);

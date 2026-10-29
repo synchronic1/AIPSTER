@@ -116,6 +116,21 @@ suspend/disconnect, and invitation decline/revoke, over REST and the matching
 MCP tools. Each gets one uncharged, ceiling-exempt admission per (owner,
 action, target, current version). A partial unique index in additive
 `0012_fabric_restriction_admission.sql` enforces this across both transports.
+
+### Durable restriction completion (0014)
+
+`0014_fabric_restriction_receipts.sql` adds immutable operation outcomes for
+grant pause/revoke and connection suspend/disconnect. Their guarded effect,
+receipt and audit commit in one local D1 batch. A failed receipt or audit write
+rolls the effect back; an unknown batch response is recovered from the matching
+receipt before fresh version checks, even after another valid transition.
+Receipts bind actor, action, target and the complete request digest. They are
+retained evidence and do not replenish admission capacity. Existing pre-repair
+missing audit entries cannot be reconstructed automatically.
+
+Migration 0013 is reserved for the separately reviewed heartbeat binding change
+in the combined sprint. Integrators must preserve that migration and append
+0014 after it; this focused federation branch intentionally has that gap.
 The free insert is granted only when the store would accept the request: a
 live non-demo owner who is the grant exporter, owns a connection side, or is
 the invitation recipient/issuer; a target in an actionable state; and a current

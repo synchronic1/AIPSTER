@@ -11,7 +11,7 @@ import { checkWriteBudget } from '../lib/quotas.js';
 import { admitFabricOperation } from './admission.mjs';
 import { canonicalize, digestJson } from './canonical.mjs';
 import { evaluate } from './policy.mjs';
-import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt } from './operations.mjs';
+import { opDigest, claimApproval, ensureAudit, ensureHistory, historyIdFor, redactForReplay, freshAttempt, readAttempt, restrictionContext, restrictionCompletion } from './operations.mjs';
 import { runBatch, changes, creatorInsert, acceptFlip, acceptConnInsert, acceptRecoverInsert, vetoRestrict, vetoWithdraw, grantInsert, grantRevise, grantStatus } from './transitions.mjs';
 
 const err = (status, code, message) => httpError(status, message, code);
@@ -416,6 +416,8 @@ async function restrictConnection(db, actor, id, input, op, toState, auditAction
   const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', id);
   if (!conn) throw err(404, 'NOT_FOUND', 'Connection not found.');
   await ownConnectionSide(db, actor, conn);
+  const completion = await restrictionContext(db, actor, op, auditAction, id, input);
+  if (completion.replay) return completion.replay;
   checkVersion(conn, input);
   const side = await actingSideNode(db, actor, conn);
   const veto = await vetoRows(db, id);
@@ -429,17 +431,19 @@ async function restrictConnection(db, actor, id, input, op, toState, auditAction
   const mirror = JSON.stringify([...new Set([...veto, side].filter(Boolean))].sort());
   let res;
   try {
-    res = await runBatch(db, vetoRestrict({ connId: id, side, version: conn.version, newState: toState, mirror, now, actorId: actor.user.id }));
-  } catch {
-    // Lost a veto-row race: settle by reading.
-    if (side && (await vetoRows(db, id)).includes(side)) {
-      const cur = await first(db, 'SELECT state FROM connections WHERE id = ?', id);
-      return { status: 200, body: { id, state: cur ? cur.state : conn.state, note: 'Your side already restricts this connection.' } };
-    }
-    return lostRace();
+    res = await runBatch(db, [
+      ...vetoRestrict({ connId: id, side, version: conn.version, newState: toState, mirror, now, actorId: actor.user.id }),
+      ...restrictionCompletion(actor, completion, auditAction, id, { id, state: toState }, now)
+    ]);
+  } catch (e) {
+    // Only our immutable receipt proves an unknown batch applied. A peer's
+    // later veto is not evidence of this operation; persistence failures must
+    // remain retryable rather than becoming a fabricated terminal conflict.
+    const recovered = await restrictionContext(db, actor, op, auditAction, id, input);
+    if (recovered.replay) return recovered.replay;
+    throw e;
   }
   if (changes(res, 0) === 1 && changes(res, 1) === 1) {
-    await auditFabric(db, actor, op, auditAction, id);
     return { status: 200, body: { id, state: toState } };
   }
   if (changes(res, 0) === 1) return { status: 500, body: { error: 'Request failed.', code: 'INTERNAL' } };
@@ -671,11 +675,6 @@ export async function decideApproval(db, actor, id, input = {}, op = null) {
   needId(id, 'Approval');
   const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', id);
   if (!appr) throw err(404, 'NOT_FOUND', 'Approval not found.');
-  if (appr.decision !== 'requested') throw err(409, 'ALREADY_DECIDED', `Approval is ${appr.decision}.`);
-  if (appr.expiry <= nowIso()) {
-    await db.prepare("UPDATE approvals SET decision = 'expired', decided_at = ? WHERE id = ? AND decision = 'requested'").bind(nowIso(), id).run();
-    throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
-  }
   // The decider must own the exporting side (or the grant being resumed).
   let exporterOk = false;
   if ((appr.action === 'grant.commit' || appr.action === 'grant.revise') && appr.preview_id) {
@@ -691,6 +690,15 @@ export async function decideApproval(db, actor, id, input = {}, op = null) {
     exporterOk = !!(grant && await actorExportsGrant(db, actor, grant));
   }
   if (!exporterOk) throw err(403, 'FORBIDDEN', 'Only the exporting owner can decide.');
+  if (appr.decision !== 'requested') throw err(409, 'ALREADY_DECIDED', `Approval is ${appr.decision}.`);
+  if (appr.expiry <= nowIso()) {
+    const expired = await db.prepare(`UPDATE approvals SET decision = 'expired', decided_at = ?
+      WHERE id = ? AND decision = 'requested'
+      AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`)
+      .bind(nowIso(), id, actor.user.id).run();
+    if (!expired.meta.changes) await throwActorClosed(db, actor);
+    throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
+  }
   const decision = input.decision === 'approve' ? 'approved' : input.decision === 'reject' ? 'rejected' : null;
   if (!decision) throw err(400, 'BAD_DECISION', "Decision must be 'approve' or 'reject'.");
   const now = nowIso();
@@ -997,12 +1005,16 @@ export async function pauseGrant(db, actor, id, input = {}, op = null) {
   if (!grant || !(await grantVisibleTo(db, actor, grant))) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (grant.quarantine_reason) throw err(409, 'GRANT_QUARANTINED', 'Grant is quarantined; re-issue it.');
   if (!await actorExportsGrant(db, actor, grant)) throw err(403, 'FORBIDDEN', 'Only the exporting owner can pause.');
+  const completion = await restrictionContext(db, actor, op, 'fabric.grant.pause', id, input);
+  if (completion.replay) return completion.replay;
   checkVersion(grant, input);
   if (grant.status !== 'enforced') throw err(409, 'BAD_STATE', `Grant is ${grant.status}.`);
   const now = nowIso();
-  const res = await runBatch(db, grantStatus({ id, version: grant.version, to: 'paused', from: 'enforced', apprId: null, connId: null, grantConnId: grant.connection_id, now, actorId: actor.user.id }));
+  const res = await runBatch(db, [
+    ...grantStatus({ id, version: grant.version, to: 'paused', from: 'enforced', apprId: null, connId: null, grantConnId: grant.connection_id, now, actorId: actor.user.id }),
+    ...restrictionCompletion(actor, completion, 'fabric.grant.pause', id, { id, status: 'paused' }, now)
+  ]);
   if (changes(res, 0) === 1) {
-    await auditFabric(db, actor, op, 'fabric.grant.pause', id);
     return { status: 200, body: { id, status: 'paused' } };
   }
   const cur = await first(db, 'SELECT status, version, quarantine_reason FROM fabric_grants WHERE id = ?', id);
@@ -1089,12 +1101,16 @@ export async function revokeGrant(db, actor, id, input = {}, op = null) {
   if (!grant || !(await grantVisibleTo(db, actor, grant))) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (grant.quarantine_reason) throw err(409, 'GRANT_QUARANTINED', 'Grant is quarantined; re-issue it.');
   if (!await actorExportsGrant(db, actor, grant)) throw err(403, 'FORBIDDEN', 'Only the exporting owner can revoke.');
+  const completion = await restrictionContext(db, actor, op, 'fabric.grant.revoke', id, input);
+  if (completion.replay) return completion.replay;
   checkVersion(grant, input);
   if (grant.status === 'revoked') return { status: 200, body: { id, status: 'revoked', note: 'Already revoked.' } };
   const now = nowIso();
-  const res = await runBatch(db, grantStatus({ id, version: grant.version, to: 'revoked', from: 'not-revoked', apprId: null, connId: null, grantConnId: grant.connection_id, now, actorId: actor.user.id }));
+  const res = await runBatch(db, [
+    ...grantStatus({ id, version: grant.version, to: 'revoked', from: 'not-revoked', apprId: null, connId: null, grantConnId: grant.connection_id, now, actorId: actor.user.id }),
+    ...restrictionCompletion(actor, completion, 'fabric.grant.revoke', id, { id, status: 'revoked' }, now)
+  ]);
   if (changes(res, 0) === 1) {
-    await auditFabric(db, actor, op, 'fabric.grant.revoke', id);
     return { status: 200, body: { id, status: 'revoked' } };
   }
   const cur = await first(db, 'SELECT status, version, quarantine_reason FROM fabric_grants WHERE id = ?', id);

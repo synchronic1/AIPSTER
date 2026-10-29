@@ -72,7 +72,7 @@ export function vetoRestrict({ connId, side, version, newState, mirror, now, act
       WHERE id = ? AND version = ? AND state IN ('active','suspended') AND ${ACTOR_LIVE}`,
       newState, side, mirror, newV, now, connId, version, actorId],
     [`INSERT OR IGNORE INTO connection_vetoes (connection_id, side_node, epoch, added_at, added_by)
-      SELECT ?, ?, ?, ?, ? WHERE EXISTS(SELECT 1 FROM connections c WHERE c.id = ? AND c.version = ? AND c.suspended_by = ?)`,
+      SELECT ?, ?, ?, ?, ? WHERE changes() = 1 AND EXISTS(SELECT 1 FROM connections c WHERE c.id = ? AND c.version = ? AND c.suspended_by = ?)`,
       connId, side, newV, now, actorId, connId, newV, side]
   ];
 }
@@ -152,7 +152,7 @@ export function grantStatus({ id, version, to, from, apprId, connId, connVersion
     [`UPDATE fabric_grants SET status = ?, version = ?, updated_at = ?${lastApprSql}
       WHERE id = ? AND version = ? AND ${fromPred} AND quarantine_reason IS NULL AND ${ACTOR_LIVE}${connPinSql}`,
       to, newV, now, ...lastApprParam, id, version, ...fromParam, actorId, ...connPinParam],
-    [`UPDATE connections SET grant_gen = grant_gen + 1 WHERE id = ? AND EXISTS(SELECT 1 FROM fabric_grants WHERE id = ? AND version = ? AND status = ?)`,
+    [`UPDATE connections SET grant_gen = grant_gen + 1 WHERE id = ? AND changes() = 1 AND EXISTS(SELECT 1 FROM fabric_grants WHERE id = ? AND version = ? AND status = ?)`,
       grantConnId, id, newV, to]
   ];
 }
