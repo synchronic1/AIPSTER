@@ -42,6 +42,22 @@ function closeAtAttempt(t,field){
 }
 async function assertPending(t){const r=await ledger(t);assert.equal(r.status,'uncertain');assert.equal(r.response_code,null);assert.equal(r.response_body,null)}
 async function noGrowth(t,count){assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_operation_admissions WHERE owner_id=?').bind(t.alice.user.id).first()).n,count)}
+async function commitOnKnownConnection(c,real){
+ const t=await fixture(c,real,true);assert.equal((await core.resumeConnection(t.db,t.alice,t.conn,t.input)).status,200);
+ t.path='/v1/fabric/grants';t.key='precondition-commit';
+ t.freshApproval=async()=>{
+  const preview=(await core.createPreview(t.db,t.alice,{connectionId:t.conn,resourceIds:['r_gpu1'],consumers:['bob-op'],models:['llama'],maxTokens:100,maxRequests:10})).body;
+  const approval=(await core.requestApproval(t.db,t.alice,{previewId:preview.id})).body;
+  assert.equal((await core.decideApproval(t.db,t.alice,approval.id,{decision:'approve'})).status,200);
+  return {approvalId:approval.id,previewHash:preview.digest};
+ };
+ t.input=await t.freshApproval();return t;
+}
+function beforeRead(db,pattern,hook){
+ let fired=false;
+ const wrap=(raw,sql)=>({raw,sql,bind:(...p)=>wrap(raw.bind(...p),sql),run:(...p)=>raw.run(...p),all:(...p)=>raw.all(...p),async first(...p){if(!fired&&pattern.test(sql)){fired=true;await hook()}return raw.first(...p)}});
+ return {prepare:sql=>wrap(db.prepare(sql),sql),exec:sql=>db.exec(sql),batch:stmts=>db.batch(stmts.map(s=>s.raw||s))};
+}
 
 for(const real of [false,true]){
  const engine=real?'local D1':'sqlite';
@@ -185,5 +201,49 @@ for(const real of [false,true]){
    assert.deepEqual(await snapshot(t),before);
    const freshInput=await t.approval(75);assert.equal((await route(t,{input:freshInput,key:'fresh-approved-commit'})).status,201);
   }
+ });
+ for(const boundary of ['expiry','connection-state','connection-version','snapshot'])test(`${engine}: ${boundary} precheck re-reads a same-op claim made after the approval snapshot`,async c=>{
+  const t=await commitOnKnownConnection(c,real),a=hold(t.db,/INSERT INTO fabric_grants/);c.after(a.release);
+  let entered,releaseClaim;const claimReady=new Promise(r=>entered=r),claimGate=new Promise(r=>releaseClaim=r);c.after(releaseClaim);
+  const first=faultOnce(a.db,/UPDATE approvals SET consumed_at/,'before',false,async()=>{entered();await claimGate});
+  const original=route(t,{db:first});await claimReady;await expire(t);
+  const b=beforeRead(t.db,/SELECT \* FROM grant_previews WHERE id/,async()=>{
+   releaseClaim();await a.ready;
+   if(boundary==='expiry')c.mock.timers.tick(61*60e3);
+   else if(boundary==='snapshot')await t.db.prepare("UPDATE resources SET incarnation='changed-before-check' WHERE id='r_gpu1'").run();
+   else{
+    assert.equal((await core.suspendConnection(t.db,t.bob,t.conn,{expectedVersion:3})).status,200);
+    if(boundary==='connection-version')assert.equal((await core.resumeConnection(t.db,t.bob,t.conn,{expectedVersion:4,nodeKey:t.b.nodeSecret})).status,200);
+   }
+  });
+  const takeover=await route(t,{db:b});assert.equal(takeover.status,503);assert.equal(takeover.body.code,'COMMIT_UNCERTAIN');await assertPending(t);
+  const foreign=await core.commitGrant(t.db,t.alice,t.input,{key:'different-operation',path:t.path});assert.equal(foreign.status,409);assert.equal(foreign.body.code,'APPROVAL_CONSUMED');
+  a.release();assert.equal((await original).status,boundary==='expiry'?201:boundary==='connection-state'?409:412);
+  const applied=await t.db.prepare('SELECT * FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first();
+  if(boundary==='expiry'){
+   assert.ok(applied);await core.revokeGrant(t.db,t.alice,applied.id,{expectedVersion:1});const before=await snapshot(t);
+   const retry=await route(t);assert.equal(retry.status,200);assert.equal(retry.body.id,applied.id);assert.deepEqual(await snapshot(t),before);
+  }else{
+   assert.equal(applied,null);const before=await snapshot(t);assert.equal((await route(t)).status,503);await assertPending(t);assert.deepEqual(await snapshot(t),before);
+   if(boundary==='connection-state')assert.equal((await core.resumeConnection(t.db,t.bob,t.conn,{expectedVersion:4,nodeKey:t.b.nodeSecret})).status,200);
+   assert.equal((await route(t,{input:await t.freshApproval(),key:'fresh-after-precheck'})).status,201);
+  }
+ });
+ for(const [field,status] of [['disabled',401],['demo',403]])test(`${engine}: ${field} owner is denied before catch-path completed-commit audit recovery`,async c=>{
+  const t=await commitOnKnownConnection(c,real),a=hold(t.db,/INSERT INTO fabric_grants/);c.after(a.release);
+  let entered,releaseClaim;const claimReady=new Promise(r=>entered=r),claimGate=new Promise(r=>releaseClaim=r);c.after(releaseClaim);
+  const first=faultOnce(a.db,/UPDATE approvals SET consumed_at/,'before',false,async()=>{entered();await claimGate});
+  const original=route(t,{db:first});await claimReady;await expire(t);let applied;
+  const b=beforeRead(t.db,/SELECT \* FROM connections WHERE id/,async()=>{
+   releaseClaim();await a.ready;a.release();assert.equal((await original).status,201);
+   applied=await t.db.prepare('SELECT id FROM fabric_grants WHERE approval_id=?').bind(t.input.approvalId).first();
+   assert.equal((await core.disconnectConnection(t.db,t.bob,t.conn,{expectedVersion:3})).status,200);
+   await t.db.prepare(`UPDATE "user" SET ${field}=1 WHERE id=?`).bind(t.alice.user.id).run();
+  });
+  let auditWrites=0;
+  const watched={...b,prepare:sql=>{const raw=b.prepare(sql);if(!/INSERT OR IGNORE INTO audit/.test(sql))return raw;const wrap=s=>({raw:s,sql,bind:(...p)=>wrap(s.bind(...p)),first:(...p)=>s.first(...p),all:(...p)=>s.all(...p),run:(...p)=>{auditWrites++;return s.run(...p)}});return wrap(raw)}};
+  const denied=await route(t,{db:watched});assert.equal(denied.status,status);assert.equal(denied.body.id,undefined);assert.equal(auditWrites,0);await assertPending(t);
+  const before=await snapshot(t);await t.db.prepare(`UPDATE "user" SET ${field}=0 WHERE id=?`).bind(t.alice.user.id).run();
+  const replay=await route(t);assert.equal(replay.status,200);assert.equal(replay.body.id,applied.id);assert.deepEqual(await snapshot(t),before);
  });
 }
