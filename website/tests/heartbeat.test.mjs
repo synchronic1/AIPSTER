@@ -416,3 +416,26 @@ test('offline/stale stays derived by the 5-minute status rule', async () => {
   const aged = await readJson(await t.call('/api/status', { headers: t.as(t.alice) }));
   assert.equal(aged.json.items.find((i) => i.id === r.id).liveness, 'stale');
 });
+test('heartbeat at exactly the 25s boundary is admitted (round 9)', async () => {
+  const t = await createTestEnv();
+  const r = await register(t, t.alice, 'alice-box');
+  const key = await mintHeartbeat(t, t.alice, r.id);
+  const first = await readJson(await beat(t, key.secret, r.id, { usable: true }));
+  assert.equal(first.status, 200, first.text);
+  // Freeze the clock so the retry lands exactly 25.000s after the beat:
+  // the boundary where the fast path admits (retryMs = 0) but a strict
+  // `<` in the intake UPDATE used to reject, with the classifier then
+  // falling through to a terminal 404. Only Date.now is frozen (the
+  // boundary input); the session fixture stays valid throughout.
+  const frozen = Date.now();
+  await t.DB.prepare('UPDATE resources SET heartbeat_at = ? WHERE id = ?')
+    .bind(new Date(frozen - 25000).toISOString(), r.id).run();
+  const realNow = Date.now;
+  Date.now = () => frozen;
+  try {
+    const edge = await readJson(await beat(t, key.secret, r.id, { usable: true }));
+    assert.equal(edge.status, 200, edge.text);
+  } finally {
+    Date.now = realNow;
+  }
+});

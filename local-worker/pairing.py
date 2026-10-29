@@ -235,21 +235,77 @@ def check_private_store(data_dir):
                            "; fix permissions or re-pair into a private dir")
 
 
+def _read_settled_node_id(node_file, tries=50, delay=0.1):
+    """Read back a raced node-id, waiting for the winner's write to land.
+
+    O_EXCL creation and content write are two steps: a loser arriving
+    between them sees an empty file. Poll briefly instead of failing —
+    the winner writes within milliseconds. Returns None only if the
+    file vanishes (deleted under us).
+    """
+    for _ in range(tries):
+        try:
+            found = node_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        if found:
+            return found
+        time.sleep(delay)
+    return ""
+
+
 def load_or_create_node_id(state_dir):
-    """Stable worker identity (1..64 id chars), created once and kept."""
+    """Stable worker identity (1..64 id chars), created once and kept.
+
+    Concurrent first pairs converge on one identity (Codex P2 round 9):
+    creation is exclusive (O_EXCL), so exactly one caller generates and
+    every loser reads back the winner after its write settles — nobody
+    overwrites, so no duplicate resources and no lost reclaim identity.
+    """
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     node_file = state_dir / "node-id"
-    if node_file.exists():
-        value = node_file.read_text(encoding="utf-8").strip()
-        if value and len(value) <= 64 and all(c.isalnum() or c in "-_" for c in value):
-            return value
+    for _ in range(2):
+        value = "n_" + secrets.token_hex(16)
+        try:
+            # 0600 at creation on POSIX; the mode is ignored on Windows,
+            # where node-id (an identifier, not a secret) keeps the
+            # per-user data dir's default ACLs.
+            fd = os.open(node_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            found = _read_settled_node_id(node_file)
+            if found is None:
+                continue  # deleted under us; recreate on the next pass
+            break
+        try:
+            if _IS_NT and not restrict_file(node_file):
+                raise PairingError(None, "STORE_UNPROTECTED",
+                                   f"cannot protect {node_file}; refusing to write state")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(value + "\n")
+        except BaseException:
+            # Whatever failed (restriction, write, close, interrupt):
+            # leave no leftovers behind, then re-raise. The next pair
+            # recreates cleanly.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(node_file)
+            except OSError:
+                pass
+            raise
+        return value
+    else:
+        # Vanished twice in a row: genuinely odd; surface it plainly.
         raise PairingError(None, "BAD_NODE_ID",
-                           f"{node_file} does not hold a valid node id; "
-                           "delete it to generate a fresh one on next pair")
-    value = "n_" + secrets.token_hex(16)
-    write_private(node_file, value + "\n")
-    return value
+                           f"{node_file} vanished twice; delete it to generate a fresh one on next pair")
+    if found and len(found) <= 64 and all(c.isalnum() or c in "-_" for c in found):
+        return found
+    raise PairingError(None, "BAD_NODE_ID",
+                       f"{node_file} does not hold a valid node id; "
+                       "delete it to generate a fresh one on next pair")
 
 
 def probe_hardware(config_path=None):
@@ -609,12 +665,23 @@ def cmd_unpair(args):
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     files = pairing_files(data_dir)
     removed = []
+    failed = []
     for key in ("meta", "key"):
         try:
             files[key].unlink()
             removed.append(str(files[key]))
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            # Anything else (permissions, Windows file lock, I/O error)
+            # leaves a usable credential behind: report it (Codex P2
+            # round 9), never a false "not paired". Paths only, no secrets.
+            failed.append(f"{files[key]}: {exc.strerror or exc}")
+    if failed:
+        print("error: could not remove " + "; ".join(failed), file=sys.stderr)
+        print("note: existing credentials may still be usable; fix permissions and retry unpair",
+              file=sys.stderr)
+        return EXIT_USAGE
     if removed:
         print("unpaired locally: " + ", ".join(removed))
         print("note: revoke the sender key in the dashboard Keys panel; it stays live until then")

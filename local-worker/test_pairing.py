@@ -25,7 +25,7 @@ import pairing
 from pairing import (PairingError, RePairRequired, check_api_base,
                      decide_usable, load_or_create_node_id, probe_hardware,
                      claim, send_heartbeat, load_pairing, cmd_heartbeat,
-                     EXIT_OK, EXIT_REPAIR_REQUIRED)
+                     EXIT_OK, EXIT_USAGE, EXIT_REPAIR_REQUIRED)
 
 FAKE_CODE = "pair-01234567-89AB-CDEF-GHJKMNPQ"[:27]
 FAKE_SECRET = "synthetic-heartbeat-key-0123456789abcdef"
@@ -481,6 +481,82 @@ class Round5Tests(unittest.TestCase):
                  "config": None, "interval": 60}), loop=False)
         self.assertNotEqual(code, EXIT_OK)
         self.assertEqual(self.state.beats, [], "refused store sends nothing")
+
+
+class Round9Tests(unittest.TestCase):
+    """Codex round-9 regressions: racing first pairs, honest unpair."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_concurrent_first_pairs_converge_on_one_node_id(self):
+        state = self.data / "state"
+        gate = threading.Barrier(8)
+        results, errors = [], []
+
+        def run_one():
+            try:
+                gate.wait(timeout=30)
+                results.append(load_or_create_node_id(state))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run_one) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(set(results)), 1,
+                         "all racers share the winning identity")
+        self.assertRegex(results[0], r"^n_[0-9a-f]{32}$")
+        self.assertEqual((state / "node-id").read_text().strip(), results[0])
+
+    def test_existing_node_id_is_never_regenerated(self):
+        state = self.data / "state"
+        state.mkdir(parents=True)
+        (state / "node-id").write_text("n_pinnedidentity01\n")
+        self.assertEqual(load_or_create_node_id(state), "n_pinnedidentity01")
+        self.assertEqual(load_or_create_node_id(state), "n_pinnedidentity01")
+
+    def test_unpair_reports_deletion_failure(self):
+        run_cli("pair", self.pair_args())
+        real_unlink = Path.unlink
+
+        def flaky_unlink(self):
+            if self.name == "heartbeat-key.txt":
+                raise PermissionError(13, "denied")
+            return real_unlink(self)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=flaky_unlink):
+            out, err, code = run_cli("unpair", argparse_namespace(
+                {"api_base": self.base, "data_dir": str(self.data)}))
+        self.assertEqual(code, EXIT_USAGE, out + err)
+        self.assertIn("heartbeat-key.txt", err)
+        self.assertIn("still be usable", err)
+        self.assertNotIn(FAKE_SECRET, out + err, "no secret in failure output")
+        self.assertFalse((self.data / "pairing.json").exists(), "meta was removed")
+        self.assertTrue((self.data / "heartbeat-key.txt").exists(), "key survives")
+        self.assertEqual((self.data / "heartbeat-key.txt").read_text().strip(), FAKE_SECRET)
+
+    def test_unpair_empty_store_reports_not_paired(self):
+        out, _, code = run_cli("unpair", argparse_namespace(
+            {"api_base": self.base, "data_dir": str(self.data)}))
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("not paired", out)
 
 
 def argparse_namespace(values):
