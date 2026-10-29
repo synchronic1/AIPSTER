@@ -548,6 +548,7 @@ def pair_lock(data_dir):
     jumps fail safe — worst case is the old concurrent behavior or a
     bounded wait ending in a clean retryable error, never corruption.
     """
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
     lock = Path(data_dir) / "pair.lock"
     deadline = time.monotonic() + PAIR_LOCK_TIMEOUT_SEC
     while True:
@@ -700,6 +701,21 @@ def cmd_heartbeat(args, loop):
             result = send_heartbeat(meta["api_base"], meta["resource_id"],
                                     meta["heartbeat_key"], usable)
         except RePairRequired as exc:
+            # A re-pair may have landed between our reload and this beat
+            # (Codex P2 round 12): if the stored credential changed,
+            # retry with it instead of stranding a freshly paired
+            # worker. An unchanged stored key is a genuine revocation
+            # and still exits below; a vanished store does too.
+            try:
+                with pair_lock(data_dir):
+                    fresh = load_pairing(data_dir)
+            except PairingError:
+                fresh = None
+            if fresh is not None and fresh.get("heartbeat_key") != meta.get("heartbeat_key"):
+                meta = fresh
+                print("heartbeat: credential rotated; retrying with the stored key",
+                      file=sys.stderr)
+                continue
             write_status(data_dir, {"at": time.time(), "ok": False,
                                     "status": "repair-required", "code": exc.code})
             print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
@@ -767,6 +783,30 @@ def cmd_unpair(args):
     # in the dashboard Keys panel, and the resource row is untouched.
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     files = pairing_files(data_dir)
+    # Under the same mutex as pair (Codex P2 round 12): an unlocked
+    # deletion racing pair's writes could remove the new key before the
+    # new metadata lands, leaving a success-reported NOT_PAIRED store.
+    try:
+        with pair_lock(data_dir):
+            removed, failed = _unpair_locked(files)
+    except PairingError as exc:
+        print(f"unpair failed [{exc.code}]: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if failed:
+        print("error: could not remove " + "; ".join(failed), file=sys.stderr)
+        print("note: existing credentials may still be usable; fix permissions and retry unpair",
+              file=sys.stderr)
+        return EXIT_USAGE
+    if removed:
+        print("unpaired locally: " + ", ".join(removed))
+        print("note: revoke the sender key in the dashboard Keys panel; it stays live until then")
+    else:
+        print("status: not paired")
+    return EXIT_OK
+
+
+def _unpair_locked(files):
+    """Delete meta + key; caller holds pair_lock. Returns (removed, failed)."""
     removed = []
     failed = []
     for key in ("meta", "key"):
@@ -780,17 +820,7 @@ def cmd_unpair(args):
             # leaves a usable credential behind: report it (Codex P2
             # round 9), never a false "not paired". Paths only, no secrets.
             failed.append(f"{files[key]}: {exc.strerror or exc}")
-    if failed:
-        print("error: could not remove " + "; ".join(failed), file=sys.stderr)
-        print("note: existing credentials may still be usable; fix permissions and retry unpair",
-              file=sys.stderr)
-        return EXIT_USAGE
-    if removed:
-        print("unpaired locally: " + ", ".join(removed))
-        print("note: revoke the sender key in the dashboard Keys panel; it stays live until then")
-    else:
-        print("status: not paired")
-    return EXIT_OK
+    return removed, failed
 
 
 def build_parser():
