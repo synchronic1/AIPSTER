@@ -25,14 +25,30 @@ async function fixture(c, real) {
   return { ...t, input, op, state, resume: (db = t.db) => core.resumeGrant(db, t.alice, t.grant, input, op) };
 }
 
-async function route(t, { db = t.db, mcp = false, input = t.input, key = t.op.key } = {}) {
-  const url = new URL(mcp ? '/v1/fabric/mcp' : t.op.path, 'https://synthetic.invalid');
-  const body = mcp ? { tool: 'fabric.resume_grant', params: { id: t.grant, ...input }, idempotencyKey: key } : input;
+async function route(t, { db = t.db, mcp = false, input = t.input, key = t.op.key, action = 'resume', path = t.op.path } = {}) {
+  const url = new URL(mcp ? '/v1/fabric/mcp' : path, 'https://synthetic.invalid');
+  const body = mcp ? { tool: `fabric.${action}_grant`, params: { id: t.grant, ...input }, idempotencyKey: key } : input;
   const request = new Request(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key }, body: JSON.stringify(body) });
   const response = await handleFabric({ db, actor: t.alice, url, request, env: { FEDERATION_ENABLED: '1' },
     json: (status, data) => Response.json(data, { status }),
     needAuthz: () => null, needSession: () => null, needCsrf: () => null, needNotDemo: () => null });
   return { status: response.status, body: await response.json() };
+}
+
+function closeAfterGate(t, field) {
+  let fired = false;
+  const wrap = (raw, sql) => ({ raw, bind: (...args) => wrap(raw.bind(...args), sql),
+    all: (...args) => raw.all(...args), run: (...args) => raw.run(...args),
+    async first(...args) {
+      if (!fired && /SELECT attempt FROM idempotency_records/.test(sql)) {
+        fired = true;
+        await t.db.prepare(`UPDATE "user" SET ${field}=1 WHERE id=?`).bind(t.alice.user.id).run();
+      }
+      return raw.first(...args);
+    }
+  });
+  return { fired: () => fired, db: { prepare: sql => wrap(t.db.prepare(sql), sql),
+    batch: stmts => t.db.batch(stmts.map(s => s.raw || s)), exec: sql => t.db.exec(sql) } };
 }
 
 function holdEffect(db) {
@@ -142,5 +158,64 @@ for (const real of [false, true]) {
     const rows = (await t.db.prepare('SELECT restriction FROM fabric_operation_admissions WHERE owner_id=? AND idem_key=?').bind(t.alice.user.id, t.op.key).all()).results;
     assert.deepEqual(rows.map(r => ({ ...r })), [{ restriction: null }], 'resume is a charged expansion, not a restrictive exemption');
     assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_operation_admissions WHERE owner_id=?').bind(t.alice.user.id).first()).n, MAX_RETAINED_FABRIC_OPERATIONS);
+  });
+
+  for (const mcp of [false, true]) test(`${engine}: ${mcp ? 'MCP' : 'REST'} temporary owner closure cannot terminalize an applied resume`, async c => {
+    const t = await fixture(c, real);
+    assert.equal((await route(t, { mcp, db: faultOnce(t.db, /UPDATE idempotency_records SET status = \?, response_code/, 'before') })).status, 500);
+    await t.db.prepare("UPDATE idempotency_records SET created_at='2000-01-01' WHERE idem_key=?").bind(t.op.key).run();
+    await core.revokeGrant(t.db, t.alice, t.grant, { expectedVersion: 3 }); const before = await t.state();
+    const gatedBefore = await t.db.prepare('SELECT * FROM idempotency_records WHERE idem_key=?').bind(t.op.key).first();
+    for (const [field, status] of [['disabled', 401], ['demo', 403]]) {
+      await t.db.prepare(`UPDATE "user" SET ${field}=1 WHERE id=?`).bind(t.alice.user.id).run();
+      const denied = await route(t, { mcp }); assert.equal(denied.status, status); assert.equal(denied.body.id, undefined); assert.equal(denied.body.result, undefined);
+      assert.deepEqual(await t.db.prepare('SELECT * FROM idempotency_records WHERE idem_key=?').bind(t.op.key).first(), gatedBefore);
+      await t.db.prepare(`UPDATE "user" SET ${field}=0 WHERE id=?`).bind(t.alice.user.id).run();
+    }
+    assert.equal((await route(t, { mcp })).status, 200); assert.deepEqual(await t.state(), before);
+    for (const [field, status] of [['disabled', 401], ['demo', 403]]) {
+      await t.db.prepare(`UPDATE "user" SET ${field}=1 WHERE id=?`).bind(t.alice.user.id).run();
+      assert.equal((await route(t, { mcp })).status, status, 'completed outcomes also require current DB authority');
+      await t.db.prepare(`UPDATE "user" SET ${field}=0 WHERE id=?`).bind(t.alice.user.id).run();
+    }
+    assert.equal((await t.db.prepare('SELECT response_code FROM idempotency_records WHERE idem_key=?').bind(t.op.key).first()).response_code, 200);
+  });
+
+  for (const mcp of [false, true]) for (const [field, deniedStatus] of [['disabled', 401], ['demo', 403]]) {
+    test(`${engine}: ${mcp ? 'MCP' : 'REST'} ${field} after gate denies caller but preserves the applied receipt outcome`, async c => {
+      const t = await fixture(c, real);
+      assert.equal((await route(t, { mcp, db: faultOnce(t.db, /UPDATE idempotency_records SET status = \?, response_code/, 'before') })).status, 500);
+      await t.db.prepare("UPDATE idempotency_records SET created_at='2000-01-01' WHERE idem_key=?").bind(t.op.key).run();
+      await core.revokeGrant(t.db, t.alice, t.grant, { expectedVersion: 3 }); const before = await t.state();
+      const closure = closeAfterGate(t, field), denied = await route(t, { mcp, db: closure.db });
+      assert.equal(closure.fired(), true); assert.equal(denied.status, deniedStatus);
+      assert.equal(denied.body.id, undefined); assert.equal(denied.body.result, undefined);
+      const saved = await t.db.prepare('SELECT status,response_code,response_body FROM idempotency_records WHERE idem_key=?').bind(t.op.key).first();
+      assert.equal(saved.status, 'completed'); assert.equal(saved.response_code, 200);
+      assert.deepEqual(JSON.parse(saved.response_body), { id: t.grant, status: 'enforced' });
+      assert.equal((await route(t, { mcp })).status, deniedStatus, 'do not expose cached success while the actor remains closed');
+      await t.db.prepare(`UPDATE "user" SET ${field}=0 WHERE id=?`).bind(t.alice.user.id).run();
+      assert.equal((await route(t, { mcp })).status, 200); assert.deepEqual(await t.state(), before);
+    });
+  }
+
+  for (const action of ['revise', 'commit']) test(`${engine}: temporary auth denial preserves ${action} forensic completion for an authorized retry`, async c => {
+    c.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const t = await revisionFixture(real); c.after(t.close);
+    const input = action === 'revise' ? t.input : await t.approval(90), path = action === 'revise' ? t.op.path : '/v1/fabric/grants', key = 'forensic-auth-retry';
+    const pattern = action === 'revise' ? /INSERT OR IGNORE INTO fabric_grant_revisions/ : /INSERT OR IGNORE INTO audit/;
+    assert.equal((await route(t, { action, input, path, key, db: faultOnce(t.db, pattern, 'before') })).status, 500);
+    const id = action === 'revise' ? t.grant : (await t.db.prepare('SELECT id FROM fabric_grants WHERE approval_id=?').bind(input.approvalId).first()).id;
+    const before = await t.db.prepare('SELECT * FROM fabric_grants WHERE id=?').bind(id).first();
+    const closure = closeAfterGate(t, 'disabled');
+    const denied = await route(t, { action, input, path, key, db: closure.db }); assert.equal(closure.fired(), true); assert.equal(denied.status, 401);
+    const pending = await t.db.prepare('SELECT status,response_code FROM idempotency_records WHERE idem_key=?').bind(key).first();
+    assert.equal(pending.status, 'uncertain'); assert.equal(pending.response_code, null, 'do not cache200 before forensic completion');
+    assert.equal((await t.db.prepare('SELECT count(*) n FROM audit WHERE action=? AND target=?').bind(`fabric.grant.${action}`, id).first()).n, 0);
+    await t.db.prepare('UPDATE "user" SET disabled=0 WHERE id=?').bind(t.alice.user.id).run();
+    const completed = await route(t, { action, input, path, key }); assert.equal(completed.status, 200);
+    assert.equal((await t.db.prepare('SELECT count(*) n FROM audit WHERE action=? AND target=?').bind(`fabric.grant.${action}`, id).first()).n, 1);
+    if (action === 'revise') assert.equal((await t.db.prepare('SELECT count(*) n FROM fabric_grant_revisions WHERE grant_id=?').bind(id).first()).n, 1);
+    assert.deepEqual(await t.db.prepare('SELECT * FROM fabric_grants WHERE id=?').bind(id).first(), before);
   });
 }
