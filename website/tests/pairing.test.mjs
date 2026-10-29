@@ -520,3 +520,67 @@ test('deleting an interrupted claim kills the code, not future re-pairs', async 
   assert.equal(repair.status, 201, repair.text);
   assert.notEqual(repair.json.resourceId, 'r_interrupt');
 });
+test('teardown then in-flight claim: 404, nothing recreated, sender dead (round 6)', async () => {
+  const t = await createTestEnv();
+  const minted = await mintCode(t, t.alice);
+  const first = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_race' }));
+  assert.equal(first.status, 201, first.text);
+  const del = await readJson(await t.call(`/api/inventory/${first.json.resourceId}`, {
+    method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf },
+  }));
+  assert.equal(del.status, 200, del.text);
+  const code = await t.DB.prepare('SELECT invalidated_at FROM pairing_codes WHERE id = ?').bind(minted.json.id).first();
+  assert.ok(code && code.invalidated_at, 'teardown invalidated the spent code');
+  // The in-flight peer (consumed before the DELETE) must not complete.
+  const late = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_race' }));
+  assert.equal(late.status, 404);
+  assert.equal(late.json.code, 'PAIRING_INVALID');
+  const rows = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(rows.n, 0, 'deleted resource not resurrected');
+  const live = await t.DB.prepare('SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL').bind(t.alice.id).first();
+  assert.equal(live.n, 0, 'no live sender key left behind');
+  const beat = await readJson(await t.call(`/api/resources/${first.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + first.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(beat.status, 401);
+  assert.equal(beat.json.code, 'KEY_REVOKED', 'teardown killed the sender key');
+});
+
+test('a fresh claim on an invalidated code creates nothing (round 6 fence)', async () => {
+  const t = await createTestEnv();
+  // Teardown's exact SET clause, landing before the claim instead of
+  // mid-flight: the fresh path has no validity gate, so only the atomic
+  // creation/binding/mint fences refuse this. Pins the fence predicates
+  // through the real endpoint; predicate+write atomicity closes the race.
+  const minted = await mintCode(t, t.alice);
+  await t.DB.prepare('UPDATE pairing_codes SET resource_id = NULL, invalidated_at = ? WHERE id = ?')
+    .bind(new Date().toISOString(), minted.json.id).run();
+  const out = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_fenced' }));
+  assert.equal(out.status, 404);
+  assert.equal(out.json.code, 'PAIRING_INVALID');
+  const rows = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(rows.n, 0, 'no resource row');
+  const keys = await t.DB.prepare('SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(keys.n, 0, 'no sender key minted');
+});
+
+test('an invalidated re-pair disturbs neither the live row nor its key (round 6 fence)', async () => {
+  const t = await createTestEnv();
+  const one = await pair(t, t.alice, 'n_steady', { name: 'steady-box' });
+  const minted = await mintCode(t, t.alice);
+  await t.DB.prepare('UPDATE pairing_codes SET resource_id = NULL, invalidated_at = ? WHERE id = ?')
+    .bind(new Date().toISOString(), minted.json.id).run();
+  const out = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_steady' }));
+  assert.equal(out.status, 404);
+  assert.equal(out.json.code, 'PAIRING_INVALID');
+  const count = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(count.n, 1, 'live row untouched, no duplicate');
+  const row = await t.DB.prepare('SELECT name FROM resources WHERE id = ?').bind(one.resourceId).first();
+  assert.equal(row.name, 'steady-box');
+  const keys = await t.DB.prepare('SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ?').bind(t.alice.id).first();
+  assert.equal(keys.n, 1, 'no rotation minted');
+  const beat = await readJson(await t.call(`/api/resources/${one.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + one.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(beat.status, 200, 'live sender key still beats');
+});
