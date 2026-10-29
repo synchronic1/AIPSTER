@@ -60,7 +60,7 @@ test('cardFor uses the status rule exactly, at the stale boundary', () => {
   const row = (hb) => ({ id: 'r_1', owner_id: 'u_1', name: 'lab', kind: 'local', origin: 'lab', cpu: 'x', gpu: 'y', capabilities_json: '[]', configured: 1, authenticated: 1, online: 1, usable: 1, heartbeat_at: hb, limits_json: '{}', scope: 'owner only', verification_json: '{}', credits_json: null, created_at: new Date(now).toISOString() });
   const fresh = cardFor(row(new Date(now - STALE_AFTER_MS).toISOString()), 'Alice', now);
   assert.equal(fresh.state.online, true, 'age == STALE_AFTER_MS is still online (same `>` rule as resourceLiveness)');
-  assert.equal(fresh.state.status, 'ready');
+  assert.equal(fresh.state.status, 'reachable');
   const aged = cardFor(row(new Date(now - STALE_AFTER_MS - 1).toISOString()), 'Alice', now);
   assert.equal(aged.state.online, false);
   assert.equal(aged.state.usable, false);

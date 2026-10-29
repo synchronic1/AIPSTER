@@ -426,3 +426,90 @@ test('an all-uppercase code claims (typed-entry contract)', async () => {
   const out = await readJson(await claim(t, { code: minted.json.code.toUpperCase(), nodeId: 'n-upper' }));
   assert.equal(out.status, 201, out.text);
 });
+test('a beating usable resource reports reachable, never ready', async () => {
+  const t = await createTestEnv();
+  const p = await pair(t, t.alice, 'n_reachable', { name: 'reachable-box' });
+  const beat = await readJson(await t.call(`/api/resources/${p.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + p.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(beat.status, 200, beat.text);
+  const inv = await readJson(await t.call('/api/inventory', { headers: t.as(t.alice) }));
+  const card = inv.json.items.find((r) => r.id === p.resourceId);
+  assert.equal(card.state.status, 'reachable');
+  assert.equal(card.state.usable, true, 'heartbeat attestation preserved');
+  assert.ok(!JSON.stringify(card).includes('ready'), 'no ready claim anywhere on the card');
+});
+test('lost-response reclaim succeeds at the key cap', async () => {
+  const t = await createTestEnv();
+  for (let i = 0; i < 19; i++) {
+    const k = await readJson(await t.call('/api/keys', {
+      method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name: `filler-${i}`, scope: 'read' },
+    }));
+    assert.equal(k.status, 201, `filler ${i}: ${k.text}`);
+  }
+  const minted = await mintCode(t, t.alice);
+  const first = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_caploss' }));
+  assert.equal(first.status, 201, first.text, 'claim mints the twentieth key');
+  // Response lost: the same-code retry replaces the never-delivered sender
+  // instead of demanding a free slot that will never open.
+  const retry = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_caploss' }));
+  assert.equal(retry.status, 200, retry.text);
+  assert.equal(retry.json.resourceId, first.json.resourceId);
+  assert.notEqual(retry.json.heartbeatKey, first.json.heartbeatKey, 'fresh sender key');
+  const live = await t.DB.prepare("SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL").bind(t.alice.id).first();
+  assert.equal(live.n, 20, 'net-zero replacement: the cap still holds');
+  const stale = await readJson(await t.call(`/api/resources/${first.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + first.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(stale.status, 401);
+  assert.equal(stale.json.code, 'KEY_REVOKED', 'superseded sender is dead');
+  const fresh = await readJson(await t.call(`/api/resources/${retry.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + retry.json.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(fresh.status, 200, 'recovered sender key works');
+});
+test('a genuinely new sender still hits the key cap', async () => {
+  const t = await createTestEnv();
+  for (let i = 0; i < 20; i++) {
+    const k = await readJson(await t.call('/api/keys', {
+      method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name: `filler-${i}`, scope: 'read' },
+    }));
+    assert.equal(k.status, 201, `filler ${i}: ${k.text}`);
+  }
+  const minted = await mintCode(t, t.alice);
+  const over = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_overcap' }));
+  assert.equal(over.status, 409, over.text);
+  assert.equal(over.json.code, 'KEY_LIMIT');
+  const live = await t.DB.prepare("SELECT COUNT(*) AS n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL").bind(t.alice.id).first();
+  assert.equal(live.n, 20);
+  const rows = await t.DB.prepare("SELECT COUNT(*) AS n FROM resources WHERE owner_id = ? AND node_id = 'n_overcap'").bind(t.alice.id).first();
+  assert.equal(rows.n, 0, 'no resource created over the cap');
+});
+test('display-name search costs one query however many collide', async () => {
+  const t = await createTestEnv();
+  const now = new Date().toISOString();
+  for (let i = 0; i < 10; i++) {
+    const name = i === 0 ? 'lab' : `lab-${i + 1}`;
+    await t.DB.prepare('INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(`r_seed_${i}`, t.alice.id, name, 'local', 'declared', 'c', 'g', now).run();
+  }
+  const seen = { perCandidate: 0, bulk: 0 };
+  const realPrepare = t.DB.prepare;
+  t.DB.prepare = (sql) => {
+    if (typeof sql === 'string') {
+      if (sql.includes('SELECT id FROM resources WHERE owner_id = ? AND name = ?')) seen.perCandidate++;
+      if (sql.includes('SELECT name FROM resources WHERE owner_id = ?')) seen.bulk++;
+    }
+    return realPrepare(sql);
+  };
+  try {
+    const minted = await mintCode(t, t.alice);
+    const out = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_names', name: 'lab' }));
+    assert.equal(out.status, 201, out.text);
+    assert.equal(out.json.resource.name, 'lab-11', 'same suffix sequence');
+    assert.equal(seen.perCandidate, 0, 'no per-candidate loop');
+    assert.equal(seen.bulk, 1, 'one bounded name read');
+  } finally {
+    t.DB.prepare = realPrepare;
+  }
+});

@@ -39,6 +39,7 @@ class FakeApiState:
         self.claim_body = None
         self.beat_plan = []  # list of (status, body, retry_after)
         self.live_keys = {FAKE_SECRET}
+        self.claim_hook = None  # optional fn(body) -> claim payload (per-claim keys)
 
 
 def make_server(state):
@@ -65,7 +66,10 @@ def make_server(state):
                 body = {}
             if self.path == "/api/pairing/claim":
                 state.claims.append(body)
-                payload = dict(state.claim_body or {})
+                if state.claim_hook is not None:
+                    payload = dict(state.claim_hook(body))
+                else:
+                    payload = dict(state.claim_body or {})
                 payload.setdefault("resourceId", "r_fake01")
                 payload.setdefault("heartbeatKey", FAKE_SECRET)
                 payload.setdefault("keyId", "k_fake01")
@@ -482,6 +486,111 @@ class Round5Tests(unittest.TestCase):
                  "config": None, "interval": 60}), loop=False)
         self.assertNotEqual(code, EXIT_OK)
         self.assertEqual(self.state.beats, [], "refused store sends nothing")
+
+
+class ConcurrencyAndLoopTests(unittest.TestCase):
+    """Ported from Muse W3 rounds 9/11/12: exclusive node id, loop reload."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_concurrent_first_pairs_converge_on_one_node_id(self):
+        state = self.data / "state"
+        gate = threading.Barrier(8)
+        results, errors = [], []
+
+        def run_one():
+            try:
+                gate.wait(timeout=30)
+                results.append(load_or_create_node_id(state))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run_one) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(set(results)), 1,
+                         "all racers share the winning identity")
+        self.assertRegex(results[0], r"^n_[0-9a-f]{32}$")
+        self.assertEqual((state / "node-id").read_text().strip(), results[0])
+
+    def test_loop_stops_after_unpair(self):
+        run_cli("pair", self.pair_args())
+        args = argparse_namespace({"api_base": self.base, "data_dir": str(self.data),
+                                   "config": None, "interval": 60})
+        real_send = pairing.send_heartbeat
+        calls = []
+
+        def beat_then_unpair(*a, **k):
+            out = real_send(*a, **k)
+            calls.append(out)
+            if len(calls) == 1:
+                run_cli("unpair", argparse_namespace(
+                    {"api_base": self.base, "data_dir": str(self.data)}))
+            if len(calls) >= 5:
+                raise RePairRequired(401, "KEY_REVOKED", "test cap: loop never noticed unpair")
+            return out
+
+        with patch.object(pairing, "send_heartbeat", side_effect=beat_then_unpair), \
+                patch.object(pairing.time, "sleep", side_effect=lambda s: None):
+            code = cmd_heartbeat(args, loop=True)
+        self.assertEqual(code, EXIT_REPAIR_REQUIRED)
+        self.assertEqual(len(calls), 1, "no beat after unpair")
+        status = json.loads((self.data / "state" / "heartbeat-status.json").read_text())
+        self.assertEqual(status["status"], "unpaired")
+
+    def test_loop_retries_when_repair_lands_mid_beat(self):
+        minted = []
+
+        def hook(body):
+            i = len(minted)
+            key = f"synthetic-key-{i:02d}-0123456789abcdef"
+            minted.append(key)
+            return {"resourceId": "r_fake01", "heartbeatKey": key,
+                    "keyId": f"k_fake{i:02d}", "keyPrefix": f"aip_live_k_fake{i:02d}_x",
+                    "heartbeatUrl": "/api/resources/r_fake01/heartbeat", "created": True}
+
+        self.state.claim_hook = hook
+        run_cli("pair", self.pair_args())
+        self.state.live_keys = {minted[0]}
+        args = argparse_namespace({"api_base": self.base, "data_dir": str(self.data),
+                                   "config": None, "interval": 60})
+        real_send = pairing.send_heartbeat
+        calls = []
+
+        def flaky_beat(api_base, resource_id, secret, usable):
+            calls.append(secret)
+            if len(calls) == 1:
+                # Re-pair lands after our reload but before the beat
+                # reaches the server: new key installed, old revoked.
+                run_cli("pair", self.pair_args(code="pair-99999999-AAAA-BBBB-CCCC"[:27]))
+                self.state.live_keys = {minted[-1]}
+            if len(calls) >= 3:
+                raise RePairRequired(401, "KEY_REVOKED", "test cap: genuine terminal revocation")
+            return real_send(api_base, resource_id, secret, usable)
+
+        with patch.object(pairing, "send_heartbeat", side_effect=flaky_beat), \
+                patch.object(pairing.time, "sleep", side_effect=lambda s: None):
+            code = cmd_heartbeat(args, loop=True)
+        self.assertEqual(code, EXIT_REPAIR_REQUIRED)
+        self.assertEqual(calls, [minted[0], minted[1], minted[1]],
+                         "revoked beat retried once with the rotated key, then a genuine revocation exits")
 
 
 def argparse_namespace(values):
