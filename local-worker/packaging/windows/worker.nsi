@@ -35,6 +35,9 @@ Var RemoveData
 !ifndef UNINSTALL_FILES
   !error "build.py must pass /DUNINSTALL_FILES=<exact payload removal list>"
 !endif
+!ifndef UNINSTALL_VERIFY
+  !error "build.py must pass /DUNINSTALL_VERIFY=<exact payload verification list>"
+!endif
 !ifndef SIZE_KB
   !define SIZE_KB "0"
 !endif
@@ -183,6 +186,44 @@ Function un.onInit
   ${If} $0 == "1"
     StrCpy $RemoveData 1
   ${EndIf}
+  ; Never uninstall over running worker processes (tray, console launcher,
+  ; or raw CLI): Windows locks the executables, so deletion would leave
+  ; payload behind. Abort before touching registration or files, mirroring
+  ; the install-time check. Silent uninstalls abort (exit 2).
+  un_running_check:
+    nsExec::ExecToStack 'tasklist /FO CSV /NH'
+    Pop $1
+    Pop $2
+    ${If} $1 != 0
+      Goto un_proceed
+    ${EndIf}
+    StrCpy $4 ""
+    ${StrStr} $3 $2 "aipster-tray.exe"
+    ${If} $3 != ""
+      StrCpy $4 "aipster-tray.exe"
+    ${Else}
+      ${StrStr} $3 $2 "aipster-worker.exe"
+      ${If} $3 != ""
+        StrCpy $4 "aipster-worker.exe"
+      ${Else}
+        ${StrStr} $3 $2 "dendrite.exe"
+        ${If} $3 != ""
+          StrCpy $4 "dendrite.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 != ""
+      IfSilent un_silent_abort un_prompt_user
+      un_prompt_user:
+      MessageBox MB_ABORTRETRYIGNORE|MB_ICONEXCLAMATION \
+        "AIPSTER Worker ($4) is still running. Stop it first (tray menu Quit or Ctrl+C), then retry." \
+        IDRETRY un_running_check IDIGNORE un_proceed
+      Abort
+      un_silent_abort:
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+  un_proceed:
 FunctionEnd
 
 Function un.DataChoice
@@ -212,8 +253,27 @@ Section "Uninstall"
   abort:
     MessageBox MB_OK|MB_ICONSTOP \
       "Uninstall aborted: $INSTDIR does not look like an AIPSTER Worker install."
+    SetErrorLevel 2
     Abort
   proceed:
+  DetailPrint "Removing application files from $INSTDIR..."
+  ; User-selected locations may contain unrelated files or worker data.
+  !include "${UNINSTALL_FILES}"
+  Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR"
+  ; Verify every payload file is actually gone before touching any
+  ; registration. On incomplete removal the install stays registered and
+  ; retryable; report failure instead of false success.
+  !include "${UNINSTALL_VERIFY}"
+  Goto uninstall_verified
+  uninstall_incomplete:
+    DetailPrint "Removal incomplete: application files are still present (locked or in use). Registration preserved; stop the worker and retry."
+    IfSilent +2
+      MessageBox MB_OK|MB_ICONEXCLAMATION \
+        "Removal incomplete: some application files are still present (locked or in use). Nothing was unregistered; stop the worker and retry."
+    SetErrorLevel 2
+    Abort
+  uninstall_verified:
   DetailPrint "Removing autostart entry, shortcuts, and registry keys..."
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "AIPSTER-Worker"
   Delete "$SMPROGRAMS\AIPSTER Worker\AIPSTER Worker.lnk"
@@ -222,11 +282,6 @@ Section "Uninstall"
   Delete "$DESKTOP\AIPSTER Worker.lnk"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\AIPSTER-Worker"
   DeleteRegKey HKCU "Software\AIPSTER-Worker"
-  DetailPrint "Removing application files from $INSTDIR..."
-  ; User-selected locations may contain unrelated files or worker data.
-  !include "${UNINSTALL_FILES}"
-  Delete "$INSTDIR\uninstall.exe"
-  RMDir "$INSTDIR"
   ${If} $RemoveData == 1
     DetailPrint "Removing the default data directory as chosen..."
     RMDir /r "$LOCALAPPDATA\AIPSTER-Worker"

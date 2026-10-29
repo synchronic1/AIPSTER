@@ -89,17 +89,30 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
+def _payload_files(app_dir):
+    return sorted(p.relative_to(app_dir) for p in app_dir.rglob("*") if p.is_file())
+
+
+def _payload_literal(path):
+    value = str(path).replace("/", "\\")
+    if any(c in value for c in '\r\n"') or ".." in path.parts or path.is_absolute():
+        raise ValueError("unsafe payload path")
+    return value.replace("$", "$")
+
+
 def write_uninstall_files(app_dir, destination):
     """Compile exact payload removal; never recursively delete the chosen directory."""
-    files = sorted(p.relative_to(app_dir) for p in app_dir.rglob("*") if p.is_file())
-    def literal(path):
-        value = str(path).replace("/", "\\")
-        if any(c in value for c in '\r\n"') or ".." in path.parts or path.is_absolute():
-            raise ValueError("unsafe payload path")
-        return value.replace("$", "$$")
-    lines = [f'Delete "$INSTDIR\\{literal(p)}"' for p in files]
+    files = _payload_files(app_dir)
+    lines = [f'Delete "$INSTDIR\\{_payload_literal(p)}"' for p in files]
     dirs = {parent for p in files for parent in p.parents if parent != Path(".")}
-    lines += [f'RMDir "$INSTDIR\\{literal(p)}"' for p in sorted(dirs, key=lambda p: (-len(p.parts), str(p)))]
+    lines += [f'RMDir "$INSTDIR\\{_payload_literal(p)}"' for p in sorted(dirs, key=lambda p: (-len(p.parts), str(p)))]
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_uninstall_verify(app_dir, destination):
+    """Compile exact payload verification; leftover files abort before unregistration."""
+    lines = [f'IfFileExists "$INSTDIR\\{_payload_literal(p)}" uninstall_incomplete'
+             for p in _payload_files(app_dir)]
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -303,9 +316,11 @@ def main():
     size_kb = (sum(p.stat().st_size for p in payload_files) + 1023) // 1024
     uninstall_files = stage / "uninstall-files.nsh"
     write_uninstall_files(app_dir, uninstall_files)
+    uninstall_verify = stage / "uninstall-verify.nsh"
+    write_uninstall_verify(app_dir, uninstall_verify)
     run([makensis, f"/DAPP_VERSION={version}", f"/DVI_VERSION={vi_version}",
          f"/DBUILD={INSTALLER_BUILD}", f"/DAPPDIR={app_dir}", f"/DSIZE_KB={size_kb}",
-         f"/DLICENSE={REPO / 'LICENSE'}", f"/DUNINSTALL_FILES={uninstall_files}", f"/DOUTFILE={dist_dir / artifact}",
+         f"/DLICENSE={REPO / 'LICENSE'}", f"/DUNINSTALL_FILES={uninstall_files}", f"/DUNINSTALL_VERIFY={uninstall_verify}", f"/DOUTFILE={dist_dir / artifact}",
          str(PACKAGING / "worker.nsi")],
         clean_env())
     installer = dist_dir / artifact

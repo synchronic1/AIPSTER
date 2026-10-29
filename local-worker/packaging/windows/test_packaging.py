@@ -228,6 +228,21 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse((installed / 'dendrite.exe').exists())
         self.assertNotIn('RMDir /r "$INSTDIR"', (WINDOWS / 'worker.nsi').read_text())
 
+    def test_uninstall_verify_lists_exact_payload_files(self):
+        payload = self.data / 'payload'
+        payload.mkdir(parents=True)
+        (payload / 'dendrite.exe').write_bytes(b'synthetic')
+        (payload / 'licenses').mkdir()
+        (payload / 'licenses/LICENSE.txt').write_text('synthetic license')
+        verify = self.data / 'uninstall-verify.nsh'
+        build.write_uninstall_verify(payload, verify)
+        lines = verify.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        for line, name in zip(lines, ['dendrite.exe', 'licenses\\LICENSE.txt']):
+            self.assertTrue(line.startswith('IfFileExists "$INSTDIR\\'), line)
+            self.assertTrue(line.endswith(f'{name}" uninstall_incomplete'), line)
+        self.assertNotIn('/r', verify.read_text())
+
     def test_cpython_license_is_byte_exact_and_required(self):
         home = self.data / 'python'
         home.mkdir(parents=True)
