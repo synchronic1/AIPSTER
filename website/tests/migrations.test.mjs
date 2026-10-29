@@ -19,6 +19,10 @@ test('migrations create the auth and app tables', () => {
   assert.ok(cols('allowlist').includes('email'), 'allowlist.email');
   assert.ok(names.includes('write_budget'), 'missing table write_budget');
   for (const c of ['user_id', 'window', 'count']) assert.ok(cols('write_budget').includes(c), `write_budget.${c}`);
+  assert.ok(names.includes('pairing_codes'), 'missing table pairing_codes (0014)');
+  for (const c of ['salt', 'verifier', 'expires_at', 'used_at', 'attempts', 'node_id', 'resource_id']) assert.ok(cols('pairing_codes').includes(c), `pairing_codes.${c}`);
+  assert.ok(names.includes('idempotency_keys'), 'missing table idempotency_keys (0014)');
+  assert.ok(cols('resources').includes('node_id'), 'resources.node_id (0014 pairing identity)');
 });
 
 test('migrations are idempotent where SQLite allows', () => {
