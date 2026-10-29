@@ -189,24 +189,37 @@ Function un.onInit
   ${EndIf}
   ; Never uninstall over running worker processes (tray, console launcher,
   ; or raw CLI): Windows locks the executables, so deletion would leave
-  ; payload behind. Abort before touching registration or files, mirroring
-  ; the install-time check. Silent uninstalls abort (exit 2).
+  ; payload behind. Abort before touching registration or files. Each
+  ; tasklist call is filtered to one image: NSIS strings truncate at
+  ; 1023 chars, so an unfiltered process list would hide workers.
+  ; Silent uninstalls abort (exit 2).
   un_running_check:
-    nsExec::ExecToStack 'tasklist /FO CSV /NH'
+    StrCpy $4 ""
+    nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-tray.exe"'
     Pop $1
     Pop $2
-    ${If} $1 != 0
-      Goto un_proceed
-    ${EndIf}
-    StrCpy $4 ""
-    ${UnStrStr} $3 $2 "aipster-tray.exe"
-    ${If} $3 != ""
-      StrCpy $4 "aipster-tray.exe"
-    ${Else}
-      ${UnStrStr} $3 $2 "aipster-worker.exe"
+    ${If} $1 == 0
+      ${UnStrStr} $3 $2 "aipster-tray.exe"
       ${If} $3 != ""
-        StrCpy $4 "aipster-worker.exe"
-      ${Else}
+        StrCpy $4 "aipster-tray.exe"
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-worker.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
+        ${UnStrStr} $3 $2 "aipster-worker.exe"
+        ${If} $3 != ""
+          StrCpy $4 "aipster-worker.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq dendrite.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
         ${UnStrStr} $3 $2 "dendrite.exe"
         ${If} $3 != ""
           StrCpy $4 "dendrite.exe"
