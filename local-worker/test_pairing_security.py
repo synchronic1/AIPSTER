@@ -92,19 +92,33 @@ class PairingSecurityTests(unittest.TestCase):
             self.assertEqual(paths[0].stat().st_mode & 0o777, 0o700)
             self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in paths[1:]))
         else:
-            script = r'''$items = [Console]::In.ReadToEnd() | ConvertFrom-Json
+            script = r'''$ErrorActionPreference = 'Stop'
+$items = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 foreach ($path in $items) {
-  $acl = Get-Acl -LiteralPath $path
+  $directory = [System.IO.Directory]::Exists($path)
+  $acl = if ($directory) { [System.IO.Directory]::GetAccessControl($path) } else { [System.IO.File]::GetAccessControl($path) }
+  if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 3 }
   if (-not $acl.AreAccessRulesProtected) { exit 1 }
-  foreach ($entry in $acl.Access) {
-    if ($entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 2 }
+  $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+  if ($rules.Count -ne 1) { exit 4 }
+  foreach ($entry in $rules) {
+    if ($entry.IdentityReference.Value -ne $sid) { exit 2 }
+    if ($entry.IsInherited -or $entry.AccessControlType -ne 'Allow') { exit 5 }
+    if ([int]$entry.FileSystemRights -ne 0x1F01FF) { exit 6 }
+    if ([int]$entry.InheritanceFlags -ne $(if ($directory) { 3 } else { 0 })) { exit 7 }
+    if ([int]$entry.PropagationFlags -ne 0) { exit 8 }
   }
 }'''
             ps = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            # CI starts Python in pwsh. Its inherited module search path can
+            # select incompatible PowerShell 7 modules inside Windows PS5.1.
+            # Read ACLs through .NET directly, independently of the product's
+            # ctypes helper, and give this verifier only its own system modules.
+            env = {**os.environ, "PSModulePath": str(ps.parent / "Modules")}
             checked = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
                                      input=json.dumps([str(p) for p in paths]), text=True, capture_output=True,
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
+                                     creationflags=subprocess.CREATE_NO_WINDOW, env=env)
             self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_key_or_manifest_failure_preserves_the_old_origin_key_tuple(self):
