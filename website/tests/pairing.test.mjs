@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { verifierFor } from '../src/lib/keys.js';
-import { createTestEnv, readJson } from './d1-shim.mjs';
+import { applyMigrations, createTestEnv, readJson } from './d1-shim.mjs';
 
 async function mintCode(t, user, body = {}, extraHeaders = {}) {
   return readJson(await t.call('/api/pairing/codes', {
@@ -583,4 +583,95 @@ test('an invalidated re-pair disturbs neither the live row nor its key (round 6 
     method: 'POST', headers: { Authorization: 'Bearer ' + one.heartbeatKey }, body: { usable: true },
   }));
   assert.equal(beat.status, 200, 'live sender key still beats');
+});
+test('health is not ready without the onboarding schema (round 7)', async () => {
+  // Deploy-before-migrate: W2 code against a DB migrated through 0005 only.
+  // Key minting (resource_id), pairing (node_id, pairing_codes), and
+  // idempotent registration (idempotency_keys) would all 500 here.
+  const OLD = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_write_budget.sql'];
+  const bare = await createTestEnv({ skipMigrations: true });
+  applyMigrations(bare.sqlite, OLD);
+  const stale = await readJson(await bare.call('/api/health'));
+  assert.equal(stale.json.ready, false, 'deploy-before-migrate is not ready');
+  assert.equal(stale.json.detail.schema, false);
+
+  const t2 = await createTestEnv();
+  t2.sqlite.exec('DROP INDEX idx_keys_resource; ALTER TABLE key_verifiers DROP COLUMN resource_id');
+  const missing0013 = await readJson(await t2.call('/api/health'));
+  assert.equal(missing0013.json.ready, false, 'key mint would 500 without resource_id');
+
+  const t3 = await createTestEnv();
+  t3.sqlite.exec('DROP TABLE pairing_codes');
+  const missing0014 = await readJson(await t3.call('/api/health'));
+  assert.equal(missing0014.json.ready, false);
+
+  const t4 = await createTestEnv();
+  t4.sqlite.exec('ALTER TABLE pairing_codes DROP COLUMN claim_json');
+  const missing0015 = await readJson(await t4.call('/api/health'));
+  assert.equal(missing0015.json.ready, false);
+});
+
+test('a superseded idempotent commit cannot duplicate (round 7 fence)', async () => {
+  const t = await createTestEnv();
+  // Deterministic replay of the production stall: the original's commit
+  // batch reaches the DB only after its reservation matured, a retry stole
+  // it, and the stealer committed. The shim runs statements through their
+  // own methods so intercepting batch() observes the exact commit SQL.
+  const realBatch = t.DB.batch;
+  let fired = false;
+  t.DB.batch = async (stmts) => {
+    const isCommit = !fired && Array.isArray(stmts) && stmts.length === 2
+      && stmts.some((s) => typeof s.sql === 'string' && s.sql.includes('UPDATE idempotency_keys SET resource_id'));
+    if (!isCommit) return realBatch(stmts);
+    fired = true;
+    const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    await t.DB.prepare('UPDATE idempotency_keys SET created_at = ? WHERE owner_id = ? AND key = ?')
+      .bind(stale, t.alice.id, 'idem-race').run();
+    const retry = await register(t, t.alice, { name: 'retry-box' }, 'idem-race');
+    assert.equal(retry.status, 201, retry.text);
+    return realBatch(stmts);
+  };
+  try {
+    const out = await register(t, t.alice, { name: 'original-box' }, 'idem-race');
+    assert.equal(fired, true, 'interleaving engaged the real commit batch');
+    assert.equal(out.status, 409, out.text);
+    assert.equal(out.json.code, 'IDEMPOTENT_IN_FLIGHT');
+    const count = await t.DB.prepare('SELECT COUNT(*) AS n FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+    assert.equal(count.n, 1, 'stealer row only; the late batch committed nothing');
+    const winner = await t.DB.prepare('SELECT id, name FROM resources WHERE owner_id = ?').bind(t.alice.id).first();
+    assert.equal(winner.name, 'retry-box');
+    const map = await t.DB.prepare('SELECT resource_id FROM idempotency_keys WHERE owner_id = ? AND key = ?').bind(t.alice.id, 'idem-race').first();
+    assert.equal(map.resource_id, winner.id, 'mapping still points at the stealer row');
+    // And the loser's retry replays the winner instead of duplicating.
+    const replay = await register(t, t.alice, { name: 'original-box' }, 'idem-race');
+    assert.equal(replay.status, 200, replay.text);
+    assert.equal(replay.json.id, winner.id);
+  } finally {
+    t.DB.batch = realBatch;
+  }
+});
+
+test('reclaim-recreate charges the write budget once (round 7)', async () => {
+  const t = await createTestEnv();
+  // Crash after consumption, before creation: spent code + snapshot, no row.
+  const now = new Date().toISOString();
+  const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const secret = 'DDDDDDDDDDDD';
+  const salt = 'test-salt-budget';
+  const snap = JSON.stringify({ name: 'budget-box', kind: 'local', cpu: 'c', gpu: 'g', caps: [] });
+  await t.DB.prepare('INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts, node_id, resource_id, invalidated_at, claim_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('p_dd00dd00', t.alice.id, salt, await verifierFor(secret, salt), now, future, now, 0, 'n_budget', null, null, snap).run();
+  // Hourly budget nearly spent: 119 of 120 claimed. A double charge would
+  // 429 after the row committed, stranding a keyless resource.
+  const window = now.slice(0, 13);
+  await t.DB.prepare('INSERT INTO write_budget (user_id, window, count) VALUES (?, ?, 119)').bind(t.alice.id, window).run();
+  const out = await readJson(await claim(t, { code: 'pair-dd00dd00-DDDD-DDDD-DDDD', nodeId: 'n_budget' }));
+  assert.equal(out.status, 200, out.text);
+  assert.ok(out.json.heartbeatKey, 'key issued: recovery was not stranded keyless');
+  const budget = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(t.alice.id, window).first();
+  assert.equal(budget.count, 120, 'charged exactly once');
+  const beat = await readJson(await t.call(`/api/resources/${out.json.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + out.json.heartbeatKey }, body: { usable: false },
+  }));
+  assert.equal(beat.status, 200, 'recovered sender key works');
 });

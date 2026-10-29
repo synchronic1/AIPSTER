@@ -191,15 +191,23 @@ async function handleApi(request, env, url) {
       try {
         const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
         const names = new Set(rows.map((r) => r.name));
-        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit', 'write_budget']
+        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit', 'write_budget', 'pairing_codes', 'idempotency_keys']
           .every((n) => names.has(n));
         // Migration contract: required columns must exist, not just tables.
         // LIMIT 0 probes fail when any column is missing (e.g. 0003/0004
         // not applied); portable across SQLite/D1 without pragma calls.
+        // The onboarding columns ride the same probe (Codex P2 round 7): a
+        // deploy before 0013-0015 must not report ready while key minting
+        // (resource_id), pairing (node_id, pairing_codes), and idempotent
+        // registration (idempotency_keys) would 500.
         let colsOk = false;
         if (tablesOk) {
           await all(env.DB, 'SELECT username, displayUsername, demo, disabled FROM "user" LIMIT 0');
           await all(env.DB, 'SELECT id, "key", count, lastRequest FROM rateLimit LIMIT 0');
+          await all(env.DB, 'SELECT resource_id FROM key_verifiers LIMIT 0');
+          await all(env.DB, 'SELECT node_id FROM resources LIMIT 0');
+          await all(env.DB, 'SELECT invalidated_at, claim_json FROM pairing_codes LIMIT 0');
+          await all(env.DB, 'SELECT owner_id, "key", resource_id, created_at FROM idempotency_keys LIMIT 0');
           colsOk = true;
         }
         schemaOk = tablesOk && colsOk;
@@ -324,10 +332,15 @@ async function handleApi(request, env, url) {
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
     await checkWriteBudget(db, me());
+    // Reservation token (Codex P2 round 7): the created_at this request
+    // wrote when it claimed the key. The commit batch below is fenced on
+    // it, so a request superseded by a steal cannot commit late.
+    let idemToken = null;
     if (idemKey) {
-      const replay = await claimIdempotencyKey(db, me(), idemKey);
-      if (replay === 'in-flight') return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
-      if (replay) return json(200, cardFor(replay, await ownerName(db, me())));
+      const claim = await claimIdempotencyKey(db, me(), idemKey);
+      if (claim === 'in-flight') return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
+      if (claim && typeof claim === 'object') return json(200, cardFor(claim, await ownerName(db, me())));
+      idemToken = claim;
     }
     const id = rid('r_');
     const now = nowIso();
@@ -344,17 +357,32 @@ async function handleApi(request, env, url) {
       // One batch (a transaction): the row and its replay mapping commit
       // together, so a mid-request crash can neither strand a NULL mapping
       // (Codex P2: a post-steal retry would duplicate the resource) nor
-      // bind a phantom.
+      // bind a phantom. Both statements are fenced on OUR reservation
+      // (Codex P2 round 7): a request whose batch lands after a steal
+      // commits nothing instead of duplicating the row and overwriting
+      // the stealer's mapping. The EXISTS predicate is evaluated at batch
+      // execution time, which is exactly when a stalled batch is stale.
       try {
         const [ins] = await db.batch([
-          db.prepare(insertSql).bind(...insertParams),
-          db.prepare('UPDATE idempotency_keys SET resource_id = ? WHERE owner_id = ? AND key = ?').bind(id, me(), idemKey),
+          db.prepare(insertSql + ' AND EXISTS (SELECT 1 FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL AND created_at = ?)').bind(...insertParams, me(), idemKey, idemToken),
+          db.prepare('UPDATE idempotency_keys SET resource_id = ? WHERE owner_id = ? AND key = ? AND resource_id IS NULL AND created_at = ?').bind(id, me(), idemKey, idemToken),
         ]);
-        assertClaimed(ins, 'resource');
+        if (Number(ins.meta.changes) !== 1) {
+          // Cap or a lost reservation (stolen or TTL-swept while we
+          // worked): classify by ownership. A superseded request waits
+          // like any in-flight collision; its retry replays the winner.
+          const cur = await first(db, 'SELECT created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', me(), idemKey);
+          if (!cur || cur.created_at !== idemToken) {
+            return json(409, { error: 'A request with this Idempotency-Key is already in flight. Retry shortly.', code: 'IDEMPOTENT_IN_FLIGHT' });
+          }
+          assertClaimed(ins, 'resource');
+        }
       } catch (error) {
         // Cap-miss binds a phantom row id and a DB fault leaves our NULL
-        // claim: either way release the key so the next retry is fresh.
-        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ?', me(), idemKey);
+        // claim: either way release the key so the next retry is fresh —
+        // but only OUR reservation (Codex P2 round 7): an unconditional
+        // delete would drop the stealer's mapping and orphan its commit.
+        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL AND created_at = ?', me(), idemKey, idemToken);
         throw error;
       }
     } else {
@@ -758,7 +786,11 @@ async function handleApi(request, env, url) {
           }
         }
         if (again) {
-          await checkWriteBudget(db, ownerId);
+          // Single charge (Codex P2 round 7): the recreate branch above
+          // already charged before creating, so charging again here would
+          // 429 a nearly-spent budget AFTER the row committed — leaving a
+          // paired but keyless resource. Resume/adopt paths charge here.
+          if (!made) await checkWriteBudget(db, ownerId);
           const rotated = await rotateHeartbeatKey(db, ownerId, again.id, nodeId, nowIso(), row.id);
           if (!rotated) {
             const inv = await first(db, 'SELECT invalidated_at FROM pairing_codes WHERE id = ?', row.id);
@@ -1051,14 +1083,17 @@ async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now, codeId) 
 }
 
 async function claimIdempotencyKey(db, ownerId, key) {
-  // Returns the prior resource row on replay, null when this call owns the
-  // key, or 'in-flight' when another request holds an unbound mapping.
+  // Returns the prior resource row on replay, the reservation timestamp
+  // (created_at) when this call owns the key, or 'in-flight' when another
+  // request holds an unbound mapping. Callers fence their commit batch on
+  // the returned stamp (Codex P2 round 7).
   await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND created_at < ?',
     ownerId, key, new Date(Date.now() - IDEMPOTENCY_TTL_MS).toISOString());
   try {
+    const stamp = nowIso();
     await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
-      ownerId, key, nowIso());
-    return null;
+      ownerId, key, stamp);
+    return stamp;
   } catch {
     const prior = await first(db, 'SELECT resource_id, created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
     if (prior && !prior.resource_id && prior.created_at
@@ -1071,9 +1106,10 @@ async function claimIdempotencyKey(db, ownerId, key) {
       try {
         const took = await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL AND created_at = ?', ownerId, key, prior.created_at);
         if (Number(took.meta.changes) !== 1) return 'in-flight';
+        const stamp = nowIso();
         await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
-          ownerId, key, nowIso());
-        return null;
+          ownerId, key, stamp);
+        return stamp;
       } catch {
         return 'in-flight';
       }
@@ -1086,9 +1122,10 @@ async function claimIdempotencyKey(db, ownerId, key) {
       try {
         const took = await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id = ?', ownerId, key, prior.resource_id);
         if (Number(took.meta.changes) !== 1) return 'in-flight';
+        const stamp = nowIso();
         await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
-          ownerId, key, nowIso());
-        return null;
+          ownerId, key, stamp);
+        return stamp;
       } catch {
         return 'in-flight';
       }
