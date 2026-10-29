@@ -73,6 +73,14 @@ rebuild-from-source-SHA + re-qualify, not byte-match.
   the HKCU singletons — covered by the CI full profile) and the strict
   parent-death orphan kill (no job nesting under this sandboxed launcher;
   strict wherever confinement engages).
+- CI full profile (`windows-2025`, runs `40932568817` + `40935178276`):
+  **0 failures** — silent install, registry/shortcuts, autostart
+  default-off, console-launcher matrix, tray matrix T1–T12, uninstall
+  preserve + `/REMOVEDATA=1`. Both token-ACL checks record `[restricted
+  ACL context]` (runner `icacls` strips inheritance yet `SYSTEM` +
+  `BUILTIN\Administrators` persist as explicit ACEs — proven environmental
+  by the identical-command scratch probe; strict user-only passes on a real
+  machine).
 - Website: **262/262** `npm test`, plus `npm run check` and `npm run build`
   green, lockfile untouched.
 - Live install preserved throughout: same worker PID before/after, healthy
@@ -80,12 +88,24 @@ rebuild-from-source-SHA + re-qualify, not byte-match.
 
 ## Screenshots
 
-- Wizard (from `dist/shots/`, gitignored): `01-welcome`, `02-license`
-  (Apache text renders), `03-components` (autostart off by default),
-  `04-components-autostart-checked` (actually unchecked — the scripted toggle
-  missed; opt-in is qualify-covered via `/AUTOSTART=1`), `05-directory`
-  (temp path prefilled), `06-installing` (**shows the Finish page**: install
-  finished in <3s; "Start now" unchecked by default).
+CI `windows-installer-screenshots` artifact, run `40935178276` (isolated
+runner desktop, never the owner's screen; all PNGs eyeballed):
+`01-welcome`, `02-license` (Apache text renders), `03-components`
+("Start when I log in" unchecked by default; desktop shortcut checked),
+`04-directory` (temp path prefilled, editable, Browse offered),
+`05-installing` + `06-finish` (byte-identical: install finished in <3s, both
+show the Finish page; "Start AIPSTER Worker now" unchecked; honest
+"Nothing is shared or paired" copy), `07-start-menu` (caught Explorer's
+"Working on it..." spinner twice — the listing itself is log-verified as
+`['AIPSTER Worker.lnk', 'Uninstall.lnk']`; the driver now waits for the
+entries before shooting), `08-worker-console` (firstrun/config/`listen:`
+lines, uvicorn up; the token-ACL warning renders with user/rc/aces and no
+secret; token path only, never the value),
+`09-uninstall-confirm`, `10-uninstall-data-choice` ("Also remove my worker
+data" unchecked by default), `11-uninstall-data-notice` ("was preserved.
+Delete that folder manually if you want it gone"), `12-uninstall-finish`.
+Log asserts: `installed: True`, `install removed: True`,
+`data preserved: True`.
 - **Tray/menu screenshots: blocked, honestly deferred.** No isolated GUI
   environment exists on this machine (no Windows Sandbox binary, no VM, no
   elevation), and UI tests on the active desktop are prohibited. The Win32
@@ -106,14 +126,14 @@ wizard before every keystroke, and aborts if it is closed externally.
 
 1. Signature: builds are unsigned (owner action: code-signing cert + CI).
 2. Tray/menu pixels: owner-VM capture + eyeball review (behavior covered).
-3. CI full-profile result on the PR (install/uninstall/registry/shortcut
-   paths untested locally by design).
+3. ~~CI full-profile result on the PR~~ RESOLVED: 0 failures on
+   `windows-2025` (runs `40932568817`, `40935178276`).
 4. macOS/Linux installers: staged, visibly pending (portable controller
    core; no backends yet).
 5. Pairing/connected/inference-ready: unimplemented by design; no state,
    string, or screenshot claims otherwise.
 6. Release upload + dashboard `available` flip: release-owner action after
    rebuilding from the merge commit and re-verifying the hash.
-7. Desktop-opt-out and uninstall-checkbox UI paths: compiler-checked, owner-VM
-   eyeball (scripted equivalents `/AUTOSTART`-style and `/REMOVEDATA=1` are
-   headless-covered).
+7. Desktop-opt-out path and the *checked* uninstall data-removal box:
+   compiler-checked, owner-VM eyeball (the unchecked box + preserve notice
+   are CI-captured in shots 10–11; `/REMOVEDATA=1` is headless-covered).

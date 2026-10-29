@@ -219,7 +219,14 @@ def main():
     subprocess.Popen(["explorer", str(start_menu)])
     explorer = find_window("AIPSTER Worker", timeout=20)
     if explorer:
-        time.sleep(1)
+        # Explorer shows "Working on it..." while populating: wait for the
+        # entries (already log-verified above) before shooting, else the PNG
+        # catches an empty spinner (seen twice on windows-2025).
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            if any(".lnk" in text for text in child_texts(explorer)):
+                break
+            time.sleep(1)
         shot_window(shots, "07-start-menu", explorer)
         send_keys("%{F4}")  # close Explorer
     # Running worker console evidence (temp data home, loopback only).
