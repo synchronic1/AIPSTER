@@ -104,7 +104,8 @@ for (const real of [false, true]) {
     assert.deepEqual(await t.state(), applied);
     assert.equal((await core.revokeGrant(t.db, t.alice, t.grant, { expectedVersion: 2 })).status, 200);
     const revoked = await t.state();
-    await assert.rejects(t.revise(), { code: 'BAD_STATE' });
+    assert.deepEqual(await t.revise(), { status: 200, body: { id: t.grant, version: 2 } });
+    await assert.rejects(core.reviseGrant(t.db, t.alice, t.grant, t.input, { ...t.op, key: 'fresh-after-revoke' }), { code: 'BAD_STATE' });
     assert.deepEqual(await t.state(), revoked);
   });
 

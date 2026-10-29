@@ -754,21 +754,27 @@ async function grantVisibleTo(db, actor, grant) {
   try { await ownConnectionSide(db, actor, conn); return true; } catch { return false; }
 }
 
+// Only the exact consuming operation may reconcile a committed grant. Callers
+// must first authorize the exporter and validate the supplied preview binding.
+async function completeCommit(db, actor, appr, preview, op, operationId) {
+  if (!appr || appr.consumed_by_op !== operationId || appr.consumed_action !== 'grant.commit' || appr.consumed_target !== null) return null;
+  const existing = await first(db, 'SELECT id FROM fabric_grants WHERE approval_id = ? AND exporter_id = ? AND connection_id = ?',
+    appr.id, actor.user.id, preview.connection_id);
+  if (!existing) return null;
+  await auditFabric(db, actor, op, 'fabric.grant.commit', existing.id, 'reconciled');
+  return { status: 200, body: { id: existing.id, note: 'Approval was already consumed for this grant.' } };
+}
+
 export async function commitGrant(db, actor, input = {}, op = null) {
   if (!isHuman(actor)) needHuman();
   if (typeof input.approvalId !== 'string' || !input.approvalId) throw err(409, 'NOT_APPROVED', 'An approved approval is required.');
   const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', input.approvalId);
   if (!appr || appr.action !== 'grant.commit') throw err(404, 'NOT_FOUND', 'Approval not found.');
-  if (appr.decision !== 'approved') throw err(409, 'NOT_APPROVED', `Approval is ${appr.decision}.`);
-  if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
-  if (appr.consumed_at) {
-    const existing = await first(db, 'SELECT id FROM fabric_grants WHERE approval_id = ?', appr.id);
-    if (existing) {
-      await auditFabric(db, actor, op, 'fabric.grant.commit', existing.id, 'reconciled');
-      return { status: 200, body: { id: existing.id, note: 'Approval was already consumed for this grant.' } };
-    }
-    return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
+  if (appr.created_by !== actor.user.id) {
+    throw err(403, 'FORBIDDEN', 'This approval belongs to a different owner.');
   }
+  if (appr.decision !== 'approved') throw err(409, 'NOT_APPROVED', `Approval is ${appr.decision}.`);
+  if (appr.approver !== actor.user.id) throw err(403, 'FORBIDDEN', 'This approval belongs to a different owner.');
   const preview = await first(db, 'SELECT * FROM grant_previews WHERE id = ?', appr.preview_id);
   if (!preview) throw err(409, 'PREVIEW_STALE', 'Preview is gone.');
   if (input.previewHash !== appr.preview_digest || appr.preview_digest !== preview.digest) {
@@ -780,12 +786,22 @@ export async function commitGrant(db, actor, input = {}, op = null) {
   if (!appr.issued_connection || appr.issued_connection !== preview.connection_id) {
     throw err(409, 'NOT_APPROVED', 'Approval cannot be validated against this connection; re-approve.');
   }
+  const terms = parseJson(preview.canonical_json, {});
+  await ownNode(db, actor, terms.exporterNode);
+  const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
+  if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
+  const opd = await opDigest(actor, op);
+  if (appr.consumed_at) {
+    const completed = await completeCommit(db, actor, appr, preview, op, opd);
+    if (completed) return completed;
+    return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
+  }
+  if (appr.expiry <= nowIso()) throw err(410, 'APPROVAL_EXPIRED', 'Approval expired.');
   const conn = await first(db, 'SELECT * FROM connections WHERE id = ?', preview.connection_id);
   if (!conn || conn.state !== 'active') throw err(409, 'CONNECTION_DOWN', 'Connection is not active.');
   const vector = parseJson(appr.revision_vector, {});
   if (vector.connection !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the preview; regenerate it.');
   if (appr.issued_version !== conn.version) throw err(412, 'PREVIEW_STALE', 'Connection changed since the approval; re-approve.');
-  const terms = parseJson(preview.canonical_json, {});
   // Revalidate every snapshot entry against live state (fast-fail; the
   // batch re-pins the whole snapshot at write time).
   for (const s of terms.snapshot || []) {
@@ -796,17 +812,11 @@ export async function commitGrant(db, actor, input = {}, op = null) {
   }
   // The shared claim: exactly one of commit/revise/resume wins this
   // approval. Losers change nothing.
-  const opd = await opDigest(actor, op);
   const claimNow = nowIso();
   if (!(await claimApproval(db, { id: appr.id, action: 'grant.commit', target: null, op: opd, now: claimNow }))) {
-    const raced = await first(db, 'SELECT consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', appr.id);
-    if (raced && raced.consumed_by_op === opd) {
-      const existing = await first(db, 'SELECT id FROM fabric_grants WHERE approval_id = ?', appr.id);
-      if (existing) {
-        await auditFabric(db, actor, op, 'fabric.grant.commit', existing.id, 'reconciled');
-        return { status: 200, body: { id: existing.id, note: 'Approval was already consumed for this grant.' } };
-      }
-    }
+    const raced = await first(db, 'SELECT id, consumed_by_op, consumed_action, consumed_target FROM approvals WHERE id = ?', appr.id);
+    const recovered = await completeCommit(db, actor, raced, preview, op, opd);
+    if (recovered) return recovered;
     return { status: 409, body: { error: 'Approval was already consumed.', code: 'APPROVAL_CONSUMED' } };
   }
   const id = `fg_${randHex(8)}`;
@@ -898,7 +908,6 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
   const grant = await first(db, 'SELECT * FROM fabric_grants WHERE id = ?', id);
   if (!grant || !(await grantVisibleTo(db, actor, grant))) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (grant.quarantine_reason) throw err(409, 'GRANT_QUARANTINED', 'Grant is quarantined; re-issue it.');
-  if (grant.status === 'revoked') throw err(409, 'BAD_STATE', 'Revoked grants cannot be revised.');
   if (!await actorExportsGrant(db, actor, grant)) throw err(403, 'FORBIDDEN', 'Only the exporting owner can revise.');
   const live = await first(db, 'SELECT disabled, demo FROM "user" WHERE id = ?', actor.user.id);
   if (!live || Number(live.disabled) === 1 || Number(live.demo) === 1) await throwActorClosed(db, actor);
@@ -906,6 +915,9 @@ export async function reviseGrant(db, actor, id, input = {}, op = null) {
   const requestHash = await digestJson(input);
   const completed = await completeRevision(db, actor, id, opd, requestHash);
   if (completed) return completed;
+  // A committed receipt describes history, not fresh authority. Complete its
+  // history/audit even after a later revoke, while keeping new revisions closed.
+  if (grant.status === 'revoked') throw err(409, 'BAD_STATE', 'Revoked grants cannot be revised.');
   if (typeof input.approvalId !== 'string' || !input.approvalId) throw err(409, 'NOT_APPROVED', 'A fresh approved, unconsumed approval is required.');
   const appr = await first(db, 'SELECT * FROM approvals WHERE id = ?', input.approvalId);
   if (!appr || (appr.action !== 'grant.commit' && appr.action !== 'grant.revise') || appr.decision !== 'approved') {
