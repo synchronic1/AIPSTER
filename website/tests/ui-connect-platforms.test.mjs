@@ -17,7 +17,7 @@ function fixture(navigator, { clickFails = false } = {}) {
   const clipboard = [];
   let blob;
   const context = vm.createContext({
-    navigator, Blob, generation: 0,
+    navigator, Blob, generation: 0, me: { id: 'synthetic-platform-owner', demo: false },
     esc: (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
     $: (id) => { assert.equal(id, 'connect-card'); return card; },
     fetch: () => { throw new Error('Onboarding must not contact an API'); },
@@ -91,8 +91,8 @@ test('held-out desktop client hints preserve qualified and unqualified target be
       assert.equal(ui.run('detectOs()'), expected);
       await ui.copy();
       assert.equal(captured.length, qualified ? 1 : 0);
-      assert.match(ui.card.innerHTML, /not available/);
-      assert.match(ui.card.innerHTML, /not connected/);
+      assert.match(ui.card.innerHTML, /nothing to download/);
+      assert.match(ui.card.innerHTML, /not connected/i);
       assert.doesNotMatch(ui.card.innerHTML, /Download installer/);
     });
   }

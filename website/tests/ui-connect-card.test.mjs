@@ -259,8 +259,8 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
       && !text.includes('Windows x64 is the only tested platform'), `${name}: no Windows setup instructions are exposed`);
     const selected = nodesOf(html).filter((n) => n.tagName === 'option' && n.attrs.some((x) => x.name === 'selected'));
     assert.deepEqual(selected.map((o) => attr(o, 'value')), [''], `${name}: target placeholder is selected`);
-    assert.deepEqual(nodesOf(html).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [],
-      `${name}: no copy action is offered`);
+    assert.deepEqual(nodesOf(html).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['pair'],
+      `${name}: only platform-independent browser pairing is offered`);
     await ui.press('copy-agent');
     assert.deepEqual(ui.captured, [], `${name}: fabricated copy action writes nothing`);
     assert.ok(!ui.el('connect-card').innerHTML.includes('<textarea'), `${name}: no fallback packet is generated before choosing`);
@@ -395,7 +395,7 @@ test('packaged-but-unpublished installer shows version/checksum with no download
   const text = textOf(html);
   assert.ok(text.includes('Installer pending publication for Windows x64'), 'disabled per-platform action');
   assert.ok(text.includes('packaged; release qualification pending') && text.includes('nothing to download'), 'visible explanation');
-  assert.ok(text.includes('0.1.0') && text.includes('7f463aae'), 'version + checksum shown');
+  assert.ok(text.includes('0.1.0') && text.includes('ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7'), 'reviewed build version + exact checksum shown');
   assert.ok(!/Download installer/.test(text), 'no live download label while unpublished');
   const linksBefore = cardLinks(html);
   await ui.press('download');
