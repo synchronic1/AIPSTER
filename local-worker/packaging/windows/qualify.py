@@ -20,6 +20,7 @@ Usage:
 """
 import json
 import os
+import secrets
 import shutil
 import socket
 import struct
@@ -47,6 +48,13 @@ def check(name, condition, detail=""):
 
 def skip(name, reason):
     print(f"SKIP {name} ({reason})", flush=True)
+
+
+def check_token_acl(name, token_file, scratch_dir, env):
+    """Strict SID-based read-only verification; inability to secure tokens is a failure."""
+    sys.path.insert(0, str(PACKAGING.parent))
+    from aipster_tray.firstrun import private_token_acl
+    check(name, private_token_acl(token_file))
 
 
 def free_port():
@@ -165,12 +173,6 @@ def ico_entries(path):
     return entries
 
 
-def private_token_acl(path):
-    sys.path.insert(0, str(PACKAGING.parent))
-    from aipster_tray.firstrun import private_token_acl as verify
-    return verify(path)
-
-
 def read_state_file(data):
     try:
         return json.loads((Path(data) / "state.json").read_text(encoding="utf-8"))
@@ -244,6 +246,134 @@ def pure_tests():
     tag_c = ipc.instance_tag(tempfile.gettempdir())
     check("instance tag stable per dir (case-insensitive), distinct across dirs",
           tag_a == tag_b and tag_a != tag_c and len(tag_a) == 8)
+    check("http_origin brackets IPv6, leaves IPv4/hostnames plain",
+          st.http_origin("::1", 8090) == "http://[::1]:8090"
+          and st.http_origin("127.0.0.1", 8090) == "http://127.0.0.1:8090"
+          and st.http_origin("localhost", 8090) == "http://localhost:8090")
+    check("status line shows a bracketed IPv6 endpoint",
+          "endpoint=http://[::1]:8090" in st.describe({"state": "running", "host": "::1",
+                                                       "port": 8090}))
+    from aipster_tray.child import port_busy
+    free = free_port()
+    check("port_busy False on a free IPv4 port", port_busy("127.0.0.1", free) is False)
+    hold = socket.socket()
+    hold.bind(("127.0.0.1", free))
+    try:
+        check("port_busy True on a bound IPv4 port", port_busy("127.0.0.1", free) is True)
+    finally:
+        hold.close()
+    from unittest.mock import patch
+    with patch("socket.getaddrinfo", side_effect=socket.gaierror("synthetic resolver failure")):
+        check("port_busy False on an unresolvable host (worker reports the config error)",
+              port_busy("synthetic.invalid", free) is False)
+    try:
+        v6 = socket.socket(socket.AF_INET6)
+        v6.bind(("::1", 0))
+        v6port = v6.getsockname()[1]
+    except OSError:
+        skip("port_busy IPv6 literal", "no IPv6 loopback on this box")
+    else:
+        try:
+            check("port_busy True on a bound IPv6 port", port_busy("::1", v6port) is True)
+        finally:
+            v6.close()
+        check("port_busy False on a free IPv6 port", port_busy("::1", v6port) is False)
+    pairs = []
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo("localhost", 0,
+                                                             type=socket.SOCK_STREAM):
+            if (family, sockaddr[0]) not in pairs:
+                pairs.append((family, sockaddr[0]))
+    except socket.gaierror:
+        pairs = []
+    if len(pairs) < 2:
+        skip("port_busy multi-address all-fail semantics", "localhost resolves to <2 addresses")
+    else:
+        multi_port = free_port()
+        holders = []
+        try:
+            for family, addr in pairs[:-1]:
+                holder = socket.socket(family)
+                if family == socket.AF_INET6:
+                    holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                holder.bind((addr, multi_port))
+                holders.append(holder)
+            one_free = port_busy("localhost", multi_port)
+            last = socket.socket(pairs[-1][0])
+            if pairs[-1][0] == socket.AF_INET6:
+                last.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            last.bind((pairs[-1][1], multi_port))
+            holders.append(last)
+            all_held = port_busy("localhost", multi_port)
+        finally:
+            for holder in holders:
+                holder.close()
+        check("port_busy multi-address: one free allows, all bound blocks",
+              one_free is False and all_held is True, f"one_free={one_free} all={all_held}")
+    # Token reload: stub the dendrite/pydantic imports _reload needs so this
+    # runs on bare CI python; the frozen-exe rotation proof is T12 below.
+    import types
+    from types import SimpleNamespace
+    saved_modules = {name: sys.modules.get(name)
+                     for name in ("dendrite", "dendrite.config", "pydantic")}
+    fake_node = SimpleNamespace(token_env="DENDRITE_API_TOKEN", host="127.0.0.1", port=8090)
+    fake_config_mod = types.ModuleType("dendrite.config")
+    fake_config_mod.load_config = lambda path: SimpleNamespace(node=fake_node)
+    fake_dendrite = types.ModuleType("dendrite")
+    fake_dendrite.config = fake_config_mod
+    fake_pydantic = types.ModuleType("pydantic")
+    fake_pydantic.ValidationError = type("ValidationError", (Exception,), {})
+    sys.modules["dendrite"] = fake_dendrite
+    sys.modules["dendrite.config"] = fake_config_mod
+    sys.modules["pydantic"] = fake_pydantic
+    try:
+        from aipster_tray.controller import Controller
+        from aipster_tray.firstrun import ensure_private_token
+        backend = SimpleNamespace(refresh=lambda *a: None, notify=lambda *a: None)
+        with tempfile.TemporaryDirectory(prefix="aipster-reload-") as temp:
+            data = Path(temp)
+            (data / "config.toml").write_text("[node]\n", encoding="utf-8")
+            saved_env = os.environ.get("DENDRITE_API_TOKEN")
+            os.environ.pop("DENDRITE_API_TOKEN", None)
+            try:
+                ctl = Controller(data, backend)
+                ctl.config = data / "config.toml"
+                first_err = ctl._reload()
+                first = ctl.child_env().get(ctl.token_env)
+                rotated = secrets.token_urlsafe(32)
+                (data / "api-token.txt").write_text(rotated + "\n", encoding="utf-8")
+                second_err = ctl._reload()
+                second = ctl.child_env().get(ctl.token_env)
+                check("restart reload picks up a rotated token file",
+                      first_err == "" and second_err == "" and bool(first)
+                      and second == rotated and first != rotated)
+                check("rotated file token survives ensure_private_token re-read",
+                      ensure_private_token(data / "api-token.txt")[0] == rotated)
+                fake_node.token_env = "AIPSTER_QUAL_PRESET_TOKEN"
+                os.environ["AIPSTER_QUAL_PRESET_TOKEN"] = "preset-env-token-value"
+                try:
+                    ctl2 = Controller(data, backend)
+                    ctl2.config = data / "config.toml"
+                    preset_err = ctl2._reload()
+                    check("preset parent env wins over the token file",
+                          preset_err == ""
+                          and os.environ["AIPSTER_QUAL_PRESET_TOKEN"] == "preset-env-token-value"
+                          and (data / "api-token.txt").read_text(encoding="utf-8").strip()
+                          == rotated)
+                finally:
+                    os.environ.pop("AIPSTER_QUAL_PRESET_TOKEN", None)
+                    fake_node.token_env = "DENDRITE_API_TOKEN"
+            finally:
+                if saved_env is None:
+                    os.environ.pop("DENDRITE_API_TOKEN", None)
+                else:
+                    os.environ["DENDRITE_API_TOKEN"] = saved_env
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 # ------------------------------------------------------- tray behavior matrix
@@ -497,8 +627,7 @@ def tray_matrix(app_dir, work):
         check("fresh tray run generates config + strong token",
               (data / "config.toml").exists() and len(token) == 43
               and all("!" <= c <= "~" for c in token))
-        check("fresh token file is user-ACL-only",
-              private_token_acl(token_file))
+        check_token_acl("fresh token file is user-ACL-only", token_file, data, env)
         if payload and payload["state"] == "port_busy":
             # Coexistence: default 8090 is taken; reconfigure and start.
             text = (data / "config.toml").read_text(encoding="utf-8")
@@ -574,6 +703,50 @@ def tray_matrix(app_dir, work):
             check("orphaned port is released", port_closed)
     finally:
         lab4.quit_all()
+
+    # T12: token rotation takes effect on restart (stop, replace file, start).
+    lab5 = TrayLab(app_dir, work)
+    try:
+        rotate_port = free_port()
+        env, data = lab5.env_for("tray-rotate")
+        (data / "config.toml").write_text(
+            f'[node]\nid = "tray-rotate"\nhost = "127.0.0.1"\nport = {rotate_port}\n'
+            'state_dir = "state"\n\n[[runtimes]]\nid = "mock"\nkind = "mock"\ngpu_layers = 0\n'
+            '\n[[models]]\nid = "mock-summary"\nruntime = "mock"\ncapabilities = ["summarize"]\n',
+            encoding="utf-8")
+        proc = lab5.launch(env)
+        payload = wait_state(data, "running", timeout=45)
+        check("rotation-test worker starts", bool(payload and payload["state"] == "running"))
+        old_token = (data / "api-token.txt").read_text(encoding="utf-8").strip()
+        payload_bytes = json.dumps(
+            {"capability": "summarize", "model_id": "mock-summary",
+             "prompt": "SYNTHETIC ROTATE FIXTURE", "max_tokens": 4}).encode()
+        json_headers = {"Content-Type": "application/json"}
+        code, _ = http_status(rotate_port, "/v1/execute", data=payload_bytes,
+                              headers=json_headers | {"Authorization": "Bearer " + old_token})
+        check("worker serves with the filed token before rotation", code == 200, str(code))
+        lab5.cli(env, "stop")
+        wait_state(data, "stopped", timeout=20)
+        new_token = secrets.token_urlsafe(32)
+        (data / "api-token.txt").write_text(new_token + "\n", encoding="utf-8")
+        lab5.cli(env, "start")
+        payload = wait_state(data, "running", timeout=45)
+        check("worker restarts after rotation",
+              bool(payload and payload["state"] == "running"),
+              json.dumps(payload) if payload else "no state file")
+        code_old, _ = http_status(rotate_port, "/v1/execute", data=payload_bytes,
+                                  headers=json_headers | {"Authorization": "Bearer " + old_token})
+        code_new, body_new = http_status(rotate_port, "/v1/execute", data=payload_bytes,
+                                         headers=json_headers | {"Authorization": "Bearer " + new_token})
+        check("restarted worker rejects the old token, serves the rotated one",
+              code_old == 401 and code_new == 200, f"old={code_old} new={code_new}")
+        lab5.cli(env, "quit")
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        lab5.quit_all()
 
 
 # ------------------------------------------------------------- full profile
@@ -714,8 +887,7 @@ def full_profile(setup):
         check("config + state + logs created",
               (data / "config.toml").exists() and (data / "state").is_dir()
               and (data / "logs").is_dir())
-        check("token file is user-ACL-only",
-              private_token_acl(token_file))
+        check_token_acl("token file is user-ACL-only", token_file, home, env)
         payload = json.dumps({"capability": "summarize", "model_id": "mock-summary",
                               "prompt": "SYNTHETIC QUAL FIXTURE", "max_tokens": 8}).encode()
         json_headers = {"Content-Type": "application/json"}
@@ -838,7 +1010,10 @@ def full_profile(setup):
           not launcher.exists() and unrelated.exists()
           and unrelated.read_text() == "synthetic preserve-me")
     unrelated.unlink()
-    install.rmdir()  # Empty test directory only; the uninstaller never recurses here.
+    try:
+        install.rmdir()  # Empty test directory only; never recursive.
+    except FileNotFoundError:
+        pass  # Async uninstaller may have just removed the now-empty directory.
     check("empty install directory can be removed", not install.exists())
     check("Start Menu entry removed", not start_menu.exists())
     check("desktop shortcut removed", not desktop_lnk.exists())

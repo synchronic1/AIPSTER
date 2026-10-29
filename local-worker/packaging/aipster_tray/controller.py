@@ -17,7 +17,7 @@ from pathlib import Path
 from . import state as st
 from .child import WorkerChild, port_busy, looks_like_bind_error
 from .firstrun import (APP_NAME, bundle_dir, build_info, data_dir, ensure_setup,
-                       ensure_private_token, endpoint_url)
+                       ensure_private_token)
 
 HEALTH_TIMEOUT = 25
 TICK_SECONDS = 1
@@ -32,7 +32,7 @@ _ACTIVE = None  # controller owning this process's window (single instance)
 
 def _health_ok(host, port):
     try:
-        with urllib.request.urlopen(endpoint_url(host, port) + "/healthz", timeout=1.5) as r:
+        with urllib.request.urlopen(st.http_origin(host, port) + "/healthz", timeout=1.5) as r:
             import json
             return json.load(r).get("status") == "ok"
     except Exception:
@@ -135,7 +135,7 @@ class Controller:
     def endpoint_label(self):
         if not self.loaded:
             return ""
-        return endpoint_url(self.loaded.node.host, self.loaded.node.port)
+        return st.http_origin(self.loaded.node.host, self.loaded.node.port)
 
     # -- worker ops ------------------------------------------------------------
     def start_worker(self, manual=True):

@@ -107,10 +107,6 @@ def private_token_acl(path):
         return False
 
 
-def endpoint_url(host, port):
-    return f"http://{'[' + host + ']' if ':' in host else host}:{port}"
-
-
 def ensure_private_token(path):
     path = Path(path)
     try:
