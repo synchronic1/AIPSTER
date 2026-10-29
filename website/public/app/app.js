@@ -199,11 +199,13 @@ async function loadOverview() {
 // only with a re-verified re-pin.
 // The card renders with no API call and initially holds no credential; the call
 // it ever makes is minting a one-time pairing code when the user clicks Pair,
-// and the code is cleared on Done, tab switch, or sign-out. No verified
-// installer is downloadable yet; Windows packaging still needs release qualification, so progress stops at
-// "Setup needed" until the worker is installed and paired elsewhere.
-const WORKER_COMMIT = '055df699d04fe9f9ca0275da2e93ff8dccb9032c';
-const DOCS_COMMIT = '8ce77129f6565f8765345a6d8906c650dd28205c';
+// and the code is cleared on Done, tab switch, or sign-out.
+// The Windows installer is packaged and qualified but its release file is not
+// published yet, so there is nothing to download; macOS/Linux are not packaged
+// at all. Progress honestly stops at "Setup needed" until the worker is
+// installed and paired elsewhere.
+const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
+const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
