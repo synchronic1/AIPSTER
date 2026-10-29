@@ -6,7 +6,7 @@ import {resolve,join,sep} from 'node:path';
 import {checkPublic} from './check.mjs';
 const original=resolve(import.meta.dirname,'../public');
 async function fixture(change,run){const root=await mkdtemp(join(tmpdir(),'aipster-public-check-'));try{await cp(original,root,{recursive:true});await change(root);await run(root);}finally{assert(root.startsWith(resolve(tmpdir())+sep)&&root.includes('aipster-public-check-'));await rm(root,{recursive:true,force:true});}}
-test('valid public-only artifact passes',async()=>{assert.equal((await checkPublic(original)).files.length,23);});
+test('valid public-only artifact passes',async()=>{assert.equal((await checkPublic(original)).files.length,24);});
 
 test('an accidentally copied auth/credential file fails',async()=>fixture(root=>writeFile(resolve(root,'.dev.vars'),'SYNTHETIC_ONLY=1'),root=>assert.rejects(checkPublic(root),/allowlist/)));
 test('inline active HTML fails',async()=>fixture(async root=>{const path=resolve(root,'index.html');await writeFile(path,(await readFile(path,'utf8')).replace('</body>','<script>1</script></body>'));},root=>assert.rejects(checkPublic(root),/Active/)));
@@ -96,7 +96,7 @@ test('semantic approved script and link spellings remain allowed', async () => f
   await edit(root, 'app/index.html', text => text.replace('<script src="/app/app.js"></script>', "<script SRC = '/app/app.js'></script>"));
   await edit(root, 'index.html', text => text.replace('href="#overview"', "HREF = '#overview'"));
   await edit(root, 'styles.css', text => text + '\nbody{background-image:url(/favicon.svg)}');
-}, async root => assert.equal((await checkPublic(root)).files.length, 23)));
+}, async root => assert.equal((await checkPublic(root)).files.length, 24)));
 
 test('approved script cannot acquire inline code or be duplicated', async () => {
   for (const replacement of [
@@ -128,4 +128,10 @@ test('social preview metadata is one consistent absolute-URL set', async () => {
   const canon = [...html.matchAll(/<link\s+rel="canonical"\s+href="([^"]+)"\s*\/?>/g)];
   assert.equal(canon.length, 1, 'exactly one canonical link');
   assert.equal(canon[0][1], 'https://aipster.net/');
+});
+test('HeurChain beta is an exact reviewed sponsor destination', async () => {
+  for (const ref of ['https://heurchain.com/beta/', 'https://heurchain.com/', 'http://heurchain.com/beta', 'https://www.heurchain.com/beta']) {
+    await fixture(async root => { const path = resolve(root, 'index.html'); await writeFile(path, (await readFile(path, 'utf8')).replace('</body>', `<a href="${ref}">link</a></body>`)); },
+      root => assert.rejects(checkPublic(root), /External destination requires review/));
+  }
 });
