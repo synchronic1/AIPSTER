@@ -138,6 +138,53 @@ def write_private(path, text):
     restrict_file(path)
 
 
+def ensure_private_dir(path):
+    """Create a directory user-private; refuse to trust a shared one.
+
+    Directories we create get 0700 (POSIX) so pairing metadata cannot be
+    swapped under us. Pre-existing directories are left alone but POSIX
+    callers must pass check_private_store before credentials route
+    through them (Codex P2: api_base in pairing.json chooses where the
+    heartbeat Bearer [REDACTED] On Windows the per-user data dir plus file
+    ACLs are the control; see load_pairing."""
+    path = Path(path)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+    return path
+
+
+def check_private_store(data_dir):
+    """Refuse credential routing through a shared-writable store (POSIX).
+
+    pairing.json controls where the heartbeat key is sent, so metadata
+    gets the same protection as the key file. No-op on Windows, where
+    the user-ACL file control plus the per-user data dir apply."""
+    if os.name == "nt":
+        return
+    data = Path(data_dir)
+    problems = []
+    try:
+        if data.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            problems.append(str(data))
+    except OSError:
+        pass
+    for name in ("pairing.json", "heartbeat-key.txt"):
+        try:
+            if (data / name).exists() and (data / name).stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                problems.append(str(data / name))
+        except OSError:
+            pass
+    if problems:
+        raise PairingError(None, "BAD_PAIRING_STORE",
+                           "pairing store is shared-writable: " + ", ".join(problems) +
+                           "; fix permissions or re-pair into a private dir")
+
+
 def load_or_create_node_id(state_dir):
     """Stable worker identity (1..64 id chars), created once and kept."""
     state_dir = Path(state_dir)
@@ -189,11 +236,16 @@ def probe_hardware(config_path=None):
         try:
             from dendrite.config import load_config
             config = load_config(Path(config_path))
-            kinds = {getattr(r, "kind", "") for r in getattr(config, "runtimes", [])}
-            if kinds and kinds <= {"mock"}:
-                return snapshot  # simulated runtimes are not real capacity
+            kinds = {}
+            for runtime in getattr(config, "runtimes", []) or []:
+                kinds[getattr(runtime, "id", None)] = getattr(runtime, "kind", "")
             caps = []
             for model in getattr(config, "models", []) or []:
+                # Per-model filtering (Codex P2): a mixed config must not
+                # advertise mock-backed models as real capacity, and models
+                # on unknown runtimes claim nothing.
+                if kinds.get(getattr(model, "runtime", None), "mock") == "mock":
+                    continue
                 for cap in getattr(model, "capabilities", []) or []:
                     if cap not in caps:
                         caps.append(str(cap))
@@ -337,6 +389,7 @@ def pairing_files(data_dir):
 
 def load_pairing(data_dir):
     """Load pairing metadata + secret. Raises PairingError when unpaired."""
+    check_private_store(data_dir)
     files = pairing_files(data_dir)
     if not files["meta"].exists() or not files["key"].exists():
         raise PairingError(None, "NOT_PAIRED", "worker is not paired; run `pair` first")
@@ -376,6 +429,7 @@ def cmd_pair(args):
         if exc.status is None:
             return EXIT_USAGE
         return EXIT_PAIRING_REJECTED
+    ensure_private_dir(data_dir)
     files = pairing_files(data_dir)
     meta = {
         "api_base": check_api_base(args.api_base),
@@ -387,7 +441,8 @@ def cmd_pair(args):
         "created": result.get("created"),
         "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    files["meta"].write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    # Metadata is private too: api_base routes the credential (Codex P2).
+    write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
     write_private(files["key"], result["heartbeatKey"].strip() + "\n")
     print(f"paired: resource {meta['resource_id']} (key {meta['key_prefix']})")
     print(f"stored: {files['meta']} + {files['key']} (user-only access)")
@@ -399,13 +454,15 @@ def cmd_heartbeat(args, loop):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
         meta = load_pairing(data_dir)
-        usable = decide_usable(args.config)
     except PairingError as exc:
         print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK
     interval = max(args.interval, HEARTBEAT_MIN_INTERVAL_SEC)
     failures = 0
     while True:
+        # Recomputed per beat (Codex P2): installed/removed models and
+        # engines change readiness, and a stale true would misreport ready.
+        usable = decide_usable(args.config)
         try:
             result = send_heartbeat(meta["api_base"], meta["resource_id"],
                                     meta["heartbeat_key"], usable)
@@ -423,14 +480,17 @@ def cmd_heartbeat(args, loop):
                     return EXIT_NETWORK
                 time.sleep(wait)
                 continue
-            if exc.status is None:
+            if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
+                # Transport faults AND transient server failures share the
+                # bounded backoff (Codex P2): a 5xx must not terminate the
+                # sender while the service recovers.
                 failures += 1
                 if failures > MAX_ATTEMPTS_NETWORK:
-                    print(f"heartbeat: network down after {MAX_ATTEMPTS_NETWORK} tries: {exc}",
+                    print(f"heartbeat: giving up after {MAX_ATTEMPTS_NETWORK} tries: [{exc.code}] {exc}",
                           file=sys.stderr)
                     return EXIT_NETWORK
                 wait = min(2 ** failures, 60)
-                print(f"heartbeat: {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
+                print(f"heartbeat: [{exc.code}] {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
                       file=sys.stderr)
                 if not loop:
                     return EXIT_NETWORK
