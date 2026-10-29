@@ -154,14 +154,19 @@ test('review P2: a resume whose audit write failed reconciles on same-key retry'
   t.sqlite.exec("CREATE TRIGGER review_resume_audit BEFORE INSERT ON audit WHEN NEW.action = 'fabric.grant.resume' BEGIN SELECT RAISE(ABORT, 'synthetic'); END");
   assert.equal((await post(t, t.alice, `grants/${grant.id}/resume`, body, key)).status, 500);
   t.sqlite.exec('DROP TRIGGER review_resume_audit');
-  // The effect committed; only the audit is missing.
+  // Audit failure rolls the approval and effect back with its receipt.
   const g = t.sqlite.prepare('SELECT status, version, last_approval_id FROM fabric_grants WHERE id = ?').get(grant.id);
-  assert.deepEqual({ ...g }, { status: 'enforced', version: 3, last_approval_id: pa.json.id });
+  assert.equal(g.status, 'paused'); assert.equal(g.version, 2);
+  assert.notEqual(g.last_approval_id, pa.json.id);
+  assert.equal(t.sqlite.prepare('SELECT consumed_at FROM approvals WHERE id=?').get(pa.json.id).consumed_at, null);
+  assert.equal(t.sqlite.prepare("SELECT count(*) n FROM fabric_restriction_receipts WHERE action='fabric.grant.resume'").get().n, 0);
   assert.equal(audits(), 0);
   const retry = await post(t, t.alice, `grants/${grant.id}/resume`, body, key);
   assert.equal(retry.status, 200);
   assert.equal(retry.json.status, 'enforced');
   assert.equal(audits(), 1);
+  assert.equal(t.sqlite.prepare('SELECT version FROM fabric_grants WHERE id=?').get(grant.id).version, 3);
+  assert.equal(t.sqlite.prepare("SELECT count(*) n FROM fabric_restriction_receipts WHERE action='fabric.grant.resume'").get().n, 1);
   // Idempotent thereafter: the completed record replays, no second audit.
   const again = await post(t, t.alice, `grants/${grant.id}/resume`, body, key);
   assert.equal(again.status, 200);
