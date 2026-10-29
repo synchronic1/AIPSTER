@@ -243,6 +243,93 @@ class PairingTests(unittest.TestCase):
         self.assertFalse((self.data / "heartbeat-key.txt").exists())
 
 
+class Round2Tests(unittest.TestCase):
+    """Codex re-review regressions: store protection, fresh usability,
+    transient backoff, per-model capability filtering."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_pairing_meta_is_private(self):
+        run_cli("pair", self.pair_args())
+        self.assertEqual(stat.S_IMODE((self.data / "pairing.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o700)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_shared_store_is_refused(self):
+        run_cli("pair", self.pair_args())
+        os.chmod(self.data, 0o777)
+        with self.assertRaises(PairingError) as cm:
+            load_pairing(self.data)
+        self.assertEqual(cm.exception.code, "BAD_PAIRING_STORE")
+        os.chmod(self.data, 0o700)
+        os.chmod(self.data / "pairing.json", 0o666)
+        with self.assertRaises(PairingError):
+            load_pairing(self.data)
+        os.chmod(self.data / "pairing.json", 0o600)
+        meta = load_pairing(self.data)
+        self.assertEqual(meta["resource_id"], "r_fake01")
+
+    def test_usable_recomputed_per_beat(self):
+        run_cli("pair", self.pair_args())
+        args = argparse_namespace({"api_base": self.base, "data_dir": str(self.data),
+                                   "config": None, "interval": 60})
+        with patch.object(pairing, "decide_usable", side_effect=[False, True, True]) as decided, \
+                patch.object(pairing, "send_heartbeat", side_effect=[
+                    {"heartbeatAt": "t1"}, {"heartbeatAt": "t2"},
+                    RePairRequired(401, "KEY_REVOKED", "dead")]) as sent, \
+                patch.object(pairing.time, "sleep"):
+            code = cmd_heartbeat(args, loop=True)
+        self.assertEqual(code, EXIT_REPAIR_REQUIRED)
+        self.assertEqual(decided.call_count, 3, "usability re-evaluated every beat")
+        self.assertEqual([c.args[3] for c in sent.call_args_list[:2]], [False, True])
+
+    def test_5xx_backs_off_then_recovers(self):
+        run_cli("pair", self.pair_args())
+        args = argparse_namespace({"api_base": self.base, "data_dir": str(self.data),
+                                   "config": None, "interval": 60})
+        slept = []
+        with patch.object(pairing, "send_heartbeat", side_effect=[
+                PairingError(503, "UPSTREAM", "blip"),
+                {"heartbeatAt": "2026-10-29T00:00:01.000Z"},
+                RePairRequired(401, "KEY_REVOKED", "dead")]), \
+                patch.object(pairing.time, "sleep", side_effect=lambda s: slept.append(s)):
+            code = cmd_heartbeat(args, loop=True)
+        self.assertEqual(code, EXIT_REPAIR_REQUIRED)
+        self.assertEqual(slept, [2, 60], "transient backoff, then the normal interval")
+
+    def test_mixed_config_excludes_mock_and_unknown_caps(self):
+        import types
+        hw_mod = types.ModuleType("dendrite.hardware")
+        hw_mod.discover_hardware = lambda: {"cpu": "stub-cpu", "gpus": []}
+        cfg_mod = types.ModuleType("dendrite.config")
+
+        def fake_load(path):
+            ns = types.SimpleNamespace
+            return ns(runtimes=[ns(id="m", kind="mock"), ns(id="l", kind="llama")],
+                      models=[ns(id="mock-summary", runtime="m", capabilities=["summarize"]),
+                              ns(id="real-7b", runtime="l", capabilities=["chat"]),
+                              ns(id="ghost", runtime="nope", capabilities=["evil"])])
+        cfg_mod.load_config = fake_load
+        with patch.dict(sys.modules, {"dendrite.hardware": hw_mod, "dendrite.config": cfg_mod}):
+            hw = probe_hardware("stub.toml")
+        self.assertEqual(hw["capabilities"], ["chat"])
+        self.assertEqual(hw["cpu"], "stub-cpu")
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():

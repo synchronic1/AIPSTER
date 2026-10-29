@@ -332,23 +332,35 @@ async function handleApi(request, env, url) {
     const id = rid('r_');
     const now = nowIso();
     // Atomic cap: the count test is inside the single INSERT statement.
-    try {
-      const rc = await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?
-        WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
-        id, me(), body.name.trim(), kind, origin,
-        String(body.cpu || 'unknown').slice(0, 80), String(body.gpu || 'none recorded').slice(0, 80),
-        JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : []),
-        JSON.stringify(body.limits && typeof body.limits === 'object' ? body.limits : {}),
-        'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now, me());
+    const insertSql = `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?
+      WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`;
+    const insertParams = [id, me(), body.name.trim(), kind, origin,
+      String(body.cpu || 'unknown').slice(0, 80), String(body.gpu || 'none recorded').slice(0, 80),
+      JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : []),
+      JSON.stringify(body.limits && typeof body.limits === 'object' ? body.limits : {}),
+      'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now, me()];
+    if (idemKey) {
+      // One batch (a transaction): the row and its replay mapping commit
+      // together, so a mid-request crash can neither strand a NULL mapping
+      // (Codex P2: a post-steal retry would duplicate the resource) nor
+      // bind a phantom.
+      try {
+        const [ins] = await db.batch([
+          db.prepare(insertSql).bind(...insertParams),
+          db.prepare('UPDATE idempotency_keys SET resource_id = ? WHERE owner_id = ? AND key = ?').bind(id, me(), idemKey),
+        ]);
+        assertClaimed(ins, 'resource');
+      } catch (error) {
+        // Cap-miss binds a phantom row id and a DB fault leaves our NULL
+        // claim: either way release the key so the next retry is fresh.
+        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ?', me(), idemKey);
+        throw error;
+      }
+    } else {
+      const rc = await run(db, insertSql, ...insertParams);
       assertClaimed(rc, 'resource');
-    } catch (error) {
-      // A failed insert must not hold the key: release it so a later retry
-      // is a fresh attempt, not a phantom replay or a stuck in-flight.
-      if (idemKey) await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL', me(), idemKey);
-      throw error;
     }
-    if (idemKey) await run(db, 'UPDATE idempotency_keys SET resource_id = ? WHERE owner_id = ? AND key = ?', id, me(), idemKey);
     await audit(db, me(), 'resource.register', id, body.name.trim());
     const row = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
     return json(201, cardFor(row, await ownerName(db, me())));
@@ -954,11 +966,14 @@ async function claimIdempotencyKey(db, ownerId, key) {
     const prior = await first(db, 'SELECT resource_id, created_at FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
     if (prior && !prior.resource_id && prior.created_at
       && Number.isFinite(Date.parse(prior.created_at)) && Date.parse(prior.created_at) + IDEMPOTENT_IN_FLIGHT_MS < Date.now()) {
-      // Stuck mapping: the owner crashed between insert and completion
-      // (Codex P2). Steal it after a grace window instead of wedging the
-      // key for the full TTL.
+      // Stuck mapping: the owner crashed between insert and completion.
+      // Steal it after a grace window instead of wedging the key for the
+      // full TTL — conditional on the OBSERVED reservation (Codex P2): a
+      // concurrent stealer's fresh row carries a new timestamp, so at most
+      // one stealer deletes and the loser sees changes = 0.
       try {
-        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL', ownerId, key);
+        const took = await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id IS NULL AND created_at = ?', ownerId, key, prior.created_at);
+        if (Number(took.meta.changes) !== 1) return 'in-flight';
         await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
           ownerId, key, nowIso());
         return null;
@@ -969,9 +984,11 @@ async function claimIdempotencyKey(db, ownerId, key) {
     if (prior && prior.resource_id) {
       const row = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', prior.resource_id, ownerId);
       if (row) return row;
-      // Orphaned mapping (resource deleted since): drop it and own the key.
+      // Orphaned mapping (resource deleted since): drop it and own the key,
+      // conditional on the observed row so a concurrent adopter wins alone.
       try {
-        await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key);
+        const took = await run(db, 'DELETE FROM idempotency_keys WHERE owner_id = ? AND key = ? AND resource_id = ?', ownerId, key, prior.resource_id);
+        if (Number(took.meta.changes) !== 1) return 'in-flight';
         await run(db, 'INSERT INTO idempotency_keys (owner_id, key, resource_id, created_at) VALUES (?, ?, NULL, ?)',
           ownerId, key, nowIso());
         return null;
