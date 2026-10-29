@@ -9,9 +9,9 @@ removal verification, registration preserved on incomplete removal.
 | Field | Value |
 |---|---|
 | Artifact | `AIPSTER-Worker-0.1.0-win64-setup.exe` |
-| Size | 13,090,393 bytes |
-| SHA-256 | `d4290b077df3949c941e78aed085cd2b000a4e938f6fe81b2f2174347847d4c2` |
-| Built from | `3688d3a4191317ddc84321f03eadd5b4157d0a69`, clean tree (final integrated candidate) |
+| Size | 13,092,887 bytes |
+| SHA-256 | `ed0ebc3d376990cf7223e31c09b855b0581d3bd0a31d8fc0e36cab79aa0a2915` |
+| Built from | `939e216bf326c091293920f1633d418961a4d475`, clean tree (final integrated candidate incl. main #32/#37) |
 | Payload | 98 files; complete hashes in generated `dist/manifest.json` |
 | Native uninstall fixtures | running-process abort (exit 2, zero deletions, registration preserved) and locked-payload abort (exit 2, registration preserved) pass; evidence `installer-uninstall-takeover-evidence.json` |
 | Coexist qualification | 52 PASS, 4 explicit installer-path SKIP, 0 FAIL next to a live install; full install/uninstall paths deferred to clean CI |
