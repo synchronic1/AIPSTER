@@ -37,6 +37,7 @@ class FakeApiState:
         self.beats = []
         self.claim_status = 201
         self.claim_body = None
+        self.claim_hook = None  # optional fn(body) -> claim payload (per-claim keys)
         self.beat_plan = []  # list of (status, body, retry_after)
         self.live_keys = {FAKE_SECRET}
 
@@ -65,7 +66,10 @@ def make_server(state):
                 body = {}
             if self.path == "/api/pairing/claim":
                 state.claims.append(body)
-                payload = dict(state.claim_body or {})
+                if state.claim_hook is not None:
+                    payload = dict(state.claim_hook(body))
+                else:
+                    payload = dict(state.claim_body or {})
                 payload.setdefault("resourceId", "r_fake01")
                 payload.setdefault("heartbeatKey", FAKE_SECRET)
                 payload.setdefault("keyId", "k_fake01")
@@ -557,6 +561,109 @@ class Round9Tests(unittest.TestCase):
             {"api_base": self.base, "data_dir": str(self.data)}))
         self.assertEqual(code, EXIT_OK)
         self.assertIn("not paired", out)
+
+
+class Round11Tests(unittest.TestCase):
+    """Codex round-11 regressions: pair mutex, loop recheck."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.state = FakeApiState()
+        self.server, self.base = make_server(self.state)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def pair_args(self, **kw):
+        args = {"api_base": self.base, "data_dir": str(self.data),
+                "config": None, "name": None, "code": FAKE_CODE}
+        args.update(kw)
+        return argparse_namespace(args)
+
+    def test_concurrent_pairs_install_the_live_credential(self):
+        minted, minted_lock = [], threading.Lock()
+
+        def hook(body):
+            with minted_lock:
+                i = len(minted)
+                key = f"synthetic-key-{i:02d}-0123456789abcdef"
+                minted.append((key, threading.get_ident()))
+            return {"resourceId": "r_fake01", "heartbeatKey": key,
+                    "keyId": f"k_fake{i:02d}", "keyPrefix": f"aip_live_k_fake{i:02d}_x",
+                    "heartbeatUrl": "/api/resources/r_fake01/heartbeat", "created": True}
+
+        self.state.claim_hook = hook
+        real_claim = pairing.claim
+        other_done = threading.Event()
+
+        def gated_claim(*args, **kwargs):
+            out = real_claim(*args, **kwargs)
+            with minted_lock:
+                idx = next(i for i, (k, _) in enumerate(minted)
+                           if k == out["heartbeatKey"])
+            if idx == 0:
+                # First-minted waits for the rival to finish, forcing the
+                # exact overwrite order the mutex must prevent. Post-fix
+                # the rival is lock-blocked, so this always waits out the
+                # timeout (documented ~5s cost); pre-fix the rival
+                # finishes in milliseconds and the overwrite lands.
+                other_done.wait(timeout=5)
+            return out
+
+        results, errors = {}, []
+
+        def run_one(tag, code):
+            try:
+                results[tag] = run_cli("pair", self.pair_args(code=code))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                other_done.set()
+
+        threads = [threading.Thread(target=run_one, args=("a", FAKE_CODE)),
+                   threading.Thread(target=run_one, args=("b", "pair-99999999-AAAA-BBBB-CCCC"[:27]))]
+        with patch.object(pairing, "claim", side_effect=gated_claim):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        self.assertEqual(results["a"][2], EXIT_OK)
+        self.assertEqual(results["b"][2], EXIT_OK, "both report success even in the race")
+        live = minted[-1][0]
+        installed = (self.data / "heartbeat-key.txt").read_text().strip()
+        self.assertEqual(installed, live, "files hold the last-minted (live) credential")
+        loaded = load_pairing(self.data)
+        self.assertEqual(loaded["heartbeat_key"], live, "fingerprint-consistent live pair")
+        self.state.live_keys = {live}
+        beat = send_heartbeat(self.base, loaded["resource_id"], live, False)
+        self.assertTrue(beat.get("ok"), "installed credential actually beats")
+
+    def test_loop_stops_after_unpair(self):
+        run_cli("pair", self.pair_args())
+        args = argparse_namespace({"api_base": self.base, "data_dir": str(self.data),
+                                   "config": None, "interval": 60})
+        real_send = pairing.send_heartbeat
+        calls = []
+
+        def beat_then_unpair(*a, **k):
+            out = real_send(*a, **k)
+            calls.append(out)
+            if len(calls) == 1:
+                run_cli("unpair", argparse_namespace(
+                    {"api_base": self.base, "data_dir": str(self.data)}))
+            if len(calls) >= 5:
+                raise RePairRequired(401, "KEY_REVOKED", "test cap: loop never noticed unpair")
+            return out
+
+        with patch.object(pairing, "send_heartbeat", side_effect=beat_then_unpair), \
+                patch.object(pairing.time, "sleep", side_effect=lambda s: None):
+            code = cmd_heartbeat(args, loop=True)
+        self.assertEqual(code, EXIT_REPAIR_REQUIRED)
+        self.assertEqual(len(calls), 1, "no beat after unpair")
+        status = json.loads((self.data / "state" / "heartbeat-status.json").read_text())
+        self.assertEqual(status["status"], "unpaired")
 
 
 def argparse_namespace(values):
