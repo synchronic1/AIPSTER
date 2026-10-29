@@ -34,7 +34,7 @@ can land without a pairing-session edit.
   reclaim + rotation, expired/replayed/foreign codes, revocation, delete,
   disabled owner, stale strip, secret-free output. Needs `node` plus
   `website/node_modules`; skips honestly otherwise.
-- `local-worker/test_pairing_security.py` — 14 controlled security/storage
+- `local-worker/test_pairing_security.py` — 15 controlled security/storage
   regressions: redirect refusal, private ACLs, failed/interrupted publication,
   concurrent manifest snapshots, safe legacy reads, truthful status and retries.
 - Protocol: `docs/pairing.md` (claim) + `docs/heartbeat-intake.md`
@@ -51,7 +51,9 @@ still read `heartbeat-key.txt`. Pairing writes/protects the new key first and on
 then atomically publishes the manifest. Interrupted writes retain an old or a
 complete new origin/resource/key tuple. Earlier/private orphan generations are
 retained for in-flight readers and removed only by explicit `unpair`; no automatic
-garbage collection may remove them. No secret is stored in the manifest. HTTP
+garbage collection may remove them. Before claiming again, all retained managed
+legacy/generation keys are made private too; a hardening failure stops the claim
+and leaves the existing origin/resource/key selection intact. No secret is stored in the manifest. HTTP
 redirects are refused, including same-origin redirects and TLS downgrades.
 
 1. Freeze `pairing.py` with the bundle (a launcher import picks it up;

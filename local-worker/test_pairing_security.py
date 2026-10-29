@@ -229,5 +229,26 @@ foreach ($path in $items) {
             finally:
                 pairing.restrict_file(path)
 
+    def test_repair_hardens_retained_legacy_and_generation_keys_before_claim(self):
+        original = self.legacy()
+        self.assertEqual(self.pair(), pairing.EXIT_OK)
+        retained = list(pairing.managed_key_files(self.data))
+        for path in retained:
+            if os.name == "nt":
+                self.assertEqual(subprocess.run(["icacls", str(path), "/grant", "*S-1-1-0:R"], capture_output=True).returncode, 0)
+            else:
+                path.chmod(0o644)
+        self.assertEqual(self.pair(), pairing.EXIT_OK)
+        for path in retained:
+            self.assertTrue(path.exists(), 'no key is deleted while an older reader may need it')
+            pairing.check_private_store(self.data, path)
+        before = pairing.load_pairing(self.data)
+        with patch.object(pairing, "restrict_file", return_value=False), patch.object(pairing, "claim") as claim, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pairing.cmd_pair(self.args), pairing.EXIT_USAGE)
+        claim.assert_not_called()
+        self.assertEqual(pairing.load_pairing(self.data), before)
+        self.assertEqual((self.data / "heartbeat-key.txt").read_text(), original["heartbeat_key"])
+
 
 if __name__ == "__main__": unittest.main()
