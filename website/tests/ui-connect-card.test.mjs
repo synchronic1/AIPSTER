@@ -85,6 +85,7 @@ test('anonymous visitors never get the card', async () => {
 test('signed-in owner sees the card on My Compute with pinned public destinations', async () => {
   const ui = await makeUi();
   assert.equal(ui.el('view-app').hidden, false, 'positive control: session restored');
+  const before = ui.calls.length;
   await ui.clickTab('compute');
   const card = ui.el('connect-card');
   assert.equal(card.hidden, false);
@@ -101,7 +102,7 @@ test('signed-in owner sees the card on My Compute with pinned public destination
   assert.equal(anchorText(archive), 'Get worker source (.zip)', 'source-only download is labelled as source');
   assert.equal(nodes.filter((n) => n.tagName === 'button' || n.tagName === 'form' || n.tagName === 'input').length, 0, 'card performs no actions');
   // Only the existing inventory read happens; the card adds no API call.
-  assert.deepEqual(ui.calls, ['GET /api/auth/get-session', 'GET /api/inventory?limit=50', 'GET /api/shared-with-me?limit=50', 'GET /api/usage?limit=1', 'GET /api/inventory?limit=50']);
+  assert.deepEqual(ui.calls.slice(before), ['GET /api/inventory?limit=50']);
 });
 
 test('card copy is honest about status, platforms and prerequisites', async () => {
