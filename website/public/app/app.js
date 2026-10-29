@@ -202,7 +202,7 @@ async function loadOverview() {
 // and the code is cleared on Done, tab switch, or sign-out. No verified
 // installer is packaged for any platform yet, so progress honestly stops at
 // "Setup needed" until the worker is installed and paired elsewhere.
-const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
+const WORKER_COMMIT = '0cf2321defc091272b749ac34c1f1dac2aa5304e';
 const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
