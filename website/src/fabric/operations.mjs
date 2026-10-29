@@ -21,10 +21,45 @@ export async function opDigest(actor, op) {
 }
 
 export const isCommitFailure = (path, status) => status >= 400 && status < 500 && status !== 401 && status !== 403
-  && (path === '/v1/fabric/grants' || path === '/v1/fabric/mcp:fabric.commit_grant');
+  && claimActionForPath(path) === 'grant.commit';
 export const pendingCommit = () => ({ status: 503, body: {
   error: 'Commit outcome is not recorded; retry reconciliation or use a fresh approval.', code: 'COMMIT_UNCERTAIN'
 } });
+
+// Claim-bearing action per router path, REST or MCP. Terminal ledger
+// failures and delayed approval claims serialize as a pair per action:
+// failure first forbids a delayed claim; claim first forbids a terminal
+// failure. Commit, resume and revision share this fence.
+export const claimActionForPath = (path) => {
+  if (path === '/v1/fabric/grants' || path === '/v1/fabric/mcp:fabric.commit_grant') return 'grant.commit';
+  if (path === '/v1/fabric/mcp:fabric.revise_grant'
+    || (typeof path === 'string' && /^\/v1\/fabric\/grants\/[^/]+\/revise$/.test(path))) return 'grant.revise';
+  if (path === '/v1/fabric/mcp:fabric.resume_grant'
+    || (typeof path === 'string' && /^\/v1\/fabric\/grants\/[^/]+\/resume$/.test(path))) return 'grant.resume';
+  return null;
+};
+
+export const pendingClaim = (action) => action === 'grant.revise' ? { status: 503, body: {
+  error: 'Revision outcome is not recorded; retry reconciliation or re-approve a fresh operation.', code: 'REVISION_UNCERTAIN'
+} } : action === 'grant.resume' ? { status: 503, body: {
+  error: 'Resume outcome is not recorded; retry reconciliation or re-approve a fresh operation.', code: 'RESUME_UNCERTAIN'
+} } : pendingCommit();
+
+// Stable router operations carry their ledger identity so a recorded
+// terminal failure vetoes a delayed claim. Calls without any stable op
+// identity are independent operations.
+export const ledgerFor = (actor, op) => (op && typeof op.key === 'string' && op.key && typeof op.path === 'string' && op.path)
+  ? { actor: `${actor.kind}:${actor.user.id}`, key: op.key, path: op.path } : null;
+
+// Veto fragment for claim writes: a recorded terminal failure for this
+// router operation forbids a delayed claim, even one using its old
+// timestamp. A processing/uncertain takeover is deliberately not a veto.
+export const ledgerVeto = (ledger) => ledger ? {
+  clause: ` AND NOT EXISTS(SELECT 1 FROM idempotency_records
+    WHERE actor = ? AND idem_key = ? AND path = ? AND method = 'POST'
+    AND (status = 'quarantined' OR (status = 'completed' AND response_code >= 400)))`,
+  binds: [ledger.actor, ledger.key, ledger.path],
+} : { clause: '', binds: [] };
 
 // THE approval claim, shared by commit/revise/resume. Exactly one
 // claimant wins per approval, ever: the UPDATE commits before any
@@ -32,16 +67,14 @@ export const pendingCommit = () => ({ status: 503, body: {
 // failure leaves the approval spent (fail-closed reapproval).
 // Returns true iff this caller won the claim.
 export async function claimApproval(db, { id, action, target, op, now, ledger = null }) {
-  // Commit's claim and terminal ledger failure serialize in opposite order:
+  // A claim and its terminal ledger failure serialize in opposite order:
   // once a failure wins, an old delayed claim must never create access.
   // A processing/uncertain takeover is deliberately not a veto: an already
   // authorized old attempt may still finish and be reconciled by the new one.
-  const fence = ledger ? ` AND NOT EXISTS(SELECT 1 FROM idempotency_records
-    WHERE actor = ? AND idem_key = ? AND path = ? AND method = 'POST'
-    AND (status = 'quarantined' OR (status = 'completed' AND response_code >= 400)))` : '';
+  const veto = ledgerVeto(ledger);
   const r = await db.prepare(`UPDATE approvals SET consumed_at = ?, consumed_by_op = ?, consumed_action = ?, consumed_target = ?
-    WHERE id = ? AND consumed_at IS NULL AND decision = 'approved' AND expiry > ?${fence}`)
-    .bind(now, op, action, target, id, now, ...(ledger ? [ledger.actor, ledger.key, ledger.path] : [])).run();
+    WHERE id = ? AND consumed_at IS NULL AND decision = 'approved' AND expiry > ?${veto.clause}`)
+    .bind(now, op, action, target, id, now, ...veto.binds).run();
   return Number(r.meta.changes) === 1;
 }
 
