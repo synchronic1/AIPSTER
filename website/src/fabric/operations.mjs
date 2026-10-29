@@ -20,15 +20,28 @@ export async function opDigest(actor, op) {
   return `direct${randHex(8)}`;
 }
 
+export const isCommitFailure = (path, status) => status >= 400 && status < 500 && status !== 401 && status !== 403
+  && (path === '/v1/fabric/grants' || path === '/v1/fabric/mcp:fabric.commit_grant');
+export const pendingCommit = () => ({ status: 503, body: {
+  error: 'Commit outcome is not recorded; retry reconciliation or use a fresh approval.', code: 'COMMIT_UNCERTAIN'
+} });
+
 // THE approval claim, shared by commit/revise/resume. Exactly one
 // claimant wins per approval, ever: the UPDATE commits before any
 // effect runs, so losers change nothing. A win followed by an effect
 // failure leaves the approval spent (fail-closed reapproval).
 // Returns true iff this caller won the claim.
-export async function claimApproval(db, { id, action, target, op, now }) {
+export async function claimApproval(db, { id, action, target, op, now, ledger = null }) {
+  // Commit's claim and terminal ledger failure serialize in opposite order:
+  // once a failure wins, an old delayed claim must never create access.
+  // A processing/uncertain takeover is deliberately not a veto: an already
+  // authorized old attempt may still finish and be reconciled by the new one.
+  const fence = ledger ? ` AND NOT EXISTS(SELECT 1 FROM idempotency_records
+    WHERE actor = ? AND idem_key = ? AND path = ? AND method = 'POST'
+    AND (status = 'quarantined' OR (status = 'completed' AND response_code >= 400)))` : '';
   const r = await db.prepare(`UPDATE approvals SET consumed_at = ?, consumed_by_op = ?, consumed_action = ?, consumed_target = ?
-    WHERE id = ? AND consumed_at IS NULL AND decision = 'approved' AND expiry > ?`)
-    .bind(now, op, action, target, id, now).run();
+    WHERE id = ? AND consumed_at IS NULL AND decision = 'approved' AND expiry > ?${fence}`)
+    .bind(now, op, action, target, id, now, ...(ledger ? [ledger.actor, ledger.key, ledger.path] : [])).run();
   return Number(r.meta.changes) === 1;
 }
 
