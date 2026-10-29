@@ -120,10 +120,12 @@ action, target, current version). A partial unique index in additive
 ### Durable restriction completion (0014)
 
 `0014_fabric_restriction_receipts.sql` adds immutable operation outcomes for
-grant pause/revoke and connection suspend/disconnect. Their guarded effect,
+grant pause/revoke, connection suspend/disconnect and invitation decline/revoke. Their guarded effect,
 receipt and audit commit in one local D1 batch. A failed receipt or audit write
 rolls the effect back; an unknown batch response is recovered from the matching
 receipt before fresh version checks, even after another valid transition.
+Zero-row mutation results also re-read the receipt before classifying the live
+state, so an overlapping lease takeover preserves the original outcome.
 Receipts bind actor, action, target and the complete request digest. They are
 retained evidence and do not replenish admission capacity. Existing pre-repair
 missing audit entries cannot be reconstructed automatically.

@@ -319,14 +319,21 @@ export async function declineInvitation(db, actor, id, op = null) {
   if (!mine.some((m) => m.id === inv.recipient_node && m.workspace === inv.recipient_workspace)) {
     throw err(403, 'FORBIDDEN', 'Only the recipient side can decline.');
   }
-  const upd = await db.prepare(`UPDATE invitations SET state = 'declined', decided_at = ? WHERE id = ? AND state = 'issued'
-    AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`).bind(nowIso(), id, actor.user.id).run();
-  if (!upd.meta.changes) {
+  const completion = await restrictionContext(db, actor, op, 'fabric.invitation.decline', id, {});
+  if (completion.replay) return completion.replay;
+  const now = nowIso();
+  const res = await runBatch(db, [
+    [`UPDATE invitations SET state = 'declined', decided_at = ? WHERE id = ? AND state = 'issued'
+      AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`, now, id, actor.user.id],
+    ...restrictionCompletion(actor, completion, 'fabric.invitation.decline', id, { id, state: 'declined' }, now)
+  ]);
+  if (!changes(res, 0)) {
+    const recovered = await restrictionContext(db, actor, op, 'fabric.invitation.decline', id, {});
+    if (recovered.replay) return recovered.replay;
     const cur = await first(db, 'SELECT state FROM invitations WHERE id = ?', id);
     if (!cur || cur.state === 'issued') await throwActorClosed(db, actor);
     throw err(409, 'INVITATION_USED', 'Invitation is no longer pending.');
   }
-  await auditFabric(db, actor, op, 'fabric.invitation.decline', id);
   return { status: 200, body: { id, state: 'declined' } };
 }
 
@@ -335,14 +342,21 @@ export async function revokeInvitation(db, actor, id, op = null) {
   const inv = await first(db, 'SELECT * FROM invitations WHERE id = ?', id);
   if (!inv) throw err(404, 'NOT_FOUND', 'Invitation not found.');
   await ownNode(db, actor, inv.issuer_node);
-  const upd = await db.prepare(`UPDATE invitations SET state = 'revoked', decided_at = ? WHERE id = ? AND state = 'issued'
-    AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`).bind(nowIso(), id, actor.user.id).run();
-  if (!upd.meta.changes) {
+  const completion = await restrictionContext(db, actor, op, 'fabric.invitation.revoke', id, {});
+  if (completion.replay) return completion.replay;
+  const now = nowIso();
+  const res = await runBatch(db, [
+    [`UPDATE invitations SET state = 'revoked', decided_at = ? WHERE id = ? AND state = 'issued'
+      AND EXISTS(SELECT 1 FROM "user" u WHERE u.id = ? AND u.disabled = 0 AND u.demo = 0)`, now, id, actor.user.id],
+    ...restrictionCompletion(actor, completion, 'fabric.invitation.revoke', id, { id, state: 'revoked' }, now)
+  ]);
+  if (!changes(res, 0)) {
+    const recovered = await restrictionContext(db, actor, op, 'fabric.invitation.revoke', id, {});
+    if (recovered.replay) return recovered.replay;
     const cur = await first(db, 'SELECT state FROM invitations WHERE id = ?', id);
     if (!cur || cur.state === 'issued') await throwActorClosed(db, actor);
     throw err(409, 'INVITATION_USED', 'Invitation is no longer pending.');
   }
-  await auditFabric(db, actor, op, 'fabric.invitation.revoke', id);
   return { status: 200, body: { id, state: 'revoked' } };
 }
 
@@ -447,6 +461,10 @@ async function restrictConnection(db, actor, id, input, op, toState, auditAction
     return { status: 200, body: { id, state: toState } };
   }
   if (changes(res, 0) === 1) return { status: 500, body: { error: 'Request failed.', code: 'INTERNAL' } };
+  // Another attempt of this operation may have committed after our initial
+  // receipt read. Recover it before classifying a zero-row CAS from live state.
+  const recovered = await restrictionContext(db, actor, op, auditAction, id, input);
+  if (recovered.replay) return recovered.replay;
   // Restriction lost: version moved, terminal state, or actor closed.
   const cur = await first(db, 'SELECT version, state FROM connections WHERE id = ?', id);
   if (!cur) throw err(404, 'NOT_FOUND', 'Connection not found.');
@@ -1017,6 +1035,8 @@ export async function pauseGrant(db, actor, id, input = {}, op = null) {
   if (changes(res, 0) === 1) {
     return { status: 200, body: { id, status: 'paused' } };
   }
+  const recovered = await restrictionContext(db, actor, op, 'fabric.grant.pause', id, input);
+  if (recovered.replay) return recovered.replay;
   const cur = await first(db, 'SELECT status, version, quarantine_reason FROM fabric_grants WHERE id = ?', id);
   if (!cur) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (cur.quarantine_reason) return { status: 409, body: { error: 'Grant is quarantined; re-issue it.', code: 'GRANT_QUARANTINED' } };
@@ -1113,6 +1133,8 @@ export async function revokeGrant(db, actor, id, input = {}, op = null) {
   if (changes(res, 0) === 1) {
     return { status: 200, body: { id, status: 'revoked' } };
   }
+  const recovered = await restrictionContext(db, actor, op, 'fabric.grant.revoke', id, input);
+  if (recovered.replay) return recovered.replay;
   const cur = await first(db, 'SELECT status, version, quarantine_reason FROM fabric_grants WHERE id = ?', id);
   if (!cur) throw err(404, 'NOT_FOUND', 'Grant not found.');
   if (cur.status === 'revoked') return { status: 200, body: { id, status: 'revoked', note: 'Already revoked.' } };

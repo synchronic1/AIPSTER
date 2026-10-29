@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {fabricEnv,connectPair,commitFlow,S,K,freshKey,readJson} from './qa-helpers.mjs';
+import {faultOnce} from './revision-fixtures.mjs';
 const post = (t,u,p,b={},key=freshKey()) => t.call('/v1/fabric/'+p,{method:'POST',headers:S(t,u,{'Idempotency-Key':key}),body:b}).then(readJson);
 const get = (t,u,p) => t.call('/v1/fabric/'+p,{headers:S(t,u)}).then(readJson);
 async function approved(t,u,conn,resource='r_gpu1') {
@@ -81,15 +82,36 @@ test('QA CONTROL: invitation expiry/workspace proof, no imported re-export, disa
  assert.equal((await post(t,t.alice,'previews',{connectionId:conn.id,resourceIds:['r_gpu1'],consumers:['x'],models:['llama'],maxTokens:1,maxRequests:1})).status,422);
  t.sqlite.exec("UPDATE user SET disabled=1 WHERE id='u_alice'"); assert.equal((await get(t,t.alice,'nodes')).status,401);
 });
-test('QA SECURITY: concurrent revoke wins over approved resume',async()=>{
+for(const first of ['revoke','resume']) test(`QA SECURITY: deterministic ${first}-first revoke/resume CAS ordering`,async c=>{
  const t=await fabricEnv(); const {conn}=await connectPair(t); const {grant}=await commitFlow(t,conn.id);
+ c.after(()=>t.sqlite.close());
  await post(t,t.alice,`grants/${grant.id}/pause`,{expectedVersion:1});
  const a=await post(t,t.alice,'approvals',{action:'grant.resume',targetId:grant.id});
  await post(t,t.alice,`approvals/${a.json.id}/decide`,{decision:'approve'});
  const core=await import('../src/fabric/store.mjs'); const actor={kind:'session',user:{id:t.alice.id}};
- const r=await Promise.all([core.resumeGrant(t.DB,actor,grant.id,{expectedVersion:2,approvalId:a.json.id}),core.revokeGrant(t.DB,actor,grant.id,{expectedVersion:2})]);
+ let winner;
+ const ordered=faultOnce(t.DB,/UPDATE fabric_grants SET status/,'before',true,async()=>{
+  winner=first==='revoke'
+   ?await core.revokeGrant(t.DB,actor,grant.id,{expectedVersion:2})
+   :await core.resumeGrant(t.DB,actor,grant.id,{expectedVersion:2,approvalId:a.json.id});
+ });
+ const loser=first==='revoke'
+  ?await core.resumeGrant(ordered,actor,grant.id,{expectedVersion:2,approvalId:a.json.id})
+  :await core.revokeGrant(ordered,actor,grant.id,{expectedVersion:2});
+ assert.equal(winner.status,200);
  const row=t.sqlite.prepare('SELECT status,version FROM fabric_grants WHERE id=?').get(grant.id);
- assert.equal(row.status,'revoked',`BUG: both results ${r.map(x=>x.status)} leave ${JSON.stringify(row)}`);
+ assert.equal(row.version,3);
+ if(first==='revoke'){
+  assert.equal(row.status,'revoked');assert.equal(loser.status,409);assert.equal(loser.body.code,'BAD_STATE');
+  assert.equal(t.sqlite.prepare("SELECT count(*) n FROM audit WHERE action='fabric.grant.resume' AND target=?").get(grant.id).n,0);
+ }else{
+  assert.equal(row.status,'enforced');assert.equal(loser.status,412);assert.equal(loser.body.code,'VERSION_MISMATCH');
+  assert.equal(t.sqlite.prepare("SELECT count(*) n FROM audit WHERE action='fabric.grant.revoke' AND target=?").get(grant.id).n,0);
+  assert.equal((await core.revokeGrant(t.DB,actor,grant.id,{expectedVersion:3})).status,200);
+  const revoked=t.sqlite.prepare('SELECT status,version FROM fabric_grants WHERE id=?').get(grant.id);
+  assert.equal(revoked.status,'revoked');assert.equal(revoked.version,4);
+  await assert.rejects(core.resumeGrant(t.DB,actor,grant.id,{expectedVersion:4,approvalId:a.json.id}),{code:'BAD_STATE'});
+ }
 });
 test('QA SECURITY: unrelated owner cannot request preview approval and retrieve digest',async()=>{
  const t=await fabricEnv(); const {conn}=await connectPair(t);
