@@ -426,3 +426,16 @@ test('an all-uppercase code claims (typed-entry contract)', async () => {
   const out = await readJson(await claim(t, { code: minted.json.code.toUpperCase(), nodeId: 'n-upper' }));
   assert.equal(out.status, 201, out.text);
 });
+test('a beating usable resource reports reachable, never ready', async () => {
+  const t = await createTestEnv();
+  const p = await pair(t, t.alice, 'n_reachable', { name: 'reachable-box' });
+  const beat = await readJson(await t.call(`/api/resources/${p.resourceId}/heartbeat`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + p.heartbeatKey }, body: { usable: true },
+  }));
+  assert.equal(beat.status, 200, beat.text);
+  const inv = await readJson(await t.call('/api/inventory', { headers: t.as(t.alice) }));
+  const card = inv.json.items.find((r) => r.id === p.resourceId);
+  assert.equal(card.state.status, 'reachable');
+  assert.equal(card.state.usable, true, 'heartbeat attestation preserved');
+  assert.ok(!JSON.stringify(card).includes('ready'), 'no ready claim anywhere on the card');
+});
