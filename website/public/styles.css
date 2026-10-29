@@ -37,7 +37,7 @@
 .sponsors-banner{background:var(--green);color:#eef3e9}
 .sponsors-line{display:flex;align-items:center;justify-content:center;gap:8px 14px;flex-wrap:wrap;max-width:1184px;margin:0 auto;padding:12px 48px;font-size:13px;font-weight:600;letter-spacing:.01em;text-align:center}
 .sponsors-line strong{font-weight:750}
-.sponsor-logos{display:inline-flex;align-items:center;gap:10px}
+.sponsor-logos{display:inline-flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
 .sponsor-chip{display:inline-flex;align-items:center;padding:7px 12px;border-radius:8px}
 .sponsor-chip:focus-visible{outline:2px solid #fff;outline-offset:1px;box-shadow:0 0 0 4px #0b0e12}
 .sponsor-chip.light{background:#fff}
