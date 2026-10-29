@@ -14,8 +14,10 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed #17 head: worker requires a local token and validates Host/Origin.
-const COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
-const TREE = `https://github.com/synchronic1/AIPSTER/blob/${COMMIT}/local-worker/`;
+const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
+// Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
+const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
+const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
   `${TREE}README.md#tested-installation`,
@@ -118,7 +120,7 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   for (const phrase of ['Connect your computer', 'Connection setup pending', 'Not connected.', 'does not share your resources or enable inference',
     'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified', 'untested', 'separate prerequisites',
     'There is no installer or binary yet', 'There is no pairing code or worker credential yet', 'Disconnect and uninstall', 'Troubleshooting',
-    'ganglion-dendrite 0.1.0', COMMIT, 'worker files only']) {
+    'ganglion-dendrite 0.1.0', WORKER_COMMIT, 'worker and its root LICENSE only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   assert.ok(!/\bconnected\b/i.test(text.replace(/not connected/gi, '')), 'never claims a connected state');
@@ -135,9 +137,9 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   assert.deepEqual(lines, [
     'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
-    'git sparse-checkout set --no-cone local-worker',
-    `git fetch origin ${COMMIT}`,
-    `git checkout --detach ${COMMIT}`,
+    'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
+    `git fetch origin ${WORKER_COMMIT}`,
+    `git checkout --detach ${WORKER_COMMIT}`,
     'cd local-worker',
     'uv run --no-project --python 3.12.14 python install.py',
     '.\\.venv\\Scripts\\python.exe test_installation.py',
@@ -149,6 +151,19 @@ test('card copy is honest about status, platforms and prerequisites', async () =
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   assert.ok(!/aip_|AIPSTER_(?:API_)?KEY|X-Aipster|\/api\//.test(commands), 'no AIPSTER credential or endpoint in worker commands');
+});
+
+test('pinned Quick Start README matches the worker-only checkout and includes its required license', async () => {
+  assert.notEqual(DOCS_COMMIT, WORKER_COMMIT, 'documentation and worker source have independent immutable pins');
+  const readme = await readFile(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../local-worker/README.md'), 'utf8');
+  const block = readme.match(/From PowerShell[\s\S]*?```powershell([\s\S]*?)```/);
+  assert.ok(block, 'README has a tested PowerShell installation block');
+  assert.ok(block[1].includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
+  assert.ok(block[1].includes(`git fetch origin ${WORKER_COMMIT}`));
+  assert.ok(block[1].includes(`git checkout --detach ${WORKER_COMMIT}`));
+  assert.match(readme, /sparse checkout contains the worker and the root `LICENSE` only/);
+  assert.match(readme, /required by \[the licensing record\]\(LICENSING\.md\)/);
+  assert.doesNotMatch(block[1], /git clone https:\/\/github\.com\/synchronic1\/AIPSTER\.git\s+cd AIPSTER\/local-worker/);
 });
 
 test('card carries no credentials and nothing is logged', async () => {
