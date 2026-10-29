@@ -394,14 +394,16 @@ async function handleApi(request, env, url) {
       // still reads KEY_REVOKED instead of vanishing into AUTH_REQUIRED.
       // Grants/jobs cannot dangle (NOT NULL references), so their rows go;
       // the audit trail (grant.create, resource.delete) records what
-      // existed. Pairing history keeps resource_id nulled, which reclaim
-      // treats as invalid. Heartbeat intake rejects further beats either way.
+      // existed. Spent pairing codes for the resource are invalidated
+      // (binding nulled + invalidated_at), which reclaim treats as
+      // permanently invalid — never resumed, even by the same node.
+      // Heartbeat intake rejects further beats either way.
       const now = nowIso();
       await db.batch([
         db.prepare('UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ?').bind(now, r.id),
         db.prepare('DELETE FROM jobs WHERE resource_id = ?').bind(r.id),
         db.prepare('DELETE FROM grants WHERE resource_id = ?').bind(r.id),
-        db.prepare('UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ?').bind(r.id),
+        db.prepare('UPDATE pairing_codes SET resource_id = NULL, invalidated_at = ? WHERE resource_id = ?').bind(now, r.id),
         db.prepare('DELETE FROM idempotency_keys WHERE resource_id = ?').bind(r.id),
         db.prepare('DELETE FROM resources WHERE id = ?').bind(r.id),
       ]);
@@ -697,25 +699,49 @@ async function handleApi(request, env, url) {
     if (row.used_at) {
       // Lost-response retry: the same node re-binds within the reclaim
       // window and gets a fresh sender key; anything else sees the same
-      // generic invalid as an unknown code.
-      if (row.node_id === nodeId
+      // generic invalid as an unknown code. Codes whose resource was
+      // deleted are invalidated at teardown and NEVER resume (Codex P2
+      // round 4): without the gate, a re-paired node would adopt the
+      // replacement resource and revoke its fresh sender key.
+      if (row.node_id === nodeId && !row.invalidated_at
         && Number.isFinite(Date.parse(row.used_at)) && Date.parse(row.used_at) + PAIRING_RECLAIM_MS >= Date.now()) {
         let again = null;
+        let how = 'reclaim';
         if (row.resource_id) {
           again = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', row.resource_id, ownerId);
         } else {
-          // Incomplete-claim resume (Codex P2 round 3): a crash between
-          // code consumption and binding left a resource row with no
-          // recorded binding. The same node re-adopts it by (owner, node)
-          // instead of stranding the code permanently.
           again = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
-          if (again) await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', again.id, row.id);
+          if (again) {
+            // Crash between consumption and binding with the row committed:
+            // re-adopt it instead of stranding the code (round 3).
+            await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', again.id, row.id);
+            how = 'resume';
+          } else {
+            // Crash between consumption and creation with NO row committed:
+            // rebuild from the snapshot recorded at consumption (Codex P2
+            // round 4). This is the only path that creates here, and it is
+            // unreachable for invalidated codes (gate above).
+            let snap = {};
+            try { snap = JSON.parse(row.claim_json || '{}') || {}; } catch { snap = {}; }
+            if (typeof snap !== 'object' || snap === null) snap = {};
+            const fields = {
+              name: typeof snap.name === 'string' && snap.name.trim() ? snap.name.trim().slice(0, 80) : `worker-${nodeId.slice(0, 16)}`,
+              kind: ['local', 'cluster', 'provider'].includes(snap.kind) ? snap.kind : 'local',
+              cpu: typeof snap.cpu === 'string' && snap.cpu.trim() ? snap.cpu.slice(0, 80) : 'unknown',
+              gpu: typeof snap.gpu === 'string' && snap.gpu.trim() ? snap.gpu.slice(0, 80) : 'none recorded',
+              caps: Array.isArray(snap.caps) ? snap.caps.map(String).slice(0, 20) : [],
+            };
+            await checkWriteBudget(db, ownerId);
+            again = await insertPairedResource(db, ownerId, nodeId, fields, nowIso());
+            await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', again.id, row.id);
+            how = 'recreated';
+          }
         }
         if (again) {
           await checkWriteBudget(db, ownerId);
           const rotated = await rotateHeartbeatKey(db, ownerId, again.id, nodeId, nowIso());
           if (!rotated) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
-          await audit(db, ownerId, 'pairing.claim', row.id, `${nodeId} -> ${again.id} (reclaim)`);
+          await audit(db, ownerId, 'pairing.claim', row.id, `${nodeId} -> ${again.id} (${how})`);
           return json(200, {
             resourceId: again.id, created: false, resource: cardFor(again, await ownerName(db, ownerId)),
             heartbeatKey: rotated.secret, keyId: rotated.id, keyPrefix: rotated.prefix,
@@ -738,39 +764,28 @@ async function handleApi(request, env, url) {
     const wantName = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : `worker-${nodeId.slice(0, 16)}`;
     await checkWriteBudget(db, ownerId);
     // Serialize concurrent claims of one code: exactly one winner marks it
-    // used; losers see invalid and must use a fresh code.
+    // used; losers see invalid and must use a fresh code. The snapshot
+    // lets a same-node retry recreate the row if creation never commits.
     const now = nowIso();
-    const won = await run(db, 'UPDATE pairing_codes SET used_at = ?, node_id = ? WHERE id = ? AND used_at IS NULL', now, nodeId, row.id);
+    const snapshot = JSON.stringify({ name: wantName, kind, cpu, gpu, caps });
+    const won = await run(db, 'UPDATE pairing_codes SET used_at = ?, node_id = ?, claim_json = ? WHERE id = ? AND used_at IS NULL', now, nodeId, snapshot, row.id);
     if (Number(won.meta.changes) !== 1) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
     // Find-or-create by (owner, node): retries and re-pairs never duplicate.
     let resource = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
     let created = false;
     if (!resource) {
-      const name = await uniqueResourceName(db, ownerId, wantName);
-      const id = rid('r_');
-      let won = true;
       try {
-        const rc = await run(db, `INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-          SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, ?, 'owner only', ?, NULL, ?
-          WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
-          id, ownerId, nodeId, name, kind, cpu, gpu, JSON.stringify(caps),
-          JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId);
-        assertClaimed(rc, 'resource');
+        resource = await insertPairedResource(db, ownerId, nodeId, { name: wantName, kind, cpu, gpu, caps }, now);
+        created = true;
       } catch (error) {
         if (error && error.status) throw error; // cap errors are final
-        // Lost a same-node race: the unique (owner, node) index rejected
-        // this insert after the pre-check saw nothing. Adopt the winner
-        // instead of failing an already-consumed code (Codex P2); a
-        // genuine DB fault finds no winner and rethrows below.
+        // Lost a same-node race (or the audit after a committed insert
+        // failed): adopt the winner instead of failing a consumed code. A
+        // genuine DB fault finds no winner and rethrows below; the retry
+        // then recreates from the snapshot via the reclaim path.
         const winner = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
         if (!winner) throw error;
         resource = winner;
-        won = false;
-      }
-      if (won) {
-        await audit(db, ownerId, 'resource.register', id, name);
-        resource = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
-        created = true;
       }
     }
     await run(db, 'UPDATE pairing_codes SET resource_id = ? WHERE id = ?', resource.id, row.id);
@@ -939,6 +954,21 @@ async function uniqueResourceName(db, ownerId, base) {
     if (!hit) return cand;
   }
   return `${clean.slice(0, 60)}-${rid('').slice(0, 6)}`;
+}
+
+async function insertPairedResource(db, ownerId, nodeId, fields, now) {
+  // Single shape for paired-row creation (fresh claims and snapshot
+  // recreates): unique display name, atomic owner cap, audit, re-read.
+  const name = await uniqueResourceName(db, ownerId, fields.name);
+  const id = rid('r_');
+  const rc = await run(db, `INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+    SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, ?, 'owner only', ?, NULL, ?
+    WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
+    id, ownerId, nodeId, name, fields.kind, fields.cpu, fields.gpu, JSON.stringify(fields.caps),
+    JSON.stringify({}), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now, ownerId);
+  assertClaimed(rc, 'resource');
+  await audit(db, ownerId, 'resource.register', id, name);
+  return first(db, 'SELECT * FROM resources WHERE id = ?', id);
 }
 
 async function rotateHeartbeatKey(db, ownerId, resourceId, nodeId, now) {

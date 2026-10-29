@@ -61,6 +61,13 @@ POST /api/pairing/claim                           # code-authenticated ONLY
   are re-verified, exactly like a fresh claim. Any other node, a wrong
   secret, a disabled owner, or a later retry sees the generic
   `404 PAIRING_INVALID` and rotates nothing.
+- **Interrupted-claim recovery:** consumption records a snapshot of the
+  registration fields. If creation never committed, the same node rebuilds
+  the row from the snapshot on retry; if the row committed without a
+  binding, the same node re-adopts it. Codes whose resource was deleted
+  are invalidated at teardown and never resume — replaying one after a
+  re-pair returns `404` and leaves the replacement sender key untouched.
+  (Migration 0015: `invalidated_at`, `claim_json`.)
 - **Display-name collisions** suffix (`lab`, `lab-2`, …). Identity is the row
   id / node binding, never the name.
 - New rows are `configured=1, authenticated=1, online=0, usable=0` with
@@ -101,9 +108,9 @@ scope — the delivered key is heartbeat-scoped and fails every other route.
   other teardown): one all-or-nothing batch — every bound key, live or
   long-revoked, drops its binding with revocation timestamps preserved
   (senders read `KEY_REVOKED`, not a vanishing credential); jobs die
-  before grants (`jobs.grant_id`), then the resource row; pairing history
-  is kept with `resource_id` nulled; idempotency mappings are deleted;
-  `resource.delete` is audited. A second delete is `404`.
+  before grants (`jobs.grant_id`), then the resource row; spent codes are
+  invalidated (binding nulled + `invalidated_at`); idempotency mappings
+  are deleted; `resource.delete` is audited. A second delete is `404`.
 - Manual registration stays available as the Advanced/expert path; pairing
   is the default onboarding flow in the UI (dashboard slice).
 

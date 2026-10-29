@@ -343,6 +343,84 @@ class Round2Tests(unittest.TestCase):
         self.assertEqual(meta["resource_id"], "r_fake01")
 
 
+class Round4Tests(unittest.TestCase):
+    """Codex round-4 regressions: redirect blocking, truncated reads."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+
+    def test_redirect_is_blocked_and_credential_never_forwarded(self):
+        evil_hits = []
+
+        class EvilHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                evil_hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        evil = ThreadingHTTPServer(("127.0.0.1", 0), EvilHandler)
+        evil_thread = threading.Thread(target=evil.serve_forever, daemon=True)
+        evil_thread.start()
+        self.addCleanup(evil.server_close)
+        self.addCleanup(evil.shutdown)
+        evil_base = f"http://127.0.0.1:{evil.server_port}"
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(302)
+                self.send_header("Location", evil_base + "/collect")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        main = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        main_thread = threading.Thread(target=main.serve_forever, daemon=True)
+        main_thread.start()
+        self.addCleanup(main.server_close)
+        self.addCleanup(main.shutdown)
+        with self.assertRaises(PairingError) as cm:
+            pairing.post_json(f"http://127.0.0.1:{main.server_port}/x", {}, FAKE_SECRET)
+        self.assertEqual(cm.exception.code, "REDIRECT_BLOCKED")
+        self.assertEqual(evil_hits, [], "sender key never reaches the redirect target")
+
+    def test_truncated_response_is_a_retryable_network_fault(self):
+        class TruncHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true,"heartbeatAt":"x"}')
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TruncHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with self.assertRaises(PairingError) as cm:
+            pairing.post_json(f"http://127.0.0.1:{server.server_port}/hb", {"usable": False}, FAKE_SECRET)
+        self.assertEqual(cm.exception.code, "NETWORK")
+        self.assertIsNone(cm.exception.status, "transport fault, owned by the backoff")
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():
