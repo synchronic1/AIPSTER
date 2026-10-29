@@ -170,8 +170,8 @@ async function loadOverview() {
   refreshStatusStrip(token, gen, 0);
   try {
     const [inv, shared, usage] = await Promise.all([api('/api/inventory?limit=50'), api('/api/shared-with-me?limit=50'), api('/api/usage?limit=1')]);
-    const ready = inv.items.filter((r) => r.state.status === 'ready').length;
-    el.innerHTML = `<div class="card"><h2>My resources</h2><p>${inv.total} total · ${ready} ready</p></div>
+    const reachable = inv.items.filter((r) => r.state.status === 'reachable').length;
+    el.innerHTML = `<div class="card"><h2>My resources</h2><p>${inv.total} total · ${reachable} reachable</p></div>
       <div class="card"><h2>Shared with me</h2><p>${shared.total} active grant(s)</p></div>
       <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>`;
     $('ov-note').innerHTML = me && me.demo

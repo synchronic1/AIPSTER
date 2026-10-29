@@ -546,13 +546,18 @@ async function handleApi(request, env, url) {
       if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return ownerSpent();
       if (globalCount === null) await pruneHeartbeatBuckets(db, hbWindow);
       const now = nowIso();
+      // Boundary: a beat exactly one interval old is admitted (Codex P2
+      // round 9). The fast path and the retry calculation both treat
+      // retryMs = 0 as "no wait needed", so the atomic UPDATE must admit
+      // there too — a strict `<` rejected the beat and the classifier,
+      // finding no remaining delay, fell through to a terminal 404.
       const windowStart = new Date(Date.now() - HEARTBEAT_MIN_INTERVAL_MS).toISOString();
       const [claimed, ownerCharge, globalCharge] = await db.batch([
         db.prepare(
           `UPDATE resources SET heartbeat_at = ?, online = 1, usable = ?
            WHERE id = ?
              AND owner_id = ?
-             AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+             AND (heartbeat_at IS NULL OR heartbeat_at <= ?)
              AND EXISTS (SELECT 1 FROM "user" u WHERE u.id = resources.owner_id AND COALESCE(u.disabled, 0) != 1)
              AND EXISTS (SELECT 1 FROM key_verifiers k WHERE k.id = ? AND k.resource_id = ? AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at >= ?))
              AND ${HEARTBEAT_CAPS_SQL}`)
