@@ -114,6 +114,7 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   const html = ui.el('connect-card').innerHTML;
   const text = textOf(html);
   for (const phrase of ['Connect your computer', 'Connection setup pending', 'Not connected.', 'does not share your resources or enable inference',
+    'AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant',
     'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified', 'untested', 'separate prerequisites',
     'There is no installer or binary yet', 'There is no pairing code or worker credential yet', 'Disconnect and uninstall', 'Troubleshooting',
     'ganglion-dendrite 0.1.0', COMMIT]) {
@@ -122,6 +123,7 @@ test('card copy is honest about status, platforms and prerequisites', async () =
   assert.ok(!/\bconnected\b/i.test(text.replace(/not connected/gi, '')), 'never claims a connected state');
   assert.ok(!/\bready\b|\bonline\b/i.test(text.replace(/offline/gi, '')), 'never claims readiness or liveness');
   assert.ok(!/download (the )?(binary|installer|\.exe)|pairing (token|code):/i.test(text));
+  assert.ok(!/in (a few|\d+) (minutes?|seconds?)/i.test(text), 'no unmeasured setup-time claim');
   assert.ok(html.includes('<span class="pill warn">Connection setup pending</span>'));
   assert.equal((html.match(/class="pill ok"/g) || []).length, 1, 'only the Windows platform label is green');
   assert.ok(html.includes('<span class="pill ok">Windows x64: tested</span>'));
