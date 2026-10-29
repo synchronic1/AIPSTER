@@ -19,9 +19,9 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
-const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
+const WORKER_COMMIT = 'a8c4285393f5b62bd18e98b414c08d5931d57310';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
-const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
+const DOCS_COMMIT = 'a8c4285393f5b62bd18e98b414c08d5931d57310';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
@@ -38,7 +38,7 @@ const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
 const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
 const SECRET_SHAPED = /aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i;
 
-async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent' } = {}) {
+async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent', failPaths = [] } = {}) {
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
   const t = await createTestEnv();
   const elements = new Map();
@@ -81,6 +81,9 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
   const calls = [];
   const fetchImpl = async (fetchPath, opts = {}) => {
     calls.push(`${opts.method ?? 'GET'} ${fetchPath}`);
+    if (failPaths.some((p) => fetchPath.startsWith(p))) {
+      return new Response(JSON.stringify({ error: 'injected failure' }), { status: 500 });
+    }
     const res = await t.call(fetchPath, { method: opts.method ?? 'GET', headers: { Cookie: cookie, Origin: 'http://localhost:8787', ...opts.headers }, body: opts.body });
     if (fetchPath === '/api/auth/sign-out' && res.ok) cookie = '';
     return res;
@@ -743,4 +746,25 @@ test('overview reachable count follows fresh liveness, not terminal usability', 
   }
   const text = textOf(ui.el('ov-cards').innerHTML);
   assert.ok(text.includes('2 total \u00b7 1 reachable'), `live-but-unusable worker counted, stale one not: ${text}`);
+});
+
+test('key management renders when the inventory walk fails', async () => {
+  // Muse W4 round 13: a large inventory could fail the walk, and the
+  // old Promise.all discarded the keys response with it — hiding the
+  // key list and Revoke. Keys must render independently.
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', failPaths: ['/api/inventory'] });
+  const now = new Date().toISOString();
+  await ui.db.prepare(`INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('k_ui1', 'u_alice', 'my-read-key', 'read', null, 's', 'v', 'aip_live_k_ui1_x', null, '', now, null, null).run();
+  await ui.clickTab('keys');
+  for (let i = 0; i < 200; i++) {
+    const html = ui.el('key-list').innerHTML;
+    if (html.includes('my-read-key') || html.includes('injected failure')) break;
+    await new Promise(setImmediate);
+  }
+  const html = ui.el('key-list').innerHTML;
+  assert.ok(html.includes('my-read-key'), 'key card renders despite inventory failure: ' + html);
+  assert.ok(html.includes('data-revkey'), 'Revoke control stays available');
+  assert.ok(ui.el('key-resource').innerHTML.includes('unavailable'), 'dropdown degrades honestly');
 });

@@ -97,9 +97,14 @@ function renderStatus(el, data) {
     // Only heartbeat-seen rows replace the telemetry-unavailable copy with
     // reachability-only copy. usable=false gets a distinct not-ready
     // attention note and never renders as runnable/ready.
-    const hb = !seen ? '' : r.usable === false
-      ? ' · ATTENTION: reachable but NOT usable for inference'
-      : ' · heartbeat seen (reachability only — not ready to run)';
+    // Present-tense reachability needs a fresh heartbeat (Muse W4
+    // round 13): lastSeenAt survives after a worker goes stale, so the
+    // old timestamp-presence check kept ATTENTION: reachable forever.
+    const hb = !seen ? '' : r.liveness !== 'online'
+      ? ' · not currently reachable'
+      : r.usable === false
+        ? ' · ATTENTION: reachable but NOT usable for inference'
+        : ' · heartbeat seen (reachability only — not ready to run)';
     return `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(age)}${hb}${r.demoFixture ? ' · DEMO' : ''}</p>`;
   }).join('');
   const anySeen = list.some((r) => r.lastSeenAt !== null && r.lastSeenAt !== undefined);
@@ -207,8 +212,8 @@ async function loadOverview() {
 // published yet, so there is nothing to download; macOS/Linux are not packaged
 // at all. Progress honestly stops at "Setup needed" until the worker is
 // installed and paired elsewhere.
-const WORKER_COMMIT = '242c5300e0379d25bcb1624c67abc9806271d1df';
-const DOCS_COMMIT = '5c7fd1e326275b60946807cd6b083856e8448e9e';
+const WORKER_COMMIT = 'a8c4285393f5b62bd18e98b414c08d5931d57310';
+const DOCS_COMMIT = 'a8c4285393f5b62bd18e98b414c08d5931d57310';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
@@ -714,8 +719,11 @@ async function loadGrants() {
 async function loadKeys() {
   const el = $('key-list'); loading(el);
   try {
-    const [data, inv] = await Promise.all([api('/api/keys?limit=50'), allInventory()]);
-    $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    // Keys render independently of the inventory walk (Muse W4 round
+    // 13): a large inventory could fail the walk, and the old
+    // Promise.all discarded the keys response with it — hiding the key
+    // list and Revoke. A failed walk now degrades only the dropdown.
+    const data = await api('/api/keys?limit=50');
     el.innerHTML = data.items.filter((k) => !k.revokedAt).map((k) =>
       `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}${k.scope === 'heartbeat' && k.resourceId ? ` · resource: ${esc(k.resourceId)}` : ''}</p>
        <p class="muted">created ${esc(k.createdAt)} · expires ${esc(k.expiresAt || 'never')} · last used ${esc(k.lastUsedAt || 'never')}</p>
@@ -725,6 +733,13 @@ async function loadKeys() {
       try { await api('/api/keys/' + b.dataset.revkey, { method: 'DELETE' }); banner('Key revoked.'); loadKeys(); }
       catch (e) { if (isStale(e)) return; banner(e.message); }
     }));
+    try {
+      const inv = await allInventory();
+      $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    } catch (e) {
+      if (isStale(e)) return;
+      $('key-resource').innerHTML = '<option value="">Resources unavailable — Revoke still works below</option>';
+    }
   } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
