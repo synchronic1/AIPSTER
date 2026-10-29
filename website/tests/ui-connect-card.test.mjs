@@ -626,6 +626,20 @@ test('resource cards show derivable link states, never installed/ready', async (
   assert.ok(!/\binstalled\b/i.test(text), 'the browser never claims an install state');
 });
 
+test('pair and sender commands use the installed interpreter', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  const html = ui.el('connect-card').innerHTML;
+  assert.ok(html.includes('.\\.venv\\Scripts\\python.exe pairing.py pair'), 'windows pair via venv');
+  assert.ok(html.includes('.\\.venv\\Scripts\\python.exe pairing.py heartbeat-loop'), 'windows sender via venv');
+  assert.ok(!html.includes('<code>python pairing.py'), 'no bare-python command in the card');
+  const mac = await makeUi({ platform: 'MacIntel', clipboard: 'ok' });
+  await mac.clickTab('compute');
+  const mhtml = mac.el('connect-card').innerHTML;
+  assert.ok(mhtml.includes('.venv/bin/python pairing.py pair'), 'posix pair via venv');
+  assert.ok(mhtml.includes('.venv/bin/python pairing.py heartbeat-loop'), 'posix sender via venv');
+});
+
 test('manual registration lives under Advanced with all fields intact', async () => {
   const html = await readFile(path.join(PUBLIC, 'app', 'index.html'), 'utf8');
   const compute = html.slice(html.indexOf('<section id="tab-compute"'), html.indexOf('<section id="tab-shared"'));
