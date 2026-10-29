@@ -497,3 +497,26 @@ test('same node recreates after consumption without creation', async () => {
   }));
   assert.equal(beat.status, 200, 'recreated sender key works');
 });
+
+test('deleting an interrupted claim kills the code, not future re-pairs', async () => {
+  const t = await createTestEnv();
+  // Interrupted claim: spent code, node recorded, no binding, row exists.
+  const now = new Date().toISOString();
+  const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await t.DB.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_interrupt', t.alice.id, 'n_interrupt', 'interrupt-box', 'local', 'paired', 'c', 'g', 1, 1, 0, 0, now).run();
+  await t.DB.prepare('INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts, node_id, resource_id, invalidated_at, claim_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('p_cccccc01', t.alice.id, 's', await verifierFor('CCCCCCCCCCCC', 's'), now, future, now, 0, 'n_interrupt', null, null, null).run();
+  const del = await readJson(await t.call('/api/inventory/r_interrupt', {
+    method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf },
+  }));
+  assert.equal(del.status, 200, del.text);
+  const retry = await readJson(await claim(t, { code: 'pair-cccccc01-CCCC-CCCC-CCCC', nodeId: 'n_interrupt' }));
+  assert.equal(retry.status, 404, 'interrupted code died with its resource');
+  assert.equal(retry.json.code, 'PAIRING_INVALID');
+  // A fresh code re-pairs the node cleanly: invalidation is per-code.
+  const minted = await mintCode(t, t.alice);
+  const repair = await readJson(await claim(t, { code: minted.json.code, nodeId: 'n_interrupt' }));
+  assert.equal(repair.status, 201, repair.text);
+  assert.notEqual(repair.json.resourceId, 'r_interrupt');
+});

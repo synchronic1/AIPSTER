@@ -382,7 +382,7 @@ async function handleApi(request, env, url) {
     const m = /^\/api\/inventory\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (m && method === 'DELETE') {
       const d = needSession() || needCsrf(); if (d) return deny(d);
-      const r = await first(db, 'SELECT id FROM resources WHERE id = ? AND owner_id = ?', m[1], me());
+      const r = await first(db, 'SELECT id, node_id FROM resources WHERE id = ? AND owner_id = ?', m[1], me());
       if (!r) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       // Unbilled like key/grant revocation: teardown must work at a spent
       // budget. One batch (a transaction): teardown is all-or-nothing,
@@ -397,16 +397,26 @@ async function handleApi(request, env, url) {
       // existed. Spent pairing codes for the resource are invalidated
       // (binding nulled + invalidated_at), which reclaim treats as
       // permanently invalid — never resumed, even by the same node.
-      // Heartbeat intake rejects further beats either way.
+      // Interrupted claims for the same node (consumed, never bound) are
+      // invalidated by the same batch. Heartbeat intake rejects further
+      // beats either way.
       const now = nowIso();
-      await db.batch([
+      // Interrupted claims (Codex P2 round 5): a code consumed for this
+      // node but never bound (crash between consumption and binding) must
+      // die with the resource too, or a same-node retry would recreate the
+      // deleted row — or adopt a replacement and rotate its fresh key.
+      // Only consumed codes carry node_id, so live codes are untouched;
+      // NULL-node (manual) rows have no codes to invalidate.
+      const teardown = [
         db.prepare('UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ?').bind(now, r.id),
         db.prepare('DELETE FROM jobs WHERE resource_id = ?').bind(r.id),
         db.prepare('DELETE FROM grants WHERE resource_id = ?').bind(r.id),
         db.prepare('UPDATE pairing_codes SET resource_id = NULL, invalidated_at = ? WHERE resource_id = ?').bind(now, r.id),
         db.prepare('DELETE FROM idempotency_keys WHERE resource_id = ?').bind(r.id),
-        db.prepare('DELETE FROM resources WHERE id = ?').bind(r.id),
-      ]);
+      ];
+      if (r.node_id) teardown.push(db.prepare('UPDATE pairing_codes SET resource_id = NULL, invalidated_at = ? WHERE owner_id = ? AND node_id = ? AND invalidated_at IS NULL').bind(now, me(), r.node_id));
+      teardown.push(db.prepare('DELETE FROM resources WHERE id = ?').bind(r.id));
+      await db.batch(teardown);
       await audit(db, me(), 'resource.delete', r.id);
       return json(200, { ok: true });
     }

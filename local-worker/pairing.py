@@ -21,6 +21,8 @@ local tests only).
 
 import argparse
 import getpass
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -43,6 +45,9 @@ REQUEST_TIMEOUT_SEC = 15
 HEARTBEAT_INTERVAL_SEC = 60
 HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
+
+# Patchable platform flag (tests force the Windows branch anywhere).
+_IS_NT = (os.name == "nt")
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -143,21 +148,44 @@ def restrict_file(path):
 
 
 def write_private(path, text):
-    """Atomically write a secret-bearing file with user-only permissions."""
+    """Atomically write a secret file with protection established FIRST.
+
+    On Windows the temp file is ACL-restricted BEFORE any secret byte is
+    written (Codex P1 round 5): mkstemp inherits the directory ACLs and
+    chmod cannot narrow them, so post-write restriction leaves a readable
+    window. Any protection failure aborts without writing. The restriction
+    travels with the file across os.replace; if the final verify fails the
+    file is removed rather than left exposed.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     try:
+        if _IS_NT and not restrict_file(tmp):
+            raise PairingError(None, "STORE_UNPROTECTED",
+                               f"cannot protect {path}; refusing to write secrets")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
+        fd = None
         os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
         os.replace(tmp, path)
     finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp)
         except OSError:
             pass
-    restrict_file(path)
+    if _IS_NT and not restrict_file(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise PairingError(None, "STORE_UNPROTECTED",
+                           f"cannot protect {path}; refusing to leave secrets exposed")
 
 
 def ensure_private_dir(path):
@@ -429,6 +457,11 @@ def load_pairing(data_dir):
         raise PairingError(None, "BAD_PAIRING_STORE", f"pairing store unreadable: {exc}")
     if not meta.get("resource_id") or not meta.get("api_base") or not secret:
         raise PairingError(None, "BAD_PAIRING_STORE", "pairing store is incomplete; pair again")
+    expect = meta.get("key_sha256") or ""
+    actual = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(expect, actual):
+        raise PairingError(None, "BAD_PAIRING_STORE",
+                           "credential files disagree (interrupted re-pair?); pair again")
     meta["heartbeat_key"] = secret
     return meta
 
@@ -464,20 +497,27 @@ def cmd_pair(args):
         if exc.status is None:
             return EXIT_USAGE
         return EXIT_PAIRING_REJECTED
+    # Key first, then metadata; either order is safe because load_pairing
+    # verifies the fingerprint below (Codex P2 round 5): a crash between
+    # the two writes can only produce a refused mismatch, never a mixed
+    # generation that sends an old key to a new endpoint.
+    secret = result["heartbeatKey"].strip()
+    fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
     files = pairing_files(data_dir)
+    write_private(files["key"], secret + "\n")
     meta = {
         "api_base": check_api_base(args.api_base),
         "resource_id": result["resourceId"],
         "node_id": node_id,
         "key_id": result.get("keyId"),
         "key_prefix": result.get("keyPrefix"),
+        "key_sha256": fingerprint,
         "heartbeat_url": result.get("heartbeatUrl"),
         "created": result.get("created"),
         "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     # Metadata is private too: api_base routes the credential (Codex P2).
     write_private(files["meta"], json.dumps(meta, indent=2) + "\n")
-    write_private(files["key"], result["heartbeatKey"].strip() + "\n")
     print(f"paired: resource {meta['resource_id']} (key {meta['key_prefix']})")
     print(f"stored: {files['meta']} + {files['key']} (user-only access)")
     print("heartbeat proves reachability only; it never means inference-ready")
