@@ -21,6 +21,80 @@ export function budgetWindow(now = new Date()) {
   return now.toISOString().slice(0, 13); // UTC hour bucket: '2026-10-28T16'
 }
 
+// ---- heartbeat intake budgets (docs/heartbeat-quotas.md) ----
+// Per-owner AND deployment-wide hourly ceilings on ACCEPTED heartbeats.
+// Admission is ONE D1 batch (a transaction): the resource UPDATE carries
+// both cap checks, and each counter upsert is conditional on changes() = 1
+// from the statement before it. A request is either accepted and charged to
+// both buckets exactly once, or rejected with zero rows written; nothing is
+// ever claimed and refunded. Counters live in SEPARATE buckets: the
+// window key prefix keeps heartbeat counters apart from the 120/hour
+// write_budget rows even though they share the write_budget TABLE, so no
+// migration is needed and neither budget draws from the other.
+// PLACEHOLDER defaults: production numbers are chosen by the user +
+// release review, never by this change. Env overrides (positive integers):
+// HEARTBEAT_OWNER_PER_HOUR, HEARTBEAT_GLOBAL_PER_HOUR.
+export const HEARTBEAT_OWNER_PER_HOUR_PLACEHOLDER = 500;
+export const HEARTBEAT_GLOBAL_PER_HOUR_PLACEHOLDER = 1000;
+// Reserved write_budget.user_id for the deployment-wide bucket. Real user
+// ids never contain ':', so this row cannot collide with a tenant bucket.
+export const HEARTBEAT_GLOBAL_ID = 'heartbeat:global';
+
+export function heartbeatWindow(now = new Date()) {
+  return 'hb/' + budgetWindow(now);
+}
+
+function parseBudget(raw, fallback) {
+  const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+export function heartbeatBudgets(env) {
+  return {
+    owner: parseBudget(env && env.HEARTBEAT_OWNER_PER_HOUR, HEARTBEAT_OWNER_PER_HOUR_PLACEHOLDER),
+    global: parseBudget(env && env.HEARTBEAT_GLOBAL_PER_HOUR, HEARTBEAT_GLOBAL_PER_HOUR_PLACEHOLDER),
+  };
+}
+
+export function secondsUntilNextHour(nowMs = Date.now()) {
+  const next = new Date(nowMs);
+  next.setUTCMinutes(60, 0, 0);
+  return Math.max(1, Math.ceil((next.getTime() - nowMs) / 1000));
+}
+
+// Cap predicate for the resource UPDATE inside the admission batch. Binds:
+// owner id, window, owner cap, window, global cap.
+export const HEARTBEAT_CAPS_SQL =
+  `COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) < ?
+   AND COALESCE((SELECT count FROM write_budget WHERE user_id = '${HEARTBEAT_GLOBAL_ID}' AND window = ?), 0) < ?`;
+
+// The two counter statements that follow the resource UPDATE in the same
+// batch. Each runs only when the statement before it changed exactly one
+// row, so the counters move together with an accepted heartbeat or not at
+// all. The upsert creates the hourly bucket on first use. `unconditional`
+// drops the changes() gate; the worker uses it only to complete the charge
+// of a heartbeat the batch has already committed.
+export function heartbeatCounterStatements(db, ownerId, window, { unconditional = false } = {}) {
+  const upsert = `INSERT INTO write_budget (user_id, window, count) SELECT ?, ?, 1 WHERE ${unconditional ? '1' : 'changes() = 1'}
+     ON CONFLICT (user_id, window) DO UPDATE SET count = count + 1`;
+  return [db.prepare(upsert).bind(ownerId, window), db.prepare(upsert).bind(HEARTBEAT_GLOBAL_ID, window)];
+}
+
+// Drop past hourly heartbeat buckets. Called only while the current global
+// bucket does not exist yet, i.e. before the first accepted heartbeat of the
+// hour; it deletes zero rows on every later call in that state.
+export async function pruneHeartbeatBuckets(db, window) {
+  await run(db, "DELETE FROM write_budget WHERE window LIKE 'hb/%' AND window < ?", window);
+}
+
+// Read-only bucket count (null when the bucket does not exist yet). Used
+// for fast-path rejections and to name the reason after a lost admission;
+// the batch still decides races.
+export async function heartbeatBucketCount(db, id, window) {
+  const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, window);
+  return row ? Number(row.count) : null;
+}
+
 export async function checkWriteBudget(db, userId) {
   const window = budgetWindow();
   const row = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', userId, window);

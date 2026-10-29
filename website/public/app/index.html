@@ -166,12 +166,13 @@
     </section>
     <section id="tab-keys" role="tabpanel" hidden>
       <h1>API Keys</h1>
-      <p class="muted">Secrets are shown <strong>once</strong> at creation. Only non-reversible verifiers are stored. Keys work for inventory/usage reads and (with inference scope) future jobs &mdash; never for sharing, key, or settings management. These are AIPSTER keys, not provider keys.</p>
+      <p class="muted">Secrets are shown <strong>once</strong> at creation. Only non-reversible verifiers are stored. Keys work for inventory/usage reads and (with inference scope) future jobs &mdash; never for sharing, key, or settings management. Heartbeat keys bind to one resource and can only post its heartbeats. These are AIPSTER keys, not provider keys.</p>
       <p id="demo-keys-note" class="muted" hidden>Sandbox credentials only: demo keys start with aip_demo_ and can never touch real resources.</p>
       <form id="key-form" class="card">
         <h2>New key</h2>
         <label>Name <input id="key-name" required maxlength="80"></label>
-        <label>Scope <select id="key-scope"><option value="read">read</option><option value="inference">inference</option></select></label>
+        <label>Scope <select id="key-scope"><option value="read">read</option><option value="inference">inference</option><option value="heartbeat">heartbeat</option></select></label>
+        <label id="key-resource-wrap" hidden>Resource <select id="key-resource"></select></label>
         <label>Expires <input id="key-expires" type="date"></label>
         <p id="key-error" class="error" role="alert" hidden></p>
         <button type="submit">Create key</button>
@@ -180,6 +181,11 @@
         <h2>Copy this secret now</h2>
         <code id="key-secret"></code>
         <p class="muted">It cannot be shown again. It is not stored in the browser.</p>
+        <div id="key-curl-wrap" hidden>
+          <h3>Heartbeat example (copyable)</h3>
+          <code id="key-curl"></code>
+          <button id="key-curl-copy" type="button">Copy curl</button>
+        </div>
         <button id="key-dismiss" type="button">Done</button>
       </div>
       <h2>Your keys</h2><div id="key-list" class="grid"></div>

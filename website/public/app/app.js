@@ -46,6 +46,27 @@ async function api(path, opts = {}) {
 
 const pill = (ok, label) => `<span class="pill ${ok ? 'ok' : 'bad'}">${esc(label)}: ${ok ? 'yes' : 'no'}</span>`;
 
+// Paged inventory fetch: walks /api/inventory?limit=50&offset=… until the
+// reported total is reached (at most 2 requests under the 100-resource cap),
+// so selectors offer every owned resource instead of the newest 50. Each
+// page goes through the fenced api(), and the generation is re-checked
+// between pages so a tab switch mid-pagination drops the stale walk.
+async function allInventory() {
+  const gen = generation;
+  const items = [];
+  let offset = 0;
+  let total = Infinity;
+  for (let pages = 0; pages < 10 && items.length < total; pages++) {
+    const page = await api(`/api/inventory?limit=50&offset=${offset}`);
+    if (gen !== generation) throw staleError();
+    if (!page || !Array.isArray(page.items) || !page.items.length) break;
+    items.push(...page.items);
+    total = Number.isSafeInteger(page.total) && page.total >= 0 ? page.total : items.length;
+    offset += page.items.length;
+  }
+  return items;
+}
+
 // ---- resource-status strip (read-only, bounded polling) ----
 // Polls GET /api/status only while signed in on the Overview tab: a 30s base
 // interval with exponential backoff to 5min on failure, stopping entirely on
@@ -70,11 +91,23 @@ const formatAge = (ms) => {
 function renderStatus(el, data) {
   const s = data.summary || { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 };
   const list = data.items || [];
-  const items = list.map((r) =>
-    `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs))}${r.demoFixture ? ' · DEMO' : ''}</p>`).join('');
+  const items = list.map((r) => {
+    const seen = r.lastSeenAt !== null && r.lastSeenAt !== undefined;
+    const age = r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs);
+    // Only heartbeat-seen rows replace the telemetry-unavailable copy with
+    // reachability-only copy. usable=false gets a distinct not-ready
+    // attention note and never renders as runnable/ready.
+    const hb = !seen ? '' : r.usable === false
+      ? ' · ATTENTION: reachable but NOT usable for inference'
+      : ' · heartbeat seen (reachability only — not ready to run)';
+    return `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(age)}${hb}${r.demoFixture ? ' · DEMO' : ''}</p>`;
+  }).join('');
+  const anySeen = list.some((r) => r.lastSeenAt !== null && r.lastSeenAt !== undefined);
   const note = data.demo
     ? 'DEMO DATA: simulated fixture, not a live node.'
-    : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
+    : anySeen
+      ? 'Heartbeat telemetry seen for some resources — reachability only, never inference acceptance. Resources never seen have no telemetry; nothing here means ready to run.'
+      : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
   // Counts always cover every owned resource; only the listed page is capped.
   const truncated = data.itemsTruncated === true
     ? `<p class="muted">showing ${list.length} of ${s.total} — older resources omitted from the list; counts cover all resources.</p>`
@@ -560,9 +593,10 @@ async function loadGrants() {
 async function loadKeys() {
   const el = $('key-list'); loading(el);
   try {
-    const data = await api('/api/keys?limit=50');
+    const [data, inv] = await Promise.all([api('/api/keys?limit=50'), allInventory()]);
+    $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
     el.innerHTML = data.items.filter((k) => !k.revokedAt).map((k) =>
-      `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}</p>
+      `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}${k.scope === 'heartbeat' && k.resourceId ? ` · resource: ${esc(k.resourceId)}` : ''}</p>
        <p class="muted">created ${esc(k.createdAt)} · expires ${esc(k.expiresAt || 'never')} · last used ${esc(k.lastUsedAt || 'never')}</p>
        <button type="button" class="danger" data-revkey="${esc(k.id)}">Revoke</button></div>`).join('');
     if (!data.items.some((k) => !k.revokedAt)) state(el, '', 'No API keys yet.');
@@ -713,6 +747,8 @@ function resetState() {
   fabPreview = null; fabNodes.length = 0;
   $('fab-on').hidden = true; $('fab-off').hidden = true;
   $('fab-error').textContent = ''; $('fab-error').hidden = true;
+  $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true;
+  $('key-resource').innerHTML = ''; $('key-resource-wrap').hidden = true;
   $('whoami').textContent = '';
   $('settings-email').textContent = ''; $('settings-via').textContent = '…';
   for (const id of ['res-name', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'grant-user', 'key-name', 'key-expires', 'settings-name', 'demo-username', 'demo-password']) $(id).value = '';
@@ -795,20 +831,47 @@ $('grant-form').addEventListener('submit', async (e) => {
   } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
+$('key-scope').addEventListener('change', () => {
+  $('key-resource-wrap').hidden = $('key-scope').value !== 'heartbeat';
+});
+
 $('key-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const err = $('key-error'); err.hidden = true;
   try {
     const body = { name: $('key-name').value, scope: $('key-scope').value };
     if ($('key-expires').value) body.expiresAt = new Date($('key-expires').value + 'T00:00:00Z').toISOString();
+    if (body.scope === 'heartbeat') {
+      if (!$('key-resource').value) throw new Error('Choose the resource this heartbeat key is bound to.');
+      body.resourceId = $('key-resource').value;
+    }
     const k = await api('/api/keys', { method: 'POST', body: JSON.stringify(body) });
     $('key-secret').textContent = k.secret;
+    // Heartbeat keys reveal a copyable curl example bound to the same
+    // resource; the secret itself is still shown once and never persisted.
+    if (k.scope === 'heartbeat' && k.resourceId) {
+      $('key-curl').textContent = `curl -X POST ${location.origin}/api/resources/${k.resourceId}/heartbeat -H "Authorization: Bearer ${k.secret}" -H "Content-Type: application/json" -d '{"usable":true}'`;
+      $('key-curl-wrap').hidden = false;
+    } else {
+      $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true;
+    }
     $('key-reveal').hidden = false;
     $('key-name').value = ''; $('key-expires').value = '';
     loadKeys();
   } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
-$('key-dismiss').addEventListener('click', () => { $('key-secret').textContent = ''; $('key-reveal').hidden = true; });
+$('key-dismiss').addEventListener('click', () => { $('key-secret').textContent = ''; $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true; $('key-reveal').hidden = true; });
+$('key-curl-copy').addEventListener('click', async () => {
+  try {
+    const text = $('key-curl').textContent || '';
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      banner('Curl example copied.');
+    } else {
+      banner('Select the curl example above to copy it.');
+    }
+  } catch (e) { if (isStale(e)) return; banner('Copy failed: ' + e.message); }
+});
 
 $('settings-form').addEventListener('submit', async (e) => {
   e.preventDefault();
