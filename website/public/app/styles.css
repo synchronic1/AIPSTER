@@ -53,6 +53,7 @@ button.danger { background:transparent; color:var(--bad); border:1px solid var(-
 @media (max-width:820px){ .connect-grid{grid-template-columns:1fr;} .connect-rail{border-right:0;border-bottom:1px solid var(--line);padding:0 0 .9rem;} .connect-illus{width:190px;} }
 .actions { display:flex; flex-wrap:wrap; gap:.5rem; margin:.5rem 0; }
 button.btn { font:inherit; cursor:pointer; }
+button.btn[disabled] { background:transparent; color:var(--muted); border-color:var(--line); cursor:not-allowed; }
 a.btn, button.btn { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:.5rem 1rem; border:1px solid var(--accent); border-radius:.4rem; background:var(--accent); color:#0b0e12; font-weight:600; text-decoration:none; }
 a.btn.secondary, button.btn.secondary { background:transparent; color:var(--accent); }
 @media (max-width:640px){ main{padding:.6rem;} .tabs button{flex:1 1 40%;} .actions .btn{flex:1 1 100%;} }

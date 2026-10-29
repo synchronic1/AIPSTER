@@ -148,8 +148,10 @@ async function loadOverview() {
 }
 
 // "Connect your computer" onboarding. Installer-first and OS-aware: a primary
-// installer action, a secondary agent-assisted setup that copies pinned,
-// secret-free instructions, and an OS picker that corrects detection. Linked
+// installer action (disabled with an explanation until a verified installer
+// exists), a secondary agent-assisted setup that copies pinned, secret-free
+// instructions on qualified platforms only, and an OS picker that corrects
+// detection. Linked
 // documentation is pinned separately from the worker source, which remains
 // pinned to the reviewed #17 head (merged; worker requires a local token and
 // validates Host/Origin); move either pin only with a re-verified re-pin.
@@ -169,7 +171,7 @@ const WORKER_LINKS = {
   securityFix: 'https://github.com/synchronic1/AIPSTER/pull/17',
   heartbeat: 'https://github.com/synchronic1/AIPSTER/pull/20'
 };
-const COPIED_MESSAGE = 'Instructions copied. Open ChatGPT, Claude, or your preferred local agent and paste these instructions.';
+const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
 
 // Verified installer availability per platform. Every platform is honestly
 // unavailable until a packaging PR ships a worker-only artifact (the worker
@@ -183,24 +185,26 @@ const INSTALLERS = {
   linux: { available: false, reason: 'no verified installer package exists yet' }
 };
 const OS_META = {
-  windows: { label: 'Windows x64', shell: 'PowerShell', venvBin: '.\\.venv\\Scripts', posix: false },
-  macos: { label: 'macOS', shell: 'Terminal', venvBin: '.venv/bin', posix: true },
-  linux: { label: 'Linux', shell: 'a shell', venvBin: '.venv/bin', posix: true }
+  windows: { label: 'Windows x64', shell: 'PowerShell', venvBin: '.\\.venv\\Scripts', posix: false, agentQualified: true },
+  macos: { label: 'macOS', shell: 'Terminal', venvBin: '.venv/bin', posix: true, agentQualified: false },
+  linux: { label: 'Linux', shell: 'a shell', venvBin: '.venv/bin', posix: true, agentQualified: false }
 };
 
-// Best-effort OS-family suggestion; the picker always lets the user correct
+// Best-effort platform suggestion; the picker always lets the user correct
 // it. Architecture is never inferred: every Windows result is reported as
-// plain "Windows", never "Windows x64". Mobile and tablet platforms (Android,
-// iPadOS reporting a Mac-like platform with touch) are not classified.
+// plain "Windows", never "Windows x64". Phones and tablets report 'mobile'
+// so the card can direct the user to the computer they want to connect
+// instead of offering a desktop install as though it runs on the phone.
 function detectOs() {
   try {
     if (typeof navigator === 'undefined') return null;
     const plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
     const s = String(plat).toLowerCase();
+    if (s.includes('android') || s.includes('iphone') || s.includes('ipad') || s.includes('mobile')) return 'mobile';
     if (s.includes('win')) return 'windows';
     if (s.includes('mac')) {
       const touch = Number(navigator.maxTouchPoints || 0);
-      if (touch > 1) return null;
+      if (touch > 1) return 'mobile';
       return 'macos';
     }
     if (s.includes('linux')) return 'linux';
@@ -208,6 +212,7 @@ function detectOs() {
   return null;
 }
 const OS_FAMILY = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
+const MOBILE_NOTE = 'You seem to be on a phone or tablet. Open AIPSTER on the computer you want to connect — the steps below install on the computer in front of you.';
 
 // Pinned worker commands per OS: worker-only sparse checkout at WORKER_COMMIT,
 // isolated install, self-test, fresh worker-local token, mock serve.
@@ -221,7 +226,7 @@ function workerCommands(os) {
   return [
     'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
-    'git sparse-checkout set --no-cone local-worker',
+    'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
     'git fetch origin ' + WORKER_COMMIT,
     'git checkout --detach ' + WORKER_COMMIT,
     'cd local-worker',
@@ -242,7 +247,8 @@ function agentInstructions(os) {
   const tested = os === 'windows'
     ? 'Windows x64 is the only tested platform (mock check only).'
     : 'Only Windows x64 is tested; macOS and Linux steps are untested adaptation, so verify each step before continuing.';
-  return ['Set up the AIPSTER local worker on THIS computer (assisted install).',
+  return ['AIPSTER agent setup packet v1.',
+    'Set up the AIPSTER local worker on THIS computer (assisted install).',
     '',
     'READ FIRST - what this does and does NOT do:',
     '- Install the local Dendrite worker (ganglion-dendrite 0.1.0) from the reviewed',
@@ -264,10 +270,15 @@ function agentInstructions(os) {
     '- OS and CPU architecture; Git version; uv 0.12.12 exactly (must match); Python',
     '  3.12.14 availability (install with "uv python install 3.12.14" if missing);',
     '  about 1 GiB free disk space and memory for tooling.',
+    '- Confirm CPU architecture: these steps cover x64 only. On ARM64 or any other',
+    '  architecture, stop and explain that no qualified instructions exist; do not',
+    '  adapt them silently.',
     '- ' + tested,
     '',
     'Step 2 - fetch worker files only (in ' + meta.shell + '):',
     fetch,
+    '- The checkout contains the worker and the root LICENSE only; the license is',
+    '  required by local-worker/LICENSING.md. Do not fetch the rest of the repository.',
     '',
     'Step 3 - install into an isolated environment:',
     '- Run: ' + lines[6],
@@ -329,29 +340,32 @@ function paintConnectCard() {
   const meta = OS_META[connect.os];
   const options = ['windows', 'macos', 'linux'].map((k) =>
     `<option value="${k}"${k === connect.os ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
-  const detectedNote = connect.detected
+  const detectedNote = connect.detected === 'mobile' ? MOBILE_NOTE : connect.detected
     ? `Detected: ${esc(OS_FAMILY[connect.detected])}. Change it if that is wrong.`
     : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
   const inst = INSTALLERS[connect.os];
   const usable = installerUsable(inst);
   const primary = usable
     ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
-    : '<button type="button" class="btn" data-action="download">Download installer</button>';
+    : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
+  const secondary = meta.agentQualified
+    ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
+    : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
   const installerLine = usable
     ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
     : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
   let status = '';
-  if (connect.phase === 'download-note') {
-    status = `<p class="notice" role="status">No verified installer for ${esc(meta.label)} yet — ${esc(inst.reason)}. Use "Set up with my agent" above, or Advanced below for the pinned manual steps.</p>`;
+  if (connect.phase === 'platforms') {
+    status = `<p class="notice" role="status"><strong>Supported platforms:</strong> Windows x64 — tested (mock check only). macOS and Linux are not qualified, so agent setup is offered for Windows only. See Advanced for the pinned manual steps.</p>`;
   } else if (connect.phase === 'copied') {
-    status = `<p class="notice" role="status"><span class="pill ok">Copied</span> ${esc(COPIED_MESSAGE)}</p>`;
+    status = `<p class="notice" role="status"><span class="pill ok">Copied</span> ${esc(COPIED_MESSAGE)} The agent needs authorized access to this computer — a browser-only chat cannot install software by itself.</p>`;
   } else if (connect.phase === 'copy-failed') {
-    status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, or press "Set up with my agent" to try again.</p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
+    status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
   }
   const commands = workerCommands(connect.os).map(esc).join('\n');
   const advanced = `<details><summary>Advanced: manual install, source and troubleshooting</summary>
 <h3>Manual install (${esc(meta.label)})</h3>
-<p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${esc(L.tested)}">tested installation</a> (the clone fetches worker files only via sparse checkout):</p>
+<p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${esc(L.tested)}">tested installation</a> (the sparse checkout contains the worker and its root <code>LICENSE</code> only):</p>
 <pre tabindex="0" aria-label="${esc(meta.label)} install commands"><code>${commands}</code></pre>
 <p class="muted"><code>serve</code> refuses to start without <code>DENDRITE_API_TOKEN</code> (32+ characters), even on loopback. This is a <strong>worker-local</strong> token that you generate on this machine. It is not an AIPSTER API key or heartbeat key. Never reuse it, and never paste it into AIPSTER, a URL or a shared config. Local requests other than <code>/healthz</code> need <code>Authorization: Bearer</code> with that token (see the <a href="${esc(L.quickstart)}">quickstart</a>).</p>
 <p class="muted">The mock config returns simulated output only. A native engine (llama-server, built separately) and a GGUF model you obtain yourself are separate prerequisites. See <a href="${esc(L.engine)}">engine preparation</a>.</p>
@@ -372,14 +386,14 @@ function paintConnectCard() {
 <ol class="progress" aria-label="Connection progress">
 <li class="now" aria-current="step"><strong>Setup needed</strong><span class="st muted">You are here. Not connected.</span></li>
 <li><strong>Installing</strong><span class="st muted">Blocked: no verified installer is packaged yet.</span></li>
-<li><strong>Pairing</strong><span class="st muted">Blocked: <a href="${esc(L.heartbeat)}">heartbeat and pairing support</a> is not merged or deployed.</span></li>
+<li><strong>Pairing</strong><span class="st muted">Blocked: <a href="${esc(L.heartbeat)}">heartbeat intake</a> is not merged or deployed. Pairing is a separate contract and is not implemented.</span></li>
 <li><strong>Connected</strong><span class="st muted">Needs verified worker evidence. A download or a running worker is not proof.</span></li>
 </ol>
 <p><span class="pill warn">Setup needed</span></p>
 </div><div class="connect-body">
 <p class="lede">Prepare this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then register it below as a declared, unverified resource. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; pairing and dispatch are not available yet, so nothing can run.</p>
 <div class="osrow"><label for="connect-os">Your system</label><select id="connect-os" data-action="os" aria-describedby="connect-os-note">${options}</select><span class="muted" id="connect-os-note">${detectedNote}</span></div>
-<p class="actions">${primary}<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button></p>
+<p class="actions">${primary}${secondary}</p>
 ${installerLine}
 ${status}
 ${advanced}
@@ -405,12 +419,30 @@ function onConnectClick(ev) {
   const t = ev && ev.target;
   const near = t && typeof t.closest === 'function' ? t.closest('[data-action]') : null;
   const action = (near && near.dataset && near.dataset.action) || (t && t.dataset && t.dataset.action);
-  if (action === 'download') {
-    connect.phase = 'download-note';
+  if (action === 'platforms') {
+    connect.phase = 'platforms';
     paintConnectCard();
   } else if (action === 'copy-agent') {
     copyAgentInstructions();
+  } else if (action === 'save-instructions') {
+    saveInstructions();
   }
+}
+
+function saveInstructions() {
+  if (!connect || !connect.fallback) return;
+  try {
+    if (typeof Blob === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
+    if (typeof document === 'undefined' || !document.createElement || !document.body) return;
+    const url = URL.createObjectURL(new Blob([connect.fallback], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'aipster-worker-setup.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (typeof setTimeout === 'function') setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch { /* the selectable text remains; nothing else to offer */ }
 }
 
 function onConnectChange(ev) {
@@ -453,7 +485,8 @@ async function copyAgentInstructions() {
 
 function renderConnectCard() {
   const detected = detectOs();
-  connect = { os: detected || 'windows', detected, phase: 'idle', fallback: '' };
+  const os = detected && detected !== 'mobile' ? detected : 'windows';
+  connect = { os, detected, phase: 'idle', fallback: '' };
   paintConnectCard();
   const el = $('connect-card');
   el.onclick = onConnectClick;

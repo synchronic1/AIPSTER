@@ -32,7 +32,7 @@ const EXPECTED_LINKS = [
   'https://github.com/synchronic1/AIPSTER/pull/20'
 ].sort();
 const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
-const COPIED_MESSAGE = 'Instructions copied. Open ChatGPT, Claude, or your preferred local agent and paste these instructions.';
+const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
 const SECRET_SHAPED = /aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i;
 
 async function makeUi({ anonymous = false, platform, touchPoints = 0, clipboard = 'absent' } = {}) {
@@ -124,14 +124,16 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   assert.equal(card.hidden, false);
   const nodes = nodesOf(card.innerHTML);
   const buttons = nodes.filter((n) => n.tagName === 'button');
-  const byAction = Object.fromEntries(buttons.map((b) => [attr(b, 'data-action'), b]));
-  assert.deepEqual(Object.keys(byAction).sort(), ['copy-agent', 'download']);
-  assert.equal(attr(byAction.download, 'type'), 'button');
-  assert.equal(attr(byAction['copy-agent'], 'type'), 'button');
-  assert.equal(textOf(card.innerHTML.match(/<button[^>]*data-action="download"[^>]*>.*?<\/button>/s)[0]), 'Download installer');
-  assert.equal(textOf(card.innerHTML.match(/<button[^>]*data-action="copy-agent"[^>]*>.*?<\/button>/s)[0]), 'Set up with my agent');
-  assert.ok(attr(byAction.download, 'class').split(' ').includes('btn'));
-  assert.ok(attr(byAction['copy-agent'], 'class').split(' ').includes('secondary'));
+  const actioned = buttons.filter((b) => attr(b, 'data-action'));
+  assert.deepEqual(actioned.map((b) => attr(b, 'data-action')), ['copy-agent']);
+  const copyBtn = actioned[0];
+  assert.equal(attr(copyBtn, 'type'), 'button');
+  assert.equal(nodeText(copyBtn), 'Set up with my agent');
+  assert.ok(attr(copyBtn, 'class').split(' ').includes('secondary'));
+  const primaryBtn = buttons.find((b) => !attr(b, 'data-action'));
+  assert.ok(primaryBtn, 'primary action is present');
+  assert.ok(primaryBtn.attrs.some((x) => x.name === 'disabled'), 'unavailable installer is a disabled action, not a fake download');
+  assert.equal(nodeText(primaryBtn), 'Installer coming soon for Windows x64');
   const selects = nodes.filter((n) => n.tagName === 'select');
   assert.equal(selects.length, 1, 'one OS picker');
   assert.equal(attr(selects[0], 'data-action'), 'os');
@@ -151,11 +153,11 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const head = card.innerHTML.slice(0, card.innerHTML.indexOf('<details'));
   assert.ok(!head.includes('<pre') && !head.includes('git clone') && !head.includes('DENDRITE_API_TOKEN'), 'no runbook above Advanced');
   const text = textOf(card.innerHTML);
-  for (const phrase of ['Connect your computer', 'Download installer', 'Set up with my agent',
+  for (const phrase of ['Connect your computer', 'Installer coming soon for Windows x64', 'Set up with my agent',
     'Installer for Windows x64:', 'not available', 'nothing to download', 'published as source only',
     'Setup needed', 'Installing', 'Pairing', 'Connected', 'You are here. Not connected.',
     'AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant',
-    'Advanced: manual install, source and troubleshooting', 'ganglion-dendrite 0.1.0', COMMIT]) {
+    'Advanced: manual install, source and troubleshooting', 'ganglion-dendrite 0.1.0', WORKER_COMMIT]) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
   // Only the existing inventory read happens; the card adds no API call.
@@ -170,38 +172,50 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   assert.match(win.captured[0], /\.venv\\Scripts\\python\.exe test_installation\.py/);
   assert.ok(win.captured[0].includes('Windows x64 is the only tested platform'));
 
+  // Unqualified platforms get "View supported platforms", never agent setup.
   const mac = await makeUi({ platform: 'MacIntel', clipboard: 'ok' });
   await mac.clickTab('compute');
-  const macText = textOf(mac.el('connect-card').innerHTML);
-  assert.ok(macText.includes('Detected: macOS. Change it if that is wrong.'));
-  assert.ok(macText.includes('Installer for macOS: not available'));
-  await mac.press('copy-agent');
-  assert.match(mac.captured[0], /\.venv\/bin\/python test_installation\.py/);
-  assert.ok(mac.captured[0].includes('macOS and Linux steps are untested adaptation'));
+  const macHtml = mac.el('connect-card').innerHTML;
+  assert.ok(textOf(macHtml).includes('Detected: macOS. Change it if that is wrong.'));
+  assert.ok(textOf(macHtml).includes('Installer for macOS: not available'));
+  const macActions = nodesOf(macHtml).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean);
+  assert.deepEqual(macActions, ['platforms'], 'no copy action on an unqualified platform');
+  await mac.press('platforms');
+  const platText = textOf(mac.el('connect-card').innerHTML);
+  assert.ok(platText.includes('Supported platforms:'), 'platforms notice');
+  assert.ok(platText.includes('agent setup is offered for Windows only'));
+  assert.deepEqual(mac.captured, [], 'viewing platforms writes nothing to the clipboard');
 
-  // Manual correction overrides detection everywhere (status, instructions, Advanced).
+  // Manual correction overrides detection everywhere (status, Advanced).
   await mac.chooseOs('linux');
-  const linuxText = textOf(mac.el('connect-card').innerHTML);
-  assert.ok(linuxText.includes('Installer for Linux: not available'));
-  assert.ok(linuxText.includes('macOS / Linux: not qualified'));
-  await mac.press('copy-agent');
-  assert.equal(mac.captured.length, 2);
-  assert.match(mac.captured[1], /\.venv\/bin\/dendrite serve --config configs\/mock\.toml/);
+  const linuxHtml = mac.el('connect-card').innerHTML;
+  assert.ok(textOf(linuxHtml).includes('Installer for Linux: not available'));
+  assert.ok(textOf(linuxHtml).includes('macOS / Linux: not qualified'));
+  const linuxPre = nodesOf(linuxHtml.slice(linuxHtml.indexOf('<pre'), linuxHtml.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
+  assert.ok(linuxPre.includes('.venv/bin/python test_installation.py'), 'Advanced follows the picked OS');
+  assert.ok(linuxPre.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
+  await mac.chooseOs('windows');
+  assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['copy-agent'], 'agent setup returns on the qualified platform');
 
   // Detection unavailable: the tested platform is preselected and labelled.
   const unknown = await makeUi({ clipboard: 'ok' });
   await unknown.clickTab('compute');
   assert.ok(textOf(unknown.el('connect-card').innerHTML).includes('Detection unavailable in this browser'));
+  const cros = await makeUi({ platform: 'CrOS x86_64', clipboard: 'ok' });
+  await cros.clickTab('compute');
+  assert.ok(textOf(cros.el('connect-card').innerHTML).includes('Detection unavailable in this browser'));
 
   // A bogus picker value changes nothing.
   await win.chooseOs('bogus');
   assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64: not available'));
 
-  // Mobile and tablet platforms are not classified as desktop systems.
-  for (const opts of [{ platform: 'Android' }, { platform: 'MacIntel', touchPoints: 5 }, { platform: 'CrOS x86_64' }]) {
+  // Phones and tablets are directed to the computer they want to connect.
+  for (const opts of [{ platform: 'Android' }, { platform: 'iPhone' }, { platform: 'MacIntel', touchPoints: 5 }]) {
     const mob = await makeUi({ ...opts, clipboard: 'ok' });
     await mob.clickTab('compute');
-    assert.ok(textOf(mob.el('connect-card').innerHTML).includes('Detection unavailable in this browser'), JSON.stringify(opts));
+    const mobText = textOf(mob.el('connect-card').innerHTML);
+    assert.ok(mobText.includes('Open AIPSTER on the computer you want to connect'), JSON.stringify(opts));
+    assert.ok(nodesOf(mob.el('connect-card').innerHTML).some((n) => n.tagName === 'select'), 'picker stays available');
   }
 });
 
@@ -212,12 +226,15 @@ test('agent setup copies pinned, secret-free instructions and confirms once', as
   await ui.press('copy-agent');
   const text = textOf(ui.el('connect-card').innerHTML);
   assert.ok(text.includes(COPIED_MESSAGE), 'exact confirmation wording');
+  assert.ok(text.includes('needs authorized access to this computer'), 'agent-access limit is stated');
   assert.equal(ui.captured.length, 1, 'one clipboard write per click');
   const instructions = ui.captured[0];
   const flat = instructions.replace(/\s+/g, ' ');
-  for (const phrase of ['THIS computer', COMMIT, 'ganglion-dendrite 0.1.0', 'uv 0.12.12', '3.12.14',
-    'git sparse-checkout set --no-cone local-worker', 'install.py', 'test_installation.py',
+  for (const phrase of ['AIPSTER agent setup packet v1.', 'THIS computer', WORKER_COMMIT, 'ganglion-dendrite 0.1.0',
+    'uv 0.12.12', '3.12.14', 'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
+    'the root LICENSE only', 'required by local-worker/LICENSING.md', 'install.py', 'test_installation.py',
     'DENDRITE_API_TOKEN', 'worker-LOCAL token', 'NOT an AIPSTER key',
+    'these steps cover x64 only', 'no qualified instructions exist',
     'does NOT share this computer', 'does NOT enable inference', 'does NOT contact AIPSTER',
     'no pairing code or worker credential yet', 'A running worker is NOT proof of inference readiness',
     'delete local-worker/.venv', 'There is no automatic update']) {
@@ -241,8 +258,15 @@ test('clipboard failure shows selectable instructions; retry recovers', async ()
   assert.equal(areas.length, 1, 'one selectable fallback');
   assert.ok(areas[0].attrs.some((x) => x.name === 'readonly'), 'fallback is read-only');
   const fallback = areas[0].childNodes.map((c) => c.value || '').join('');
-  assert.ok(fallback.includes(COMMIT) && fallback.includes('THIS computer'), 'fallback carries the complete instructions');
+  assert.ok(fallback.includes(WORKER_COMMIT) && fallback.includes('THIS computer'), 'fallback carries the complete instructions');
   assert.ok(!SECRET_SHAPED.test(fallback), 'fallback carries no credential-shaped material');
+  assert.ok(text.includes('download them as a file'), 'file-download fallback is offered');
+  const saveBtns = nodesOf(html).filter((n) => n.tagName === 'button' && attr(n, 'data-action') === 'save-instructions');
+  assert.equal(saveBtns.length, 1, 'one Download instructions action');
+  assert.equal(nodeText(saveBtns[0]), 'Download instructions');
+  // The file download degrades silently where no DOM download exists.
+  await ui.press('save-instructions');
+  assert.equal(nodesOf(ui.el('connect-card').innerHTML).filter((n) => n.tagName === 'textarea').length, 1, 'fallback survives a download attempt');
   // Retry after the browser allows copying again.
   ui.setClipboard('ok');
   await ui.press('copy-agent');
@@ -257,26 +281,25 @@ test('clipboard failure shows selectable instructions; retry recovers', async ()
   assert.equal(nodesOf(bare.el('connect-card').innerHTML).filter((n) => n.tagName === 'textarea').length, 1);
 });
 
-test('download explains unavailability without navigating anywhere', async () => {
+test('unavailable installer is a disabled action with an explanation, never a download', async () => {
   const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
   await ui.clickTab('compute');
   const before = ui.calls.length;
-  const linksBefore = cardLinks(ui.el('connect-card').innerHTML);
-  await ui.press('download');
   const html = ui.el('connect-card').innerHTML;
   const text = textOf(html);
-  assert.ok(text.includes('No verified installer for Windows x64 yet'), 'honest per-platform notice');
-  assert.ok(text.includes('nothing to download') || text.includes('Use "Set up with my agent"'), 'notice routes to a working path');
-  assert.ok(!text.includes(COPIED_MESSAGE), 'download never claims a copy');
-  assert.deepEqual(cardLinks(html), linksBefore, 'no navigation or download starts');
-  assert.deepEqual(ui.calls.slice(before), [], 'download adds no API call');
+  assert.ok(text.includes('Installer coming soon for Windows x64'), 'disabled per-platform action');
+  assert.ok(text.includes('not available') && text.includes('nothing to download'), 'visible explanation');
+  assert.ok(!/Download installer/.test(text), 'no live download label while nothing exists');
+  const linksBefore = cardLinks(html);
+  await ui.press('download');
+  assert.deepEqual(cardLinks(ui.el('connect-card').innerHTML), linksBefore, 'stale download action starts nothing');
+  assert.deepEqual(ui.calls.slice(before), [], 'no API call');
 });
 
 test('progress never claims an unverified installed, paired or connected state', async () => {
   const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
   await ui.clickTab('compute');
   await ui.press('copy-agent');
-  await ui.press('download');
   const html = ui.el('connect-card').innerHTML;
   const text = textOf(html);
   for (const stage of ['Setup needed', 'Installing', 'Pairing', 'Connected']) {
@@ -288,7 +311,9 @@ test('progress never claims an unverified installed, paired or connected state',
   assert.ok(nodeText(current[0]).startsWith('Setup needed'), 'Setup needed is the current stage');
   const progressText = textOf(progressHtml);
   assert.ok(progressText.includes('Blocked: no verified installer is packaged yet.'));
-  assert.ok(progressText.includes('Blocked:') && progressText.includes('heartbeat and pairing support') && progressText.includes('not merged or deployed'));
+  assert.ok(progressText.includes('Blocked:') && progressText.includes('heartbeat intake') && progressText.includes('not merged or deployed'));
+  assert.ok(progressText.includes('Pairing is a separate contract and is not implemented.'));
+  assert.ok(!/pairing support/i.test(progressText), 'heartbeat intake is never called pairing support');
   assert.ok(progressText.includes('Needs verified worker evidence. A download or a running worker is not proof.'));
   const rest = textOf(html.replace(progressHtml, ''));
   assert.ok(!/\bconnected\b/i.test(rest.replace(/not connected/gi, '')), 'never claims a connected state');
@@ -307,9 +332,11 @@ test('interrupted setup restarts cleanly and never paints after sign-out', async
   assert.ok(!idle.includes(COPIED_MESSAGE), 'returning to the tab resets to the idle view');
   assert.ok(!ui.el('connect-card').innerHTML.includes('<textarea'), 'no stale fallback survives');
   // Changing OS also resets any in-progress notice.
-  await ui.press('download');
   await ui.chooseOs('macos');
-  assert.ok(!textOf(ui.el('connect-card').innerHTML).includes('No verified installer'), 'OS change resets the notice');
+  await ui.press('platforms');
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes('Supported platforms:'), 'positive control');
+  await ui.chooseOs('windows');
+  assert.ok(!textOf(ui.el('connect-card').innerHTML).includes('Supported platforms:'), 'OS change resets the notice');
 
   // A copy still in flight when the session ends paints nothing.
   const slow = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
@@ -418,6 +445,7 @@ test('card placeholder sits in My Compute and the public policy still passes', a
   const css = await readFile(path.join(PUBLIC, 'app', 'styles.css'), 'utf8');
   assert.match(css, /\.connect pre \{[^}]*overflow-x:auto/, 'long commands scroll inside the card, not the page');
   assert.match(css, /button\.btn \{[^}]*min-height:44px/, 'touch-sized card buttons');
+  assert.match(css, /button\.btn\[disabled\] \{[^}]*cursor:not-allowed/, 'disabled installer action is visibly inert');
   assert.match(css, /\.connect \.progress/, 'progress stepper is styled');
   await checkPublic(PUBLIC);
 });
