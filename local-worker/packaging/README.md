@@ -128,6 +128,31 @@ a clear message instead of pretending.
 
 ## Build & qualify (Windows x86-64)
 
+Windows storage uses `local-worker/private_storage_win32.py`, a stdlib ctypes
+helper with typed native APIs and strict descriptor read-back, avoiding a
+PowerShell subprocess on each start. Existing paths must be owned by the
+process user. Only an exclusively created directory or mkstemp file may have
+the process token's default owner (Administrators on elevated runners)
+normalized to that user. This never changes privileges or takes over an
+existing foreign-owned directory/key. Tests provision their fresh private
+data paths through the same creation contract.
+
+The token directory and existing/new token files must belong to the current
+process user. First run establishes a protected DACL containing only that
+user's SID and fails closed if it cannot; token publication is atomic and a
+concurrent first-run winner is retained. File-backed tokens are re-read for
+every tray child start; explicitly inherited environment tokens keep priority.
+IPv6 loopback probes and displayed URLs use the configured address family.
+Crash restart closes the old job handle before launching the next child.
+
+Uninstall removes only files listed in the build's generated payload include
+and empty directories. An install location containing unrelated user files
+remains on disk with those files preserved. Explicit `/REMOVEDATA=1` remains
+the separate default-data removal choice. Builds include the exact pinned
+CPython distribution's `LICENSE.txt`, alongside dependency notices, and run
+`windows/test_packaging.py` before freezing. Qualification verifies native ACLs
+by SID and protection state rather than localized `icacls` display strings.
+
 Prerequisites: Windows 10 1809+ / 11 x86-64, `uv 0.12.12` on PATH,
 NSIS 3.13 (`makensis` on PATH; `winget install NSIS.NSIS`), network to PyPI.
 

@@ -74,7 +74,7 @@ test('grant lifecycle: create, duplicate, quotas, revoke', async () => {
   assert.equal((await readJson(await mk({ maxJobs: 0 }))).json.code, 'BAD_QUOTA');
   const shared = await readJson(await t.call('/api/shared-with-me', { headers: t.as(t.bob) }));
   assert.equal(shared.json.total, 1);
-  assert.equal(shared.json.items[0].enforcement, 'server-enforced');
+  assert.equal(shared.json.items[0].enforcement, 'recorded');
   const otherRevoke = await readJson(await t.call('/api/grants/' + g.json.id, { method: 'DELETE', headers: { ...t.as(t.bob), ...t.csrf } }));
   assert.equal(otherRevoke.status, 404);
   const rev = await readJson(await t.call('/api/grants/' + g.json.id, { method: 'DELETE', headers: { ...t.as(t.alice), ...t.csrf } }));

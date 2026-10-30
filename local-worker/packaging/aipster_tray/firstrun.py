@@ -6,8 +6,8 @@ configured env var. The token value is never printed or logged.
 """
 import os
 import secrets
-import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 APP_NAME = "AIPSTER-Worker"
@@ -36,52 +36,64 @@ def token_is_strong(value):
     return bool(value) and len(value) >= MIN_TOKEN_LENGTH and all("!" <= c <= "~" for c in value)
 
 
-def restrict_file(path):
-    """Best-effort user-only ACL on Windows; no-op elsewhere (documented).
-
-    Applies inheritance-removal + explicit grant in one icacls invocation
-    (no window with an empty DACL), then verifies by reading the ACL back.
-    Warns with full diagnostics and continues on failure: the file still
-    sits in the user-profile directory (itself user-ACL'd), so hardening is
-    defense in depth and must never break startup. Callers log the result;
-    tests assert the strict outcome where the OS allows it.
-    """
+def _private_path(path, directory=False, verify=False, created=False):
+    """Owned, unlinked storage; Windows ACLs use the process SID, never USERNAME."""
+    path = Path(path)
+    if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+        raise OSError("linked worker storage is refused")
     if os.name != "nt":
+        if path.stat().st_uid != os.getuid():
+            raise OSError("worker storage belongs to another user")
+        if verify:
+            return not bool(path.stat().st_mode & 0o077)
+        path.chmod(0o700 if directory else 0o600)
         return True
-    user = os.environ.get("USERNAME")
-    if not user:
-        try:
-            user = subprocess.check_output(["whoami"], text=True).strip()
-        except (OSError, subprocess.CalledProcessError):
-            user = None
-    if not user:
-        print(f"warning: could not determine the user; {path} keeps inherited ACLs",
-              file=sys.stderr)
+    if not getattr(sys, "frozen", False):
+        # The canonical stdlib helper also serves the standalone worker.
+        source_root = str(Path(__file__).resolve().parents[2])
+        if source_root not in sys.path:
+            sys.path.insert(0, source_root)
+    from private_storage_win32 import protect_path
+    return protect_path(path, directory=directory, verify=verify, new=created)
+
+
+
+def restrict_file(path, *, created=False):
+    return _private_path(path, created=created)
+
+
+def private_directory(path):
+    path = Path(path)
+    try:
+        path.mkdir(parents=True)  # Exclusive creation proves new-path ownership provenance.
+        created = True
+    except FileExistsError:
+        created = False
+    if not _private_path(path, directory=True, created=created):
+        raise OSError("cannot establish private worker directory")
+
+
+def private_token_acl(path):
+    """Read-only verification for qualification: SID-based and locale-independent."""
+    try:
+        return _private_path(path, verify=True)
+    except OSError:
         return False
-    applied = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                             capture_output=True, text=True, check=False)
-    shown = subprocess.run(["icacls", str(path)], capture_output=True, text=True, check=False)
-    # icacls prints `path FIRST_ACE` on line 0: strip the echoed path, keep the ACE.
-    out_lines = (shown.stdout or "").splitlines()
-    if out_lines and str(path) in out_lines[0]:
-        out_lines[0] = out_lines[0].replace(str(path), "", 1)
-    elif out_lines:
-        out_lines[0] = ""  # unparseable: ignore rather than misread the filename
-    aces = " ".join(line for line in out_lines
-                    if line.strip() and "successfully" not in line.lower()
-                    and "failed processing" not in line.lower())
-    ok = (applied.returncode == 0 and "(F)" in aces and "(I)" not in aces
-          and "BUILTIN" not in aces)
-    if not ok:
-        print(f"warning: token ACL hardening incomplete for {path}: "
-              f"user={user} rc={applied.returncode} "
-              f"apply_err={applied.stderr.strip()[:200]!r} aces={aces[:300]!r}; "
-              "file keeps broader ACLs", file=sys.stderr)
-    return ok
 
 
 def ensure_private_token(path):
+    path = Path(path)
+    try:
+        private_directory(path.parent)
+        return _ensure_private_token(path)
+    except OSError as exc:
+        raise SystemExit("aipster: cannot establish private token storage; no worker started") from exc
+
+
+def _ensure_private_token(path):
     if path.exists():
+        if not restrict_file(path):
+            raise OSError("cannot establish private token ACL")
         value = path.read_text(encoding="utf-8").strip()
         if not token_is_strong(value):
             raise SystemExit(
@@ -90,14 +102,27 @@ def ensure_private_token(path):
                 "to generate a fresh one on next start.")
         return value, False
     value = secrets.token_urlsafe(TOKEN_BYTES)
-    path.write_text(value + "\n", encoding="utf-8")
-    restrict_file(path)
-    return value, True
+    fd, temp = tempfile.mkstemp(prefix=".api-token-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if not restrict_file(temp, created=True):
+                raise OSError("cannot establish private token ACL")
+            handle.write(value + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # Publish without overwriting a concurrent first-run winner.
+            os.link(temp, path)
+        except FileExistsError:
+            return _ensure_private_token(path)
+        return value, True
+    finally:
+        Path(temp).unlink(missing_ok=True)
 
 
 def ensure_setup(data):
     """Create data dirs + default config. Returns (config_path, fresh_config)."""
-    data.mkdir(parents=True, exist_ok=True)
+    private_directory(data)
     (data / "state").mkdir(exist_ok=True)
     (data / "logs").mkdir(exist_ok=True)
     config = data / "config.toml"
