@@ -5,14 +5,28 @@
 // store (CATALOG_FIXTURES=1); one test proves the unprovisioned refusal.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
-import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex } from '../src/lib/catalog/validate.mjs';
+import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex, MAX_ASSET_BYTES } from '../src/lib/catalog/validate.mjs';
 import { __resetFixtureStore } from '../src/lib/catalog/store.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const GGUF = 'fixture-org/tiny-instruct-gguf';
 
 const sess = (t, user) => ({ ...t.as(user), ...t.csrf });
+
+async function seedDemo(t) {
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, username, displayUsername, demo, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('u_demo', 'Demo explorer', 'demo@aipster.invalid', 0, null, 'demo', 'demo', 1, now, now).run();
+  const hash = await hashPassword('demo-test-password-01');
+  await t.DB.prepare('INSERT INTO account (id, accountId, providerId, userId, password, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .bind('acc_demo_credential', 'u_demo', 'credential', 'u_demo', hash, now, now).run();
+  const res = await t.call('/api/auth/sign-in/username', { method: 'POST', body: { username: 'demo', password: 'demo-test-password-01' } });
+  const session = res.headers.getSetCookie().find((c) => c && c.startsWith('better-auth.session_token='));
+  assert.ok(session, 'demo sign-in sets a session cookie');
+  return { Cookie: session.split(';')[0] };
+}
 
 function tinySafetensors() {
   const header = JSON.stringify({ w: { dtype: 'F32', shape: [2], data_offsets: [0, 8] } });
@@ -90,6 +104,106 @@ test('AC10: demo and API keys cannot ingest', async () => {
   assert.equal(keyed.status, 403, 'ingestion is session-only');
   const myKeys = await readJson(await t.call('/api/catalog/my-assets', { headers: { Authorization: 'Bearer ' + keys.json.secret } }));
   assert.equal(myKeys.status, 403, 'asset listing is session-only');
+});
+
+test('S-F13: demo is denied begin, chunk, and finalize (not just keyed callers)', async () => {
+  const t = await fx();
+  const cookie = await seedDemo(t);
+  const headers = { ...cookie, ...t.csrf };
+  const b = await readJson(await t.call('/api/catalog/uploads', {
+    method: 'POST', headers, body: { name: 'd', kind: 'model', files: [{ relpath: 'm.gguf', bytes: 8 }] },
+  }));
+  assert.equal(b.status, 403);
+  assert.equal(b.json.code, 'DEMO_RESTRICTED');
+  const c = await readJson(await t.call('/api/catalog/uploads/up_bogus/chunk?path=m.gguf&index=0', {
+    method: 'PUT', headers, rawBody: new Uint8Array([1, 2, 3, 4]),
+  }));
+  assert.equal(c.status, 403);
+  assert.equal(c.json.code, 'DEMO_RESTRICTED');
+  const f = await readJson(await t.call('/api/catalog/uploads/up_bogus/finalize', { method: 'POST', headers, body: {} }));
+  assert.equal(f.status, 403);
+  assert.equal(f.json.code, 'DEMO_RESTRICTED');
+});
+
+test('F5: gapped chunk indexes are refused even when byte sums match', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const bytes = ggufBytes(64);
+  const b = await begin(t, t.alice, {
+    name: 'gap', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c0 = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes.slice(0, 32));
+  assert.equal(c0.status, 200, c0.text);
+  const c2 = await chunk(t, t.alice, b.json.id, 'model.gguf', 2, bytes.slice(32, 64));
+  assert.equal(c2.status, 200, c2.text);
+  const fin = await finalize(t, t.alice, b.json.id);
+  assert.equal(fin.status, 400, fin.text);
+  assert.equal(fin.json.code, 'UPLOAD_INCOMPLETE');
+  assert.match(fin.json.error, /contiguous/i, 'the gap is named, not silently skipped');
+});
+
+test('F15: finalize re-checks quota against concurrent promotion', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const b = await begin(t, t.alice, {
+    name: 'late', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  await chunk(t, t.alice, b.json.id, 'model.gguf', 0, ggufBytes(64));
+  // A concurrent promotion lands between begin and finalize (direct row:
+  // no real bytes needed to prove the accounting re-check).
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, freshness_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('rival', 'u_alice', 'private', 'rival', 'r'.repeat(64), 'model', 'text-generation', 'llama', 'gguf', 'Q4_K_M', '{}', 'private', '{}', 'validated', now, now).run();
+  await t.DB.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)')
+    .bind('rival', 'model.gguf', MAX_ASSET_BYTES, '00'.repeat(32)).run();
+  const fin = await finalize(t, t.alice, b.json.id);
+  assert.equal(fin.status, 400, fin.text);
+  assert.equal(fin.json.code, 'QUOTA_EXCEEDED');
+});
+
+test('F18: adapter finalize requires a resolvable base asset', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const ghost = await roundTrip(t, t.alice, 'ghost-adapter', [{ relpath: 'adapter.gguf', bytes: ggufBytes() }], {
+    kind: 'adapter', baseAssetId: 'no-such-base', baseRevision: 'ab'.repeat(32),
+    targetModules: ['q_proj'], tokenizer: 'base-tok',
+  });
+  assert.equal(ghost.status, 422, ghost.text);
+  assert.equal(ghost.json.code, 'BASE_NOT_FOUND');
+  const base = await roundTrip(t, t.alice, 'real-base', [{ relpath: 'model.gguf', bytes: ggufBytes() }]);
+  assert.equal(base.status, 201, base.text);
+  const good = await roundTrip(t, t.alice, 'bound-adapter', [{ relpath: 'adapter.gguf', bytes: ggufBytes() }], {
+    kind: 'adapter', baseAssetId: base.json.assetId, baseRevision: 'ab'.repeat(32),
+    targetModules: ['q_proj'], tokenizer: 'base-tok',
+  });
+  assert.equal(good.status, 201, good.text);
+});
+
+test('S-F6: shard accounting is case-insensitive like the suffix policy', async () => {
+  const err = checkShardIndex(
+    [{ relpath: 'MODEL.SAFETENSORS', bytes: 100 }],
+    { weight_map: { w: 'MODEL.SAFETENSORS' }, metadata: { total_size: 100 } },
+  );
+  assert.equal(err, null, 'upper-case shard name is accounted');
+});
+
+test('S-F7: magic screen covers common archive/executable variants', async () => {
+  const cases = [
+    ['gzip', new Uint8Array([0x1f, 0x8b, 8, 0])],
+    ['rar', new TextEncoder().encode('Rar!\x1a\x07\x00')],
+    ['7z', new Uint8Array([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])],
+    ['mach-o-64', new Uint8Array([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0])],
+    ['zip-empty', new Uint8Array([0x50, 0x4b, 0x05, 0x06])],
+  ];
+  for (const [label, bytes] of cases) {
+    assert.ok(screenMagic(bytes), `${label} is refused`);
+  }
+  assert.equal(screenMagic(new TextEncoder().encode('GGUF')), null, 'gguf weights still pass');
+  assert.equal(screenMagic(tinySafetensors().slice(0, 64)), null, 'safetensors still passes');
 });
 
 test('AC11: traversal, bad suffixes, hostile bytes, and bad manifests fail closed', async () => {

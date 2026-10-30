@@ -940,7 +940,8 @@ function renderDeployment(d, events) {
     ${d.error ? `<p class="error" role="alert">${esc(d.error.code || 'FAILED')}: ${esc(d.error.detail || '')}</p>` : ''}
     <p class="muted">reservation ${esc(d.reservation ? d.reservation.state : 'none')} · ${fmtBytes(d.estimateTotalBytes)} · updated ${esc(d.updatedAt)}</p>
     <h4>Event trail</h4><ul>${ev || '<li>No events yet.</li>'}</ul>
-    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
+    ${d.state === 'cancelling' ? '<p class="muted">Cancel requested — awaiting worker acknowledgment. Capacity stays held.</p>' : ''}
+    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) || d.state === 'cancelling' ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
 }
 
 function renderDeploymentLite(d) {
@@ -948,7 +949,8 @@ function renderDeploymentLite(d) {
     ${d.scripted ? '<p class="muted">DEMO walkthrough.</p>' : ''}
     <p>${deployPill(d.state)} <span class="muted">${esc(d.assetId)}@${esc(String(d.revision).slice(0, 12))} → node ${esc(d.nodeId)}</span></p>
     ${d.error ? `<p class="error" role="alert">${esc(d.error.code || 'FAILED')}: ${esc(d.error.detail || '')}</p>` : ''}
-    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
+    ${d.state === 'cancelling' ? '<p class="muted">Cancel requested — awaiting worker acknowledgment. Capacity stays held.</p>' : ''}
+    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) || d.state === 'cancelling' ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
 }
 
 async function runPlan() {
@@ -1282,7 +1284,11 @@ function resetState() {
   for (const id of ['res-name', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'grant-user', 'key-name', 'key-expires', 'settings-name', 'demo-username', 'demo-password']) $(id).value = '';
   for (const id of ['cat-q', 'cat-task', 'cat-format', 'cat-quant', 'cat-license']) { const el = $(id); if (el) el.value = ''; }
   for (const id of ['cat-kind', 'cat-node', 'cat-compat']) { const el = $(id); if (el) el.selectedIndex = 0; }
-  for (const id of ['catalog-list', 'asset-detail']) { const el = $(id); if (el) el.innerHTML = ''; }
+  for (const id of ['catalog-list', 'asset-detail', 'my-deployments', 'compat-out', 'deploy-out', 'deploy-track']) { const el = $(id); if (el) el.innerHTML = ''; }
+  for (const id of ['catalog-meta', 'catalog-error', 'upload-progress', 'upload-error', 'deploy-error']) { const el = $(id); if (el) el.textContent = ''; }
+  pendingPlan = null;
+  lastCompatInput = null;
+  depCache.clear();
   for (const id of ['up-name', 'up-task', 'up-format', 'up-license', 'up-base-id', 'up-base-rev', 'up-modules', 'up-tokenizer']) { const el = $(id); if (el) el.value = ''; }
   for (const id of ['my-assets']) { const el = $(id); if (el) el.innerHTML = ''; }
   catalogWired = false;

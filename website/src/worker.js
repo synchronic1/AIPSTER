@@ -168,8 +168,8 @@ async function catalogNodeAccess(db, userId, nodeId) {
   const r = await first(db, 'SELECT * FROM resources WHERE id = ?', nodeId);
   if (!r) return null;
   if (r.owner_id === userId) return r;
-  const g = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', nodeId, userId);
-  if (!g) return null;
+  const g = await first(db, 'SELECT * FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', nodeId, userId);
+  if (!g || !(await grantPartiesSameSide(db, g))) return null;
   const owner = await first(db, 'SELECT disabled FROM "user" WHERE id = ?', r.owner_id);
   if (!owner || Number(owner.disabled) === 1) return null;
   return r;
@@ -356,30 +356,76 @@ async function verifyPlanToken(env, token, userId) {
   return { plan: payload };
 }
 
+// Shared deployment guards (single source for compat/plan/execute): a
+// primary adapter without an explicit base binding is refused (F6), and
+// gated assets are refused at plan AND at execute, since gated-ness can
+// change between the two (F7/T11). Each returns a 4xx response or null.
+function adapterBaseRequired(asset, adapterRef) {
+  if (asset && asset.kind === 'adapter' && !adapterRef) {
+    return json(400, { error: 'Adapter weights need an explicit base: use the adapterRef+baseRef form; display names never bind a base.', code: 'ADAPTER_BASE_REQUIRED' });
+  }
+  return null;
+}
+
+function gatedRefusal(asset, adapterAsset) {
+  if ((asset && asset.gated) || (adapterAsset && adapterAsset.gated)) {
+    return json(403, { error: 'Gated asset: complete the access grant yourself first. Nothing is auto-accepted, and metered access is never assumed.', code: 'GATED_ACCESS_REQUIRED', retryable: false });
+  }
+  return null;
+}
+
 // Deployment transitions: forward-only along the lifecycle, or to
-// failed/cancelled from anywhere non-terminal. Every transition writes an
-// event row in the same step; terminal failures and cancels release the
-// reservation (AC15/AC17). Ready KEEPS its reservation: loaded weights
-// occupy memory until an unload API exists (documented follow-on).
+// failed/cancelled/cancelling from anywhere non-terminal (a load that
+// finishes first honestly wins as ready). Writes are compare-and-swap:
+// a concurrent writer wins and the loser re-reads instead of
+// resurrecting (F1). Events land only on success; terminal failures and
+// cancels release the reservation (AC15/AC17). Ready KEEPS its
+// reservation: loaded weights occupy memory until an unload API exists
+// (documented follow-on).
+// Late receipts on terminal jobs are audited, never applied (F9).
 const DEPLOY_ORDER = ['queued', 'admitted', 'staging', 'verifying', 'loading', 'ready'];
-const DEPLOY_TERMINAL = ['ready', 'failed', 'cancelled'];
+const DEPLOY_TERMINAL = TERMINAL_STATES;
 
 async function transitionDeployment(db, job, to, detail = '', code = null) {
   const from = job.state;
   if (DEPLOY_TERMINAL.includes(from)) return { ok: false, error: `Deployment is already ${from}.` };
-  const forward = to === 'failed' || to === 'cancelled' || (DEPLOY_ORDER.includes(from) && DEPLOY_ORDER.includes(to) && DEPLOY_ORDER.indexOf(to) > DEPLOY_ORDER.indexOf(from));
+  const forward = to === 'failed' || to === 'cancelled'
+    || (to === 'cancelling' && !DEPLOY_TERMINAL.includes(from))
+    || (from === 'cancelling' && to === 'ready')
+    || (DEPLOY_ORDER.includes(from) && DEPLOY_ORDER.includes(to) && DEPLOY_ORDER.indexOf(to) > DEPLOY_ORDER.indexOf(from));
   if (!forward) return { ok: false, error: `Illegal transition ${from} -> ${to}.` };
   const now = nowIso();
-  await db.batch([
-    db.prepare('UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ?')
-      .bind(to, to === 'failed' ? JSON.stringify({ code, detail: detail.slice(0, 500) }) : '{}', now, job.id),
-    db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(rid('ev_'), job.id, now, from, to, detail.slice(0, 500)),
-  ]);
+  const applied = await run(db, 'UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state = ?',
+    to, to === 'failed' ? JSON.stringify({ code, detail: detail.slice(0, 500) }) : '{}', now, job.id, from);
+  if (Number(applied && applied.meta ? applied.meta.changes : 0) !== 1) {
+    return { ok: false, conflict: true, error: `Deployment moved under this write (saw ${from}).` };
+  }
+  await run(db, 'INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)',
+    rid('ev_'), job.id, now, from, to, detail.slice(0, 500));
   if (to === 'failed' || to === 'cancelled') {
     await run(db, "UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'", now, job.id);
   }
   return { ok: true };
+}
+
+// Late-receipt audit: terminal jobs never transition, but a worker receipt
+// that arrives after the fact is evidence, not nothing. Recorded without
+// applying; consecutive identical notes are not spammed (F9).
+// Idempotent note: appends a non-transition event unless the latest event
+// already says the same thing (keeps quiet-worker polling from spamming).
+async function noteEvent(db, jobId, detail) {
+  const last = await first(db, 'SELECT detail FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY rowid DESC LIMIT 1', jobId);
+  if (last && last.detail === detail) return;
+  await run(db, 'INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)',
+    rid('ev_'), jobId, nowIso(), '', '', detail.slice(0, 500));
+}
+
+async function auditLateReceipt(db, jobId, receipt) {
+  const last = await first(db, 'SELECT detail FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY rowid DESC LIMIT 1', jobId);
+  const detail = `late receipt ignored (job already terminal): ${String(receipt.status).slice(0, 64)}`;
+  if (last && last.detail === detail) return;
+  await run(db, 'INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)',
+    rid('ev_'), jobId, nowIso(), '', '', detail);
 }
 
 // Deployment API shapes. The full shape carries the immutable plan
@@ -398,7 +444,7 @@ function catalogDeploymentLite(r) {
 
 async function catalogDeploymentShape(db, r) {
   const plan = JSON.parse(r.plan_json);
-  const res = await first(db, 'SELECT state, bytes FROM catalog_reservations WHERE deployment_id = ?', r.id);
+  const res = await first(db, 'SELECT state, bytes, created_at FROM catalog_reservations WHERE deployment_id = ?', r.id);
   return {
     ...catalogDeploymentLite(r),
     plan: {
@@ -407,7 +453,7 @@ async function catalogDeploymentShape(db, r) {
       context: plan.context, concurrency: plan.concurrency,
       planFingerprint: plan.planFingerprint, opId: plan.opId,
     },
-    reservation: res ? { state: res.state, bytes: res.bytes } : null,
+    reservation: res ? { state: res.state, bytes: res.bytes, heldSince: res.created_at } : null,
   };
 }
 
@@ -1064,6 +1110,12 @@ async function handleApi(request, env, url) {
     if (compat && !['compatible', 'blocked', 'unknown'].includes(compat)) {
       return json(400, { error: 'compat must be "compatible", "blocked", or "unknown".', code: 'BAD_FILTER' });
     }
+    if (compat) {
+      // Compat filtering IS evaluation: demo browses but never evaluates.
+      // (Demo-only gate: read API keys keep working, no CSRF on a GET.)
+      const demoNoEval = needNotDemo();
+      if (demoNoEval) return deny(demoNoEval);
+    }
     if (compat && !compatNode) {
       return json(400, { error: 'compat filtering needs nodeId: compatibility is per-node, never global.', code: 'BAD_FILTER' });
     }
@@ -1083,7 +1135,7 @@ async function handleApi(request, env, url) {
         const dec = evaluateCompatibility({ asset, settings: { context: 4096, concurrency: 1, runtime }, snapshot: snap.snapshot, snapshotAgeMs: snap.ageMs, snapshotAt: snap.reportedAt, nodeId: compatNode, principal: me(), nowMs: Date.now() });
         return dec.state === want;
       });
-      return json(200, { ...result, items, total: result.total, fixture, compatFiltered: true });
+      return json(200, { ...result, items, total: items.length, unfilteredTotal: result.total, fixture, compatFiltered: true });
     } catch (e) {
       if (e && e.hub) return json(e.status || 502, { error: e.message, code: e.code || 'HUB_ERROR', retryable: e.retryable !== false, action: 'Retry shortly, or narrow the search.' });
       throw e;
@@ -1167,6 +1219,8 @@ async function handleApi(request, env, url) {
       const resolved = await ref(repo || assetId, 'Model');
       if (resolved.http) return resolved.http;
       const asset = resolved.asset;
+      const unboundEarly = adapterBaseRequired(asset, adapterRepo || adapterAssetId);
+      if (unboundEarly) return unboundEarly;
       let adapterAsset = null;
       let baseAsset = asset;
       const adapterRef = adapterRepo || adapterAssetId;
@@ -1199,6 +1253,11 @@ async function handleApi(request, env, url) {
       await run(db, `INSERT INTO catalog_compat_cache (cache_key, principal, fingerprint_json, decision_json, expires_at)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET decision_json = excluded.decision_json, expires_at = excluded.expires_at`,
         cacheKey, me(), fp, decisionJson, decision.expiresAt);
+      // Hygiene: prune expired rows and cap per-principal growth (200,
+      // provisional) so the display cache cannot grow unbounded (S-F12).
+      await run(db, 'DELETE FROM catalog_compat_cache WHERE principal = ? AND expires_at < ?', me(), decision.expiresAt);
+      await run(db, `DELETE FROM catalog_compat_cache WHERE principal = ? AND cache_key NOT IN (
+        SELECT cache_key FROM catalog_compat_cache WHERE principal = ? ORDER BY expires_at DESC LIMIT 200)`, me(), me());
       return json(200, { ...decision, cached: false, fixture });
     } catch (e) {
       if (e && e.hub) return json(e.status || 502, { error: e.message, code: e.code || 'HUB_ERROR', retryable: e.retryable !== false, action: 'Retry shortly.' });
@@ -1208,7 +1267,7 @@ async function handleApi(request, env, url) {
   if (path === '/api/catalog/summary' && method === 'GET') {
     const d = needAuthz('read'); if (d) return deny(d);
     const assets = await first(db, "SELECT COUNT(*) n FROM catalog_assets WHERE owner_id = ? AND access = 'private'", me());
-    const jobs = await first(db, "SELECT COUNT(*) n FROM catalog_deployments WHERE owner_id = ? AND state NOT IN ('succeeded', 'failed', 'cancelled')", me());
+    const jobs = await first(db, "SELECT COUNT(*) n FROM catalog_deployments WHERE owner_id = ? AND state NOT IN ('ready', 'failed', 'cancelled')", me());
     const refresh = await first(db, 'SELECT MAX(created_at) at FROM jobs WHERE owner_id = ?', me());
     return json(200, {
       privateAssets: assets ? assets.n : 0,
@@ -1348,6 +1407,11 @@ async function handleApi(request, env, url) {
       const assembled = new Map();
       for (const f of manifest.files) {
         const mine = parts.filter((p) => p.key.endsWith('/' + f.relpath)).sort((a, b) => (a.key < b.key ? -1 : 1));
+        const order = mine.map((p) => Number(p.key.split('/')[3]));
+        if (!order.length || !order.every((v, i) => v === i)) {
+          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+          return json(400, { error: `Incomplete bytes for ${f.relpath}: chunk indexes are not contiguous from 0 (got ${order.join(',')}); never guessed, never skipped.`, code: 'UPLOAD_INCOMPLETE' });
+        }
         const got = mine.reduce((n, p) => n + p.size, 0);
         if (got !== f.bytes) {
           await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
@@ -1381,6 +1445,28 @@ async function handleApi(request, env, url) {
         await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), nowIso(), uploadId);
         await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
         return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: verdict.checks });
+      }
+      // Quota is re-checked at finalize: a concurrent promotion may have
+      // landed since begin (F15). owned + inflight (self included) is the
+      // post-promote footprint.
+      const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
+      const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')", me());
+      if ((ownedNow ? ownedNow.n : 0) + (inflightNow ? inflightNow.n : 0) > MAX_ASSET_BYTES) {
+        await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+        return json(400, { error: 'Account storage quota exceeded by a concurrent promotion; retry after cleanup.', code: 'QUOTA_EXCEEDED' });
+      }
+      if (manifest.kind === 'adapter') {
+        // The declared base must resolve to an owned asset (F18).
+        // Hub-form bases pass through: offline verification is impossible
+        // and live resolution is a documented live-gate.
+        const baseId = manifest.adapter.baseAssetId;
+        if (!baseId.includes('/') && !baseId.startsWith('hub:')) {
+          const base = await first(db, 'SELECT id FROM catalog_assets WHERE id = ? AND owner_id = ?', baseId, me());
+          if (!base) {
+            await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+            return json(422, { error: `Adapter base asset not found: ${baseId}.`, code: 'BASE_NOT_FOUND' });
+          }
+        }
       }
       // Promote: every file lands under the asset prefix before any row
       // points at it; the DB writes commit in one batch (AC12).
@@ -1429,6 +1515,8 @@ async function handleApi(request, env, url) {
       });
     }
   }
+  // Intent (review S-F18): asset listing is session-only while single-asset
+  // reads allow read keys — listing across assets is the broader capability.
   if (path === '/api/catalog/my-assets' && method === 'GET') {
     const d = needSession(); if (d) return deny(d);
     const q = pagination(url);
@@ -1458,6 +1546,8 @@ async function handleApi(request, env, url) {
       const totalBytes = files.reduce((n, f) => n + f.bytes, 0);
       if (totalBytes > 128 * 1024 * 1024) return json(413, { error: 'Asset exceeds the 128 MiB scaffold validation cap.', code: 'ASSET_TOO_LARGE' });
       const manifest = JSON.parse(asset.manifest_json);
+      // Intent (review F19): revalidation re-reads bounded header peeks, not
+      // full bytes — a drift check against stored digests, not a re-ingest.
       const peek = async (relpath) => store.peek(`asset/${asset.id}/${relpath}`, MAX_HEADER_PEEK);
       const peeks = new Map();
       for (const f of files) peeks.set(f.relpath, await peek(f.relpath));
@@ -1511,8 +1601,10 @@ async function handleApi(request, env, url) {
     if (fixtureScript !== null) {
       if (!isFixtureEnv(env)) return json(400, { error: 'Scripted worker receipts exist in fixture environments only.', code: 'BAD_PLAN_INPUT' });
       if (!Array.isArray(fixtureScript) || fixtureScript.length > 32) return json(400, { error: 'fixtureScript holds at most 32 receipt steps.', code: 'BAD_PLAN_INPUT' });
+      if (JSON.stringify(fixtureScript).length > 2048) return json(400, { error: 'fixtureScript is too large; the plan token would exceed the size the server accepts.', code: 'BAD_PLAN_INPUT' });
       for (const s of fixtureScript) {
         if (!s || typeof s !== 'object' || typeof s.status !== 'string') return json(400, { error: 'Each receipt step needs a status.', code: 'BAD_PLAN_INPUT' });
+        if ((s.detail !== undefined && typeof s.detail !== 'string') || (s.code !== undefined && typeof s.code !== 'string')) return json(400, { error: 'Receipt detail and code must be strings when present.', code: 'BAD_PLAN_INPUT' });
       }
     }
     const node = await catalogNodeAccess(db, me(), nodeId);
@@ -1531,9 +1623,10 @@ async function handleApi(request, env, url) {
       adapterAsset = a.asset;
       baseAsset = b.asset;
     }
-    if (asset.gated || (adapterAsset && adapterAsset.gated)) {
-      return json(403, { error: 'Gated asset: complete the access grant yourself first. Nothing is auto-accepted, and metered access is never assumed.', code: 'GATED_ACCESS_REQUIRED', retryable: false });
-    }
+    const unbound = adapterBaseRequired(asset, adapterRef);
+    if (unbound) return unbound;
+    const gated = gatedRefusal(asset, adapterAsset);
+    if (gated) return gated;
     const snap = await catalogSnapshot(db, nodeId);
     const decision = evaluateCompatibility({
       asset, adapterAsset, baseAsset, settings: { context, concurrency, runtime },
@@ -1631,6 +1724,10 @@ async function handleApi(request, env, url) {
     if (resolved.asset.revision !== plan.asset.revision) {
       return json(422, { error: 'Pinned revision drifted between plan and execute; re-plan.', code: 'PIN_DRIFT' });
     }
+    const unboundX = adapterBaseRequired(resolved.asset, plan.adapter ? plan.adapter.ref : null);
+    if (unboundX) return unboundX;
+    const gatedX = gatedRefusal(resolved.asset, adapterAsset);
+    if (gatedX) return gatedX;
     const snap = await catalogSnapshot(db, plan.nodeId);
     const decision = evaluateCompatibility({
       asset: resolved.asset, adapterAsset, baseAsset,
@@ -1659,15 +1756,28 @@ async function handleApi(request, env, url) {
     const id = rid('dep_');
     const opId = rid('wop_');
     const job = { id, owner_id: me(), state: 'queued', plan_fingerprint: plan.planFingerprint, node_id: plan.nodeId };
-    await db.batch([
-      db.prepare(`INSERT INTO catalog_deployments (id, owner_id, plan_json, plan_fingerprint, idem_key, state, node_id, runtime, error_json, created_at, updated_at)
+    try {
+      await db.batch([
+        db.prepare(`INSERT INTO catalog_deployments (id, owner_id, plan_json, plan_fingerprint, idem_key, state, node_id, runtime, error_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, '{}', ?, ?)`)
-        .bind(id, me(), JSON.stringify({ ...plan, opId }), plan.planFingerprint, idempotencyKey, plan.nodeId, plan.runtime, now, now),
-      db.prepare('INSERT INTO catalog_reservations (id, deployment_id, owner_id, node_id, bytes, state, created_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .bind(rid('res_'), id, me(), plan.nodeId, plan.estimateTotalBytes, 'held', now, null),
-      db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)')
-        .bind(rid('ev_'), id, now, '', 'queued', 'admitted; reservation held'),
-    ]);
+          .bind(id, me(), JSON.stringify({ ...plan, opId }), plan.planFingerprint, idempotencyKey, plan.nodeId, plan.runtime, now, now),
+        db.prepare('INSERT INTO catalog_reservations (id, deployment_id, owner_id, node_id, bytes, state, created_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(rid('res_'), id, me(), plan.nodeId, Math.max(plan.estimateTotalBytes, decision.estimate.totalBytes), 'held', now, null),
+        db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)')
+          .bind(rid('ev_'), id, now, '', 'queued', 'admitted; reservation held'),
+      ]);
+    } catch (error) {
+      // Lost an idempotency race: the winner's row is authoritative.
+      // Re-read by key — replay on fingerprint match, 409 on mismatch,
+      // rethrow when no row exists (a genuinely different failure) (F2).
+      const winner = await first(db, 'SELECT * FROM catalog_deployments WHERE owner_id = ? AND idem_key = ?', me(), idempotencyKey);
+      if (!winner) throw error;
+      if (winner.plan_fingerprint !== plan.planFingerprint) {
+        return json(409, { error: 'Idempotency key was already used for a different plan; mint a fresh key per execution.', code: 'IDEMPOTENCY_MISMATCH' });
+      }
+      const wonEvents = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', winner.id);
+      return json(200, { ...(await catalogDeploymentShape(db, winner)), events: wonEvents, duplicate: true });
+    }
     const accepted = await transport.dispatch({ opId, jobId: id, nodeId: plan.nodeId, script: plan.fixtureScript || [] });
     if (!accepted || accepted.accepted !== true) {
       await transitionDeployment(db, { ...job, state: 'queued' }, 'failed', 'worker transport refused dispatch', 'DISPATCH_FAILED');
@@ -1688,6 +1798,10 @@ async function handleApi(request, env, url) {
     return json(200, { ...page, items: page.items.map((r) => catalogDeploymentLite(r)) });
   }
   {
+    // Intent (review F16): the GET status read advances the job by consuming
+    // one pending worker receipt, so read-scoped API keys drive progress.
+    // That is deliberate: polling is the only transport, and every advance
+    // is idempotent receipt application, never a blind mutation.
     const m = /^\/api\/catalog\/deployments\/([A-Za-z0-9_-]{1,64})(\/cancel)?$/.exec(path);
     if (m && (method === 'GET' || method === 'POST')) {
       const isCancel = !!m[2];
@@ -1704,8 +1818,27 @@ async function handleApi(request, env, url) {
           const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
           return json(200, { ...(await catalogDeploymentShape(db, row)), events, duplicate: true });
         }
+        if (row.state === 'cancelling') {
+          if (transport) await transport.cancel(plan.opId);
+          const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+          return json(200, { ...(await catalogDeploymentShape(db, row)), events, duplicate: true });
+        }
+        // Cancel pends until the worker acknowledges: the request goes
+        // out best-effort and the job waits in `cancelling` with its
+        // reservation held. A lost race gets one retry on fresh state,
+        // then an honest 409 (F1/F9).
         if (transport) await transport.cancel(plan.opId);
-        await transitionDeployment(db, row, 'cancelled', 'cancel requested by owner; worker cancel best-effort, reservation released');
+        let moved = await transitionDeployment(db, row, 'cancelling', 'cancel requested by owner; worker cancel best-effort; awaiting acknowledgment');
+        if (!moved.ok) {
+          const retry = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
+          if (TERMINAL_STATES.includes(retry.state) || retry.state === 'cancelling') {
+            const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+            return json(200, { ...(await catalogDeploymentShape(db, retry)), events, duplicate: true });
+          }
+          if (transport) await transport.cancel(plan.opId);
+          moved = await transitionDeployment(db, retry, 'cancelling', 'cancel requested by owner; worker cancel best-effort; awaiting acknowledgment');
+          if (!moved.ok) return json(409, { error: 'Deployment moved under the cancel request; refresh and retry.', code: 'DEPLOYMENT_CONFLICT' });
+        }
         await audit(db, me(), 'catalog.deploy.cancel', row.id, row.state);
         const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
         const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
@@ -1714,43 +1847,92 @@ async function handleApi(request, env, url) {
       // Status read with fixture reconciliation: each read processes one
       // pending worker receipt (fixture transport only). Revocation is
       // re-checked on every advance: lost access fails the flight (AC20).
-      if (!TERMINAL_STATES.includes(row.state) && transport) {
-        const access = await catalogNodeAccess(db, me(), row.node_id);
-        if (!access) {
-          await transitionDeployment(db, row, 'failed', 'access to the node was revoked mid-flight; worker told to stop; reservation released', 'REVOKED');
-          const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
-          const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
-          return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, reconciled: true });
-        }
-        let receipt = await transport.poll(plan.opId);
-        if (receipt.status === 'unknown') {
-          // Reconcile by op id: re-dispatch resumes without duplicating
-          // work; a second unknown means the worker truly lost it.
-          await transport.dispatch({ opId: plan.opId, jobId: row.id, nodeId: row.node_id, script: plan.fixtureScript || [] });
-          receipt = await transport.poll(plan.opId);
-        }
-        if (receipt.status === 'unknown') {
-          await transitionDeployment(db, row, 'failed', `reconciliation lost: ${receipt.detail || 'worker quiet'}; partial state cleaned up; reservation released`, 'RECONCILE_LOST');
-        } else if (receipt.status === 'failed' || receipt.status === 'cancelled') {
-          await transitionDeployment(db, row, receipt.status, `${receipt.code || receipt.status}: ${receipt.detail || 'worker-reported terminal state'}; partial artifacts removed; reservation released`, typeof receipt.code === 'string' ? receipt.code.slice(0, 64) : null);
-        } else if (['admitted', 'staging', 'verifying', 'loading', 'ready'].includes(receipt.status)) {
-          // Duplicate/stale receipts (resume replays the script from the
-          // top) are no-ops when the job is already there or past it.
-          const seen = WORKER_STATES.indexOf(row.state);
-          const got = WORKER_STATES.indexOf(receipt.status);
-          if (got > seen) {
-            const t = await transitionDeployment(db, row, receipt.status, receipt.detail || `worker reports ${receipt.status}`);
-            if (!t.ok) await transitionDeployment(db, row, 'failed', `illegal worker transition: ${t.error}`, 'ILLEGAL_TRANSITION');
-          }
-        } else {
-          await transitionDeployment(db, row, 'failed', `unrecognized worker receipt: ${String(receipt.status).slice(0, 64)}`, 'BAD_RECEIPT');
-        }
+      // Every transition below is compare-and-swap: on conflict the read
+      // re-reads and returns current state instead of writing stale (F1).
+      const finishRead = async (orig) => {
         const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
         const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
-        return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, reconciled: fresh.state !== row.state });
+        return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, reconciled: fresh.state !== orig.state });
+      };
+      if (TERMINAL_STATES.includes(row.state)) {
+        // Late receipts are audited, never applied (F9).
+        if (transport) {
+          const late = await transport.poll(plan.opId);
+          if (late.status !== 'unknown') await auditLateReceipt(db, row.id, late);
+        }
+        return finishRead(row);
       }
-      const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
-      return json(200, { ...(await catalogDeploymentShape(db, row)), events, reconciled: false });
+      if (!transport) return finishRead(row);
+      const access = await catalogNodeAccess(db, me(), row.node_id);
+      if (!access) {
+        if (transport) await transport.cancel(plan.opId);
+        const revoked = await transitionDeployment(db, row, 'failed', 'access to the node was revoked mid-flight; worker cancel requested best-effort; worker state UNCONFIRMED; reservation released speculatively', 'REVOKED');
+        if (!revoked.ok) return finishRead(row);
+        return finishRead(row);
+      }
+      let receipt = await transport.poll(plan.opId);
+      if (receipt.status === 'unknown') {
+        // Reconcile by op id: re-dispatch resumes without duplicating
+        // work; a second unknown means the worker truly lost it.
+        await transport.dispatch({ opId: plan.opId, jobId: row.id, nodeId: row.node_id, script: plan.fixtureScript || [] });
+        receipt = await transport.poll(plan.opId);
+      }
+      if (row.state === 'cancelling') {
+        // Only the worker terminal reports (or a finished load) move a
+        // cancelling job; anything else is recorded at most (F9).
+        if (receipt.status === 'cancelled') {
+          const t = await transitionDeployment(db, row, 'cancelled', 'worker acknowledged cancel; reservation released');
+          if (!t.ok) return finishRead(row);
+          return finishRead(row);
+        }
+        if (receipt.status === 'failed') {
+          const t = await transitionDeployment(db, row, 'failed', `${receipt.code || 'failed'}: ${receipt.detail || 'worker-reported failure while cancelling'}; server-side cleanup NOT verified; reservation released`, typeof receipt.code === 'string' ? receipt.code.slice(0, 64) : null);
+          if (!t.ok) return finishRead(row);
+          return finishRead(row);
+        }
+        if (receipt.status === 'ready') {
+          const t = await transitionDeployment(db, row, 'ready', 'worker reported ready while cancelling: load finished before cancel landed; reservation held');
+          if (!t.ok) return finishRead(row);
+          return finishRead(row);
+        }
+        if (receipt.status === 'unknown') {
+          await noteEvent(db, row.id, 'cancel unacknowledged; worker quiet; reservation held');
+          return finishRead(row);
+        }
+        await noteEvent(db, row.id, `observed ${receipt.status} while cancelling; still awaiting cancel acknowledgment`);
+        return finishRead(row);
+      }
+      if (receipt.status === 'unknown') {
+        const t = await transitionDeployment(db, row, 'failed', `reconciliation lost: ${receipt.detail || 'worker quiet'}; partial state UNKNOWN; reservation released speculatively — reconcile on reconnect`, 'RECONCILE_LOST');
+        if (!t.ok) return finishRead(row);
+        return finishRead(row);
+      }
+      if (receipt.status === 'failed' || receipt.status === 'cancelled') {
+        const t = await transitionDeployment(db, row, receipt.status, `${receipt.code || receipt.status}: ${receipt.detail || 'worker-reported terminal state'}; server-side cleanup NOT verified; reservation released`, typeof receipt.code === 'string' ? receipt.code.slice(0, 64) : null);
+        if (!t.ok) return finishRead(row);
+        return finishRead(row);
+      }
+      if (['admitted', 'staging', 'verifying', 'loading', 'ready'].includes(receipt.status)) {
+        // Duplicate/stale receipts (resume replays the script from the
+        // top) are no-ops when the job is already there or past it.
+        const seen = WORKER_STATES.indexOf(row.state);
+        const got = WORKER_STATES.indexOf(receipt.status);
+        if (got > seen) {
+          const t = await transitionDeployment(db, row, receipt.status, receipt.detail || `worker reports ${receipt.status}`);
+          if (!t.ok) {
+            // Lost a race (typically to cancel): audit the consumed
+            // receipt when the winner terminalized, then current wins.
+            const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
+            if (TERMINAL_STATES.includes(fresh.state) && receipt.status !== 'unknown') await auditLateReceipt(db, row.id, receipt);
+            return finishRead(row);
+          }
+          return finishRead(row);
+        }
+        return finishRead(row);
+      }
+      const bad = await transitionDeployment(db, row, 'failed', `unrecognized worker receipt: ${String(receipt.status).slice(0, 64)}`, 'BAD_RECEIPT');
+      if (!bad.ok) return finishRead(row);
+      return finishRead(row);
     }
   }
 

@@ -27,12 +27,63 @@
 
 ## Evidence (all local, fixture-only)
 
-- `npm run check` PASS, `npm test` 961/961 PASS, `npm run build`
-  PASS, `npm run bundle` dry-run PASS (final re-run after last edit).
+- `npm run check` PASS, `npm test` 985/985 PASS, `npm run build`
+  PASS, `npm run bundle` dry-run PASS (final re-run after last edit,
+  quiescent tree, preview stopped, port 8791 verified free).
 - Renders 01–13: real headless-Edge captures against local fixture
   `wrangler dev` (owner session, seeded `render-box` telemetry).
+- Renders 14–20: interactive CDP-driven Edge journeys, same fixture
+  posture (owner session, seeded `render-box`/`render-box2`
+  telemetry; `quiet-box` without telemetry for unknown-compat).
+  14 cancelling, 15 cancelled, 16 timeout/failed wording,
+  17 Overview counts (ready excluded from active), 18 blocked
+  compat, 19 cancelling at 390px, 20 deployments list at 390px.
+  All seven inspected pixel-by-pixel; journey log JOURNEY-OK.
 - Mocked tests prove control-plane logic only; live qualification is
   BLOCKED behind doc 13 and is not claimed anywhere in code or UI.
+
+## Review-fix round (post-`6882227`)
+
+- Frozen candidate `6882227f49` (clean tree verified); review work
+  as new commits only, no history rewrite.
+- Commissioned fresh-context reviews of `b192554..6882227`: code
+  HOLD pending F1–F7, security READY. Migration overlap: none —
+  0017/0018 exist only on this branch; main is at 0016.
+- Triage treated findings as questions-not-bugs; every fix was
+  reproduced with a failing deterministic test first (~24 new
+  behavior tests; F1/F2 race gates pass 10/10).
+- Fixes: receipt CAS + conflict re-read/replay (F1); idempotency
+  race catch (F2); `cancelling` pending state, ack-only completion,
+  held reservation, late-receipt audit (F3/F9); summary excludes
+  ready (F4, pinned live in render 17); shared guards at
+  plan+execute (F6/F7); max reserve (F20); same-side grant
+  staleness (S-F14); demo eval gate + filtered total (S-F9/F13);
+  script intake caps (S-F3/S-F8); cache prune+cap (S-F12); quota
+  checks (F5/F15); `BASE_NOT_FOUND` (F18); shard/magic handling
+  (S-F6/S-F7); UI resetState + cancelling states (S-F10/F9).
+  F8 stays a documented live-gate (migration 0018 header);
+  F14/F18 keep deliberate `needSession` posture; F16
+  (GET advances via idempotent receipts) is intentional.
+- Interactive journeys asserted: native-button/focus-visible,
+  revision label, double-execute-single-job, cancelling→cancelled
+  with ack note, list-tracker consistency, TIMEOUT/LOAD_FAILED +
+  NOT-verified wording, blocked offers no plan action, unknown
+  compat, back/forward reload, mobile 390 cancel cycle.
+- Re-review of the final delta (fresh context, read-only):
+  READY. All 16 fixes confirmed present and bounded; F1/F2/F9
+  tests judged genuine (real UNIQUE index, serialized-gate
+  races, exact event trails); no secrets, no trust broadening.
+  Verified against the better-sqlite3 shim only — live-D1
+  behavior untested, consistent with the fixture-only posture.
+- Follow-ons accepted (low/info, not blockers): N1 cancelling +
+  silent worker holds forever (needs quiet-poll threshold or
+  force-cancel); N2 poll consumes before CAS (loser drops its
+  receipt unaudited); N3 event INSERT no longer batched with the
+  state UPDATE (crash window); N4 admission checks plan estimate
+  but reserves max(plan, decision); N5 F15 re-check still
+  check-then-act (same class as F8 residual); N6 lingered
+  transport-cancel flag after a lost race (benign audit line);
+  N7 big-endian Mach-O magics uncovered.
 
 ## Local reproduction
 
@@ -103,6 +154,7 @@ Migrations are additive (new tables/columns only).
 ## Explicitly NOT done
 
 Push, PR, merge, deploy, R2 provisioning, credential enrollment,
-paid calls, prod migration, live inference. Independent review has
-not been performed — this packet requests it; nothing here is
-self-approved for merge.
+paid calls, prod migration, live inference. Fresh-context code +
+security reviews plus a read-only delta re-review (READY) have been
+performed and are recorded above; that is review evidence for the
+owner's merge decision, not a merge authorization.

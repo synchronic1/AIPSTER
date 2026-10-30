@@ -37,6 +37,21 @@ export function __fixtureDispatchCount() {
   return uniqueDispatches.size;
 }
 
+// Test-only: did the control plane request cancel for this op?
+export function __fixtureWasCancelled(opId) {
+  const op = ops.get(opId);
+  return !!op && op.cancelled === true;
+}
+
+// Test-only: simulate a lost cancel request (transport unreliability).
+// Receipts still come from the declared script; this only clears the
+// cancel flag the route set, so tests can drive the unacknowledged and
+// cancel-lost-race branches deterministically.
+export function __fixtureUncancel(opId) {
+  const op = ops.get(opId);
+  if (op) op.cancelled = false;
+}
+
 function fakeTransport() {
   return {
     backend: 'fake-fixture',

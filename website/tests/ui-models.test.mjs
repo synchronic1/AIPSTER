@@ -317,6 +317,7 @@ test('deploy flow: plan pins revisions, execute admits, refresh advances honestl
   assert.ok(id, 'tracker carries the job id');
   await ui.waitForDOM(() => ui.el('my-deployments').innerHTML.includes(id), 'job never listed');
   assert.ok(!SECRET_SHAPED.test(ui.el('deploy-track').innerHTML), 'no secret-shaped content in the tracker');
+  assert.ok(!/eyJ[A-Za-z0-9_-]{8,}/.test(ui.el('deploy-out').innerHTML + ui.el('deploy-track').innerHTML + ui.el('my-deployments').innerHTML), 'plan tokens never enter the DOM');
   // Real execute carries no script: the quiet fixture worker fails honestly.
   clickOut(ui, { depRefresh: id });
   await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('RECONCILE_LOST'), 'honest failure never rendered');
@@ -349,8 +350,11 @@ test('fixture walkthrough reaches ready labeled DEMO; cancel releases a live job
   const id2 = depIdOf(ui);
   assert.ok(id2 && id2 !== id, 'second job has its own id');
   clickOut(ui, { depCancel: id2 });
-  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>cancelled<'), 'cancel never rendered');
-  assert.ok(ui.el('deploy-track').innerHTML.includes('released'), 'cancel releases the reservation');
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>cancelling<'), 'cancel never requested');
+  assert.ok(ui.el('deploy-track').innerHTML.includes('reservation held'), 'capacity held while cancel is unacknowledged');
+  clickOut(ui, { depRefresh: id2 });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>cancelled<'), 'cancel never completed');
+  assert.ok(ui.el('deploy-track').innerHTML.includes('released'), 'worker ack completes the cancel');
 });
 
 test('blocked decisions offer no plan action', async () => {
@@ -371,6 +375,25 @@ test('blocked decisions offer no plan action', async () => {
   assert.ok(textOf(out).includes('blocked'), 'over-budget evaluation blocks');
   assert.ok(out.includes('Deploy (unavailable)'), 'blocked keeps deploy honestly disabled');
   assert.ok(!out.includes('data-plan'), 'no plan action without estimated-compatible');
+});
+
+test('S-F10: logout clears deployment state (no previous-identity residue)', async () => {
+  const ui = await makeUi();
+  const node = await seedBigBox(ui);
+  await evaluateCompatible(ui, node);
+  clickOut(ui, { plan: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-out').innerHTML.includes('Deployment plan'), 'plan never rendered');
+  clickOut(ui, { exec: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>admitted<'), 'job never admitted');
+  const id = depIdOf(ui);
+  await ui.waitForDOM(() => ui.el('my-deployments').innerHTML.includes(id), 'list never rendered');
+  await ui.el('logout').listeners.click();
+  await ui.flush();
+  assert.equal(ui.el('view-login').hidden, false, 'logout completed');
+  assert.equal(ui.el('my-deployments').innerHTML, '', 'deployments list cleared');
+  assert.equal(ui.el('deploy-out').innerHTML, '', 'plan card cleared');
+  assert.equal(ui.el('deploy-track').innerHTML, '', 'tracker cleared');
+  assert.equal(ui.el('compat-out').innerHTML, '', 'decision cleared');
 });
 
 test('deployments list renders job cards; demo sees the honest empty note', async () => {

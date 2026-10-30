@@ -194,3 +194,22 @@ test('compat auth and input boundaries', async () => {
   const ghost = await readJson(await t.call('/api/catalog/compat', { method: 'POST', headers, body: { ...good, repo: 'fixture-org/nope' } }));
   assert.equal(ghost.status, 404);
 });
+
+test('S-F12: compat writes prune expired rows and cap per-principal growth', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const past = new Date(Date.now() - 3600000).toISOString();
+  await t.DB.prepare('INSERT INTO catalog_compat_cache (cache_key, principal, fingerprint_json, decision_json, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('expired-1', 'u_alice', '{}', '{}', past).run();
+  const future = new Date(Date.now() + 300000).toISOString();
+  for (let i = 0; i < 205; i += 1) {
+    await t.DB.prepare('INSERT INTO catalog_compat_cache (cache_key, principal, fingerprint_json, decision_json, expires_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(`fresh-${i}`, 'u_alice', '{}', '{}', future).run();
+  }
+  const res = await evaluate(t, t.alice, { repo: GGUF, nodeId: node.id, runtime: 'fixture-llama', context: 2048, concurrency: 1 });
+  assert.equal(res.status, 200, res.text);
+  const rows = await t.DB.prepare('SELECT cache_key FROM catalog_compat_cache WHERE principal = ?').bind('u_alice').all();
+  assert.ok(rows.results.length <= 200, `cache capped, got ${rows.results.length}`);
+  assert.ok(!rows.results.some((r) => r.cache_key === 'expired-1'), 'expired row pruned');
+});

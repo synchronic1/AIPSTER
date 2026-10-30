@@ -10,17 +10,16 @@ non-read ops). Versioned errors `{ error, code, retryable, action }`.
 
 | PRD op | Route | Phase |
 |---|---|---|
-| Catalog search | `GET /api/catalog/search?source=&task=&arch=&format=&quant=&runtime=&license=&compat=&q=&cursor=` | 1 |
+| Catalog search | `GET /api/catalog/search?q=&task=&arch=&format=&quant=&runtime=&license=&kind=&compat=&nodeId=&limit=&offset=` | 1 |
 | Asset detail | `GET /api/catalog/assets/:id` (Hub `org/name` or `priv:<uuid>`) | 1 |
-| Compatibility evaluate | `POST /api/catalog/compat` `{ asset, adapter?, nodeId, context, concurrency, runtime }` | 1 |
+| Compatibility evaluate | `POST /api/catalog/compat` `{ repo\|assetId\|assetRef, adapterRepo\|adapterAssetId?, baseRepo\|baseAssetId?, nodeId, context, concurrency, runtime }` (ref aliases accepted; one must be present) | 1 |
 | Capability report | `POST /api/resources/:id/capabilities` (heartbeat-key auth, schema v1) | 1 |
 | Upload begin/chunk/finalize/status | `POST /api/catalog/uploads/*` | 2 |
 | Asset validate | `POST /api/catalog/assets/:id/validate` (re-run; bounded) | 2 |
 | My assets | `GET /api/catalog/my-assets` | 2 |
 | Plan create | `POST /api/catalog/plans` → plan token (15 min, principal-bound) | 3 |
 | Deployment execute | `POST /api/catalog/deployments` (plan token + idempotency key) | 3 |
-| Job get/cancel | `GET/POST /api/catalog/deployments/:id[/cancel]` | 3 |
-| Deployment status | `GET /api/catalog/deployments/:id/status` | 3 |
+| Job get/cancel | `GET /api/catalog/deployments/:id` advances + returns; `POST .../:id/cancel` requests cancel (pends as `cancelling` until the worker acks) | 3 |
 
 Worker lifecycle transport (download/verify/load/unload/cancel/report) does
 not exist: Phase 3 implements the control-plane side (plans, durable jobs,

@@ -7,9 +7,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
-import { createTestEnv, readJson } from './d1-shim.mjs';
+import { createTestEnv, readJson, TEST_SECRET } from './d1-shim.mjs';
 import { fixtureSnapshot, fixtureSmallSnapshot } from '../src/lib/catalog/fixtures.mjs';
-import { __resetFixtureTransport, __fixtureDispatchCount } from '../src/lib/catalog/transport.mjs';
+import { __resetFixtureTransport, __fixtureDispatchCount, __fixtureUncancel } from '../src/lib/catalog/transport.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const GGUF = 'fixture-org/tiny-instruct-gguf';
@@ -224,11 +224,16 @@ test('AC17: cancel, timeout, and partial failure all release with cleanup notes'
   const ex = await execute(t, t.alice, 'op-cancel1', p.json.planToken);
   const c = await readJson(await t.call(`/api/catalog/deployments/${ex.json.id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
   assert.equal(c.status, 200, c.text);
-  assert.equal(c.json.state, 'cancelled');
+  // Review F9: cancel pends for worker ack (the old sync-terminal
+  // expectation encoded the defect this test now pins as fixed).
+  assert.equal(c.json.state, 'cancelling');
   assert.equal(c.json.duplicate, false);
-  assert.equal(c.json.reservation.state, 'released');
+  assert.equal(c.json.reservation.state, 'held');
   const dup = await readJson(await t.call(`/api/catalog/deployments/${ex.json.id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
-  assert.equal(dup.json.duplicate, true, 'cancel replays on terminal jobs');
+  assert.equal(dup.json.duplicate, true, 'cancel replays while unacknowledged');
+  const done = await status(t, t.alice, ex.json.id);
+  assert.equal(done.json.state, 'cancelled');
+  assert.equal(done.json.reservation.state, 'released');
 
   const timeout = await plan(t, t.alice, {
     nodeId: node.id,
@@ -366,4 +371,298 @@ test('AC21: live mode plans but cannot dispatch; nothing persists and scripts ar
   assert.equal(list.json.items.length, 0, 'refused dispatch persists nothing');
   const scripted = await plan(t, t.alice, { nodeId: node.id, assetRef: 'priv:livegguf', fixtureScript: SCRIPT });
   assert.equal(scripted.status, 400, 'scripted receipts are fixtures-only');
+});
+
+// ---- Review round (code F1-F4/F6/F7/F9, sec F3/F8/F14/F12-age) ----
+// Deterministic repros for the independent-review findings. Race tests
+// use a one-shot DB gate (same fault-injection idea as the fabric
+// revision fixtures): hold request A inside its write, run B to
+// completion, release A, assert the serialized outcome.
+
+// gateDbOnce wraps a test-env DB so the FIRST run()/batch() whose SQL
+// matches `pattern` waits at a gate; everything else passes through.
+function gateDbOnce(db, pattern) {
+  let entered;
+  const enteredP = new Promise((r) => { entered = r; });
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let fired = false;
+  const hold = () => { if (!fired) { fired = true; entered(); return gate; } return null; };
+  const wrapStmt = (raw, sql) => ({
+    raw, sql,
+    bind: (...p) => wrapStmt(raw.bind(...p), sql),
+    first: (...p) => raw.first(...p),
+    all: (...p) => raw.all(...p),
+    run: async (...p) => {
+      if (pattern.test(sql)) { const g = hold(); if (g) await g; }
+      return raw.run(...p);
+    },
+  });
+  return {
+    db: {
+      prepare: (sql) => wrapStmt(db.prepare(sql), sql),
+      exec: (sql) => db.exec(sql),
+      batch: async (stmts) => {
+        const raw = stmts.map((s) => (s && s.raw) || s);
+        if (stmts.some((s) => pattern.test((s && s.sql) || ''))) { const g = hold(); if (g) await g; }
+        return db.batch(raw);
+      },
+    },
+    entered: enteredP,
+    release: () => release(),
+  };
+}
+
+test('F1: stale status write loses to concurrent cancel (no resurrection, no silent release)', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.alice, 'op-f1-race1', p.json.planToken);
+  const id = ex.json.id;
+  const gate = gateDbOnce(t.env.DB, /UPDATE catalog_deployments SET state/);
+  t.env.DB = gate.db;
+  const pending = t.call(`/api/catalog/deployments/${id}`, { headers: t.as(t.alice) });
+  await gate.entered; // status is held inside its transition write
+  const cancel = await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  assert.ok(['cancelled', 'cancelling'].includes(cancel.json.state), `cancel lands first: ${cancel.text}`);
+  gate.release();
+  const st = await readJson(await pending);
+  assert.equal(st.status, 200, st.text);
+  assert.ok(['cancelled', 'cancelling'].includes(st.json.state), `stale staging write must lose, got ${st.json.state}`);
+  const trail = st.json.events.map((e) => e.to_state);
+  assert.ok(!trail.includes('staging'), `no staging event lands over the cancel: ${trail.join(',')}`);
+  assert.equal(st.json.reservation.state, 'held', 'capacity stays held, never silently released');
+});
+
+test('F2: concurrent same-key executes replay instead of 500', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  assert.equal(p.status, 201, p.text);
+  const gate = gateDbOnce(t.env.DB, /INSERT INTO catalog_deployments/);
+  t.env.DB = gate.db;
+  const body = { idempotencyKey: 'op-f2-race12', planToken: p.json.planToken };
+  const a = t.call('/api/catalog/deployments', { method: 'POST', headers: sess(t, t.alice), body });
+  await gate.entered; // A held inside its admit batch
+  const b = await readJson(await t.call('/api/catalog/deployments', { method: 'POST', headers: sess(t, t.alice), body }));
+  assert.equal(b.status, 202, b.text);
+  gate.release();
+  const ar = await readJson(await a);
+  assert.equal(ar.status, 200, ar.text);
+  assert.equal(ar.json.duplicate, true);
+  assert.equal(ar.json.id, b.json.id, 'loser replays the winner, same job identity');
+});
+
+test('F3: revocation tells the worker to stop (best-effort) and labels uncertainty', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const g = await grant(t, node.id, 'bob@example.com');
+  const p = await plan(t, t.bob, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.bob, 'op-f3-revoke1', p.json.planToken);
+  const opId = ex.json.plan.opId;
+  await readJson(await t.call(`/api/grants/${g.id}`, { method: 'DELETE', headers: sess(t, t.alice) }));
+  const s = await status(t, t.bob, ex.json.id);
+  assert.equal(s.json.error.code, 'REVOKED');
+  assert.match(s.json.error.detail, /UNCONFIRMED/, 'revocation never claims the worker stopped');
+  assert.match(s.json.error.detail, /speculative/, 'speculative release is labeled');
+  assert.ok(!s.json.error.detail.includes('worker told to stop'), 'no false cancel claim');
+  const { __fixtureWasCancelled } = await import('../src/lib/catalog/transport.mjs');
+  assert.equal(typeof __fixtureWasCancelled, 'function', 'fake exposes cancel introspection');
+  assert.equal(__fixtureWasCancelled(opId), true, 'revocation sends best-effort cancel');
+});
+
+test('F3: reconcile-lost and worker-terminal paths stop asserting unverified cleanup', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const lost = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [] });
+  const ex = await execute(t, t.alice, 'op-f3-lost-12', lost.json.planToken);
+  const s = await status(t, t.alice, ex.json.id);
+  assert.match(s.json.error.detail, /UNKNOWN/, 'quiet worker means unknown partial state');
+  assert.match(s.json.error.detail, /speculative/);
+  assert.ok(!s.json.error.detail.includes('cleaned up'), 'no cleanup claim without evidence');
+  const timeout = await plan(t, t.alice, {
+    nodeId: node.id,
+    fixtureScript: [{ status: 'failed', code: 'TIMEOUT', detail: 'stage timed out' }],
+  });
+  const ex2 = await execute(t, t.alice, 'op-f3-time12', timeout.json.planToken);
+  const s2 = await status(t, t.alice, ex2.json.id);
+  assert.match(s2.json.error.detail, /NOT verified/, 'server never claims removal it did not perform');
+  assert.ok(!s2.json.error.detail.includes('partial artifacts removed'));
+});
+
+test('F4: summary active count matches the quota definition (ready excluded)', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.alice, 'op-f4-ready12', p.json.planToken);
+  for (let i = 0; i < 4; i += 1) await status(t, t.alice, ex.json.id);
+  const p2 = await plan(t, t.alice, { nodeId: node.id, context: 512, fixtureScript: SCRIPT });
+  await execute(t, t.alice, 'op-f4-admit12', p2.json.planToken);
+  const s = await readJson(await t.call('/api/catalog/summary', { headers: t.as(t.alice) }));
+  assert.equal(s.json.activeDeployments, 1, 'one admitted counts; the ready job does not');
+});
+
+test('F6: primary adapter without explicit base binding is refused', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const c = await readJson(await t.call('/api/catalog/compat', {
+    method: 'POST', headers: sess(t, t.alice),
+    body: { repo: 'fixture-org/tiny-lora', nodeId: node.id, runtime: RUNTIME, context: 2048, concurrency: 1 },
+  }));
+  assert.equal(c.status, 400, c.text);
+  assert.equal(c.json.code, 'ADAPTER_BASE_REQUIRED');
+  const p = await plan(t, t.alice, { nodeId: node.id, assetRef: 'fixture-org/tiny-lora' });
+  assert.equal(p.status, 400, p.text);
+  assert.equal(p.json.code, 'ADAPTER_BASE_REQUIRED');
+});
+
+async function mintRawPlanToken(t, nodeId, asset) {
+  // Hand-minted plan token (test-only): proves execute-time checks that no
+  // plan route would mint for. Mirrors the v1 token contract.
+  const now = Date.now();
+  const payload = {
+    v: 1, principal: 'u_alice', asset, adapter: null, base: null, nodeId,
+    runtime: RUNTIME, context: 2048, concurrency: 1, estimateTotalBytes: 1,
+    snapshotAt: new Date().toISOString(), compatFingerprint: {}, fixtureScript: null,
+    iat: now, exp: now + 600000, planFingerprint: 'fp-f7-handmint',
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(`catalog-plan-v1:${TEST_SECRET}`), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = Buffer.from(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body))).toString('base64url');
+  return `${body}.${sig}`;
+}
+
+test('F7: execute re-checks gated rights (plan/execute TOCTOU closed)', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const token = await mintRawPlanToken(t, node.id, {
+    ref: 'fixture-org/gated-clinical', id: 'hub:fixture-org/gated-clinical',
+    revision: 'c'.repeat(40), totalBytes: 9663676416,
+  });
+  const ex = await execute(t, t.alice, 'op-f7-gated12', token);
+  assert.equal(ex.status, 403, ex.text);
+  assert.equal(ex.json.code, 'GATED_ACCESS_REQUIRED');
+});
+
+test('F9: cancel requests ack; worker ack completes the cancel', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.alice, 'op-f9-cancel1', p.json.planToken);
+  const id = ex.json.id;
+  const c = await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  assert.equal(c.status, 200, c.text);
+  assert.equal(c.json.state, 'cancelling', 'cancel pends until the worker acknowledges');
+  assert.equal(c.json.duplicate, false);
+  assert.equal(c.json.reservation.state, 'held', 'capacity held while cancel is unacknowledged');
+  const s = await status(t, t.alice, id);
+  assert.equal(s.json.state, 'cancelled');
+  assert.equal(s.json.reservation.state, 'released');
+  const trail = s.json.events.map((e) => e.to_state);
+  assert.deepEqual(trail, ['queued', 'admitted', 'cancelling', 'cancelled']);
+});
+
+test('F9: load finishing first wins honestly over cancel (ready kept, held)', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'ready' }] });
+  const ex = await execute(t, t.alice, 'op-f9-race-12', p.json.planToken);
+  const id = ex.json.id;
+  await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  __fixtureUncancel(ex.json.plan.opId); // cancel request lost: worker finishes
+  const s = await status(t, t.alice, id);
+  assert.equal(s.json.state, 'ready', 'cancel best-effort: a finished load is ready, not cancelled');
+  assert.equal(s.json.reservation.state, 'held');
+  assert.ok(s.json.events.some((e) => /finished before cancel landed/.test(e.detail)), 'race is recorded honestly');
+});
+
+test('F9: unacknowledged cancel stays pending with capacity held', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [] });
+  const ex = await execute(t, t.alice, 'op-f9-quiet12', p.json.planToken);
+  const id = ex.json.id;
+  await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  __fixtureUncancel(ex.json.plan.opId); // cancel request lost: worker silent
+  const s = await status(t, t.alice, id);
+  assert.equal(s.json.state, 'cancelling', 'silence never completes a cancel');
+  assert.equal(s.json.reservation.state, 'held');
+  assert.ok(s.json.events.some((e) => /unacknowledged/.test(e.detail)));
+});
+
+test('F9: late receipts on terminal jobs are audited, never applied', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, {
+    nodeId: node.id,
+    fixtureScript: [{ status: 'failed', code: 'TIMEOUT', detail: 'stage timed out' }, { status: 'staging' }],
+  });
+  const ex = await execute(t, t.alice, 'op-f9-late-12', p.json.planToken);
+  const id = ex.json.id;
+  const s1 = await status(t, t.alice, id);
+  assert.equal(s1.json.state, 'failed');
+  const s2 = await status(t, t.alice, id);
+  assert.equal(s2.json.state, 'failed', 'late receipt never resurrects');
+  assert.ok(s2.json.events.some((e) => /late receipt/.test(e.detail)), 'late receipt is audited');
+  const s3 = await status(t, t.alice, id);
+  assert.equal(s3.json.events.length, s2.json.events.length, 'consecutive identical late notes are not spammed');
+});
+
+test('S-F3/S-F8: malformed and oversized fixture scripts are refused at plan intake', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const typed = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'staging', detail: 12345 }] });
+  assert.equal(typed.status, 400, typed.text);
+  const coded = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'failed', code: 999 }] });
+  assert.equal(coded.status, 400, coded.text);
+  const big = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'staging', detail: 'x'.repeat(7000) }] });
+  assert.equal(big.status, 400, big.text);
+  assert.match(big.json.error, /too large/i, 'fail fast instead of minting a token the server refuses');
+});
+
+test('S-F14: stale cross-boundary grants authorize nothing', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  await grant(t, node.id, 'bob@example.com');
+  // Stale cross-boundary row: the owner later became demo. The grantee is
+  // a real user, so only the grant-side check can stop this (404).
+  await t.DB.prepare('UPDATE "user" SET demo = 1 WHERE id = ?').bind('u_alice').run();
+  const p = await plan(t, t.bob, { nodeId: node.id, fixtureScript: SCRIPT });
+  assert.equal(p.status, 404, p.text);
+});
+
+test('F12-age: reservation hold start is visible on the job', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.alice, 'op-f12-age12', p.json.planToken);
+  const s = await status(t, t.alice, ex.json.id);
+  assert.ok(s.json.reservation.heldSince, 'hold start timestamp present');
+  assert.ok(Number.isFinite(Date.parse(s.json.reservation.heldSince)));
 });

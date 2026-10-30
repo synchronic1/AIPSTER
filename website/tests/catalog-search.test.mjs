@@ -127,6 +127,29 @@ test('compat filter needs a node and evaluates per item without combining nodes'
   assert.equal(cross.status, 404, 'cannot filter on another tenant node');
 });
 
+test('S-F9: demo browses but cannot run compat-filtered evaluation', async () => {
+  const t = await fx();
+  const demoCookie = await seedDemo(t);
+  const demoHeaders = { ...demoCookie, ...t.csrf };
+  const reg = await readJson(await t.call('/api/inventory', { method: 'POST', headers: demoHeaders, body: { name: 'demo-box' } }));
+  assert.equal(reg.status, 201, reg.text);
+  const plain = await readJson(await t.call('/api/catalog/search?limit=1', { headers: demoCookie }));
+  assert.equal(plain.status, 200, 'plain browsing still works for demo');
+  const filtered = await readJson(await t.call(`/api/catalog/search?compat=unknown&nodeId=${reg.json.id}`, { headers: demoCookie }));
+  assert.equal(filtered.status, 403, filtered.text);
+  assert.equal(filtered.json.code, 'DEMO_RESTRICTED');
+});
+
+test('F13: compat-filtered search reports the filtered total', async () => {
+  const t = await fx();
+  const headers = t.as(t.alice);
+  const reg = await readJson(await t.call('/api/inventory', { method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { name: 'n1' } }));
+  const unk = await readJson(await t.call(`/api/catalog/search?compat=unknown&nodeId=${reg.json.id}`, { headers }));
+  assert.equal(unk.status, 200, unk.text);
+  assert.equal(unk.json.total, unk.json.items.length, 'total matches the filtered page');
+  assert.equal(unk.json.unfilteredTotal, 4, 'pre-filter count stays available');
+});
+
 test('Hub URL policy refuses SSRF shapes (T2)', async () => {
   const bad = (url) => assert.throws(() => assertHubUrl(url), (e) => e.code === 'BAD_HUB_URL');
   bad('http://huggingface.co/api/models');

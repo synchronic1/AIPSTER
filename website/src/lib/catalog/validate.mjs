@@ -59,6 +59,13 @@ export function screenMagic(peek) {
   if (b[0] === 0x23 && b[1] === 0x21) return 'shebang script refused';
   if (b[0] === 0x80 && b[1] >= 0x02 && b[1] <= 0x05) return 'pickle opcode refused: use safetensors';
   if (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) return 'zip container refused: upload explicit files';
+  if (b[0] === 0x50 && b[1] === 0x4b && ((b[2] === 0x05 && b[3] === 0x06) || (b[2] === 0x07 && b[3] === 0x08))) return 'zip container refused: upload explicit files';
+  if (b[0] === 0x1f && b[1] === 0x8b) return 'gzip container refused: upload explicit files';
+  if (b[0] === 0x52 && b[1] === 0x61 && b[2] === 0x72 && b[3] === 0x21 && b[4] === 0x1a && b[5] === 0x07) return 'rar container refused: upload explicit files';
+  if (b[0] === 0x37 && b[1] === 0x7a && b[2] === 0xbc && b[3] === 0xaf && b[4] === 0x27 && b[5] === 0x1c) return '7z container refused: upload explicit files';
+  if (b[0] === 0xcf && b[1] === 0xfa && b[2] === 0xed && b[3] === 0xfe) return 'Mach-O executable refused';
+  if (b[0] === 0xce && b[1] === 0xfa && b[2] === 0xed && b[3] === 0xfe) return 'Mach-O executable refused';
+  if (b[0] === 0xca && b[1] === 0xfe && b[2] === 0xba && b[3] === 0xbe) return 'Mach-O executable refused';
   return null;
 }
 
@@ -101,18 +108,18 @@ export function checkShardIndex(manifestFiles, indexJson) {
   }
   const map = (index && index.weight_map) || {};
   if (!map || typeof map !== 'object' || !Object.keys(map).length) return 'shard index has no weight map';
-  const named = new Set(Object.values(map).map(String));
-  const present = new Set(manifestFiles.filter((f) => f.relpath.endsWith('.safetensors')).map((f) => f.relpath.split('/').pop()));
+  const named = new Set(Object.values(map).map((v) => String(v).toLowerCase()));
+  const present = new Set(manifestFiles.filter((f) => f.relpath.toLowerCase().endsWith('.safetensors')).map((f) => f.relpath.split('/').pop().toLowerCase()));
   for (const n of named) {
     if (!present.has(n)) return `shard index names missing file ${n}`;
   }
   for (const f of manifestFiles) {
     const base = f.relpath.split('/').pop();
-    if (f.relpath.endsWith('.safetensors') && !named.has(base)) return `weight file ${base} is unnamed by the shard index`;
+    if (f.relpath.toLowerCase().endsWith('.safetensors') && !named.has(base.toLowerCase())) return `weight file ${base} is unnamed by the shard index`;
   }
   const total = Number(index.metadata && index.metadata.total_size);
   if (Number.isSafeInteger(total)) {
-    const sum = manifestFiles.filter((f) => f.relpath.endsWith('.safetensors')).reduce((n, f) => n + f.bytes, 0);
+    const sum = manifestFiles.filter((f) => f.relpath.toLowerCase().endsWith('.safetensors')).reduce((n, f) => n + f.bytes, 0);
     if (sum !== total) return `shard bytes ${sum} disagree with index total ${total}`;
   }
   return null;
