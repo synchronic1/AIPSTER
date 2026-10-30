@@ -902,10 +902,150 @@ async function runCompat(asset) {
       ${dec.unknown && dec.unknown.length ? `<h4>Unknown (missing evidence)</h4><ul>${rows(dec.unknown)}</ul>` : ''}
       ${dec.warnings && dec.warnings.length ? `<h4>Warnings</h4><ul>${rows(dec.warnings)}</ul>` : ''}
       ${est}
-      <p><button type="button" class="btn" disabled title="Deployment is not implemented yet (Phase 3)">Deploy (unavailable)</button></p></div>`;
+      ${dec.state === 'estimated-compatible' ? '<p><button type="button" class="btn" data-plan="1">Plan deployment</button></p>' : '<p><button type="button" class="btn" disabled title="Deployment needs an estimated-compatible decision">Deploy (unavailable)</button></p>'}<div id="deploy-out" role="status"></div></div>`;
+    lastCompatInput = { ref: body.repo || body.assetId, nodeId: body.nodeId, runtime: body.runtime, context: body.context, concurrency: body.concurrency };
+    out.onclick = (e) => {
+      const ds = e && e.target && e.target.dataset ? e.target.dataset : {};
+      if (ds.plan) runPlan();
+      if (ds.exec) runExecute(false);
+      if (ds.execDemo) runExecute(true);
+      if (ds.depRefresh) trackRefresh(ds.depRefresh, $('deploy-track'));
+      if (ds.depCancel) trackCancel(ds.depCancel, $('deploy-track'));
+    };
     const head = $('compat-head');
     if (head && head.focus) head.focus();
   } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; state(out, 'error', e.message); }
+}
+
+// ---- qualified deployments (Phase 3: plan -> execute -> track) ----
+// Plans pin exact revisions and expire in 15 minutes; execution re-checks
+// compatibility, reserves node memory, then dispatches. Each plan mints one
+// idempotency key per path (real / walkthrough) so retries and double
+// clicks replay the same job instead of duplicating it. The fixture
+// walkthrough drives the fake worker through its scripted receipts and is
+// labeled DEMO throughout; live environments refuse scripted plans.
+let lastCompatInput = null;
+let pendingPlan = null;
+const depCache = new Map();
+const DEPLOY_FINAL = ['ready', 'failed', 'cancelled'];
+const WALKTHROUGH = [{ status: 'staging' }, { status: 'verifying' }, { status: 'loading' }, { status: 'ready' }];
+const deployPill = (s) => `<span class="pill ${s === 'ready' ? 'ok' : (s === 'failed' || s === 'cancelled') ? 'bad' : 'warn'}">${esc(s)}</span>`;
+const mintIdemKey = () => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : 'key-' + Date.now().toString(36) + '-' + Math.random().toString(16).slice(2));
+
+function renderDeployment(d, events) {
+  const ev = (events || []).map((e) => `<li>${esc(e.at)} · ${esc(e.from_state || '—')} → ${esc(e.to_state)} — ${esc(e.detail || '')}</li>`).join('');
+  return `<div class="card"><h3>Deployment ${esc(d.id)}</h3>
+    ${d.scripted ? '<p class="muted">DEMO: scripted fixture-worker receipts, not live execution.</p>' : ''}
+    <p>${deployPill(d.state)} <span class="muted">${esc(d.plan.asset.id)}@${esc(String(d.plan.asset.revision).slice(0, 12))} → node ${esc(d.plan.nodeId)} · ${esc(d.plan.runtime)}</span></p>
+    ${d.error ? `<p class="error" role="alert">${esc(d.error.code || 'FAILED')}: ${esc(d.error.detail || '')}</p>` : ''}
+    <p class="muted">reservation ${esc(d.reservation ? d.reservation.state : 'none')} · ${fmtBytes(d.estimateTotalBytes)} · updated ${esc(d.updatedAt)}</p>
+    <h4>Event trail</h4><ul>${ev || '<li>No events yet.</li>'}</ul>
+    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
+}
+
+function renderDeploymentLite(d) {
+  return `<div class="card"><h3>Deployment ${esc(d.id)}</h3>
+    ${d.scripted ? '<p class="muted">DEMO walkthrough.</p>' : ''}
+    <p>${deployPill(d.state)} <span class="muted">${esc(d.assetId)}@${esc(String(d.revision).slice(0, 12))} → node ${esc(d.nodeId)}</span></p>
+    ${d.error ? `<p class="error" role="alert">${esc(d.error.code || 'FAILED')}: ${esc(d.error.detail || '')}</p>` : ''}
+    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
+}
+
+async function runPlan() {
+  const host = $('deploy-out');
+  if (!lastCompatInput) return;
+  loading(host);
+  pendingPlan = null;
+  try {
+    const b = lastCompatInput;
+    const res = await api('/api/catalog/plans', { method: 'POST', body: JSON.stringify({ assetRef: b.ref, nodeId: b.nodeId, runtime: b.runtime, context: b.context, concurrency: b.concurrency }) });
+    pendingPlan = { planToken: res.planToken, plan: res.plan, expiresAt: res.expiresAt, keys: {} };
+    host.innerHTML = `<div class="card"><h3>Deployment plan</h3>
+      <p class="muted">${esc(res.plan.asset.id)}@${esc(String(res.plan.asset.revision).slice(0, 12))} → node ${esc(res.plan.nodeId)} · ${esc(res.plan.runtime)} · context ${esc(res.plan.context)} · concurrency ${esc(res.plan.concurrency)}</p>
+      <p>reserved on execute: <strong>${fmtBytes(res.plan.estimateTotalBytes)}</strong> · plan expires ${esc(res.expiresAt)}</p>
+      <p class="muted">Execution re-checks compatibility and access, then reserves node memory before dispatch. Live worker dispatch is not implemented: real execution is refused honestly until a lifecycle transport qualifies.</p>
+      <p id="deploy-error" class="error" role="alert" hidden></p>
+      <div class="actions"><button type="button" class="btn" data-exec="1">Execute</button><button type="button" class="btn secondary" data-exec-demo="1">Fixture walkthrough (DEMO)</button></div>
+      <div id="deploy-track"></div></div>`;
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function runExecute(walkthrough) {
+  const err = $('deploy-error');
+  const track = $('deploy-track');
+  if (!pendingPlan || !track) return;
+  err.hidden = true;
+  loading(track);
+  try {
+    const slot = walkthrough ? 'demo' : 'real';
+    let planToken = pendingPlan.planToken;
+    if (walkthrough) {
+      const b = lastCompatInput;
+      const res = await api('/api/catalog/plans', { method: 'POST', body: JSON.stringify({ assetRef: b.ref, nodeId: b.nodeId, runtime: b.runtime, context: b.context, concurrency: b.concurrency, fixtureScript: WALKTHROUGH }) });
+      planToken = res.planToken;
+    }
+    if (!pendingPlan.keys[slot]) pendingPlan.keys[slot] = mintIdemKey();
+    const job = await api('/api/catalog/deployments', { method: 'POST', body: JSON.stringify({ idempotencyKey: pendingPlan.keys[slot], planToken }) });
+    depCache.set(job.id, { full: job, events: job.events });
+    track.innerHTML = renderDeployment(job, job.events);
+    loadDeployments();
+  } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; state(track, 'error', e.message); }
+}
+
+async function trackRefresh(id, host) {
+  if (!host) return;
+  loading(host);
+  try {
+    const s = await api('/api/catalog/deployments/' + encodeURIComponent(id));
+    depCache.set(id, { full: s, events: s.events });
+    host.innerHTML = renderDeployment(s, s.events);
+    loadDeployments();
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function trackCancel(id, host) {
+  if (!host) return;
+  loading(host);
+  try {
+    const s = await api('/api/catalog/deployments/' + encodeURIComponent(id) + '/cancel', { method: 'POST', body: JSON.stringify({}) });
+    depCache.set(id, { full: s, events: s.events });
+    host.innerHTML = renderDeployment(s, s.events);
+    loadDeployments();
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function loadDeployments() {
+  const host = $('my-deployments');
+  if (!host) return;
+  loading(host);
+  try {
+    const res = await api('/api/catalog/deployments?limit=50');
+    if (!res.items.length) {
+      host.innerHTML = '<div class="card"><p class="muted">No deployments yet. Evaluate compatibility on a model, then plan and execute.</p></div>';
+      return;
+    }
+    host.innerHTML = res.items.map((d) => {
+      const c = depCache.get(d.id);
+      return c ? renderDeployment(c.full, c.events) : renderDeploymentLite(d);
+    }).join('');
+    host.onclick = async (e) => {
+      const ds = e && e.target && e.target.dataset ? e.target.dataset : {};
+      if (ds.depRefresh) {
+        try {
+          const s = await api('/api/catalog/deployments/' + encodeURIComponent(ds.depRefresh));
+          depCache.set(ds.depRefresh, { full: s, events: s.events });
+          loadDeployments();
+        } catch (err) { if (!isStale(err)) banner(err.message); }
+      }
+      if (ds.depCancel) {
+        try {
+          const s = await api('/api/catalog/deployments/' + encodeURIComponent(ds.depCancel) + '/cancel', { method: 'POST', body: JSON.stringify({}) });
+          depCache.set(ds.depCancel, { full: s, events: s.events });
+          loadDeployments();
+        } catch (err) { if (!isStale(err)) banner(err.message); }
+      }
+    };
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
 }
 
 async function apiBytes(path, buf) {
@@ -1015,6 +1155,7 @@ async function loadModels() {
     await catalogNodes($('cat-node'), true);
   } catch (e) { if (isStale(e)) return; /* node filter degrades; search still works */ }
   if (!$('catalog-list').innerHTML) runCatalogSearch();
+  loadDeployments();
 }
 
 const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, models: loadModels, federation: loadFederation, keys: loadKeys, usage: loadUsage, settings: loadSettings };

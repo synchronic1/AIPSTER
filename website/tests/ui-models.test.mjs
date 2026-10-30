@@ -278,3 +278,113 @@ test('switching tabs drops the late search response instead of rendering it', as
   await ui.flush();
   assert.ok(!ui.el('catalog-list').innerHTML.includes('fixture-org/'), 'stale results never render after navigation');
 });
+
+// ---- Phase 3: plan -> execute -> track (AC14/AC17) ----
+async function seedBigBox(ui) {
+  const node = await registerResource(ui, 'big-box');
+  const s = fixtureSnapshot();
+  await ui.t.DB.prepare('INSERT INTO node_capabilities (node_id, schema_version, reported_at, os, arch, runtimes_json, mem_json, disk_json, workload_json) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(node.id, new Date().toISOString(), s.os, s.arch, JSON.stringify(s.runtimes), JSON.stringify(s.mem), JSON.stringify(s.disk), JSON.stringify(s.workload)).run();
+  return node;
+}
+
+async function evaluateCompatible(ui, node) {
+  await openDetail(ui, 'fixture-org/tiny-instruct-gguf');
+  ui.el('compat-node').value = node.id;
+  ui.el('compat-runtime').value = 'fixture-llama';
+  ui.el('compat-context').value = '2048';
+  ui.el('compat-concurrency').value = '1';
+  ui.el('compat-form').listeners.submit({ preventDefault() {} });
+  await ui.waitForDOM(() => ui.el('compat-out').innerHTML.includes('Plan deployment'), 'plan action never rendered');
+}
+
+const clickOut = (ui, dataset) => ui.el('compat-out').onclick({ target: { dataset } });
+const depIdOf = (ui) => (ui.el('deploy-track').innerHTML.match(/data-dep-refresh="(dep_[^"]+)"/) || [])[1];
+
+test('deploy flow: plan pins revisions, execute admits, refresh advances honestly', async () => {
+  const ui = await makeUi();
+  const node = await seedBigBox(ui);
+  await evaluateCompatible(ui, node);
+  clickOut(ui, { plan: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-out').innerHTML.includes('Deployment plan'), 'plan never rendered');
+  const planHtml = ui.el('deploy-out').innerHTML;
+  assert.ok(planHtml.includes('ffffffffffff'), 'plan shows the pinned revision');
+  assert.ok(planHtml.includes('plan expires'), 'plan expiry is explicit');
+  assert.ok(planHtml.includes('Fixture walkthrough (DEMO)'), 'demo path is labeled');
+  clickOut(ui, { exec: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>admitted<'), 'admitted tracker never rendered');
+  const id = depIdOf(ui);
+  assert.ok(id, 'tracker carries the job id');
+  await ui.waitForDOM(() => ui.el('my-deployments').innerHTML.includes(id), 'job never listed');
+  assert.ok(!SECRET_SHAPED.test(ui.el('deploy-track').innerHTML), 'no secret-shaped content in the tracker');
+  // Real execute carries no script: the quiet fixture worker fails honestly.
+  clickOut(ui, { depRefresh: id });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('RECONCILE_LOST'), 'honest failure never rendered');
+  assert.ok(ui.el('deploy-track').innerHTML.includes('released'), 'reservation release is shown');
+});
+
+test('fixture walkthrough reaches ready labeled DEMO; cancel releases a live job', async () => {
+  const ui = await makeUi();
+  const node = await seedBigBox(ui);
+  await evaluateCompatible(ui, node);
+  clickOut(ui, { plan: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-out').innerHTML.includes('Deployment plan'), 'plan never rendered');
+  clickOut(ui, { execDemo: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>admitted<'), 'walkthrough never admitted');
+  const id = depIdOf(ui);
+  for (const state of ['staging', 'verifying', 'loading', 'ready']) {
+    clickOut(ui, { depRefresh: id });
+    await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes(`>${state}<`), `walkthrough never reached ${state}`);
+  }
+  const track = ui.el('deploy-track').innerHTML;
+  assert.ok(track.includes('scripted fixture-worker receipts'), 'walkthrough is labeled DEMO, not live execution');
+  assert.ok(track.includes('reservation held'), 'ready keeps its reservation');
+  assert.ok(!track.includes('data-dep-cancel'), 'terminal jobs offer no cancel');
+  // A second, real-path job from the same plan card admits and cancels.
+  clickOut(ui, { exec: '1' });
+  await ui.waitForDOM(() => {
+    const m = ui.el('deploy-track').innerHTML.match(/Deployment (dep_[^<"]+)/);
+    return m && m[1] !== id && ui.el('deploy-track').innerHTML.includes('>admitted<');
+  }, 'second job never admitted');
+  const id2 = depIdOf(ui);
+  assert.ok(id2 && id2 !== id, 'second job has its own id');
+  clickOut(ui, { depCancel: id2 });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>cancelled<'), 'cancel never rendered');
+  assert.ok(ui.el('deploy-track').innerHTML.includes('released'), 'cancel releases the reservation');
+});
+
+test('blocked decisions offer no plan action', async () => {
+  const ui = await makeUi();
+  const node = await registerResource(ui, 'small-box');
+  const s = fixtureSnapshot();
+  s.mem = { ramTotalBytes: 17179869184, ramAvailBytes: 12884901888, gpu: [{ index: 0, name: 'Fixture Small', vramTotalBytes: 8589934592, vramAvailBytes: 6442450944 }] };
+  await ui.t.DB.prepare('INSERT INTO node_capabilities (node_id, schema_version, reported_at, os, arch, runtimes_json, mem_json, disk_json, workload_json) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(node.id, new Date().toISOString(), s.os, s.arch, JSON.stringify(s.runtimes), JSON.stringify(s.mem), JSON.stringify(s.disk), JSON.stringify(s.workload)).run();
+  await openDetail(ui, 'fixture-org/tiny-instruct-gguf');
+  ui.el('compat-node').value = node.id;
+  ui.el('compat-runtime').value = 'fixture-llama';
+  ui.el('compat-context').value = '8192';
+  ui.el('compat-concurrency').value = '2';
+  ui.el('compat-form').listeners.submit({ preventDefault() {} });
+  await ui.waitForDOM(() => ui.el('compat-out').innerHTML.includes('Decision:'), 'compat never rendered');
+  const out = ui.el('compat-out').innerHTML;
+  assert.ok(textOf(out).includes('blocked'), 'over-budget evaluation blocks');
+  assert.ok(out.includes('Deploy (unavailable)'), 'blocked keeps deploy honestly disabled');
+  assert.ok(!out.includes('data-plan'), 'no plan action without estimated-compatible');
+});
+
+test('deployments list renders job cards; demo sees the honest empty note', async () => {
+  const ui = await makeUi();
+  const node = await seedBigBox(ui);
+  await evaluateCompatible(ui, node);
+  clickOut(ui, { plan: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-out').innerHTML.includes('Deployment plan'), 'plan never rendered');
+  clickOut(ui, { exec: '1' });
+  await ui.waitForDOM(() => ui.el('deploy-track').innerHTML.includes('>admitted<'), 'job never admitted');
+  const id = depIdOf(ui);
+  await ui.waitForDOM(() => ui.el('my-deployments').innerHTML.includes(id), 'list never rendered the job');
+  assert.ok(ui.el('my-deployments').innerHTML.includes('>admitted<'), 'list card carries the state pill');
+  const demo = await makeUi({ asDemo: true });
+  await demo.clickTab('models');
+  await demo.waitForDOM(() => demo.el('my-deployments').innerHTML.includes('No deployments yet'), 'demo empty note never rendered');
+});

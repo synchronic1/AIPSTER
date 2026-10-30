@@ -124,6 +124,9 @@
         <div id="upload-progress" class="muted" role="status"></div>
         <button type="submit">Upload and validate</button>
       </form>
+      <h2>Deployments</h2>
+      <p class="muted">Qualified deployments only: a plan pins exact revisions, execution re-checks compatibility and reserves node memory before dispatch. Live worker dispatch is not implemented; the fixture worker drives scripted receipts in fixture environments.</p>
+      <div id="my-deployments" class="grid"></div>
     </section>
     <section id="tab-federation" role="tabpanel" hidden>
       <h1>Federation</h1>

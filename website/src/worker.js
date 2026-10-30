@@ -17,6 +17,7 @@ import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, valid
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
 import { validateManifest, validateRelPath as catalogRelPath, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK } from './lib/catalog/validate.mjs';
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
+import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -302,6 +303,112 @@ function validateCapabilityBody(body) {
     }
   }
   return null;
+}
+
+// One resolver for hub/fixture/private refs (compat + plans share it).
+// Private refs re-check ownership (404 like any missing id);
+// non-validated private bytes cannot evaluate (AC12).
+async function resolveCatalogRef(db, env, userId, ref, role) {
+  const fixture = isFixtureEnv(env);
+  let asset = null;
+  if (ref.startsWith('priv:')) {
+    const row = await first(db, "SELECT * FROM catalog_assets WHERE id = ? AND owner_id = ? AND access = 'private'", ref.slice(5), userId);
+    if (row) asset = await privateAssetShape(db, row);
+  } else {
+    const clean = ref.startsWith('hub:') ? ref.slice(4) : ref;
+    asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, {});
+  }
+  if (!asset || asset.gated === true) return { http: json(404, { error: `${role} not found or not visible to you.`, code: 'ASSET_NOT_FOUND' }) };
+  if (asset.source === 'private' && asset.validation !== 'validated') {
+    return { http: json(422, { error: `${role} is ${asset.validation}, not validated; rejected assets cannot evaluate.`, code: 'ASSET_NOT_VALIDATED' }) };
+  }
+  return { asset };
+}
+
+const b64u = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+const b64uDec = (s) => Uint8Array.from(atob(s.replaceAll('-', '+').replaceAll('_', '/')), (c) => c.charCodeAt(0));
+
+// Deployment plan tokens: HMAC-signed, principal-bound, 15-minute.
+// Domain-separated from session secrets. Plans are immutable: execute
+// re-resolves every pin and refuses drift (T7).
+async function signPlanToken(env, payload) {
+  const body = b64u(new TextEncoder().encode(JSON.stringify(payload)));
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('catalog-plan-v1:' + env.BETTER_AUTH_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return body + '.' + b64u(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body)));
+}
+
+async function verifyPlanToken(env, token, userId) {
+  const bad = (error, code) => ({ http: json(400, { error, code }) });
+  if (typeof token !== 'string' || token.length > 8192) return bad('Plan token unreadable.', 'BAD_PLAN');
+  const parts = token.split('.');
+  if (parts.length !== 2) return bad('Plan token unreadable.', 'BAD_PLAN');
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64uDec(parts[0])));
+  } catch {
+    return bad('Plan token unreadable.', 'BAD_PLAN');
+  }
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('catalog-plan-v1:' + env.BETTER_AUTH_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const expect = b64u(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(parts[0])));
+  if (!timingSafeEqualStr(expect, parts[1])) return bad('Plan token signature invalid.', 'BAD_PLAN');
+  if (!payload || payload.v !== 1 || payload.principal !== userId) return bad('Plan token is not yours.', 'BAD_PLAN');
+  if (!Number.isSafeInteger(payload.exp) || payload.exp <= Date.now()) return bad('Plan token expired; re-plan from a fresh evaluation.', 'PLAN_EXPIRED');
+  return { plan: payload };
+}
+
+// Deployment transitions: forward-only along the lifecycle, or to
+// failed/cancelled from anywhere non-terminal. Every transition writes an
+// event row in the same step; terminal failures and cancels release the
+// reservation (AC15/AC17). Ready KEEPS its reservation: loaded weights
+// occupy memory until an unload API exists (documented follow-on).
+const DEPLOY_ORDER = ['queued', 'admitted', 'staging', 'verifying', 'loading', 'ready'];
+const DEPLOY_TERMINAL = ['ready', 'failed', 'cancelled'];
+
+async function transitionDeployment(db, job, to, detail = '', code = null) {
+  const from = job.state;
+  if (DEPLOY_TERMINAL.includes(from)) return { ok: false, error: `Deployment is already ${from}.` };
+  const forward = to === 'failed' || to === 'cancelled' || (DEPLOY_ORDER.includes(from) && DEPLOY_ORDER.includes(to) && DEPLOY_ORDER.indexOf(to) > DEPLOY_ORDER.indexOf(from));
+  if (!forward) return { ok: false, error: `Illegal transition ${from} -> ${to}.` };
+  const now = nowIso();
+  await db.batch([
+    db.prepare('UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ?')
+      .bind(to, to === 'failed' ? JSON.stringify({ code, detail: detail.slice(0, 500) }) : '{}', now, job.id),
+    db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(rid('ev_'), job.id, now, from, to, detail.slice(0, 500)),
+  ]);
+  if (to === 'failed' || to === 'cancelled') {
+    await run(db, "UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'", now, job.id);
+  }
+  return { ok: true };
+}
+
+// Deployment API shapes. The full shape carries the immutable plan
+// summary plus the live reservation state; the list shape stays lean.
+function catalogDeploymentLite(r) {
+  const plan = JSON.parse(r.plan_json);
+  return {
+    id: r.id, state: r.state, nodeId: r.node_id, runtime: r.runtime,
+    assetId: plan.asset.id, revision: plan.asset.revision,
+    estimateTotalBytes: plan.estimateTotalBytes,
+    error: r.state === 'failed' ? JSON.parse(r.error_json || '{}') : null,
+    scripted: !!plan.fixtureScript,
+    createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
+async function catalogDeploymentShape(db, r) {
+  const plan = JSON.parse(r.plan_json);
+  const res = await first(db, 'SELECT state, bytes FROM catalog_reservations WHERE deployment_id = ?', r.id);
+  return {
+    ...catalogDeploymentLite(r),
+    plan: {
+      asset: plan.asset, adapter: plan.adapter, base: plan.base,
+      nodeId: plan.nodeId, runtime: plan.runtime,
+      context: plan.context, concurrency: plan.concurrency,
+      planFingerprint: plan.planFingerprint, opId: plan.opId,
+    },
+    reservation: res ? { state: res.state, bytes: res.bytes } : null,
+  };
 }
 
 async function revokedHeartbeatKey(request, db) {
@@ -1056,34 +1163,17 @@ async function handleApi(request, env, url) {
     if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
     try {
       const fixture = isFixtureEnv(env);
-      // One resolver for hub/fixture/private refs. Private refs re-check
-      // ownership (404 like any missing id); non-validated private bytes
-      // cannot evaluate (AC12).
-      const resolveRef = async (ref, role) => {
-        let asset = null;
-        if (ref.startsWith('priv:')) {
-          const row = await first(db, "SELECT * FROM catalog_assets WHERE id = ? AND owner_id = ? AND access = 'private'", ref.slice(5), me());
-          if (row) asset = await privateAssetShape(db, row);
-        } else {
-          const clean = ref.startsWith('hub:') ? ref.slice(4) : ref;
-          asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, {});
-        }
-        if (!asset || asset.gated === true) return { http: json(404, { error: `${role} not found or not visible to you.`, code: 'ASSET_NOT_FOUND' }) };
-        if (asset.source === 'private' && asset.validation !== 'validated') {
-          return { http: json(422, { error: `${role} is ${asset.validation}, not validated; rejected assets cannot evaluate.`, code: 'ASSET_NOT_VALIDATED' }) };
-        }
-        return { asset };
-      };
-      const resolved = await resolveRef(repo || assetId, 'Model');
+      const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role);
+      const resolved = await ref(repo || assetId, 'Model');
       if (resolved.http) return resolved.http;
       const asset = resolved.asset;
       let adapterAsset = null;
       let baseAsset = asset;
       const adapterRef = adapterRepo || adapterAssetId;
       if (adapterRef) {
-        const a = await resolveRef(adapterRef, 'Adapter');
+        const a = await ref(adapterRef, 'Adapter');
         if (a.http) return a.http;
-        const b = await resolveRef(baseRepo || baseAssetId, 'Adapter base');
+        const b = await ref(baseRepo || baseAssetId, 'Adapter base');
         if (b.http) return b.http;
         adapterAsset = a.asset;
         baseAsset = b.asset;
@@ -1125,8 +1215,8 @@ async function handleApi(request, env, url) {
       activeDeployments: jobs ? jobs.n : 0,
       lastRefresh: (refresh && refresh.at) || null,
       uploadsAvailable: storeAvailable(env),
-      deploymentAvailable: false,
-      note: storeAvailable(env) ? 'Uploads persist to the bound store.' : 'Upload bytes wait on object storage (docs/model-catalog/01-plan.md); deployment arrives in Phase 3.',
+      deploymentAvailable: transportAvailable(env),
+      note: storeAvailable(env) ? 'Uploads persist to the bound store.' : 'Upload bytes wait on object storage (docs/model-catalog/01-plan.md); deployment runs against the fixture worker only.',
     });
   }
 
@@ -1380,6 +1470,287 @@ async function handleApi(request, env, url) {
       await run(db, 'UPDATE catalog_assets SET validation = ?, manifest_json = ? WHERE id = ?', verdict.ok ? 'validated' : 'rejected', JSON.stringify(manifest), asset.id);
       await audit(db, me(), 'catalog.asset.revalidate', asset.id, verdict.ok ? 'validated' : 'rejected');
       return json(200, { ok: verdict.ok, assetId: asset.id, validation: verdict.ok ? 'validated' : 'rejected', checks: verdict.checks });
+    }
+  }
+
+  // ---- model catalog, Phase 3: qualified deployment + durable jobs ----
+  // Plans are immutable, principal-bound, 15-minute HMAC tokens over a
+  // FRESH estimated-compatible evaluation. Execute re-resolves every pin
+  // (refusing drift), re-checks access/revocation/quotas, reserves node
+  // bytes, then dispatches. No real worker lifecycle transport exists, so
+  // live dispatch fails closed with WORKER_API_UNAVAILABLE; the durable
+  // job machinery runs against the scripted fake transport in fixture
+  // environments only. Cancel, revocation, timeout, and partial failure
+  // all release reservations and record cleanup (AC15-AC21).
+  if (path === '/api/catalog/plans' && method === 'POST') {
+    const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
+    let body;
+    try {
+      body = await readJson(request);
+    } catch (error) {
+      if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+      throw error;
+    }
+    const refOf = (v) => (typeof v === 'string' ? v.slice(0, 200) : '');
+    const refOk = (r) => validateRepoId(r) || /^priv:[A-Za-z0-9_-]{1,64}$/.test(r) || (r.startsWith('hub:') && validateRepoId(r.slice(4)));
+    const assetRef = refOf(body.assetRef || body.repo || body.assetId);
+    const adapterRef = refOf(body.adapterRef || body.adapterRepo || body.adapterAssetId);
+    const baseRef = refOf(body.baseRef || body.baseRepo || body.baseAssetId);
+    const nodeId = typeof body.nodeId === 'string' ? body.nodeId.slice(0, 64) : '';
+    const runtime = typeof body.runtime === 'string' ? body.runtime.slice(0, 64) : '';
+    const context = body.context;
+    const concurrency = body.concurrency;
+    if (!assetRef || !refOk(assetRef)) return json(400, { error: 'assetRef must be org/name, hub:org/name, or priv:<id>.', code: 'BAD_REPO' });
+    if (adapterRef && !refOk(adapterRef)) return json(400, { error: 'adapterRef is malformed.', code: 'BAD_REPO' });
+    if (baseRef && !refOk(baseRef)) return json(400, { error: 'baseRef is malformed.', code: 'BAD_REPO' });
+    if (adapterRef && !baseRef) return json(400, { error: 'Adapter plans need an explicit base.', code: 'ADAPTER_BASE_REQUIRED' });
+    if (!isId(nodeId) || !runtime) return json(400, { error: 'nodeId and runtime are required.', code: 'BAD_PLAN_INPUT' });
+    if (!Number.isSafeInteger(context) || context <= 0 || context > 1048576) return json(400, { error: 'context must be 1..1048576.', code: 'BAD_SETTINGS' });
+    if (!Number.isSafeInteger(concurrency) || concurrency <= 0 || concurrency > 1024) return json(400, { error: 'concurrency must be 1..1024.', code: 'BAD_SETTINGS' });
+    const fixtureScript = body.fixtureScript === undefined ? null : body.fixtureScript;
+    if (fixtureScript !== null) {
+      if (!isFixtureEnv(env)) return json(400, { error: 'Scripted worker receipts exist in fixture environments only.', code: 'BAD_PLAN_INPUT' });
+      if (!Array.isArray(fixtureScript) || fixtureScript.length > 32) return json(400, { error: 'fixtureScript holds at most 32 receipt steps.', code: 'BAD_PLAN_INPUT' });
+      for (const s of fixtureScript) {
+        if (!s || typeof s !== 'object' || typeof s.status !== 'string') return json(400, { error: 'Each receipt step needs a status.', code: 'BAD_PLAN_INPUT' });
+      }
+    }
+    const node = await catalogNodeAccess(db, me(), nodeId);
+    if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+    const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role);
+    const resolved = await ref(assetRef, 'Model');
+    if (resolved.http) return resolved.http;
+    const asset = resolved.asset;
+    let adapterAsset = null;
+    let baseAsset = asset;
+    if (adapterRef) {
+      const a = await ref(adapterRef, 'Adapter');
+      if (a.http) return a.http;
+      const b = await ref(baseRef, 'Adapter base');
+      if (b.http) return b.http;
+      adapterAsset = a.asset;
+      baseAsset = b.asset;
+    }
+    if (asset.gated || (adapterAsset && adapterAsset.gated)) {
+      return json(403, { error: 'Gated asset: complete the access grant yourself first. Nothing is auto-accepted, and metered access is never assumed.', code: 'GATED_ACCESS_REQUIRED', retryable: false });
+    }
+    const snap = await catalogSnapshot(db, nodeId);
+    const decision = evaluateCompatibility({
+      asset, adapterAsset, baseAsset, settings: { context, concurrency, runtime },
+      snapshot: snap.snapshot, snapshotAgeMs: snap.ageMs, snapshotAt: snap.reportedAt,
+      nodeId, principal: me(), nowMs: Date.now(),
+    });
+    if (decision.state !== 'estimated-compatible') {
+      return json(422, { error: `Compatibility is ${decision.state}; only estimated-compatible configurations plan.`, code: 'COMPAT_NOT_MET', decision });
+    }
+    const nowMs = Date.now();
+    const payload = {
+      v: 1, principal: me(),
+      asset: { ref: assetRef, id: asset.id, revision: asset.revision, totalBytes: asset.totalBytes },
+      adapter: adapterAsset ? { ref: adapterRef, id: adapterAsset.id, revision: adapterAsset.revision, totalBytes: adapterAsset.totalBytes } : null,
+      base: adapterAsset ? { ref: baseRef, id: baseAsset.id, revision: baseAsset.revision } : null,
+      nodeId, runtime, context, concurrency,
+      estimateTotalBytes: decision.estimate.totalBytes,
+      snapshotAt: snap.reportedAt,
+      compatFingerprint: decision.fingerprint,
+      fixtureScript,
+      iat: nowMs, exp: nowMs + 15 * 60 * 1000,
+    };
+    const fp = JSON.stringify([payload.asset, payload.adapter, payload.base, nodeId, runtime, context, concurrency]);
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(fp));
+    payload.planFingerprint = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
+    const planToken = await signPlanToken(env, payload);
+    await audit(db, me(), 'catalog.plan.create', nodeId, `${asset.id}@${asset.revision.slice(0, 12)} -> ${nodeId} ${runtime}`);
+    return json(201, {
+      planToken,
+      expiresAt: new Date(payload.exp).toISOString(),
+      plan: {
+        asset: payload.asset, adapter: payload.adapter, base: payload.base,
+        nodeId, runtime, context, concurrency,
+        estimateTotalBytes: payload.estimateTotalBytes,
+        planFingerprint: payload.planFingerprint,
+      },
+    });
+  }
+  if (path === '/api/catalog/deployments' && method === 'POST') {
+    const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
+    let body;
+    try {
+      body = await readJson(request);
+    } catch (error) {
+      if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+      throw error;
+    }
+    const idempotencyKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey : '';
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(idempotencyKey)) {
+      return json(400, { error: 'idempotencyKey must be 8..128 id chars; mint one per execution.', code: 'BAD_IDEMPOTENCY_KEY' });
+    }
+    const verified = await verifyPlanToken(env, body.planToken, me());
+    if (verified.http) return verified.http;
+    const plan = verified.plan;
+    // Idempotency binds key + principal + exact plan fingerprint (T8):
+    // same key + same plan replays the job; same key + different plan is
+    // a client bug, never a second execution.
+    const prior = await first(db, 'SELECT * FROM catalog_deployments WHERE owner_id = ? AND idem_key = ?', me(), idempotencyKey);
+    if (prior) {
+      if (prior.plan_fingerprint !== plan.planFingerprint) {
+        return json(409, { error: 'Idempotency key was already used for a different plan; mint a fresh key per execution.', code: 'IDEMPOTENCY_MISMATCH' });
+      }
+      const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', prior.id);
+      return json(200, { ...(await catalogDeploymentShape(db, prior)), events, duplicate: true });
+    }
+    const transport = workerTransport(env);
+    if (!transport) {
+      return json(503, {
+        error: 'No worker lifecycle transport exists: download/verify/load/unload/cancel/report are unimplemented (local-worker/EXECUTION-GAPS.md). Nothing was queued.',
+        code: 'WORKER_API_UNAVAILABLE', retryable: false,
+        action: 'Qualify a worker lifecycle transport first; the plan stays valid for re-execution.',
+      });
+    }
+    if (plan.fixtureScript && !isFixtureEnv(env)) return json(400, { error: 'Scripted receipts cannot execute outside fixture environments.', code: 'BAD_PLAN' });
+    // Execute-time re-verification: the cache never authorizes. Access,
+    // pins, snapshot freshness, and the full evaluation re-run now.
+    const node = await catalogNodeAccess(db, me(), plan.nodeId);
+    if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+    const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role);
+    const resolved = await ref(plan.asset.ref, 'Model');
+    if (resolved.http) return resolved.http;
+    let adapterAsset = null;
+    let baseAsset = resolved.asset;
+    if (plan.adapter) {
+      const a = await ref(plan.adapter.ref, 'Adapter');
+      if (a.http) return a.http;
+      const b = await ref(plan.base.ref, 'Adapter base');
+      if (b.http) return b.http;
+      adapterAsset = a.asset;
+      baseAsset = b.asset;
+      if (a.asset.revision !== plan.adapter.revision || b.asset.revision !== plan.base.revision) {
+        return json(422, { error: 'Pinned revisions drifted between plan and execute; re-plan.', code: 'PIN_DRIFT' });
+      }
+    }
+    if (resolved.asset.revision !== plan.asset.revision) {
+      return json(422, { error: 'Pinned revision drifted between plan and execute; re-plan.', code: 'PIN_DRIFT' });
+    }
+    const snap = await catalogSnapshot(db, plan.nodeId);
+    const decision = evaluateCompatibility({
+      asset: resolved.asset, adapterAsset, baseAsset,
+      settings: { context: plan.context, concurrency: plan.concurrency, runtime: plan.runtime },
+      snapshot: snap.snapshot, snapshotAgeMs: snap.ageMs, snapshotAt: snap.reportedAt,
+      nodeId: plan.nodeId, principal: me(), nowMs: Date.now(),
+    });
+    if (decision.state !== 'estimated-compatible') {
+      return json(422, { error: `Compatibility is now ${decision.state}; re-plan from a fresh evaluation.`, code: 'COMPAT_NOT_MET', decision });
+    }
+    // Admission quotas (AC18): owner-active cap, node-active cap, and
+    // byte reservation against fresh availability minus held reservations.
+    const ownerActive = await first(db, "SELECT COUNT(*) n FROM catalog_deployments WHERE owner_id = ? AND state NOT IN ('ready', 'failed', 'cancelled')", me());
+    if (ownerActive && ownerActive.n >= 5) return json(409, { error: 'Too many active deployments (5). Cancel or wait for one.', code: 'DEPLOYMENT_QUOTA' });
+    const nodeActive = await first(db, "SELECT COUNT(*) n FROM catalog_deployments WHERE owner_id = ? AND node_id = ? AND state NOT IN ('ready', 'failed', 'cancelled')", me(), plan.nodeId);
+    if (nodeActive && nodeActive.n >= 2) return json(409, { error: 'Too many active deployments on this node (2).', code: 'DEPLOYMENT_QUOTA' });
+    const held = await first(db, "SELECT COALESCE(SUM(bytes), 0) n FROM catalog_reservations WHERE node_id = ? AND state = 'held'", plan.nodeId);
+    const gpu = snap.snapshot && Array.isArray(snap.snapshot.mem.gpu) ? snap.snapshot.mem.gpu[0] : null;
+    const avail = Math.max(0, (gpu ? snap.snapshot.mem.gpu[0].vramAvailBytes : snap.snapshot.mem.ramAvailBytes)
+      - (snap.snapshot.workload.reservations || []).reduce((n, r) => n + (Number.isSafeInteger(r.bytes) ? r.bytes : 0), 0)
+      - (held ? held.n : 0));
+    if (plan.estimateTotalBytes > avail) {
+      return json(409, { error: 'Node memory is over-reserved by concurrent work; retry when capacity frees.', code: 'RESERVATION_EXHAUSTED', availableBytes: avail, neededBytes: plan.estimateTotalBytes });
+    }
+    const now = nowIso();
+    const id = rid('dep_');
+    const opId = rid('wop_');
+    const job = { id, owner_id: me(), state: 'queued', plan_fingerprint: plan.planFingerprint, node_id: plan.nodeId };
+    await db.batch([
+      db.prepare(`INSERT INTO catalog_deployments (id, owner_id, plan_json, plan_fingerprint, idem_key, state, node_id, runtime, error_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, '{}', ?, ?)`)
+        .bind(id, me(), JSON.stringify({ ...plan, opId }), plan.planFingerprint, idempotencyKey, plan.nodeId, plan.runtime, now, now),
+      db.prepare('INSERT INTO catalog_reservations (id, deployment_id, owner_id, node_id, bytes, state, created_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .bind(rid('res_'), id, me(), plan.nodeId, plan.estimateTotalBytes, 'held', now, null),
+      db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(rid('ev_'), id, now, '', 'queued', 'admitted; reservation held'),
+    ]);
+    const accepted = await transport.dispatch({ opId, jobId: id, nodeId: plan.nodeId, script: plan.fixtureScript || [] });
+    if (!accepted || accepted.accepted !== true) {
+      await transitionDeployment(db, { ...job, state: 'queued' }, 'failed', 'worker transport refused dispatch', 'DISPATCH_FAILED');
+      return json(502, { error: 'Worker transport refused dispatch; reservation released.', code: 'DISPATCH_FAILED' });
+    }
+    await transitionDeployment(db, { ...job, state: 'queued' }, 'admitted', `dispatched as worker op ${opId}`);
+    await audit(db, me(), 'catalog.deploy.execute', id, `${plan.asset.id} -> ${plan.nodeId}`);
+    const row = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', id);
+    const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', id);
+    return json(202, { ...(await catalogDeploymentShape(db, row)), events, duplicate: false });
+  }
+  if (path === '/api/catalog/deployments' && method === 'GET') {
+    const d = needAuthz('read'); if (d) return deny(d);
+    const q = pagination(url);
+    const page = await pageQuery(db, {
+      select: 'SELECT *', from: 'FROM catalog_deployments WHERE owner_id = ?', params: [me()], order: 'ORDER BY created_at DESC', ...q,
+    });
+    return json(200, { ...page, items: page.items.map((r) => catalogDeploymentLite(r)) });
+  }
+  {
+    const m = /^\/api\/catalog\/deployments\/([A-Za-z0-9_-]{1,64})(\/cancel)?$/.exec(path);
+    if (m && (method === 'GET' || method === 'POST')) {
+      const isCancel = !!m[2];
+      const d = isCancel ? (needSession() || needCsrf() || needNotDemo()) : needAuthz('read');
+      if (d) return deny(d);
+      const row = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ? AND owner_id = ?', m[1], me());
+      if (!row) return json(404, { error: 'Deployment not found.', code: 'NOT_FOUND' });
+      if (isCancel && method !== 'POST') return json(405, { error: 'Cancel uses POST.', code: 'BAD_METHOD' });
+      if (!isCancel && method !== 'GET') return json(405, { error: 'Use GET for status, POST …/cancel to cancel.', code: 'BAD_METHOD' });
+      const transport = workerTransport(env);
+      const plan = JSON.parse(row.plan_json);
+      if (isCancel) {
+        if (TERMINAL_STATES.includes(row.state)) {
+          const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+          return json(200, { ...(await catalogDeploymentShape(db, row)), events, duplicate: true });
+        }
+        if (transport) await transport.cancel(plan.opId);
+        await transitionDeployment(db, row, 'cancelled', 'cancel requested by owner; worker cancel best-effort, reservation released');
+        await audit(db, me(), 'catalog.deploy.cancel', row.id, row.state);
+        const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
+        const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+        return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, duplicate: false });
+      }
+      // Status read with fixture reconciliation: each read processes one
+      // pending worker receipt (fixture transport only). Revocation is
+      // re-checked on every advance: lost access fails the flight (AC20).
+      if (!TERMINAL_STATES.includes(row.state) && transport) {
+        const access = await catalogNodeAccess(db, me(), row.node_id);
+        if (!access) {
+          await transitionDeployment(db, row, 'failed', 'access to the node was revoked mid-flight; worker told to stop; reservation released', 'REVOKED');
+          const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
+          const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+          return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, reconciled: true });
+        }
+        let receipt = await transport.poll(plan.opId);
+        if (receipt.status === 'unknown') {
+          // Reconcile by op id: re-dispatch resumes without duplicating
+          // work; a second unknown means the worker truly lost it.
+          await transport.dispatch({ opId: plan.opId, jobId: row.id, nodeId: row.node_id, script: plan.fixtureScript || [] });
+          receipt = await transport.poll(plan.opId);
+        }
+        if (receipt.status === 'unknown') {
+          await transitionDeployment(db, row, 'failed', `reconciliation lost: ${receipt.detail || 'worker quiet'}; partial state cleaned up; reservation released`, 'RECONCILE_LOST');
+        } else if (receipt.status === 'failed' || receipt.status === 'cancelled') {
+          await transitionDeployment(db, row, receipt.status, `${receipt.code || receipt.status}: ${receipt.detail || 'worker-reported terminal state'}; partial artifacts removed; reservation released`, typeof receipt.code === 'string' ? receipt.code.slice(0, 64) : null);
+        } else if (['admitted', 'staging', 'verifying', 'loading', 'ready'].includes(receipt.status)) {
+          // Duplicate/stale receipts (resume replays the script from the
+          // top) are no-ops when the job is already there or past it.
+          const seen = WORKER_STATES.indexOf(row.state);
+          const got = WORKER_STATES.indexOf(receipt.status);
+          if (got > seen) {
+            const t = await transitionDeployment(db, row, receipt.status, receipt.detail || `worker reports ${receipt.status}`);
+            if (!t.ok) await transitionDeployment(db, row, 'failed', `illegal worker transition: ${t.error}`, 'ILLEGAL_TRANSITION');
+          }
+        } else {
+          await transitionDeployment(db, row, 'failed', `unrecognized worker receipt: ${String(receipt.status).slice(0, 64)}`, 'BAD_RECEIPT');
+        }
+        const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
+        const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+        return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, reconciled: fresh.state !== row.state });
+      }
+      const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
+      return json(200, { ...(await catalogDeploymentShape(db, row)), events, reconciled: false });
     }
   }
 
