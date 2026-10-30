@@ -51,6 +51,53 @@ Network access to public Python distribution/PyPI hosts is required on first use
 The locks pin dependency artifacts, not a bit-for-bit native build or a promise
 that upstream distribution hosts will remain available.
 
+## Pairing with AIPSTER
+
+Installing never shares anything. To link this computer to your AIPSTER
+account, sign in to the dashboard, open My Compute, and use Pair this
+computer to mint a one-time code (10-minute expiry, single use). In a second
+terminal in this same `local-worker` directory, run:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py pair
+```
+
+Type the code when prompted (it is not echoed). Do not paste it or the stored
+sender key into an agent conversation. Pairing registers this computer and
+stores a sender key privately. It exits without starting the sender. Explicitly
+start it in that terminal, next to the daemon's `serve` terminal:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py heartbeat-loop --config configs/mock.toml
+```
+
+Mock always reports `usable=false`. Heartbeats prove reachability only, never
+inference readiness; `/api/jobs` remains disabled. Choose Done or reopen My
+Compute after pairing to refresh the resource list. If the key is revoked or
+expires, the sender exits asking for a fresh pairing code. `pairing.py status`
+shows secret-free local status and marks old success as stale.
+Status belongs to the selected pairing generation: a previous sender's status,
+including an in-flight response finishing after re-pairing, is not attributed
+to the new key or resource. Unbound older status records await a fresh heartbeat.
+
+To disconnect, stop both sender and daemon terminals with Ctrl+C, discard the
+worker-local daemon token, and revoke this resource's heartbeat key in the
+dashboard Keys panel. Then forget local pairing:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py unpair
+```
+
+Local unpair does not revoke the server key. Deleting `.venv` or `.state` alone
+does not remove private pairing credentials from the worker data directory.
+If any pairing file cannot be removed, unpair exits nonzero and reports
+incomplete cleanup. Stop the sender or other process holding the file, revoke
+the server key, and retry; an already missing file is harmless.
+Preserve unrelated models and engines. This source setup adds no startup task,
+service or automatic update. Packaged launcher integration is still pending.
+See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
+POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
+
 In a second terminal, set `$env:DENDRITE_API_TOKEN` to the same value, then:
 
 ```powershell
