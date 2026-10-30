@@ -1,141 +1,171 @@
-<!-- Built with Meta Muse. -->
-# Windows worker build report — installer + tray milestone
+<!-- Built with Meta Muse; isolated Codex review and repair evidence below. -->
+# Windows worker build report
 
-## Qualified artifact
+## Takeover rebuilt artifact (local, unsigned, unpublished)
+
+Uninstall repair: running-process gate, payload-first removal order, exact
+removal verification, registration preserved on incomplete removal.
 
 | Field | Value |
 |---|---|
 | Artifact | `AIPSTER-Worker-0.1.0-win64-setup.exe` |
-| Size | 13,074,277 bytes |
-| SHA-256 | `7f463aae8ac1e620f8794335810a0959e039e5f7d2a1f0b955f0b4613eae0e5d` |
-| Built from | `cd715b3daf4acad24e527f6946ea380fa991a1bc` (clean tree) |
-| Payload | 96 files: 3 exes, 3 tray ICOs, licenses, default config, build manifest |
-| Worker | ganglion-dendrite 0.1.0, source pin `242c530` + patch `0001` (verified) |
-| Toolchain | CPython 3.12.14, uv 0.12.12, NSIS 3.13, PyInstaller 6.22.3 (all hash-pinned) |
+| Size | 13,092,887 bytes |
+| SHA-256 | `ed0ebc3d376990cf7223e31c09b855b0581d3bd0a31d8fc0e36cab79aa0a2915` |
+| Built from | `939e216bf326c091293920f1633d418961a4d475`, clean tree (final integrated candidate incl. main #32/#37) |
+| Payload | 98 files; complete hashes in generated `dist/manifest.json` |
+| Native uninstall fixtures | running-process abort (exit 2, zero deletions, registration preserved) and locked-payload abort (exit 2, registration preserved) pass; evidence `installer-uninstall-takeover-evidence.json` |
+| Coexist qualification | 52 PASS, 4 explicit installer-path SKIP, 0 FAIL next to a live install; full install/uninstall paths deferred to clean CI |
 
-Full per-file hashes: `packaging/windows/dist/manifest.json` + `SHA256SUMS`
-(gitignored; regenerable from the commit above with `build.py`).
+The manifest/checksums and artifact are local build outputs, not a release.
+The release owner must rebuild from the eventual merge commit, re-qualify,
+then publish and wire that exact verified artifact. Installer download
+remains disabled.
 
-Reproducibility evidence (two same-source builds compared): 96/96 payload
-paths identical, 91/96 byte-identical. The 5 that vary are the 3 frozen exes
-+ `base_library.zip` (PyInstaller/CPython embed timestamps) and `BUILD.json`
-(which records `built_at` + the artifact hash). Pins, toolchain, source SHA
-and all 91 data files are stable; `payload_size` matches while the NSIS
-`artifact_size` varies with compression. Verification is therefore
-rebuild-from-source-SHA + re-qualify, not byte-match.
+## Native ownership follow-up
 
-## What this milestone ships
+Diagnostic CI run40935794359/job123665871201 confirmed the elevated runner's
+new paths have owner and token-default-owner S-1-5-32-544, distinct from its
+user SID; the old strict helper rejected them before writing any token.
+The native helper normalizes only exclusively created paths, retains
+existing-foreign-owner denial, verifies the exact protected user-only DACL
+and avoids the measured 23-35s PowerShell startup cost. All17 source tests
+pass locally in0.343s, including windowed log bootstrap before data use.
+Lead independent review passed5 additional native cases and4 retained
+installer cases. Elevated CI run40938858027/job123676553779 passed all17
+tests in0.526s, clean frozen build, strict full-profile qualification with
+0 failures, screenshots and artifact upload. Both native token-ACL assertions
+pass without a restricted-context exception.
 
-- **Genuine per-user installer**: license page, selectable location, Start
-  Menu + desktop shortcuts to the stable installed tray exe, autostart
-  opt-in defaulting off (`/AUTOSTART=1` scripted), 3-exe running check,
-  Add/Remove entry, uninstall that clears shortcuts/startup/registry and
-  preserves data by default (removal checkbox default-off, `/REMOVEDATA=1`).
-- **Windowed tray app** (`aipster-tray.exe`, no console): supervises one
-  `dendrite serve` child (no-window spawn, kill-on-close job confinement,
-  rotating logs), five honest local-only states (never "connected" or
-  "inference ready" — the import-time honesty gate fails the build otherwise),
-  single-instance-per-data-dir with window-message IPC
-  (`status|start|stop|restart|quit`, also via `aipster-worker tray ...`),
-  second-launch reuse, crash backoff (3 per 5 min, then parked error), busy-port
-  fast path, `state.json` + heartbeat. Menu: dashboard, logs, disabled
-  "Pairing: not implemented" line, Start/Stop, Quit.
-- **Original tray icon**: peach "A" on a dark tile with a state dot; ICOs
-  verified legible at 16px; `packaging/icon/icon.py` is the editable source.
-- **Dashboard**: Windows entry is now `packaged` (version + SHA-256 + build
-  source shown, no link) instead of "coming soon"; macOS/Linux stay honestly
-  unavailable. No URL is wired: there is nothing to download until the release
-  owner publishes the verified file.
-- **CI**: `worker-installer-build.yml` builds + qualifies (full profile) on
-  `windows-2025`, then drives `screenshots.py` on the runner desktop and
-  uploads the wizard/console/uninstall PNGs as run-scoped review artifacts
-  (pinned `upload-artifact` v5). Publishes no release.
-- **Review fixes in this build**: restart reload re-reads the filed token
-  (only a parent-preset env token wins); the port probe is family-aware
-  (busy only when every resolution fails) with one bracketed-IPv6 URL
-  builder; token ACL hardening verifies by read-back with diagnostics and
-  qualify distinguishes a restricted OS context (recorded NOTE) from an
-  app failure.
+## Current native repaired artifact (local, unsigned, unpublished)
 
-## Tests observed (this machine)
+| Field | Value |
+|---|---|
+| Artifact | `AIPSTER-Worker-0.1.0-win64-setup.exe` |
+| Size | 13,087,550 bytes |
+| SHA-256 | `81f60828bcc89f038f7a0ded16db76bb06f0c64c42942fa9c52b24cb7f503688` |
+| Built from | `cee3390bda28ac70ee75f6e432fd633e4f76a9f0`, clean tree (`source_dirty=false`) |
+| Payload | 98 files; complete hashes in generated `dist/manifest.json` |
+| Worker | ganglion-dendrite 0.1.0; original vendor tree and patches verified unchanged |
+| Toolchain | CPython 3.12.14, uv 0.12.12, NSIS 3.13, PyInstaller 6.22.3 |
+| CPython notice | 25,066 bytes; SHA-256 `886a0ead2d89030ee62dbff52b04e47ab91998341295bb9c56fb952b4e081c7a` |
 
-- `qualify.py --app-dir <build output>` (coexistence): **52 PASS, 0 FAIL** —
-  PE subsystems (tray windowed, launcher/CLI console), ICO validity (7 PNG
-  sizes incl. 16/32/48), pure state/menu/honesty/rotation/instance-tag checks,
-  IPv6/port-probe matrix (`http_origin` bracketing, bound/free IPv4+IPv6,
-  multi-address all-fail, unresolvable-host), reload/preset token checks,
-  headless tray matrix T1–T12 (run, reuse, status/stop/start/restart/quit via
-  CLI, crash restart, bounded giveup + manual recovery, port-busy + retry,
-  token secrecy, strict fresh-run ACLs, confinement observability, token
-  rotation across restart: old 401/new 200 through the frozen exes),
-  no listeners left.
-  4 explicit skips: install/registry/shortcuts/uninstall (live install owns
-  the HKCU singletons — covered by the CI full profile) and the strict
-  parent-death orphan kill (no job nesting under this sandboxed launcher;
-  strict wherever confinement engages).
-- CI full profile (`windows-2025`, runs `40932568817`, `40935178276`,
-  `40936747728`):
-  **0 failures** — silent install, registry/shortcuts, autostart
-  default-off, console-launcher matrix, tray matrix T1–T12, uninstall
-  preserve + `/REMOVEDATA=1`. Both token-ACL checks record `[restricted
-  ACL context]` (runner `icacls` strips inheritance yet `SYSTEM` +
-  `BUILTIN\Administrators` persist as explicit ACEs — proven environmental
-  by the identical-command scratch probe; strict user-only passes on a real
-  machine).
-- Website: **262/262** `npm test`, plus `npm run check` and `npm run build`
-  green, lockfile untouched.
-- Live install preserved throughout: same worker PID before/after, healthy
-  on 8090, registry + Start Menu intact (verified, not assumed).
+The manifest/checksums and artifact are local build outputs, not a release.
+The release owner must rebuild from the eventual merge commit, re-qualify,
+then publish and wire that exact verified artifact. Dashboard hashes from
+earlier source commits are historical and must not identify this repair.
 
-## Screenshots
+## Review and repair
 
-CI `windows-installer-screenshots` artifact, run `40936747728` (isolated
-runner desktop, never the owner's screen; all PNGs eyeballed):
-`01-welcome`, `02-license` (Apache text renders), `03-components`
-("Start when I log in" unchecked by default; desktop shortcut checked),
-`04-directory` (temp path prefilled, editable, Browse offered),
-`05-installing` + `06-finish` (byte-identical: install finished in <3s, both
-show the Finish page; "Start AIPSTER Worker now" unchecked; honest
-"Nothing is shared or paired" copy), `07-start-menu` (populated folder
-showing `AIPSTER Worker` + `Uninstall` shortcuts; earlier runs caught
-Explorer's "Working on it..." spinner, so the driver now waits for the
-entries — the listing is also log-verified),
-`08-worker-console` (firstrun/config/`listen:`
-lines, uvicorn up; the token-ACL warning renders with user/rc/aces and no
-secret; token path only, never the value),
-`09-uninstall-confirm`, `10-uninstall-data-choice` ("Also remove my worker
-data" unchecked by default), `11-uninstall-data-notice` ("was preserved.
-Delete that folder manually if you want it gone"), `12-uninstall-finish`.
-Log asserts: `installed: True`, `install removed: True`,
-`data preserved: True`.
-- **Tray/menu screenshots: blocked, honestly deferred.** No isolated GUI
-  environment exists on this machine (no Windows Sandbox binary, no VM, no
-  elevation), and UI tests on the active desktop are prohibited. The Win32
-  backend is ctypes reviewed-by-reading (typed bindings, handle discipline);
-  every behavior behind the menu is headless-covered. The owner VM runs the
-  manual tray verification in `packaging/README.md` (icon in overflow,
-  menu, reuse balloon, Quit) and captures pixels there.
+Current Muse PR32 head `22d4d31c0cd18c1090b61c8c22503519e165cb7b`
+is preserved as an ancestor. Its file-token rotation, multi-address port
+resolver, IPv6 URL helper, expanded qualification and CI review-artifact
+workflow are retained. The repair adds fail-closed process-SID private
+token storage, atomic first-run publication, existing-token hardening,
+old-job cleanup during crash restart, exact nonrecursive payload removal,
+CPython notice preservation and strict native ACL qualification.
 
-## Known incident (this machine)
+Uninstall preserves unrelated files in a user-selected install location.
+Default worker data removal remains an explicit separate choice. Installed
+pairing and connected/inference-ready claims remain unimplemented. The tray
+supervises local worker state only; default runtime remains simulated.
 
-An earlier screenshot run popped the Setup wizard on the active desktop; the
-user clicked through it and launched that temp test build, which still runs
-(PID 2367672, sim-only loopback). No autostart was set and no token was ever
-displayed. The driver now requires `AIPSTER_SCREENSHOTS_OK=1`, verifies the
-wizard before every keystroke, and aborts if it is closed externally.
+## Observed verification
 
-## Remaining gaps (not claimed as done)
+- Clean pinned build, vendor/patch verification, hash-locked dependency
+  installation and dependency consistency checks: PASS.
+- 17 controlled packaging regressions: PASS, also gated by `build.py`.
+- 5 independent review fixtures: original ffbe 5 failures; current Muse801
+  3 failures and 2 passes; repaired candidate 5 passes.
+- Frozen CLI help, simulated inspect, and tray help/status under temporary
+  data with scrubbed environment: PASS. These smoke checks do not run a tray
+  controller, start an installed worker, or change the user profile.
+- Repaired headless coexistence qualification: 52 PASS, 0 FAIL, 4 explicit
+  SKIP; process exit 0. Includes real frozen CLI/tray reuse, control,
+  bounded crash recovery, private token ACLs, old-token401/new-token200 after
+  restart, honest state and no remaining fixture listener. Every controller
+  and mock request used temporary AIPSTER_WORKER_DATA; no installed profile
+  or HKCU, shortcut or autostart entry was changed.
+- Lead independent review of source at a2ec5e1: 12 source tests and 4 extra
+  held-outs passed, including actual Windows concurrent token publication,
+  failed existing-token hardening, escaped exact payload plans and mandatory
+  verbatim interpreter notice. No additional source blocker was found.
 
-1. Signature: builds are unsigned (owner action: code-signing cert + CI).
-2. Tray/menu pixels: owner-VM capture + eyeball review (behavior covered).
-3. ~~CI full-profile result on the PR~~ RESOLVED: 0 failures on
-   `windows-2025` (runs `40932568817`, `40935178276`, `40936747728`).
-4. macOS/Linux installers: staged, visibly pending (portable controller
-   core; no backends yet).
-5. Pairing/connected/inference-ready: unimplemented by design; no state,
-   string, or screenshot claims otherwise.
-6. Release upload + dashboard `available` flip: release-owner action after
-   rebuilding from the merge commit and re-verifying the hash.
-7. Desktop-opt-out path and the *checked* uninstall data-removal box:
-   compiler-checked, owner-VM eyeball (the unchecked box + preserve notice
-   are CI-captured in shots 10–11; `/REMOVEDATA=1` is headless-covered).
+This report is a documentation-only follow-up to the clean cee3390 artifact
+build. The subsequent c287a33 merge preserved the latest Muse22d4d31 report
+history and changed no runtime/build/test source. The documentation commit
+is not the source SHA embedded in this artifact.
+
+## Remaining external qualification
+
+Full install/uninstall, HKCU/shortcuts/autostart, preservation of unrelated
+install-directory files, explicit default-data removal and native private
+storage now pass on the fresh elevated CI runner. Screenshots captured the
+wizard/console/uninstall flows; logs report installed=True,
+install removed=True and data preserved=True. This records capture, not a
+new human visual review. CI explicitly skips desktop opt-out UI, strict
+parent-death kill when job confinement is unavailable, and the data-removal
+checkbox UI (the scripted removal path passes). Actual tray/menu pixels,
+the remaining UI paths and strict parent-death confinement still require
+owner qualification before release/installer availability. No installer or
+uninstaller was run against the current user profile. Signing is absent;
+macOS/Linux remain unavailable; no installer release or download is published.
+
+CI built its temporary merge commit76443dd51364618a16ff321baaae061a3ad03302
+with source_dirty=false and artifact SHA-256
+44d5bb854cd52b9dcb00c5897b7779adc728b24b063fb5377fed8287d0128566.
+That CI build is distinct from the local cee3390 artifact listed above;
+neither checksum should be substituted for a future merge-commit release.
+
+The original ffbe CI build succeeded, but qualification run40929040335 failed
+two token ACL checks. Latest Muse801's attempt to classify failed ACL
+hardening as a restricted-context PASS is replaced by strict SID-based
+verification: inability to establish private token storage is terminal.
+That old run is not evidence of passing repaired full-profile CI.
+
+## Historical owner artifacts
+
+The preceding PowerShell-based repaired a2ec5e1 artifact had98files,
+13,083,766bytes andSHA-256
+`ecd0bec316981acb251da566253abc4b65e2f8c56aa41a9fc1165c52555a40e7`.
+It passed local unprivileged verification but its strict ownership handling
+failed elevated CI. It is superseded by the native artifact above.
+
+The earlier owner artifact from d689d2e was 13,073,826 bytes with SHA-256
+`b7e2b27668d3b659114dee11da442acccdac51fcd291aa9fb5682e7181b611fe`.
+Muse801 documented an artifact from cd715b3 of 13,074,277 bytes, SHA-256
+`7f463aae8ac1e620f8794335810a0959e039e5f7d2a1f0b955f0b4613eae0e5d`.
+Its reported same-source rebuild comparison had 96 matching payload paths,
+91 byte-identical files and timestamp-related variation in three executables,
+base_library.zip and BUILD.json. That observation is historical owner
+evidence; byte reproducibility of the repaired build is not claimed.
+Earlier wizard screenshots and coexistence results likewise qualify their
+recorded source/artifacts, not the repaired artifact above.
+
+
+## Preserved Muse visual/CI history
+
+Muse f73a3e7 adds uninstall data-choice/preserve-notice capture and waits for
+Start Menu links before taking the screenshot; those driver changes are
+preserved. Owner reports for runs40932568817 and40935178276 describe passing
+full-profile install/registry/shortcut/autostart/control/uninstall checks,
+but token ACL failures were accepted as restricted-context PASS. That
+leniency is absent here, so these runs do not qualify strict private storage.
+
+The owner reported reviewing CI artifact windows-installer-screenshots from
+40935178276: welcome, license, default-off autostart component, editable temp
+directory, finish with Start now unchecked, Start Menu spinner with links
+log-verified, local worker console without token value, uninstall confirm,
+unchecked Remove data, data-preserved notice and finish. It reported
+installed=True/install removed=True/data preserved=True. This is attributed
+historical evidence, not a new visual review of the native repaired build.
+Actual tray/menu pixels, desktop opt-out and the checked removal box still
+need owner review. No screenshot driver was run on the current desktop.
+
+
+Muse22d4d31 adds attributed later evidence: full-profile run40936747728
+again passed with the earlier restricted-ACL-context exception; it does not
+qualify this stricter native storage implementation. Its screenshots artifact
+40936747728 reportedly shows the populated Start Menu folder containing
+AIPSTER Worker and Uninstall rather than the prior spinner. Earlier wizard,
+console and uninstall preservation observations remain historical evidence.
+No runtime/build/test source changed between f73a3e7 and22d4d31.

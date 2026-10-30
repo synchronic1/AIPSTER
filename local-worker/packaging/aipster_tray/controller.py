@@ -17,7 +17,7 @@ from pathlib import Path
 from . import state as st
 from .child import WorkerChild, port_busy, looks_like_bind_error
 from .firstrun import (APP_NAME, bundle_dir, build_info, data_dir, ensure_setup,
-                       ensure_private_token)
+                       ensure_private_token, private_directory)
 
 HEALTH_TIMEOUT = 25
 TICK_SECONDS = 1
@@ -48,6 +48,7 @@ class Controller:
         self.config = None
         self.loaded = None
         self.token_env = "DENDRITE_API_TOKEN"
+        self.token_value = ""
         self.child = None
         self.state = st.STOPPED
         self.detail = ""
@@ -59,10 +60,6 @@ class Controller:
         self.last_heartbeat = 0.0
         self.console = log_lines
         self.log_file = None
-        # token_env name -> preset env value (or None): only a token inherited
-        # from the parent environment wins over the file; file-backed tokens
-        # are re-read on every reload so rotation takes effect on restart.
-        self._inherited = {}
 
     # -- logging ---------------------------------------------------------
     def log(self, message):
@@ -99,15 +96,13 @@ class Controller:
             except (OSError, ValueError, ValidationError) as exc:
                 return f"bad config: {exc}"
             self.token_env = self.loaded.node.token_env
-            if self.token_env not in self._inherited:
-                self._inherited[self.token_env] = os.environ.get(self.token_env) or None
-            if self._inherited[self.token_env]:
-                return ""  # preset in the parent environment: env wins, file untouched
-            try:
-                value, _ = ensure_private_token(self.data / "api-token.txt")
-            except SystemExit as exc:
-                return str(exc)
-            os.environ[self.token_env] = value
+            self.token_value = os.environ.get(self.token_env, "")
+            if not self.token_value:
+                try:
+                    value, _ = ensure_private_token(self.data / "api-token.txt")
+                except SystemExit as exc:
+                    return str(exc)
+                self.token_value = value
             return ""
         except SystemExit as exc:
             return str(exc)
@@ -118,7 +113,7 @@ class Controller:
                "WINDIR": os.environ.get("WINDIR", r"C:\Windows"),
                "COMSPEC": os.environ.get("COMSPEC", system32 + r"\cmd.exe"),
                "TEMP": os.environ.get("TEMP", ""), "TMP": os.environ.get("TMP", ""),
-               "PATH": system32, self.token_env: os.environ.get(self.token_env, "")}
+               "PATH": system32, self.token_env: self.token_value}
         return {k: v for k, v in env.items() if v}
 
     # -- state ---------------------------------------------------------------
@@ -435,7 +430,7 @@ def _redirect_to_log(data):
         return False
     try:
         data = Path(data)
-        data.mkdir(parents=True, exist_ok=True)
+        private_directory(data)
         (data / "logs").mkdir(exist_ok=True)
         handle = open(data / "logs" / "tray.log", "a", encoding="utf-8")
         sys.stdout = handle

@@ -3,6 +3,11 @@ on:
   pull_request:
     paths:
       - 'local-worker/**'
+      - 'website/src/**'
+      - 'website/migrations/**'
+      - 'website/tests/d1-shim.mjs'
+      - 'website/scripts/pairing-e2e-bridge.mjs'
+      - 'website/package*.json'
       - '.github/workflows/local-worker-checks.yml'
       - 'LICENSE'
       - 'NOTICE'
@@ -11,7 +16,7 @@ permissions:
 jobs:
   mock-install:
     runs-on: windows-2025
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
@@ -21,7 +26,15 @@ jobs:
           version: '0.12.12'
           enable-cache: false
       - run: uv python install 3.12.14
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6, same pin as public-site checks
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: website
       - run: uv run --no-project --python 3.12.14 python install.py
         working-directory: local-worker
       - run: ./.venv/Scripts/python.exe test_installation.py
+        working-directory: local-worker
+      - run: ./.venv/Scripts/python.exe -m unittest test_pairing test_pairing_security test_pairing_windows_storage test_pairing_lifecycle test_pairing_e2e -v
         working-directory: local-worker

@@ -32,7 +32,7 @@ UVICORN_HIDDEN = [
 def analysis(script, datas=(), hidden=()):
     return Analysis(  # noqa: F821
         [str(SPECDIR / script)],
-        pathex=[str(PACKAGING)],
+        pathex=[str(PACKAGING), str(PACKAGING.parent)],
         binaries=[],
         datas=list(datas),
         hiddenimports=list(hidden),

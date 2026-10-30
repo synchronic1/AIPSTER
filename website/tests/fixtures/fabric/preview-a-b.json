@@ -1,0 +1,28 @@
+{
+  "comment": "F0 fixture: canonical grant preview for A->B selected sharing. expectedDigest is the SHA-256 of the JCS-subset canonicalization of 'preview'; the F0 suite recomputes it (stability) and verifies tamper-evidence plus approval binding.",
+  "preview": {
+    "encodingVersion": "aipster-jcs-0",
+    "connectionId": "conn_a_b_1",
+    "exporterNode": "node-a",
+    "exporterWorkspace": "ws-alice",
+    "importerNode": "node-b",
+    "importerWorkspace": "ws-bob",
+    "snapshot": [
+      { "resourceId": "r1", "incarnation": "gen3", "capabilities": ["infer"], "models": ["cpu-echo-1"] },
+      { "resourceId": "r2", "incarnation": "gen1", "capabilities": ["infer"], "models": ["cpu-echo-1"] }
+    ],
+    "consumers": ["u_bob"],
+    "actions": ["infer"],
+    "route": "relay-fixture",
+    "retention": "outputs-pinned-7d",
+    "ceilings": { "maxTokens": 5000, "maxRequests": 100 },
+    "notBefore": "2026-11-01T00:00:00.000Z",
+    "expiry": "2026-11-08T00:00:00.000Z",
+    "exclusions": [
+      { "resourceId": "r9-imported", "reason": "not owner-controlled" },
+      { "resourceId": "r3-future", "reason": "enrolled after snapshot" }
+    ],
+    "capturedAt": "2026-10-27T18:00:00.000Z"
+  },
+  "expectedDigest": "49e0a3a8521ad0629a84f93b0a9d3758fd8cf3316f095849466bfb0d9ac04aee"
+}

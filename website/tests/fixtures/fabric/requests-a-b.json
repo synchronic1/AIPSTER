@@ -1,0 +1,10 @@
+{
+  "comment": "F0 fixtures: authorization request vectors evaluated by src/fabric/policy.mjs.",
+  "at": "2026-11-02T12:00:00.000Z",
+  "valid": { "resourceId": "r1", "incarnation": "gen3", "action": "infer", "model": "cpu-echo-1", "peerNode": "node-b", "peerWorkspace": "ws-bob", "consumer": "u_bob", "maxTokens": 50, "route": "relay-fixture" },
+  "combinedNeedsTwoGrants": { "resourceId": "r1", "incarnation": "gen3", "action": "infer", "model": "cpu-echo-1", "peerNode": "node-b", "peerWorkspace": "ws-bob", "consumer": "u_bob", "maxTokens": 6000, "route": "relay-fixture" },
+  "wrongRecipient": { "resourceId": "r1", "incarnation": "gen3", "action": "infer", "model": "cpu-echo-1", "peerNode": "node-c", "peerWorkspace": "ws-carol", "consumer": "u_carol", "maxTokens": 50, "route": "relay-fixture" },
+  "incarnationChanged": { "resourceId": "r1", "incarnation": "gen4", "action": "infer", "model": "cpu-echo-1", "peerNode": "node-b", "peerWorkspace": "ws-bob", "consumer": "u_bob", "maxTokens": 50, "route": "relay-fixture" },
+  "staleRevision": { "resourceId": "r1", "incarnation": "gen3", "action": "infer", "model": "cpu-echo-1", "peerNode": "node-b", "peerWorkspace": "ws-bob", "consumer": "u_bob", "maxTokens": 50, "route": "relay-fixture", "expectedRevision": 7 },
+  "deniedActor": { "resourceId": "r1", "incarnation": "gen3", "action": "infer", "model": "cpu-echo-1", "peerNode": "node-b", "peerWorkspace": "ws-bob", "consumer": "u_mallory", "maxTokens": 50, "route": "relay-fixture" }
+}

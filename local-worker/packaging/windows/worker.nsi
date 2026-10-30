@@ -11,6 +11,7 @@
 !include "StrFunc.nsh"
 !include "nsDialogs.nsh"
 ${Using:StrFunc} StrStr
+${Using:StrFunc} UnStrStr
 
 Var RemoveData
 
@@ -31,6 +32,12 @@ Var RemoveData
 !endif
 !ifndef OUTFILE
   !define OUTFILE "AIPSTER-Worker-setup.exe"
+!endif
+!ifndef UNINSTALL_FILES
+  !error "build.py must pass /DUNINSTALL_FILES=<exact payload removal list>"
+!endif
+!ifndef UNINSTALL_VERIFY
+  !error "build.py must pass /DUNINSTALL_VERIFY=<exact payload verification list>"
 !endif
 !ifndef SIZE_KB
   !define SIZE_KB "0"
@@ -135,24 +142,36 @@ Function .onInit
       StrCpy $INSTDIR $R0
   ${EndIf}
   ; Refuse to install over running worker processes (tray, console launcher,
-  ; or raw CLI). tasklist output always ends in a newline, so match exe names
-  ; as substrings, never the whole output. Silent installs abort (exit 2).
+  ; or raw CLI). Each tasklist call is filtered to one image: NSIS strings
+  ; truncate at 1023 chars, so an unfiltered process list would hide workers.
+  ; Silent installs abort (exit 2).
   running_check:
-    nsExec::ExecToStack 'tasklist /FO CSV /NH'
+    StrCpy $4 ""
+    nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-tray.exe"'
     Pop $1
     Pop $2
-    ${If} $1 != 0
-      Goto install_anyway
-    ${EndIf}
-    StrCpy $4 ""
-    ${StrStr} $3 $2 "aipster-tray.exe"
-    ${If} $3 != ""
-      StrCpy $4 "aipster-tray.exe"
-    ${Else}
-      ${StrStr} $3 $2 "aipster-worker.exe"
+    ${If} $1 == 0
+      ${StrStr} $3 $2 "aipster-tray.exe"
       ${If} $3 != ""
-        StrCpy $4 "aipster-worker.exe"
-      ${Else}
+        StrCpy $4 "aipster-tray.exe"
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-worker.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
+        ${StrStr} $3 $2 "aipster-worker.exe"
+        ${If} $3 != ""
+          StrCpy $4 "aipster-worker.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq dendrite.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
         ${StrStr} $3 $2 "dendrite.exe"
         ${If} $3 != ""
           StrCpy $4 "dendrite.exe"
@@ -180,6 +199,57 @@ Function un.onInit
   ${If} $0 == "1"
     StrCpy $RemoveData 1
   ${EndIf}
+  ; Never uninstall over running worker processes (tray, console launcher,
+  ; or raw CLI): Windows locks the executables, so deletion would leave
+  ; payload behind. Abort before touching registration or files. Each
+  ; tasklist call is filtered to one image: NSIS strings truncate at
+  ; 1023 chars, so an unfiltered process list would hide workers.
+  ; Silent uninstalls abort (exit 2).
+  un_running_check:
+    StrCpy $4 ""
+    nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-tray.exe"'
+    Pop $1
+    Pop $2
+    ${If} $1 == 0
+      ${UnStrStr} $3 $2 "aipster-tray.exe"
+      ${If} $3 != ""
+        StrCpy $4 "aipster-tray.exe"
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq aipster-worker.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
+        ${UnStrStr} $3 $2 "aipster-worker.exe"
+        ${If} $3 != ""
+          StrCpy $4 "aipster-worker.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 == ""
+      nsExec::ExecToStack 'tasklist /FO CSV /NH /FI "IMAGENAME eq dendrite.exe"'
+      Pop $1
+      Pop $2
+      ${If} $1 == 0
+        ${UnStrStr} $3 $2 "dendrite.exe"
+        ${If} $3 != ""
+          StrCpy $4 "dendrite.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $4 != ""
+      IfSilent un_silent_abort un_prompt_user
+      un_prompt_user:
+      MessageBox MB_ABORTRETRYIGNORE|MB_ICONEXCLAMATION \
+        "AIPSTER Worker ($4) is still running. Stop it first (tray menu Quit or Ctrl+C), then retry." \
+        IDRETRY un_running_check IDIGNORE un_proceed
+      Abort
+      un_silent_abort:
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+  un_proceed:
 FunctionEnd
 
 Function un.DataChoice
@@ -204,13 +274,42 @@ Function un.DataChoiceLeave
 FunctionEnd
 
 Section "Uninstall"
-  ; Safety: only remove a directory that looks like our install.
-  IfFileExists "$INSTDIR\dendrite.exe" proceed abort
+  ; Safety: only act on a directory that is our install. A retained partial
+  ; install (dendrite.exe already removed, a locked file left behind) stays
+  ; retryable while it is still the registered location and keeps its
+  ; uninstaller. Removal itself is the exact payload list, never recursive.
+  IfFileExists "$INSTDIR\dendrite.exe" proceed
+  ReadRegStr $R1 HKCU "Software\AIPSTER-Worker" "InstallDir"
+  StrCmp $R1 "" abort
+  StrCmp $R1 $INSTDIR 0 abort
+  IfFileExists "$INSTDIR\uninstall.exe" proceed abort
   abort:
     MessageBox MB_OK|MB_ICONSTOP \
-      "Uninstall aborted: $INSTDIR does not look like an AIPSTER Worker install."
+      "Uninstall aborted: $INSTDIR does not look like an AIPSTER Worker install." /SD IDOK
+    SetErrorLevel 2
     Abort
   proceed:
+  DetailPrint "Removing application files from $INSTDIR..."
+  ; User-selected locations may contain unrelated files or worker data.
+  !include "${UNINSTALL_FILES}"
+  ; Verify every payload file is actually gone before touching any
+  ; registration. On incomplete removal the install stays registered and
+  ; retryable, with its uninstaller in place; report failure instead of
+  ; false success.
+  !include "${UNINSTALL_VERIFY}"
+  Goto uninstall_verified
+  uninstall_incomplete:
+    DetailPrint "Removal incomplete: application files are still present (locked or in use). Registration preserved; stop the worker and retry."
+    IfSilent +2
+      MessageBox MB_OK|MB_ICONEXCLAMATION \
+        "Removal incomplete: some application files are still present (locked or in use). Nothing was unregistered; stop the worker and retry."
+    SetErrorLevel 2
+    Abort
+  uninstall_verified:
+  ; Only after verification: a failed removal above must keep the
+  ; uninstaller that the preserved registration points to.
+  Delete "$INSTDIR\uninstall.exe"
+  RMDir "$INSTDIR"
   DetailPrint "Removing autostart entry, shortcuts, and registry keys..."
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "AIPSTER-Worker"
   Delete "$SMPROGRAMS\AIPSTER Worker\AIPSTER Worker.lnk"
@@ -219,9 +318,6 @@ Section "Uninstall"
   Delete "$DESKTOP\AIPSTER Worker.lnk"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\AIPSTER-Worker"
   DeleteRegKey HKCU "Software\AIPSTER-Worker"
-  DetailPrint "Removing application files from $INSTDIR..."
-  Delete "$INSTDIR\uninstall.exe"
-  RMDir /r "$INSTDIR"
   ${If} $RemoveData == 1
     DetailPrint "Removing the default data directory as chosen..."
     RMDir /r "$LOCALAPPDATA\AIPSTER-Worker"

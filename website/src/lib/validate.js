@@ -60,8 +60,23 @@ export function parseJson(text, maxFields = 40) {
 }
 
 export const isId = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v);
+
+// Pairing codes (docs/pairing.md): minted as
+// `pair-<8 hex>-<4 crockford>-<4 crockford>-<4 crockford>`, accepted
+// case-insensitively with spaces ignored so typed entry is forgiving.
+// Crockford base32 without I/L/O/U avoids visual confusion. Returns the
+// {id, secret} split: the id is the lookup handle (like a key id), the
+// 60-bit secret is the verified bearer. Anything else is null.
+export const PAIR_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+export function normalizePairCode(v) {
+  if (typeof v !== 'string') return null;
+  const flat = v.replace(/\s+/g, '');
+  const m = /^pair[-_]([0-9a-fA-F]{8})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})[-_]?([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{4})$/i.exec(flat);
+  if (!m) return null;
+  return { id: 'p_' + m[1].toLowerCase(), secret: (m[2] + m[3] + m[4]).toUpperCase() };
+}
 export const isName = (v, max = 80) => typeof v === 'string' && v.trim().length >= 1 && v.length <= max;
-export const isScope = (v) => v === 'read' || v === 'inference';
+export const isScope = (v) => v === 'read' || v === 'inference' || v === 'heartbeat';
 export const isEmail = (v) => typeof v === 'string' && v.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 
 export function pagination(url) {

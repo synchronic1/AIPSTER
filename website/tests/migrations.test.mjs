@@ -15,9 +15,14 @@ test('migrations create the auth and app tables', () => {
   for (const c of ['id', 'name', 'email', 'createdAt', 'updatedAt']) assert.ok(cols('user').includes(c), `user.${c}`);
   for (const c of ['id', 'token', 'expiresAt', 'userId']) assert.ok(cols('session').includes(c), `session.${c}`);
   assert.ok(cols('key_verifiers').includes('verifier'), 'key_verifiers.verifier');
+  assert.ok(cols('key_verifiers').includes('resource_id'), 'key_verifiers.resource_id (0013 heartbeat binding)');
   assert.ok(cols('allowlist').includes('email'), 'allowlist.email');
   assert.ok(names.includes('write_budget'), 'missing table write_budget');
   for (const c of ['user_id', 'window', 'count']) assert.ok(cols('write_budget').includes(c), `write_budget.${c}`);
+  assert.ok(names.includes('pairing_codes'), 'missing table pairing_codes (0015)');
+  for (const c of ['salt', 'verifier', 'expires_at', 'used_at', 'attempts', 'node_id', 'resource_id']) assert.ok(cols('pairing_codes').includes(c), `pairing_codes.${c}`);
+  assert.ok(names.includes('idempotency_keys'), 'missing table idempotency_keys (0015)');
+  assert.ok(cols('resources').includes('node_id'), 'resources.node_id (0015 pairing identity)');
 });
 
 test('migrations are idempotent where SQLite allows', () => {
