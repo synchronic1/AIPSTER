@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIPSTER administration (scaffold)</title>
+<link rel="stylesheet" href="/admin/styles.css">
+<link rel="icon" href="/favicon.svg">
+</head>
+<body>
+<header>
+<h1>AIPSTER administration</h1>
+<p id="grant">Checking authorization…</p>
+</header>
+<nav aria-label="Administration sections">
+<ul>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#fabrics">Fabrics</a></li>
+<li><a href="#resources">Resources</a></li>
+<li><a href="#metrics">Metrics</a></li>
+<li><a href="#access">Access</a></li>
+<li><a href="#operations">Operations</a></li>
+<li><a href="#tickets">Tickets</a></li>
+<li><a href="#engineering">Engineering</a></li>
+<li><a href="#audit">Audit</a></li>
+<li><a href="#coverage">Data coverage</a></li>
+</ul>
+</nav>
+<main>
+<section id="overview" aria-label="Overview"><h2>Overview</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/overview">Load</button></section>
+<section id="fabrics" aria-label="Fabrics"><h2>Fabrics</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/fabrics">Load</button></section>
+<section id="resources" aria-label="Resources"><h2>Resources</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/resources">Load</button></section>
+<section id="metrics" aria-label="Metrics"><h2>Metrics</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/metrics">Load</button></section>
+<section id="access" aria-label="Access"><h2>Access</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/access/users">Load</button></section>
+<section id="operations" aria-label="Operations"><h2>Operations</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/operations/health">Load</button></section>
+<section id="tickets" aria-label="Tickets"><h2>Tickets</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/tickets">Load</button></section>
+<section id="engineering" aria-label="Engineering"><h2>Engineering</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/engineering/exports">Load</button></section>
+<section id="audit" aria-label="Audit"><h2>Audit</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/audit">Load</button></section>
+<section id="coverage" aria-label="Data coverage"><h2>Data coverage</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/coverage">Load</button></section>
+</main>
+<footer><p>Scaffold shell: reads report availability states, mutations are disabled, and the server authorizes every call.</p></footer>
+<script src="/admin/admin.js"></script>
+</body>
+</html>
