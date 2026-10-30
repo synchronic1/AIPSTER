@@ -15,6 +15,13 @@ const appSchema = {
   audit: 'id at actor_id action target detail',
   rateLimit: 'id key count lastRequest',
   write_budget: 'user_id window count',
+  node_capabilities: 'node_id schema_version reported_at os arch runtimes_json mem_json disk_json workload_json',
+  catalog_assets: 'id owner_id source repo revision kind task arch format quant license_json access manifest_json validation base_asset_id base_revision freshness_at created_at',
+  catalog_asset_files: 'asset_id relpath bytes sha256',
+  catalog_uploads: 'id owner_id state quotas_json manifest_json byte_ref expires_at created_at updated_at',
+  catalog_compat_cache: 'cache_key principal fingerprint_json decision_json expires_at',
+  catalog_deployments: 'id owner_id plan_json plan_fingerprint idem_key state node_id runtime error_json created_at updated_at',
+  catalog_deployment_events: 'id deployment_id at from_state to_state detail',
   pairing_codes: 'id owner_id salt verifier created_at expires_at used_at attempts node_id resource_id',
   idempotency_keys: 'owner_id key resource_id created_at',
 };

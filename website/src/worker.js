@@ -13,6 +13,8 @@ import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
 import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
+import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
+import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -154,6 +156,96 @@ async function grantPartiesSameSide(db, grant) {
 async function ownerName(db, userId) {
   const u = await first(db, 'SELECT name FROM "user" WHERE id = ?', userId);
   return (u && u.name) || 'Unknown';
+}
+
+// Catalog node access (personal fabric): the caller owns the resource or
+// holds a live grant on it. Anything else (including a merely-known id)
+// gets null so callers answer 404 without disclosing existence (T1).
+async function catalogNodeAccess(db, userId, nodeId) {
+  const r = await first(db, 'SELECT * FROM resources WHERE id = ?', nodeId);
+  if (!r) return null;
+  if (r.owner_id === userId) return r;
+  const g = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', nodeId, userId);
+  if (!g) return null;
+  const owner = await first(db, 'SELECT disabled FROM "user" WHERE id = ?', r.owner_id);
+  if (!owner || Number(owner.disabled) === 1) return null;
+  return r;
+}
+
+// Loads a node's capability snapshot for evaluation. Never invents one:
+// no row, unparseable row, or unreadable age all surface as nulls, which
+// the estimator reports as unknown (AC07).
+async function catalogSnapshot(db, nodeId) {
+  const row = await first(db, 'SELECT * FROM node_capabilities WHERE node_id = ?', nodeId);
+  if (!row) return { snapshot: null, ageMs: null, reportedAt: null };
+  let snapshot = null;
+  try {
+    snapshot = {
+      schema_version: row.schema_version, os: row.os, arch: row.arch,
+      runtimes: JSON.parse(row.runtimes_json), mem: JSON.parse(row.mem_json),
+      disk: JSON.parse(row.disk_json), workload: JSON.parse(row.workload_json),
+    };
+  } catch {
+    return { snapshot: null, ageMs: null, reportedAt: null };
+  }
+  const ageMs = Date.now() - Date.parse(row.reported_at);
+  return { snapshot, ageMs: Number.isFinite(ageMs) ? ageMs : null, reportedAt: row.reported_at };
+}
+
+// Strict capability-report body (schema v1): exact top-level keys, bounded
+// strings/arrays, safe-integer byte counts. Unknown fields are rejected —
+// a browser or worker cannot smuggle trusted readings past the schema.
+function validateCapabilityBody(body) {
+  const bad = (error) => ({ error, code: 'BAD_CAPABILITIES' });
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('Capability body must be an object.');
+  const keys = Object.keys(body);
+  const allowed = new Set(['schema_version', 'os', 'arch', 'runtimes', 'mem', 'disk', 'workload']);
+  if (keys.some((k) => !allowed.has(k))) return bad('Unknown capability field rejected.');
+  if (body.schema_version !== 1) return bad('schema_version must be 1.');
+  for (const f of ['os', 'arch']) {
+    if (typeof body[f] !== 'string' || !body[f] || body[f].length > 64) return bad(`${f} must be a 1..64 char string.`);
+  }
+  if (!Array.isArray(body.runtimes) || body.runtimes.length > 16) return bad('runtimes must be an array of at most 16 entries.');
+  for (const r of body.runtimes) {
+    if (!r || typeof r !== 'object') return bad('Each runtime must be an object.');
+    if (typeof r.name !== 'string' || !r.name || r.name.length > 64) return bad('Runtime name must be 1..64 chars.');
+    if (r.version !== undefined && (typeof r.version !== 'string' || r.version.length > 32)) return bad('Runtime version must be at most 32 chars.');
+    for (const f of ['formats', 'quants', 'adapters']) {
+      if (r[f] !== undefined && (!Array.isArray(r[f]) || r[f].length > 32 || r[f].some((v) => typeof v !== 'string' || v.length > 64))) {
+        return bad(`Runtime ${f} must be an array of at most 32 short strings.`);
+      }
+    }
+    if (r.maxContext !== undefined && (!Number.isSafeInteger(r.maxContext) || r.maxContext < 0)) return bad('Runtime maxContext must be a safe integer.');
+  }
+  const bytesOk = (v) => Number.isSafeInteger(v) && v >= 0;
+  const mem = body.mem;
+  if (!mem || typeof mem !== 'object') return bad('mem must be an object.');
+  if (!bytesOk(mem.ramTotalBytes) || !bytesOk(mem.ramAvailBytes) || mem.ramAvailBytes > mem.ramTotalBytes) {
+    return bad('mem RAM totals must be safe integers with avail <= total.');
+  }
+  if (mem.gpu !== undefined) {
+    if (!Array.isArray(mem.gpu) || mem.gpu.length > 16) return bad('mem.gpu must be an array of at most 16 entries.');
+    for (const g of mem.gpu) {
+      if (!g || typeof g !== 'object' || !bytesOk(g.vramTotalBytes) || !bytesOk(g.vramAvailBytes) || g.vramAvailBytes > g.vramTotalBytes) {
+        return bad('Each GPU needs vram totals with avail <= total.');
+      }
+      if (g.name !== undefined && (typeof g.name !== 'string' || g.name.length > 128)) return bad('GPU name must be at most 128 chars.');
+    }
+  }
+  const disk = body.disk;
+  if (!disk || typeof disk !== 'object' || !bytesOk(disk.totalBytes) || !bytesOk(disk.availBytes) || disk.availBytes > disk.totalBytes) {
+    return bad('disk needs totals with avail <= total.');
+  }
+  if (body.workload !== undefined) {
+    if (!body.workload || typeof body.workload !== 'object') return bad('workload must be an object.');
+    if (body.workload.reservations !== undefined) {
+      if (!Array.isArray(body.workload.reservations) || body.workload.reservations.length > 64) return bad('workload.reservations holds at most 64 entries.');
+      for (const w of body.workload.reservations) {
+        if (!w || typeof w !== 'object' || !bytesOk(w.bytes)) return bad('Each reservation needs a byte count.');
+      }
+    }
+  }
+  return null;
 }
 
 async function revokedHeartbeatKey(request, db) {
@@ -486,6 +578,77 @@ async function handleApi(request, env, url) {
     }
   }
 
+  // ---- node capabilities (versioned telemetry report; heartbeat-key auth) ----
+  // Separate from the heartbeat intake by design (docs/model-catalog/00):
+  // the strict {"usable"} admission path keeps its atomic guarantees, and
+  // capability snapshots arrive here under the same key binding. Reports
+  // are worker-declared evidence, not verified facts; missing or stale
+  // snapshots evaluate as unknown, never fit. Bounded 8 KiB, strict shape.
+  {
+    const m = /^\/api\/resources\/([A-Za-z0-9_-]{1,64})\/capabilities$/.exec(path);
+    if (m && method === 'POST') {
+      const resourceId = m[1];
+      if (actor.kind === 'session') return json(403, { error: 'Capability reports require a heartbeat-scoped API key; sessions cannot post telemetry.', code: 'KEY_REQUIRED' });
+      if (actor.kind === 'expired') return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });
+      if (actor.kind !== 'key') {
+        if (await revokedHeartbeatKey(request, db)) return json(401, { error: 'API key revoked.', code: 'KEY_REVOKED' });
+        return json(401, { error: 'Heartbeat API key required.', code: 'AUTH_REQUIRED' });
+      }
+      if (actor.key.scope !== 'heartbeat') return json(403, { error: 'This API key is not heartbeat-scoped.', code: 'KEY_SCOPE' });
+      if (actor.key.resource_id !== resourceId) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      const target = await first(db, 'SELECT owner_id FROM resources WHERE id = ?', resourceId);
+      if (!target || target.owner_id !== actor.key.owner_id) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      const owner = await first(db, 'SELECT disabled FROM "user" WHERE id = ?', target.owner_id);
+      if (!owner || Number(owner.disabled) === 1) return json(401, { error: 'Sign-in or API key required.', code: 'AUTH_REQUIRED' });
+      let body;
+      try {
+        body = await readJson(request, 8 * 1024);
+      } catch (error) {
+        if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+        throw error;
+      }
+      const capError = validateCapabilityBody(body);
+      if (capError) return json(400, capError);
+      // Cost guard (not security): at most one report per 25s window per
+      // node keeps telemetry from becoming a write amplifier. A lost race
+      // only permits an extra authentic write, never a wrong one.
+      const prev = await first(db, 'SELECT reported_at FROM node_capabilities WHERE node_id = ?', resourceId);
+      if (prev && prev.reported_at) {
+        const last = Date.parse(prev.reported_at);
+        if (Number.isFinite(last) && HEARTBEAT_MIN_INTERVAL_MS - (Date.now() - last) > 0) {
+          return json(429, { error: 'Capability report too soon; back off and retry.', code: 'CAPABILITIES_TOO_SOON', retryAfterSec: 25 }, { 'Retry-After': '25' });
+        }
+      }
+      const now = nowIso();
+      await run(db, `INSERT INTO node_capabilities (node_id, schema_version, reported_at, os, arch, runtimes_json, mem_json, disk_json, workload_json)
+        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET schema_version = 1, reported_at = excluded.reported_at, os = excluded.os, arch = excluded.arch,
+        runtimes_json = excluded.runtimes_json, mem_json = excluded.mem_json, disk_json = excluded.disk_json, workload_json = excluded.workload_json`,
+        resourceId, now, body.os, body.arch, JSON.stringify(body.runtimes), JSON.stringify(body.mem), JSON.stringify(body.disk), JSON.stringify(body.workload || {}));
+      await run(db, 'UPDATE resources SET heartbeat_at = ?, online = 1 WHERE id = ?', now, resourceId);
+      return json(200, { ok: true, nodeId: resourceId, reportedAt: now, schemaVersion: 1 });
+    }
+    if (m && method === 'GET') {
+      const d = needAuthz('read'); if (d) return deny(d);
+      const node = await catalogNodeAccess(db, actor.user.id, m[1]);
+      if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+      const row = await first(db, 'SELECT * FROM node_capabilities WHERE node_id = ?', m[1]);
+      if (!row) return json(200, { nodeId: m[1], snapshot: null, ageMs: null, fresh: false });
+      const ageMs = Date.now() - Date.parse(row.reported_at);
+      return json(200, {
+        nodeId: m[1],
+        snapshot: {
+          schema_version: row.schema_version, os: row.os, arch: row.arch,
+          runtimes: JSON.parse(row.runtimes_json), mem: JSON.parse(row.mem_json),
+          disk: JSON.parse(row.disk_json), workload: JSON.parse(row.workload_json),
+        },
+        reportedAt: row.reported_at,
+        ageMs: Number.isFinite(ageMs) ? ageMs : null,
+        fresh: Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= TELEMETRY_FRESH_MS,
+      });
+    }
+  }
+
   // ---- status (read-only readiness strip; written only by heartbeat intake) ----
   if (path === '/api/status' && method === 'GET') {
     const d = needAuthz('read'); if (d) return deny(d);
@@ -708,6 +871,173 @@ async function handleApi(request, env, url) {
       heartbeatKey: fresh.secret, keyId: fresh.id, keyPrefix: fresh.prefix,
       heartbeatUrl: `/api/resources/${resource.id}/heartbeat`,
       oneTime: 'This secret is shown once. It cannot be recovered.'
+    });
+  }
+
+  // ---- model catalog, Phase 1: read-only discovery + compatibility ----
+  // Browsing never downloads weights, runs inference, or changes a worker
+  // (AC01): search/detail serve metadata only, and compat evaluates a pure
+  // estimator over worker-reported snapshots. Demo sessions may browse
+  // fixture metadata; evaluation, uploads, and deployment stay denied.
+  if (path === '/api/catalog/search' && method === 'GET') {
+    const d = needAuthz('read'); if (d) return deny(d);
+    const q = pagination(url);
+    const params = {
+      q: (url.searchParams.get('q') || '').slice(0, 128),
+      task: (url.searchParams.get('task') || '').slice(0, 64),
+      arch: (url.searchParams.get('arch') || '').slice(0, 64),
+      format: (url.searchParams.get('format') || '').slice(0, 32),
+      quant: (url.searchParams.get('quant') || '').slice(0, 32),
+      runtime: (url.searchParams.get('runtime') || '').slice(0, 64),
+      license: (url.searchParams.get('license') || '').slice(0, 64),
+      kind: (url.searchParams.get('kind') || '').slice(0, 16),
+      limit: q.limit, offset: q.offset,
+    };
+    if (params.kind && params.kind !== 'model' && params.kind !== 'adapter') {
+      return json(400, { error: 'kind must be "model" or "adapter".', code: 'BAD_FILTER' });
+    }
+    const compat = (url.searchParams.get('compat') || '').slice(0, 24);
+    const compatNode = (url.searchParams.get('nodeId') || '').slice(0, 64);
+    if (compat && !['compatible', 'blocked', 'unknown'].includes(compat)) {
+      return json(400, { error: 'compat must be "compatible", "blocked", or "unknown".', code: 'BAD_FILTER' });
+    }
+    if (compat && !compatNode) {
+      return json(400, { error: 'compat filtering needs nodeId: compatibility is per-node, never global.', code: 'BAD_FILTER' });
+    }
+    try {
+      const fixture = isFixtureEnv(env) || isDemo();
+      const result = fixture ? fixtureSearch(params) : await hubSearch(params, {});
+      if (!compat) return json(200, { ...result, fixture });
+      // Per-item evaluation against the named node only (AC06: nodes are
+      // never combined). Snapshot loads once; evaluation is pure.
+      const node = await catalogNodeAccess(db, me(), compatNode);
+      if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+      const snap = await catalogSnapshot(db, compatNode);
+      const want = compat === 'compatible' ? 'estimated-compatible' : compat;
+      const runtime = params.runtime || 'fixture-llama';
+      const items = result.items.filter((asset) => {
+        if (asset.kind === 'adapter') return want === 'unknown'; // base binding needs the detail flow
+        const dec = evaluateCompatibility({ asset, settings: { context: 4096, concurrency: 1, runtime }, snapshot: snap.snapshot, snapshotAgeMs: snap.ageMs, snapshotAt: snap.reportedAt, nodeId: compatNode, principal: me(), nowMs: Date.now() });
+        return dec.state === want;
+      });
+      return json(200, { ...result, items, total: result.total, fixture, compatFiltered: true });
+    } catch (e) {
+      if (e && e.hub) return json(e.status || 502, { error: e.message, code: e.code || 'HUB_ERROR', retryable: e.retryable !== false, action: 'Retry shortly, or narrow the search.' });
+      throw e;
+    }
+  }
+  {
+    const m = /^\/api\/catalog\/assets\/([^/]{1,400})$/.exec(path);
+    if (m && method === 'GET') {
+      const d = needAuthz('read'); if (d) return deny(d);
+      let repo;
+      try {
+        repo = decodeURIComponent(m[1]);
+      } catch {
+        return json(400, { error: 'Asset id is not valid encoding.', code: 'BAD_ASSET' });
+      }
+      if (repo.startsWith('priv:')) {
+        return json(404, { error: 'Private assets arrive in Phase 2; this id names nothing yet.', code: 'ASSET_NOT_FOUND' });
+      }
+      const clean = repo.startsWith('hub:') ? repo.slice(4) : repo;
+      if (!validateRepoId(clean)) return json(400, { error: 'Repository must look like org/name.', code: 'BAD_REPO' });
+      try {
+        const fixture = isFixtureEnv(env) || isDemo();
+        const asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, {});
+        if (!asset) return json(404, { error: 'Model not found on the Hub.', code: 'ASSET_NOT_FOUND' });
+        return json(200, { ...asset, fixture });
+      } catch (e) {
+        if (e && e.hub) return json(e.status || 502, { error: e.message, code: e.code || 'HUB_ERROR', retryable: e.retryable !== false, action: 'Retry shortly.' });
+        throw e;
+      }
+    }
+  }
+  if (path === '/api/catalog/compat' && method === 'POST') {
+    const d = needAuthz('read'); if (d) return deny(d);
+    if (actor.kind === 'session') { const c = needCsrf(); if (c) return deny(c); }
+    const nd = needNotDemo(); if (nd) return deny(nd);
+    let body;
+    try {
+      body = await readJson(request);
+    } catch (error) {
+      if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+      throw error;
+    }
+    const repo = typeof body.repo === 'string' ? body.repo.slice(0, 200) : '';
+    const nodeId = typeof body.nodeId === 'string' ? body.nodeId.slice(0, 64) : '';
+    const runtime = typeof body.runtime === 'string' ? body.runtime.slice(0, 64) : '';
+    const context = body.context;
+    const concurrency = body.concurrency;
+    if (!validateRepoId(repo)) return json(400, { error: 'repo must look like org/name.', code: 'BAD_REPO' });
+    if (!isId(nodeId)) return json(400, { error: 'nodeId is required (1..64 id chars).', code: 'BAD_NODE' });
+    if (!runtime) return json(400, { error: 'runtime is required.', code: 'BAD_RUNTIME' });
+    if (!Number.isSafeInteger(context) || context <= 0 || context > 1048576) {
+      return json(400, { error: 'context must be a positive safe integer (≤ 1048576).', code: 'BAD_SETTINGS' });
+    }
+    if (!Number.isSafeInteger(concurrency) || concurrency <= 0 || concurrency > 1024) {
+      return json(400, { error: 'concurrency must be a positive safe integer (≤ 1024).', code: 'BAD_SETTINGS' });
+    }
+    const adapterRepo = typeof body.adapterRepo === 'string' ? body.adapterRepo.slice(0, 200) : '';
+    const baseRepo = typeof body.baseRepo === 'string' ? body.baseRepo.slice(0, 200) : '';
+    if (adapterRepo && !validateRepoId(adapterRepo)) return json(400, { error: 'adapterRepo must look like org/name.', code: 'BAD_REPO' });
+    if (baseRepo && !validateRepoId(baseRepo)) return json(400, { error: 'baseRepo must look like org/name.', code: 'BAD_REPO' });
+    if (adapterRepo && !baseRepo) {
+      return json(400, { error: 'Adapter evaluation needs baseRepo: display names never bind a base.', code: 'ADAPTER_BASE_REQUIRED' });
+    }
+    const node = await catalogNodeAccess(db, me(), nodeId);
+    if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+    try {
+      const fixture = isFixtureEnv(env);
+      const load = async (r) => (fixture ? fixtureDetail(r) : await hubDetail(r, {}));
+      const asset = await load(repo);
+      if (!asset || asset.gated === true) return json(404, { error: 'Model not found or not visible to you.', code: 'ASSET_NOT_FOUND' });
+      let adapterAsset = null;
+      let baseAsset = asset;
+      if (adapterRepo) {
+        adapterAsset = await load(adapterRepo);
+        baseAsset = await load(baseRepo);
+        if (!adapterAsset || adapterAsset.gated === true) return json(404, { error: 'Adapter not found or not visible to you.', code: 'ASSET_NOT_FOUND' });
+        if (!baseAsset || baseAsset.gated === true) return json(404, { error: 'Adapter base not found or not visible to you.', code: 'ASSET_NOT_FOUND' });
+      }
+      const snap = await catalogSnapshot(db, nodeId);
+      const nowMs = Date.now();
+      const decision = evaluateCompatibility({
+        asset, adapterAsset, baseAsset,
+        settings: { context, concurrency, runtime },
+        snapshot: snap.snapshot, snapshotAgeMs: snap.ageMs, snapshotAt: snap.reportedAt,
+        nodeId, principal: me(), nowMs,
+      });
+      // Principal-aware cache: the key binds principal + full input
+      // fingerprint, so input or policy changes miss (AC09). 5-minute TTL.
+      const fp = JSON.stringify(decision.fingerprint);
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${me()}\n${fp}`));
+      const cacheKey = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+      const hit = await first(db, 'SELECT decision_json, expires_at FROM catalog_compat_cache WHERE cache_key = ? AND principal = ?', cacheKey, me());
+      if (hit && Date.parse(hit.expires_at) > nowMs) {
+        return json(200, { ...JSON.parse(hit.decision_json), cached: true, fixture });
+      }
+      const decisionJson = JSON.stringify({ ...decision, cached: false });
+      await run(db, `INSERT INTO catalog_compat_cache (cache_key, principal, fingerprint_json, decision_json, expires_at)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET decision_json = excluded.decision_json, expires_at = excluded.expires_at`,
+        cacheKey, me(), fp, decisionJson, decision.expiresAt);
+      return json(200, { ...decision, cached: false, fixture });
+    } catch (e) {
+      if (e && e.hub) return json(e.status || 502, { error: e.message, code: e.code || 'HUB_ERROR', retryable: e.retryable !== false, action: 'Retry shortly.' });
+      throw e;
+    }
+  }
+  if (path === '/api/catalog/summary' && method === 'GET') {
+    const d = needAuthz('read'); if (d) return deny(d);
+    const assets = await first(db, "SELECT COUNT(*) n FROM catalog_assets WHERE owner_id = ? AND access = 'private'", me());
+    const jobs = await first(db, "SELECT COUNT(*) n FROM catalog_deployments WHERE owner_id = ? AND state NOT IN ('succeeded', 'failed', 'cancelled')", me());
+    const refresh = await first(db, 'SELECT MAX(created_at) at FROM jobs WHERE owner_id = ?', me());
+    return json(200, {
+      privateAssets: assets ? assets.n : 0,
+      activeDeployments: jobs ? jobs.n : 0,
+      lastRefresh: (refresh && refresh.at) || null,
+      uploadsAvailable: false,
+      deploymentAvailable: false,
+      note: 'Private uploads (Phase 2) and deployment (Phase 3) are not implemented yet.',
     });
   }
 
