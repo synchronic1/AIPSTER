@@ -49,7 +49,11 @@ export function cardFor(r, ownerName, nowMs = Date.now()) {
   // usable is shown only while the resource is online: a stale usable=true
   // must not imply readiness the strip denies.
   const usable = online && Number(r.usable) === 1;
-  const status = !r.configured ? 'unconfigured' : !r.authenticated ? 'unauthenticated' : !online ? 'offline' : !usable ? 'unusable' : 'ready';
+  // Terminal rung is reachability, not execution readiness: a usable:true
+  // heartbeat proves the worker is reachable and willing, never inference
+  // acceptance (/api/jobs is disabled). 'ready' returns only behind an
+  // independently established execution signal.
+  const status = !r.configured ? 'unconfigured' : !r.authenticated ? 'unauthenticated' : !online ? 'offline' : !usable ? 'unusable' : 'reachable';
   return {
     id: r.id, name: r.name, kind: r.kind, origin: r.origin,
     owner: { id: r.owner_id, name: ownerName },

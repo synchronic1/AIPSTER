@@ -7,7 +7,7 @@ const appSchema = {
   account: 'id accountId providerId userId accessToken refreshToken idToken accessTokenExpiresAt refreshTokenExpiresAt scope password createdAt updatedAt',
   verification: 'id identifier value expiresAt createdAt updatedAt',
   allowlist: 'email added_at',
-  resources: 'id owner_id name kind origin cpu gpu capabilities_json configured authenticated online usable heartbeat_at limits_json scope verification_json credits_json created_at',
+  resources: 'id owner_id name kind origin cpu gpu capabilities_json configured authenticated online usable heartbeat_at limits_json scope verification_json credits_json created_at node_id',
   grants: 'id resource_id owner_id grantee_id max_jobs max_tokens used_jobs used_tokens inference_only created_at revoked_at',
   key_verifiers: 'id owner_id name scope salt verifier prefix expires_at metadata created_at last_used_at revoked_at resource_id',
   jobs: 'id owner_id resource_id grant_id adapter model status tokens_in tokens_out cost_source created_at updated_at',
@@ -15,6 +15,8 @@ const appSchema = {
   audit: 'id at actor_id action target detail',
   rateLimit: 'id key count lastRequest',
   write_budget: 'user_id window count',
+  pairing_codes: 'id owner_id salt verifier created_at expires_at used_at attempts node_id resource_id',
+  idempotency_keys: 'owner_id key resource_id created_at',
 };
 
 const federationSchema = {

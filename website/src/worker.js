@@ -6,10 +6,10 @@
 import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
-import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
+import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET } from './lib/validate.js';
+import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { schemaReady } from './lib/schema.js';
-import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
@@ -52,6 +52,17 @@ const AUTH_BODY_MAX = 64 * 1024;
 // intake UPDATE, never by a read-then-write.
 const HEARTBEAT_BODY_MAX = 1024;
 const HEARTBEAT_MIN_INTERVAL_MS = 25 * 1000;
+// Pairing bounds (docs/pairing.md): small claim bodies, few live codes per
+// owner, few guesses per code (burned after), and a short reclaim window in
+// which the same node may re-bind a spent code after a lost response.
+const PAIRING_BODY_MAX = 4 * 1024;
+const MAX_ACTIVE_PAIRING_CODES = 5;
+const MAX_PAIRING_ATTEMPTS = 10;
+const PAIRING_RECLAIM_MS = 10 * 60 * 1000;
+// POST /api/inventory Idempotency-Key replay horizon.
+const IDEMPOTENCY_TTL_MS = 24 * 3600 * 1000;
+// Compatibility grace for NULL claims written by the pre-atomic registration path.
+const IDEMPOTENT_IN_FLIGHT_MS = 5 * 60 * 1000;
 // Demo auth surface (allowlist): the only /api/auth/* routes a demo session
 // may use are sign-in (both maintained paths), sign-out, and session reads.
 // Everything else — update-user, change-password, link-social, password
@@ -284,26 +295,18 @@ async function handleApi(request, env, url) {
   }
   if (path === '/api/inventory' && method === 'POST') {
     const d = needSession() || needCsrf(); if (d) return deny(d);
+    // Replay safety (migration 0015): a client-supplied Idempotency-Key
+    // makes retries return the original card instead of a duplicate row.
+    // Mapping, resource, budget and audit commit together. Concurrent losers
+    // replay the winner; deleted-resource mappings provision a fresh identity.
+    const idemKey = request.headers.get('Idempotency-Key');
+    if (idemKey !== null && !isId(idemKey)) return json(400, { error: 'Idempotency-Key must be 1..64 id chars.', code: 'BAD_IDEMPOTENCY' });
     const body = await readJson(request);
     if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
     const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
     const origin = typeof body.origin === 'string' ? body.origin.slice(0, 80) : 'declared';
-    await checkWriteBudget(db, me());
-    const id = rid('r_');
-    const now = nowIso();
-    // Atomic cap: the count test is inside the single INSERT statement.
-    const rc = await run(db, `INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, NULL, ?, ?, ?, NULL, ?
-      WHERE (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER}`,
-      id, me(), body.name.trim(), kind, origin,
-      String(body.cpu || 'unknown').slice(0, 80), String(body.gpu || 'none recorded').slice(0, 80),
-      JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : []),
-      JSON.stringify(body.limits && typeof body.limits === 'object' ? body.limits : {}),
-      'owner only', JSON.stringify({ note: 'Declared by owner; not verified.' }), now, me());
-    assertClaimed(rc, 'resource');
-    await audit(db, me(), 'resource.register', id, body.name.trim());
-    const row = await first(db, 'SELECT * FROM resources WHERE id = ?', id);
-    return json(201, cardFor(row, await ownerName(db, me())));
+    const registered = await registerResource(db, me(), idemKey, body, kind, origin);
+    return json(registered.created ? 201 : 200, cardFor(registered.row, await ownerName(db, me())));
   }
   {
     const m = /^\/api\/inventory\/([A-Za-z0-9_-]{1,64})$/.exec(path);
@@ -316,6 +319,36 @@ async function handleApi(request, env, url) {
         if (!g || !(await grantPartiesSameSide(db, g))) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
       }
       return json(200, cardFor(r, await ownerName(db, r.owner_id)));
+    }
+  }
+  {
+    const m = /^\/api\/inventory\/([A-Za-z0-9_-]{1,64})$/.exec(path);
+    if (m && method === 'DELETE') {
+      const d = needSession() || needCsrf(); if (d) return deny(d);
+      const r = await first(db, 'SELECT id FROM resources WHERE id = ? AND owner_id = ?', m[1], me());
+      if (!r) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      // Unbilled like key/grant revocation: teardown must work at a spent
+      // budget. Bound keys keep revoked rows with the binding nulled, so a
+      // deleted resource's sender key still reads KEY_REVOKED (rotate, not
+      // wrong credential) instead of vanishing into AUTH_REQUIRED. Grants
+      // and jobs cannot dangle (NOT NULL references), so their rows are
+      // deleted; the audit trail (grant.create, resource.delete) records
+      // what existed. Pairing claims keep their history with resource_id
+      // nulled, which the reclaim path treats as invalid. The heartbeat
+      // intake's row-existence check rejects further beats either way.
+      const now = nowIso();
+      const owned = `EXISTS(SELECT 1 FROM resources r JOIN "user" u ON u.id = r.owner_id WHERE r.id = ? AND r.owner_id = ? AND u.disabled = 0)`;
+      const deleted = await db.batch([
+        db.prepare(`DELETE FROM jobs WHERE (resource_id = ? OR grant_id IN (SELECT id FROM grants WHERE resource_id = ?)) AND ${owned}`).bind(r.id, r.id, r.id, me()),
+        db.prepare(`DELETE FROM grants WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(now, r.id, r.id, me()),
+        db.prepare(`UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`DELETE FROM idempotency_keys WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
+        db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
+      ]);
+      if (Number(deleted[5].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      return json(200, { ok: true });
     }
   }
 
@@ -550,6 +583,132 @@ async function handleApi(request, env, url) {
     }
   }
 
+  // ---- pairing (one-time worker onboarding; contract: docs/pairing.md) ----
+  // A signed-in owner mints a short-lived single-use code in the browser;
+  // the worker exchanges it for a resource row plus a resource-bound
+  // heartbeat key. The claim endpoint is code-authenticated, never
+  // session-authenticated: the worker holds no AIPSTER credential yet, so
+  // there is no CSRF surface. Abuse is bounded by 60-bit codes, a short
+  // TTL, single use, and a per-code attempt burn.
+  if (path === '/api/pairing/codes' && method === 'POST') {
+    const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
+    const body = await readJson(request);
+    let ttlMin = 10;
+    if (body.ttlMinutes !== undefined) {
+      if (!Number.isSafeInteger(body.ttlMinutes) || body.ttlMinutes < 1 || body.ttlMinutes > 60) {
+        return json(400, { error: 'ttlMinutes must be 1..60.', code: 'BAD_TTL' });
+      }
+      ttlMin = body.ttlMinutes;
+    }
+    const minted = mintPairCode();
+    const now = nowIso();
+    const window = budgetWindow(new Date(now));
+    const expiresAt = new Date(Date.now() + ttlMin * 60 * 1000).toISOString();
+    const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+    const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    // Admission, one-time secret verifier and history must commit together:
+    // a failed audit cannot strand an undisclosed code or consume its slot.
+    const [pc] = await db.batch([
+      db.prepare(`INSERT INTO pairing_codes (id, owner_id, salt, verifier, created_at, expires_at, used_at, attempts)
+        SELECT ?, ?, ?, ?, ?, ?, NULL, 0
+        WHERE EXISTS(SELECT 1 FROM "user" WHERE id=? AND disabled=0 AND demo=0)
+        AND (SELECT COUNT(*) FROM pairing_codes WHERE owner_id=? AND used_at IS NULL AND expires_at>=?) < ${MAX_ACTIVE_PAIRING_CODES}
+        AND COALESCE((SELECT count FROM write_budget WHERE user_id=? AND window=?),0) < ${WRITE_BUDGET_PER_HOUR}`)
+        .bind(minted.id, me(), salt, await verifierFor(minted.secret, salt), now, expiresAt, me(), me(), now, me(), window),
+      db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes()=1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(me(),window),
+      db.prepare(`INSERT INTO audit(id,at,actor_id,action,target,detail) SELECT ?,?,?,'pairing.code.create',?,'' WHERE changes()=1`).bind(rid('a_'),now,me(),minted.id)
+    ]);
+    if (Number(pc.meta.changes) !== 1) {
+      const live = await first(db, 'SELECT disabled,demo FROM "user" WHERE id=?', me());
+      if (!live || Number(live.disabled) || Number(live.demo)) throw httpError(401, 'Sign-in required.', 'AUTH_REQUIRED');
+      const budget = await first(db, 'SELECT count FROM write_budget WHERE user_id=? AND window=?', me(), window);
+      if (budget && budget.count >= WRITE_BUDGET_PER_HOUR) throw httpError(429, 'Too many changes in the last hour. Try again later.', 'WRITE_RATE_LIMITED');
+      return json(409, { error: `Too many unused pairing codes (${MAX_ACTIVE_PAIRING_CODES} per user). Let one expire first.`, code: 'PAIRING_LIMIT' });
+    }
+    return json(201, { id: minted.id, code: minted.code, expiresAt, oneTime: 'This code is shown once. It cannot be recovered.' });
+  }
+  if (path === '/api/pairing/claim' && method === 'POST') {
+    const body = await readJson(request, PAIRING_BODY_MAX);
+    const norm = normalizePairCode(body.code);
+    if (!norm) return json(400, { error: 'Pairing code shape is invalid.', code: 'BAD_CODE' });
+    if (!isId(body.nodeId)) return json(400, { error: 'nodeId is required (1..64 id chars).', code: 'BAD_NODE' });
+    const row = await first(db, 'SELECT * FROM pairing_codes WHERE id = ?', norm.id);
+    if (!row) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    const ownerId = row.owner_id;
+    const nodeId = body.nodeId;
+    // The node/code ids are public lookup handles, never credentials. Verify
+    // the bearer and current owner before BOTH initial claims and reclaims.
+    if (Number(row.attempts) >= MAX_PAIRING_ATTEMPTS) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    if (!timingSafeEqualStr(await verifierFor(norm.secret, row.salt), row.verifier)) {
+      await run(db, 'UPDATE pairing_codes SET attempts = attempts + 1 WHERE id = ? AND attempts < ?', row.id, MAX_PAIRING_ATTEMPTS);
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
+    const owner = await first(db, 'SELECT id, demo, disabled FROM "user" WHERE id = ?', ownerId);
+    if (!owner || Number(owner.disabled) === 1 || Number(owner.demo) === 1) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    let resource = null;
+    if (row.used_at) {
+      // Lost-response retry: the same node re-binds within the reclaim
+      // window and gets a fresh sender key; anything else sees the same
+      // generic invalid as an unknown code.
+      if (row.node_id === nodeId && row.resource_id
+        && Number.isFinite(Date.parse(row.used_at)) && Date.parse(row.used_at) + PAIRING_RECLAIM_MS >= Date.now()) {
+        resource = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?', row.resource_id, ownerId, nodeId);
+      }
+      if (!resource) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    } else if (!Number.isFinite(Date.parse(row.expires_at)) || Date.parse(row.expires_at) < Date.now()) {
+      return json(410, { error: 'Pairing code expired. Mint a new one.', code: 'PAIRING_EXPIRED' });
+    }
+    const kind = ['local', 'cluster', 'provider'].includes(body.kind) ? body.kind : 'local';
+    const cpu = typeof body.cpu === 'string' && body.cpu.trim() ? body.cpu.slice(0, 80) : 'unknown';
+    const gpu = typeof body.gpu === 'string' && body.gpu.trim() ? body.gpu.slice(0, 80) : 'none recorded';
+    const caps = Array.isArray(body.capabilities) ? body.capabilities.map(String).slice(0, 20) : [];
+    const wantName = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : `worker-${nodeId.slice(0, 16)}`;
+    const now = nowIso();
+    if (!resource) resource = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
+    let created = !resource;
+    let resourceId = resource ? resource.id : rid('r_');
+    let name = resource ? resource.name : await uniqueResourceName(db, ownerId, wantName);
+    let fresh = await completePairing(db, row, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, now);
+    if (!fresh) {
+      // A concurrent claim may have consumed this code or enrolled the node.
+      // Reload consent, preserving its authenticated identity and same-node
+      // reclaim window, before the one bounded transaction retry.
+      const winner = await first(db, 'SELECT * FROM resources WHERE owner_id = ? AND node_id = ?', ownerId, nodeId);
+      const latest = winner ? await first(db, 'SELECT * FROM pairing_codes WHERE id=?', row.id) : null;
+      const retryAt = nowIso();
+      const eligible = latest && latest.owner_id === ownerId && latest.salt === row.salt && latest.verifier === row.verifier
+        && Number(latest.attempts) < MAX_PAIRING_ATTEMPTS
+        && (latest.used_at
+          ? latest.node_id === nodeId && latest.resource_id === winner.id && Number.isFinite(Date.parse(latest.used_at))
+            && Date.parse(latest.used_at) + PAIRING_RECLAIM_MS >= Date.parse(retryAt)
+          : Number.isFinite(Date.parse(latest.expires_at)) && Date.parse(latest.expires_at) >= Date.parse(retryAt));
+      if (eligible) {
+        created = false; resourceId = winner.id; name = winner.name;
+        fresh = await completePairing(db, latest, nodeId, resourceId, { created, name, kind, cpu, gpu, caps }, retryAt);
+      }
+    }
+    if (!fresh) {
+      const live = await first(db, 'SELECT disabled,demo FROM "user" WHERE id = ?', ownerId);
+      if (!live || Number(live.disabled) || Number(live.demo)) return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+      const spent = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', ownerId, budgetWindow());
+      if (spent && spent.count >= WRITE_BUDGET_PER_HOUR) throw httpError(429, 'Too many changes in the last hour. Try again later.', 'WRITE_RATE_LIMITED');
+      const keys = await first(db, 'SELECT COUNT(*) n FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL', ownerId);
+      if (keys.n >= MAX_KEYS_PER_USER) return json(409, { error: `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, code: 'KEY_LIMIT' });
+      if (created) {
+        const count = await first(db, 'SELECT COUNT(*) n FROM resources WHERE owner_id = ?', ownerId);
+        if (count.n >= MAX_RESOURCES_PER_USER) return json(409, { error: `Resource limit reached (${MAX_RESOURCES_PER_USER} per user).`, code: 'RESOURCE_LIMIT' });
+      }
+      return json(404, { error: 'Pairing code invalid or expired.', code: 'PAIRING_INVALID' });
+    }
+    resource = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?', resourceId, ownerId, nodeId);
+    return json(created ? 201 : 200, {
+      resourceId: resource.id, created, resource: cardFor(resource, await ownerName(db, ownerId)),
+      heartbeatKey: fresh.secret, keyId: fresh.id, keyPrefix: fresh.prefix,
+      heartbeatUrl: `/api/resources/${resource.id}/heartbeat`,
+      oneTime: 'This secret is shown once. It cannot be recovered.'
+    });
+  }
+
   // ---- API keys (session only; secrets one-time) ----
   if (path === '/api/keys' && method === 'GET') {
     const d = needSession(); if (d) return deny(d);
@@ -685,6 +844,121 @@ function mapGrantLite(g) {
     usedJobs: g.used_jobs, usedTokens: g.used_tokens,
     inferenceOnly: !!g.inference_only, createdAt: g.created_at, revokedAt: g.revoked_at || null
   };
+}
+
+function mintPairCode() {
+  // 32-bit id handle + 60-bit Crockford secret (12 bytes masked to 5 bits
+  // each; 256 is a multiple of 32, so there is no modulo bias).
+  const idBytes = crypto.getRandomValues(new Uint8Array(4));
+  const idHex = Array.from(idBytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  const secret = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => PAIR_CODE_ALPHABET[b & 31]).join('');
+  return {
+    id: 'p_' + idHex,
+    secret,
+    code: `pair-${idHex}-${secret.slice(0, 4)}-${secret.slice(4, 8)}-${secret.slice(8, 12)}`
+  };
+}
+
+async function uniqueResourceName(db, ownerId, base) {
+  // Display names stay human-meaningful on collision ("lab", "lab-2", ...).
+  // Identity is the row id / node binding, never the name, so a lost rename
+  // race only duplicates a label, never an identity.
+  // The owner's names are read once (bounded by the per-owner resource cap)
+  // and candidates are checked locally, not one query per collision.
+  const clean = String(base || '').trim().slice(0, 80) || 'worker';
+  const taken = new Set((await all(db, 'SELECT name FROM resources WHERE owner_id = ?', ownerId)).map((r) => r.name));
+  for (let n = 1; n <= 100; n++) {
+    const cand = n === 1 ? clean : `${clean.slice(0, 74)}-${n}`;
+    if (!taken.has(cand)) return cand;
+  }
+  return `${clean.slice(0, 60)}-${rid('').slice(0, 6)}`;
+}
+
+async function completePairing(db, code, nodeId, resourceId, meta, now) {
+  // One transaction re-pins the authenticated consent, live owner and exact
+  // resource identity, then creates the sender before revoking older keys.
+  // No partial enrollment/rotation survives an audit or persistence failure.
+  // The key cap counts the RESULTING total: this resource's live sender keys
+  // are revoked by the same batch, so a lost-response reclaim at a full cap
+  // replaces its sender instead of needing a phantom free slot. The
+  // exclusion is NULL-safe, so unbound keys still count; genuinely new
+  // senders still hit KEY_LIMIT.
+  const ownerId = code.owner_id;
+  const { id, secret, short } = mintKey(KEY_PREFIX);
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  const hash = await verifierFor(secret, salt);
+  const result = await db.batch([
+    db.prepare(`UPDATE pairing_codes SET used_at = COALESCE(used_at, ?), node_id = ?
+      WHERE id = ? AND owner_id = ? AND salt = ? AND verifier = ? AND used_at IS ? AND resource_id IS ? AND attempts < ?
+      AND ((used_at IS NULL AND expires_at >= ?) OR (used_at IS NOT NULL AND node_id = ? AND resource_id = ? AND used_at >= ?))
+      AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0 AND demo = 0)
+      AND ((? = 1 AND NOT EXISTS(SELECT 1 FROM resources WHERE owner_id = ? AND node_id = ?)
+        AND (SELECT COUNT(*) FROM resources WHERE owner_id = ?) < ${MAX_RESOURCES_PER_USER})
+        OR (? = 0 AND EXISTS(SELECT 1 FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?)))
+      AND (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL
+        AND (resource_id IS NULL OR resource_id != ? OR scope != 'heartbeat')) < ${MAX_KEYS_PER_USER}
+      AND COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?),0) < ${WRITE_BUDGET_PER_HOUR}`)
+      .bind(now, nodeId, code.id, ownerId, code.salt, code.verifier, code.used_at, code.resource_id, MAX_PAIRING_ATTEMPTS,
+        now, nodeId, resourceId, new Date(Date.parse(now) - PAIRING_RECLAIM_MS).toISOString(), ownerId,
+        meta.created ? 1 : 0, ownerId, nodeId, ownerId, meta.created ? 1 : 0, resourceId, ownerId, nodeId, ownerId, resourceId, ownerId, budgetWindow(new Date(now))),
+    db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes() = 1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(ownerId,budgetWindow(new Date(now))),
+    ...(meta.created ? [db.prepare(`INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, limits_json, scope, verification_json, credits_json, created_at)
+      SELECT ?, ?, ?, ?, ?, 'paired', ?, ?, ?, 1, 1, 0, 0, NULL, '{}', 'owner only', ?, NULL, ? WHERE changes() = 1`)
+      .bind(resourceId, ownerId, nodeId, meta.name, meta.kind, meta.cpu, meta.gpu, JSON.stringify(meta.caps), JSON.stringify({ note: `Paired ${now}; awaiting first heartbeat.` }), now)] : []),
+    db.prepare(`INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+      SELECT ?, ?, ?, 'heartbeat', ?, ?, ?, ?, NULL, ?, ?, NULL, NULL WHERE changes() = 1
+      AND EXISTS(SELECT 1 FROM resources WHERE id = ? AND owner_id = ? AND node_id = ?)`)
+      .bind(id, ownerId, `worker heartbeat ${nodeId.slice(0, 32)}`, resourceId, salt, hash, KEY_PREFIX + id + '_' + short, `pairing node ${nodeId}`, now, resourceId, ownerId, nodeId),
+    db.prepare(`UPDATE key_verifiers SET revoked_at = ? WHERE resource_id = ? AND scope = 'heartbeat' AND revoked_at IS NULL AND id != ? AND changes() = 1`).bind(now, resourceId, id),
+    db.prepare(`UPDATE pairing_codes SET resource_id = ? WHERE id = ? AND EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(resourceId, code.id, id),
+    ...(meta.created ? [db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.register', ?, ? WHERE EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(rid('a_'), now, ownerId, resourceId, meta.name, id)] : []),
+    db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'key.create', ?, ? WHERE EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(rid('a_'), now, ownerId, id, `heartbeat:${resourceId}`, id),
+    db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'pairing.claim', ?, ? WHERE EXISTS(SELECT 1 FROM key_verifiers WHERE id = ?)`).bind(rid('a_'), now, ownerId, code.id, `${nodeId} -> ${resourceId}`, id)
+  ]);
+  if (Number(result[0].meta.changes) !== 1) return null;
+  return { id, secret, prefix: KEY_PREFIX + id + '_' + short };
+}
+
+async function registerResource(db, ownerId, key, body, kind, origin) {
+  const now = nowIso(), window = budgetWindow(new Date(now));
+  const cutoff = new Date(Date.parse(now) - IDEMPOTENCY_TTL_MS).toISOString();
+  const prior = key ? await first(db, 'SELECT * FROM idempotency_keys WHERE owner_id = ? AND key = ?', ownerId, key) : null;
+  const replay = async () => key ? first(db, `SELECT r.* FROM idempotency_keys i JOIN resources r ON r.id=i.resource_id AND r.owner_id=i.owner_id WHERE i.owner_id=? AND i.key=? AND i.created_at>=?`, ownerId, key, cutoff) : null;
+  const existing = await replay();
+  if (existing) return { created: false, row: existing };
+  if (prior && prior.resource_id === null) {
+    const claimedAt = Date.parse(prior.created_at);
+    if (!Number.isFinite(claimedAt) || claimedAt + IDEMPOTENT_IN_FLIGHT_MS >= Date.parse(now)) {
+      throw httpError(409, 'A request with this Idempotency-Key is already in flight. Retry shortly.', 'IDEMPOTENT_IN_FLIGHT');
+    }
+  }
+  // Reserve the generated resource identity inside the same transaction as
+  // admission, insertion and audit. No committed NULL mapping can wedge a
+  // retry; concurrent losers read the winner without spending another slot.
+  const id = rid('r_');
+  const allowed = `EXISTS(SELECT 1 FROM "user" WHERE id=? AND disabled=0)
+    AND (SELECT COUNT(*) FROM resources WHERE owner_id=?) < ${MAX_RESOURCES_PER_USER}
+    AND COALESCE((SELECT count FROM write_budget WHERE user_id=? AND window=?),0) < ${WRITE_BUDGET_PER_HOUR}`;
+  const claim = key ? [db.prepare(`INSERT OR IGNORE INTO idempotency_keys(owner_id,key,resource_id,created_at) SELECT ?,?,?,? WHERE ${allowed}`).bind(ownerId,key,id,now,ownerId,ownerId,ownerId,window)] : [];
+  await db.batch([
+    ...(prior ? [db.prepare(`DELETE FROM idempotency_keys WHERE owner_id=? AND key=? AND created_at=? AND resource_id IS ? AND ${allowed}`).bind(ownerId,key,prior.created_at,prior.resource_id,ownerId,ownerId,ownerId,window)] : []),
+    ...claim,
+    db.prepare(`INSERT INTO resources (id,owner_id,name,kind,origin,cpu,gpu,capabilities_json,configured,authenticated,online,usable,heartbeat_at,limits_json,scope,verification_json,credits_json,created_at)
+      SELECT ?,?,?,?,?,?,?,?,1,0,0,0,NULL,?,'owner only',?,NULL,? WHERE ${key ? 'changes()=1 AND EXISTS(SELECT 1 FROM idempotency_keys WHERE owner_id=? AND key=? AND resource_id=?)' : allowed}`)
+      .bind(id,ownerId,body.name.trim(),kind,origin,String(body.cpu||'unknown').slice(0,80),String(body.gpu||'none recorded').slice(0,80),JSON.stringify(Array.isArray(body.capabilities)?body.capabilities.map(String).slice(0,20):[]),JSON.stringify(body.limits&&typeof body.limits==='object'?body.limits:{}),JSON.stringify({note:'Declared by owner; not verified.'}),now,...(key?[ownerId,key,id]:[ownerId,ownerId,ownerId,window])),
+    db.prepare(`INSERT INTO write_budget(user_id,window,count) SELECT ?,?,1 WHERE changes()=1 ON CONFLICT(user_id,window) DO UPDATE SET count=count+1`).bind(ownerId,window),
+    db.prepare(`INSERT INTO audit(id,at,actor_id,action,target,detail) SELECT ?,?,?,'resource.register',?,? WHERE changes()=1`).bind(rid('a_'),now,ownerId,id,body.name.trim())
+  ]);
+  const row = await first(db,'SELECT * FROM resources WHERE id=? AND owner_id=?',id,ownerId);
+  if (row) return { created: true, row };
+  const winner = await replay();
+  if (winner) return { created: false, row: winner };
+  const live = await first(db,'SELECT disabled FROM "user" WHERE id=?',ownerId);
+  if (!live || Number(live.disabled)) throw httpError(401,'Sign-in or API key required.','AUTH_REQUIRED');
+  const budget = await first(db,'SELECT count FROM write_budget WHERE user_id=? AND window=?',ownerId,window);
+  if (budget && budget.count >= WRITE_BUDGET_PER_HOUR) throw httpError(429,'Too many changes in the last hour. Try again later.','WRITE_RATE_LIMITED');
+  assertClaimed({meta:{changes:0}},'resource');
 }
 
 function mapKeyRow(k) {
