@@ -53,6 +53,10 @@ from private_storage_win32 import protect_path
 
 DEFAULT_API_BASE = "https://aipster.net"
 REQUEST_TIMEOUT_SEC = 15
+# Product User-Agent (chain-release smoke, 2026-10-30): the API edge denies
+# default scripting UAs (Cloudflare 1010), so every sender request identifies
+# the worker explicitly. Verified live against /api/pairing/claim.
+USER_AGENT = "AIPSTER-worker/1.0"
 # Pair-mutex bound (Muse W3 round 11). A pair holds the lock across one
 # claim (single bounded request) plus two local writes: seconds.
 PAIR_LOCK_TIMEOUT_SEC = 180
@@ -366,7 +370,7 @@ class NoRedirects(HTTPRedirectHandler):
 def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
     """POST JSON, returning (status, body-dict, retry-after)."""
     data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if secret is not None:
         headers["Authorization"] = "Bearer " + secret
     request = Request(url, data=data, headers=headers, method="POST")
