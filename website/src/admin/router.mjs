@@ -74,6 +74,23 @@ function denied() {
   return { status: 403, body: { error: 'Administration is not authorized for this caller.', code: 'ADMIN_FORBIDDEN' } };
 }
 
+// Canonical UTC timestamps only: YYYY-MM-DDTHH:MM:SS[.sss]Z, and the value
+// must name a real instant (2026-99-99T... matches the shape but not this).
+const CANONICAL_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
+
+export function grantIsLive(expiresAt, nowMs) {
+  // null means no expiry. Anything else that is not a canonical UTC
+  // timestamp in the future denies: a malformed out-of-band value must fail
+  // closed rather than compare as text against the clock.
+  if (expiresAt === null || expiresAt === undefined) return true;
+  if (typeof expiresAt !== 'string' || !CANONICAL_UTC.test(expiresAt)) return false;
+  const ms = Date.parse(expiresAt);
+  if (!Number.isFinite(ms)) return false;
+  const roundTrip = new Date(ms).toISOString();
+  if (roundTrip !== expiresAt && roundTrip !== expiresAt.replace('Z', '.000Z')) return false;
+  return ms > nowMs;
+}
+
 export async function requireAdmin(ctx, permission) {
   // Returns { grant } on success or { status, body } to send on failure.
   const actor = ctx.actor;
@@ -86,13 +103,15 @@ export async function requireAdmin(ctx, permission) {
   let rows = [];
   try {
     rows = await all(ctx.db,
-      'SELECT role, scope, expires_at FROM admin_grants WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)',
-      actor.user.id, new Date().toISOString());
+      'SELECT role, scope, expires_at FROM admin_grants WHERE user_id = ? AND revoked_at IS NULL',
+      actor.user.id);
   } catch {
     // Fail closed when authority cannot be established (PRD AUTH04).
     return denied();
   }
+  const nowMs = Date.now();
   for (const row of rows || []) {
+    if (!row || !grantIsLive(row.expires_at, nowMs)) continue;
     const perms = row && row.scope === ADMIN_SCOPE ? ROLE_PERMISSIONS[row.role] : undefined;
     if (perms && perms.has(permission)) {
       return { grant: { role: row.role, scope: row.scope, expires_at: row.expires_at || null } };

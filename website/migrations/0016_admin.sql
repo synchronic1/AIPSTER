@@ -9,8 +9,8 @@
 -- Roles are allowlisted in code, never free text authority: an unknown
 -- role value authorizes nothing. Scope is stored for the Milestone 1
 -- design ('platform' is the only recognized scope in the scaffold).
--- expires_at is ISO-8601 UTC text; the live-grant check compares it
--- lexicographically against the current time, so non-ISO values deny.
+-- expires_at is canonical ISO-8601 UTC text (YYYY-MM-DDTHH:MM:SS[.sss]Z);
+-- the live-grant check parses and validates it, so malformed values deny.
 -- Re-runnable (IF NOT EXISTS): no ALTERs, applies cleanly under both the
 -- D1 migration journal and the test shim's full re-apply.
 CREATE TABLE IF NOT EXISTS admin_grants (

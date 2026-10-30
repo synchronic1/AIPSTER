@@ -94,6 +94,23 @@ test('admin: heartbeat keys fail closed', async () => {
   assert.equal(out.json.code, 'ADMIN_FORBIDDEN');
 });
 
+test('admin: malformed grant expirations fail closed; canonical future ones authorize', async () => {
+  // Codex P2 on #47 c6e0c80: text comparison let these authorize forever.
+  for (const bad of ['not-a-date', '2026-99-99T99:99:99.999Z', '9999-12-31', '9999-12-31 00:00:00', '9999-12-31T00:00:00+00:00', '']) {
+    const t = await createTestEnv();
+    await grant(t, 'u_alice', 'operations_observer', { expires_at: bad });
+    const out = await readJson(await t.call('/api/admin/v1/status', { headers: t.as(t.alice) }));
+    assert.equal(out.status, 403, `expires_at ${JSON.stringify(bad)} must deny`);
+  }
+  const future = new Date(Date.now() + 3600 * 1000).toISOString();
+  for (const good of [future, future.replace(/\.\d{3}Z$/, 'Z')]) {
+    const t = await createTestEnv();
+    await grant(t, 'u_alice', 'operations_observer', { expires_at: good });
+    const out = await readJson(await t.call('/api/admin/v1/status', { headers: t.as(t.alice) }));
+    assert.equal(out.status, 200, `expires_at ${good} must authorize`);
+  }
+});
+
 test('admin: revoked, expired, unknown-role, and wrong-scope grants fail closed', async () => {
   const t = await createTestEnv();
   const past = new Date(Date.now() - 3600 * 1000).toISOString();
