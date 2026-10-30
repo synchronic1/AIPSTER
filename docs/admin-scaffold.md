@@ -48,6 +48,19 @@ instrumentation and privacy release, alerts and quotas, and
 grant-management UI. Only a working collector may turn an envelope
 into data.
 
+## Production rollout (after the chain release)
+
+HOLD: do not merge until the chain release (migrations 0006–0015 plus
+deploy of `2ed8fdf`) is confirmed live. Migration 0016 needs a second
+production pass after that release:
+
+1. Back up production D1 and record the migration journal state.
+2. Apply only `0016_admin.sql` (the journal must already show
+   0006–0015 applied; nothing else pending).
+3. Probe: select from `admin_grants` (expect an empty table with the
+   documented columns), confirm every admin route denies with zero
+   grants, and verify owner routes are unchanged.
+
 ## Tests
 
 `website/tests/admin-scaffold.test.mjs` (12 tests): denial matrix,
