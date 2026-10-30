@@ -4,6 +4,14 @@ Release owner runbook for merging the integration chain and releasing it
 to production. Merged from two drafts (71f2f32 plus verified specifics);
 either author may extend it, but only the release owner executes it.
 
+Executed 2026-10-30: chain merged to main `2ed8fdf`, production journal
+`0001`..`0015`, deploy run 40981033161 succeeded, `/api/health` reports
+`ready: true` and `detail.schema: true`. Keep this runbook as the
+procedure for later chain-style releases.
+
+Run every `wrangler` command from the `website` directory (it holds
+`wrangler.jsonc`); `git` commands run from the repository root.
+
 Database identity (from `website/wrangler.jsonc`): binding `DB`,
 database `aipster-app` (`b91be793-704a-4eae-8b8f-7f4c8b78e4fc`),
 `migrations_dir` `migrations`.
@@ -94,6 +102,16 @@ gh pr merge 36 --repo synchronic1/AIPSTER --merge
 git fetch origin main; git rev-parse origin/main  # = reviewed_sha
 ```
 
+`gh pr merge` merges on GitHub only; the local tree still holds the old
+migration files. Before step 5, check out the recorded merged SHA so
+`wrangler` sees `0006`..`0015`:
+
+```powershell
+git checkout --detach <reviewed_sha>
+git rev-parse HEAD                     # must equal reviewed_sha
+Get-ChildItem website\migrations\0015_pairing.sql   # must exist
+```
+
 Use merge commits (repository process). If any PR shows a conflict, stop:
 resolve only with that branch owner's agreement, re-verify, then resume.
 Never merge overlapping superseded PRs to "complete" the chain.
@@ -112,6 +130,8 @@ zero DROP statements; ALTERs are not re-runnable):
   `0014_fabric_restriction_receipts.sql`, `0015_pairing.sql`.
 
 ```powershell
+cd website
+npx wrangler d1 migrations list aipster-app --remote   # lists 0006..0015 as pending
 npx wrangler d1 migrations apply aipster-app --remote
 ```
 
@@ -175,8 +195,10 @@ re-run the identical check by hand before calling it failed.
      `resource.delete`. A second delete is 404.
 - Liveness is not inference readiness: heartbeats and pairing prove
   reachability only.
-- `POST /api/jobs` must stay `501 INFERENCE_DISABLED`. Do not activate
-  live inference or F1P as part of release validation.
+- `POST /api/jobs` must stay `501 INFERENCE_DISABLED` for a signed-in
+  test session (anonymous callers get `401` first, from the sign-in
+  check). Do not activate live inference or F1P as part of release
+  validation.
 
 Any smoke failure: roll back the deploy (step 9). Do not roll back
 migrations without asking Peter.
