@@ -39,6 +39,7 @@
       <button role="tab" data-tab="compute" aria-selected="false">My Compute</button>
       <button role="tab" data-tab="shared" aria-selected="false">Shared With Me</button>
       <button role="tab" data-tab="sharing" aria-selected="false">Sharing</button>
+      <button role="tab" data-tab="federation" aria-selected="false">Federation</button>
       <button role="tab" data-tab="keys" aria-selected="false">API Keys</button>
       <button role="tab" data-tab="usage" aria-selected="false">Usage</button>
       <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
@@ -77,14 +78,101 @@
       </form>
       <h2>Outgoing grants</h2><div id="grant-list" class="grid"></div>
     </section>
+    <section id="tab-federation" role="tabpanel" hidden>
+      <h1>Federation</h1>
+      <p class="muted">Directional, non-transitive node sharing. Connecting grants <strong>zero</strong> resource access; every share needs an explicit preview, approval, and commit. Fixture transport only — no live peers in this build.</p>
+      <p id="demo-fab-note" class="muted" hidden>The demo account can view federation state but cannot invite, approve, or share.</p>
+      <div id="fab-off" class="card" hidden>Federation is not enabled on this deployment.</div>
+      <div id="fab-error" class="card" role="alert" hidden></div>
+      <div id="fab-on">
+      <h2>Nodes</h2>
+      <form id="fab-node-form" class="card">
+        <label>Label <input id="fab-node-label" required maxlength="80"></label>
+        <label>Workspace <input id="fab-node-ws" maxlength="64" placeholder="default"></label>
+        <p id="fab-node-error" class="error" role="alert" hidden></p>
+        <button type="submit">Register node</button>
+      </form>
+      <div id="fab-node-reveal" class="card reveal" hidden>
+        <h2>Copy this node secret now</h2>
+        <code id="fab-node-secret"></code>
+        <p class="muted">Shown once. It proves node possession when accepting invitations.</p>
+        <button id="fab-node-dismiss" type="button">Done</button>
+      </div>
+      <div id="fab-node-list" class="grid"></div>
+      <h2>Invitations</h2>
+      <form id="fab-inv-form" class="card">
+        <label>From my node <select id="fab-inv-issuer"></select></label>
+        <label>Recipient node id <input id="fab-inv-node" required maxlength="64" placeholder="node_…"></label>
+        <label>Recipient workspace <input id="fab-inv-ws" required maxlength="64" placeholder="default"></label>
+        <label>Purpose <input id="fab-inv-purpose" maxlength="280"></label>
+        <p id="fab-inv-error" class="error" role="alert" hidden></p>
+        <button type="submit">Issue invitation</button>
+      </form>
+      <div id="fab-inv-reveal" class="card reveal" hidden>
+        <h2>Deliver this token out of band</h2>
+        <code id="fab-inv-secret"></code>
+        <p class="muted">Shown once. The recipient pastes it into the accept form below.</p>
+        <button id="fab-inv-dismiss" type="button">Done</button>
+      </div>
+      <form id="fab-accept-form" class="card">
+        <h2>Accept invitation</h2>
+        <label>Token <input id="fab-accept-token" type="password" required maxlength="200" autocomplete="off"></label>
+        <label>Accept with my node <select id="fab-accept-node"></select></label>
+        <label>That node's secret <input id="fab-accept-key" type="password" required maxlength="200" autocomplete="off"></label>
+        <p id="fab-accept-error" class="error" role="alert" hidden></p>
+        <button type="submit">Accept (grants zero access by itself)</button>
+      </form>
+      <h2>Outgoing</h2><div id="fab-inv-out" class="grid"></div>
+      <h2>Incoming</h2><div id="fab-inv-in" class="grid"></div>
+      <h2>Connections</h2><div id="fab-conn-list" class="grid"></div>
+      <h2>Share resources (preview → approve → commit)</h2>
+      <form id="fab-prev-form" class="card">
+        <label>Connection <select id="fab-prev-conn"></select></label>
+        <label>My resource ids (comma separated) <input id="fab-prev-res" required maxlength="500"></label>
+        <label>Consumers (comma separated) <input id="fab-prev-consumers" required maxlength="500"></label>
+        <label>Models (comma separated) <input id="fab-prev-models" required maxlength="500"></label>
+        <label>Max tokens <input id="fab-prev-tokens" type="number" min="1" max="1000000000" value="100000" required></label>
+        <label>Max requests <input id="fab-prev-reqs" type="number" min="1" max="1000000" value="1000" required></label>
+        <p id="fab-prev-error" class="error" role="alert" hidden></p>
+        <button type="submit">Build preview</button>
+      </form>
+      <div id="fab-commit-box" class="card" hidden>
+        <p id="fab-commit-text"></p>
+        <p class="muted">digest <code id="fab-commit-digest"></code></p>
+        <p id="fab-commit-error" class="error" role="alert" hidden></p>
+        <button id="fab-commit-go" type="button">Request approval, approve &amp; commit</button>
+      </div>
+      <h2>Outgoing grants</h2><div id="fab-grant-out" class="grid"></div>
+      <h2>Incoming grants</h2><div id="fab-grant-in" class="grid"></div>
+      <h2>Denies</h2>
+      <form id="fab-deny-form" class="card">
+        <label>Resource id (blank = all) <input id="fab-deny-res" maxlength="64"></label>
+        <label>Action (blank = all) <input id="fab-deny-action" maxlength="32" placeholder="infer"></label>
+        <p id="fab-deny-error" class="error" role="alert" hidden></p>
+        <button type="submit">Add deny</button>
+      </form>
+      <div id="fab-deny-list" class="grid"></div>
+      <h2>Check access</h2>
+      <form id="fab-authz-form" class="card">
+        <label>As my node <select id="fab-authz-node"></select></label>
+        <label>Resource id <input id="fab-authz-res" required maxlength="64"></label>
+        <label>Model <input id="fab-authz-model" required maxlength="128"></label>
+        <label>Consumer <input id="fab-authz-consumer" required maxlength="128"></label>
+        <p id="fab-authz-error" class="error" role="alert" hidden></p>
+        <button type="submit">Preview decision</button>
+      </form>
+      <div id="fab-authz-out"></div>
+      </div>
+    </section>
     <section id="tab-keys" role="tabpanel" hidden>
       <h1>API Keys</h1>
-      <p class="muted">Secrets are shown <strong>once</strong> at creation. Only non-reversible verifiers are stored. Keys work for inventory/usage reads and (with inference scope) future jobs &mdash; never for sharing, key, or settings management. These are AIPSTER keys, not provider keys.</p>
+      <p class="muted">Secrets are shown <strong>once</strong> at creation. Only non-reversible verifiers are stored. Keys work for inventory/usage reads and (with inference scope) future jobs &mdash; never for sharing, key, or settings management. Heartbeat keys bind to one resource and can only post its heartbeats. These are AIPSTER keys, not provider keys.</p>
       <p id="demo-keys-note" class="muted" hidden>Sandbox credentials only: demo keys start with aip_demo_ and can never touch real resources.</p>
       <form id="key-form" class="card">
         <h2>New key</h2>
         <label>Name <input id="key-name" required maxlength="80"></label>
-        <label>Scope <select id="key-scope"><option value="read">read</option><option value="inference">inference</option></select></label>
+        <label>Scope <select id="key-scope"><option value="read">read</option><option value="inference">inference</option><option value="heartbeat">heartbeat</option></select></label>
+        <label id="key-resource-wrap" hidden>Resource <select id="key-resource"></select></label>
         <label>Expires <input id="key-expires" type="date"></label>
         <p id="key-error" class="error" role="alert" hidden></p>
         <button type="submit">Create key</button>
@@ -93,6 +181,11 @@
         <h2>Copy this secret now</h2>
         <code id="key-secret"></code>
         <p class="muted">It cannot be shown again. It is not stored in the browser.</p>
+        <div id="key-curl-wrap" hidden>
+          <h3>Heartbeat example (copyable)</h3>
+          <code id="key-curl"></code>
+          <button id="key-curl-copy" type="button">Copy curl</button>
+        </div>
         <button id="key-dismiss" type="button">Done</button>
       </div>
       <h2>Your keys</h2><div id="key-list" class="grid"></div>

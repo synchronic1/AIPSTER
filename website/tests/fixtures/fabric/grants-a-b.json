@@ -1,0 +1,13 @@
+{
+  "comment": "F0 fixtures: enforced grants for matcher vectors. g1 covers model cpu-echo-1 with a small ceiling; g2 covers cpu-echo-2 with a large ceiling (A06: neither covers model-1 + 5000 tokens). g1late duplicates g1 with a later expiry (witness selection). g0expired and g0paused exercise lifecycle denial.",
+  "grants": [
+    { "id": "g1", "status": "enforced", "recipientNode": "node-b", "recipientWorkspace": "ws-bob", "consumers": ["u_bob"], "resourceId": "r1", "incarnation": "gen3", "actions": ["infer"], "models": ["cpu-echo-1"], "notBefore": "2026-11-01T00:00:00.000Z", "expiry": "2026-11-08T00:00:00.000Z", "ceilings": { "maxTokens": 100 }, "route": "relay-fixture", "revision": 1 },
+    { "id": "g1late", "status": "enforced", "recipientNode": "node-b", "recipientWorkspace": "ws-bob", "consumers": ["u_bob"], "resourceId": "r1", "incarnation": "gen3", "actions": ["infer"], "models": ["cpu-echo-1"], "notBefore": "2026-11-01T00:00:00.000Z", "expiry": "2026-11-09T00:00:00.000Z", "ceilings": { "maxTokens": 5000 }, "route": "relay-fixture", "revision": 1 },
+    { "id": "g2", "status": "enforced", "recipientNode": "node-b", "recipientWorkspace": "ws-bob", "consumers": ["u_bob"], "resourceId": "r2", "incarnation": "gen1", "actions": ["infer"], "models": ["cpu-echo-2"], "notBefore": "2026-11-01T00:00:00.000Z", "expiry": "2026-11-08T00:00:00.000Z", "ceilings": { "maxTokens": 10000 }, "route": "relay-fixture", "revision": 1 },
+    { "id": "g0expired", "status": "enforced", "recipientNode": "node-b", "recipientWorkspace": "ws-bob", "consumers": ["u_bob"], "resourceId": "r1", "incarnation": "gen3", "actions": ["infer"], "models": ["cpu-echo-1"], "notBefore": "2026-10-01T00:00:00.000Z", "expiry": "2026-10-02T00:00:00.000Z", "ceilings": { "maxTokens": 100 }, "route": "relay-fixture", "revision": 1 },
+    { "id": "g0paused", "status": "paused", "recipientNode": "node-b", "recipientWorkspace": "ws-bob", "consumers": ["u_bob"], "resourceId": "r1", "incarnation": "gen3", "actions": ["infer"], "models": ["cpu-echo-1"], "notBefore": "2026-11-01T00:00:00.000Z", "expiry": "2026-11-08T00:00:00.000Z", "ceilings": { "maxTokens": 100 }, "route": "relay-fixture", "revision": 1 }
+  ],
+  "denies": [
+    { "id": "d1", "principal": "u_mallory", "resourceId": "r1", "action": "infer" }
+  ]
+}

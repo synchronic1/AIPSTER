@@ -46,6 +46,27 @@ async function api(path, opts = {}) {
 
 const pill = (ok, label) => `<span class="pill ${ok ? 'ok' : 'bad'}">${esc(label)}: ${ok ? 'yes' : 'no'}</span>`;
 
+// Paged inventory fetch: walks /api/inventory?limit=50&offset=… until the
+// reported total is reached (at most 2 requests under the 100-resource cap),
+// so selectors offer every owned resource instead of the newest 50. Each
+// page goes through the fenced api(), and the generation is re-checked
+// between pages so a tab switch mid-pagination drops the stale walk.
+async function allInventory() {
+  const gen = generation;
+  const items = [];
+  let offset = 0;
+  let total = Infinity;
+  for (let pages = 0; pages < 10 && items.length < total; pages++) {
+    const page = await api(`/api/inventory?limit=50&offset=${offset}`);
+    if (gen !== generation) throw staleError();
+    if (!page || !Array.isArray(page.items) || !page.items.length) break;
+    items.push(...page.items);
+    total = Number.isSafeInteger(page.total) && page.total >= 0 ? page.total : items.length;
+    offset += page.items.length;
+  }
+  return items;
+}
+
 // ---- resource-status strip (read-only, bounded polling) ----
 // Polls GET /api/status only while signed in on the Overview tab: a 30s base
 // interval with exponential backoff to 5min on failure, stopping entirely on
@@ -70,11 +91,23 @@ const formatAge = (ms) => {
 function renderStatus(el, data) {
   const s = data.summary || { total: 0, online: 0, stale: 0, offline: 0, unknown: 0 };
   const list = data.items || [];
-  const items = list.map((r) =>
-    `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs))}${r.demoFixture ? ' · DEMO' : ''}</p>`).join('');
+  const items = list.map((r) => {
+    const seen = r.lastSeenAt !== null && r.lastSeenAt !== undefined;
+    const age = r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs);
+    // Only heartbeat-seen rows replace the telemetry-unavailable copy with
+    // reachability-only copy. usable=false gets a distinct not-ready
+    // attention note and never renders as runnable/ready.
+    const hb = !seen ? '' : r.usable === false
+      ? ' · ATTENTION: reachable but NOT usable for inference'
+      : ' · heartbeat seen (reachability only — not ready to run)';
+    return `<p class="muted">${esc(r.name)} · ${esc(r.kind)} · ${esc(r.liveness)} · last seen ${esc(age)}${hb}${r.demoFixture ? ' · DEMO' : ''}</p>`;
+  }).join('');
+  const anySeen = list.some((r) => r.lastSeenAt !== null && r.lastSeenAt !== undefined);
   const note = data.demo
     ? 'DEMO DATA: simulated fixture, not a live node.'
-    : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
+    : anySeen
+      ? 'Heartbeat telemetry seen for some resources — reachability only, never inference acceptance. Resources never seen have no telemetry; nothing here means ready to run.'
+      : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
   // Counts always cover every owned resource; only the listed page is capped.
   const truncated = data.itemsTruncated === true
     ? `<p class="muted">showing ${list.length} of ${s.total} — older resources omitted from the list; counts cover all resources.</p>`
@@ -213,6 +246,9 @@ function detectOs() {
     const ua = typeof navigator.userAgent === 'string' ? navigator.userAgent : '';
     const s = (String(plat) + ' ' + ua).toLowerCase();
     if (s.includes('android') || s.includes('iphone') || s.includes('ipad') || s.includes('mobile')) return 'mobile';
+    // ChromeOS identifies itself as CrOS while navigator.platform may only
+    // report Linux. It is not a supported Linux install target.
+    if (s.includes('cros')) return null;
     if (s.includes('win')) return 'windows';
     if (s.includes('mac')) {
       const touch = Number(navigator.maxTouchPoints || 0);
@@ -225,6 +261,7 @@ function detectOs() {
 }
 const OS_FAMILY = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 const MOBILE_NOTE = 'You seem to be on a phone or tablet. Open AIPSTER on the computer you want to connect — the steps below install on the computer in front of you.';
+const needsTargetSelection = (card) => !card.picked && (!card.detected || card.detected === 'mobile');
 
 // Pinned worker commands per OS: worker-only sparse checkout at WORKER_COMMIT,
 // isolated install, self-test, fresh worker-local token, mock serve.
@@ -356,30 +393,31 @@ function paintConnectCard() {
     ? 'Pending: the installer is packaged and qualified; the release file is not published yet.'
     : 'Blocked: no verified installer is packaged yet.';
   const meta = OS_META[connect.os];
-  const unpickedMobile = connect.detected === 'mobile' && !connect.picked;
-  const options = (unpickedMobile ? '<option value="" selected>Choose a computer…</option>' : '') + ['windows', 'macos', 'linux'].map((k) =>
-    `<option value="${k}"${k === connect.os && !unpickedMobile ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
+  const unpickedTarget = needsTargetSelection(connect);
+  const targetLabel = connect.detected === 'mobile' ? 'computer' : 'system';
+  const options = (unpickedTarget ? `<option value="" selected>Choose a ${targetLabel}…</option>` : '') + ['windows', 'macos', 'linux'].map((k) =>
+    `<option value="${k}"${k === connect.os && !unpickedTarget ? ' selected' : ''}>${esc(OS_META[k].label)}</option>`).join('');
   const detectedNote = connect.detected === 'mobile'
     ? MOBILE_NOTE + (connect.picked ? ` You picked ${esc(meta.label)} as the target computer.` : '')
     : connect.detected
       ? `Detected: ${esc(OS_FAMILY[connect.detected])}. Change it if that is wrong.`
-      : 'Detection unavailable in this browser — pick your system and the steps below follow it.';
+      : 'Detection unavailable in this browser - pick your system to see target-specific steps.';
   const inst = INSTALLERS[connect.os];
   const usable = installerUsable(inst);
   const packaged = installerPackaged(inst);
-  const primary = unpickedMobile
-    ? '<button type="button" class="btn" disabled>Pick a target computer above</button>'
+  const primary = unpickedTarget
+    ? `<button type="button" class="btn" disabled>Pick a target ${targetLabel} above</button>`
     : usable
       ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
       : packaged
         ? `<button type="button" class="btn" disabled>Installer pending publication for ${esc(meta.label)}</button>`
         : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
-  const secondary = unpickedMobile ? ''
+  const secondary = unpickedTarget ? ''
     : meta.agentQualified
       ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
       : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
-  const installerLine = unpickedMobile
-    ? '<p class="muted">Pick a target computer to check installer availability.</p>'
+  const installerLine = unpickedTarget
+    ? `<p class="muted">Pick a target ${targetLabel} to check installer availability.</p>`
     : usable
       ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
       : packaged
@@ -394,8 +432,8 @@ function paintConnectCard() {
     const saveNote = connect.saveFailed ? ' The file download failed in this browser, so use the selectable text.' : '';
     status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
   }
-  const commands = workerCommands(connect.os).map(esc).join('\n');
-  const advanced = `<details><summary>Advanced: manual install, source and troubleshooting</summary>
+  const commands = unpickedTarget ? '' : workerCommands(connect.os).map(esc).join('\n');
+  const advanced = unpickedTarget ? '' : `<details><summary>Advanced: manual install, source and troubleshooting</summary>
 <h3>Manual install (${esc(meta.label)})</h3>
 <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). In ${esc(meta.shell)}, following the <a href="${esc(L.tested)}">tested installation</a> (the sparse checkout contains the worker and its root <code>LICENSE</code> only):</p>
 <pre tabindex="0" aria-label="${esc(meta.label)} install commands"><code>${commands}</code></pre>
@@ -463,7 +501,7 @@ function onConnectClick(ev) {
 }
 
 function saveInstructions() {
-  if (!connect || !connect.fallback) return;
+  if (!connect || needsTargetSelection(connect) || !connect.fallback) return;
   if (typeof Blob === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return;
   if (typeof document === 'undefined' || !document.createElement || !document.body) return;
   let url = null;
@@ -504,8 +542,7 @@ async function copyAgentInstructions() {
   // card the user has since re-rendered, switched OS on, or re-clicked.
   const card = connect;
   const os = card.os;
-  if (!OS_META[os].agentQualified) return;
-  if (card.detected === 'mobile' && !card.picked) return;
+  if (!OS_META[os] || !OS_META[os].agentQualified || needsTargetSelection(card)) return;
   const op = (card.copyOp = (card.copyOp || 0) + 1);
   const text = card.detected === 'mobile'
     ? `Target computer: ${OS_META[os].label} (these steps run on that computer, not on this phone or tablet).\n` + agentInstructions(os)
@@ -580,9 +617,10 @@ async function loadGrants() {
 async function loadKeys() {
   const el = $('key-list'); loading(el);
   try {
-    const data = await api('/api/keys?limit=50');
+    const [data, inv] = await Promise.all([api('/api/keys?limit=50'), allInventory()]);
+    $('key-resource').innerHTML = inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
     el.innerHTML = data.items.filter((k) => !k.revokedAt).map((k) =>
-      `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}</p>
+      `<div class="card"><h2>${esc(k.name)}</h2><p class="muted">${esc(k.prefix)}… · scope: ${esc(k.scope)}${k.scope === 'heartbeat' && k.resourceId ? ` · resource: ${esc(k.resourceId)}` : ''}</p>
        <p class="muted">created ${esc(k.createdAt)} · expires ${esc(k.expiresAt || 'never')} · last used ${esc(k.lastUsedAt || 'never')}</p>
        <button type="button" class="danger" data-revkey="${esc(k.id)}">Revoke</button></div>`).join('');
     if (!data.items.some((k) => !k.revokedAt)) state(el, '', 'No API keys yet.');
@@ -618,7 +656,104 @@ async function loadSettings() {
   } catch (e) { if (isStale(e)) return; banner(e.message); }
 }
 
-const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, keys: loadKeys, usage: loadUsage, settings: loadSettings };
+const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, federation: loadFederation, keys: loadKeys, usage: loadUsage, settings: loadSettings };
+
+// ---- federation ----
+const idem = () => ({ 'Idempotency-Key': (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)) });
+let fabPreview = null; // { id, digest } — cleared by resetState
+const fabNodes = [];
+
+async function loadFederation() {
+  const on = $('fab-on'), off = $('fab-off');
+  try {
+    const nodes = await api('/v1/fabric/nodes');
+    on.hidden = false; off.hidden = true; $('fab-error').hidden = true;
+    fabNodes.length = 0;
+    for (const n of nodes.items) fabNodes.push(n);
+    $('fab-node-list').innerHTML = nodes.items.length ? nodes.items.map((n) =>
+      `<div class="card"><h2>${esc(n.label)}</h2><p class="muted">${esc(n.id)} · workspace ${esc(n.workspace)} · fingerprint ${esc(n.fingerprint)}</p></div>`).join('')
+      : '<div class="card">No nodes yet. Register one above.</div>';
+    const opts = nodes.items.map((n) => `<option value="${esc(n.id)}">${esc(n.label)} (${esc(n.id)})</option>`).join('');
+    for (const id of ['fab-inv-issuer', 'fab-accept-node', 'fab-authz-node']) $(id).innerHTML = opts;
+    const [out, inc, conns] = await Promise.all([
+      api('/v1/fabric/invitations?role=issued'), api('/v1/fabric/invitations?role=received'), api('/v1/fabric/connections')
+    ]);
+    $('fab-inv-out').innerHTML = out.items.length ? out.items.map((v) =>
+      `<div class="card"><p>${esc(v.issuer_node)} → ${esc(v.recipient_node)} <span class="muted">(${esc(v.state)})</span></p>
+       ${v.state === 'issued' ? `<button type="button" class="danger" data-fab-revoke-inv="${esc(v.id)}">Revoke</button>` : ''}</div>`).join('')
+      : '<div class="card">No outgoing invitations.</div>';
+    $('fab-inv-in').innerHTML = inc.items.length ? inc.items.map((v) =>
+      `<div class="card"><p>${esc(v.issuer_node)} → ${esc(v.recipient_node)} <span class="muted">(${esc(v.state)})</span></p>
+       <p class="muted">${esc(v.purpose || 'no purpose recorded')}</p>
+       ${v.state === 'issued' ? `<button type="button" class="danger" data-fab-decline-inv="${esc(v.id)}">Decline</button>` : ''}</div>`).join('')
+      : '<div class="card">No incoming invitations.</div>';
+    $('fab-prev-conn').innerHTML = conns.items.filter((c) => c.state === 'active').map((c) =>
+      `<option value="${esc(c.id)}">${esc(c.id)} (${esc(c.a_node)} ↔ ${esc(c.b_node)})</option>`).join('');
+    $('fab-conn-list').innerHTML = conns.items.length ? conns.items.map((c) =>
+      `<div class="card"><p>${esc(c.a_node)} ↔ ${esc(c.b_node)} <span class="muted">${esc(c.state)} · v${c.version}</span></p>
+       <p>
+       ${c.state === 'active' ? `<button type="button" data-fab-susp="${esc(c.id)}" data-v="${c.version}">Suspend</button> <button type="button" class="danger" data-fab-disc="${esc(c.id)}" data-v="${c.version}">Disconnect</button>` : ''}
+       ${c.state !== 'active' ? `<button type="button" data-fab-resume="${esc(c.id)}" data-v="${c.version}">Resume…</button>` : ''}
+       </p><p class="muted" data-fab-resume-msg="${esc(c.id)}"></p></div>`).join('')
+      : '<div class="card">No connections yet. Accept an invitation to create one.</div>';
+    const [gout, gin, denies] = await Promise.all([
+      api('/v1/fabric/grants?scope=outgoing'), api('/v1/fabric/grants?scope=incoming'), api('/v1/fabric/denies')
+    ]);
+    const grantCard = (g, mine) => `<div class="card"><p>${esc(g.id)} <span class="muted">${esc(g.status)} · v${g.version} · expires ${esc(g.expiry)}</span></p>
+      <p class="muted">${(g.snapshot || []).length} resource(s) · models ${(g.models || []).map(esc).join(', ')}</p>
+      ${mine && g.status === 'enforced' ? `<button type="button" data-fab-pause="${esc(g.id)}" data-v="${g.version}">Pause</button> <button type="button" class="danger" data-fab-revoke="${esc(g.id)}" data-v="${g.version}">Revoke</button>` : ''}
+      ${mine && g.status === 'paused' ? `<button type="button" data-fab-grant-resume="${esc(g.id)}" data-v="${g.version}">Resume…</button>` : ''}</div>`;
+    $('fab-grant-out').innerHTML = gout.items.length ? gout.items.map((g) => grantCard(g, true)).join('') : '<div class="card">No outgoing grants.</div>';
+    $('fab-grant-in').innerHTML = gin.items.length ? gin.items.map((g) => grantCard(g, false)).join('') : '<div class="card">No incoming grants.</div>';
+    $('fab-deny-list').innerHTML = denies.items.length ? denies.items.map((d) =>
+      `<div class="card"><p>deny ${esc(d.action || '*')} on ${esc(d.resource_id || '*')}</p><button type="button" class="danger" data-fab-undeny="${esc(d.id)}">Remove</button></div>`).join('')
+      : '<div class="card">No denies.</div>';
+    wireFabButtons();
+  } catch (e) {
+    if (isStale(e)) return;
+    // Only the flag-off 404 means "not enabled". Any other failure
+    // (auth, server, network) keeps that copy hidden and reports the
+    // actionable error instead.
+    if (e && e.message && e.message.includes('(NOT_FOUND)')) {
+      on.hidden = true; off.hidden = false; $('fab-error').hidden = true;
+    } else {
+      on.hidden = true; off.hidden = true;
+      const box = $('fab-error');
+      box.textContent = 'Federation unavailable: ' + (e && e.message ? e.message : 'request failed.');
+      box.hidden = false;
+    }
+  }
+}
+
+function wireFabButtons() {
+  const click = (sel, fn) => document.querySelectorAll(sel).forEach((b) => b.addEventListener('click', fn));
+  click('[data-fab-revoke-inv]', async (e) => { try { await api('/v1/fabric/invitations/' + e.target.dataset.fabRevokeInv + '/revoke', { method: 'POST', headers: idem(), body: '{}' }); banner('Invitation revoked.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+  click('[data-fab-decline-inv]', async (e) => { try { await api('/v1/fabric/invitations/' + e.target.dataset.fabDeclineInv + '/decline', { method: 'POST', headers: idem(), body: '{}' }); banner('Invitation declined.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+  click('[data-fab-susp]', async (e) => { try { await api('/v1/fabric/connections/' + e.target.dataset.fabSusp + '/suspend', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Connection suspended.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+  click('[data-fab-disc]', async (e) => { try { await api('/v1/fabric/connections/' + e.target.dataset.fabDisc + '/disconnect', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Connection disconnected.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+  click('[data-fab-resume]', async (e) => {
+    const id = e.target.dataset.fabResume, v = Number(e.target.dataset.v);
+    const key = prompt('Withdraw your side\u2019s veto: paste YOUR node\u2019s own secret (shown once at registration). A peer secret withdraws nothing.');
+    if (!key) return;
+    try {
+      const out = await api('/v1/fabric/connections/' + id + '/resume', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: v, nodeKey: key.trim() }) });
+      banner(out && out.state === 'active' ? 'Connection resumed.' : 'Your veto is withdrawn; ' + ((out && out.remainingVetoes) || []).length + ' peer veto(s) remain.');
+      loadFederation();
+    } catch (ex) { if (!isStale(ex)) banner(ex.message); }
+  });
+  click('[data-fab-pause]', async (e) => { try { await api('/v1/fabric/grants/' + e.target.dataset.fabPause + '/pause', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Grant paused.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+  click('[data-fab-revoke]', async (e) => { try { await api('/v1/fabric/grants/' + e.target.dataset.fabRevoke + '/revoke', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: Number(e.target.dataset.v) }) }); banner('Grant revoked.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+  click('[data-fab-grant-resume]', async (e) => {
+    const id = e.target.dataset.fabGrantResume, v = Number(e.target.dataset.v);
+    try {
+      const a = await api('/v1/fabric/approvals', { method: 'POST', headers: idem(), body: JSON.stringify({ action: 'grant.resume', targetId: id }) });
+      await api('/v1/fabric/approvals/' + a.id + '/decide', { method: 'POST', headers: idem(), body: JSON.stringify({ decision: 'approve' }) });
+      await api('/v1/fabric/grants/' + id + '/resume', { method: 'POST', headers: idem(), body: JSON.stringify({ expectedVersion: v, approvalId: a.id }) });
+      banner('Grant resumed.'); loadFederation();
+    } catch (ex) { if (!isStale(ex)) banner(ex.message); }
+  });
+  click('[data-fab-undeny]', async (e) => { try { await api('/v1/fabric/denies/' + e.target.dataset.fabUndeny, { method: 'DELETE' }); banner('Deny removed.'); loadFederation(); } catch (ex) { if (!isStale(ex)) banner(ex.message); } });
+}
 
 function resetState() {
   // Clear every identity-scoped pixel and form field. Runs on logout and on
@@ -626,15 +761,28 @@ function resetState() {
   // switch never shows the previous identity's data (incl. revealed secrets).
   statusPollToken++;
   for (const id of ['status-strip', 'ov-cards', 'ov-note', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
+  for (const id of ['fab-node-list', 'fab-inv-out', 'fab-inv-in', 'fab-conn-list', 'fab-grant-out', 'fab-grant-in', 'fab-deny-list', 'fab-authz-out']) $(id).innerHTML = '';
+  for (const id of ['fab-inv-issuer', 'fab-accept-node', 'fab-authz-node', 'fab-prev-conn']) $(id).innerHTML = '';
   $('grant-resource').innerHTML = '';
   $('key-secret').textContent = ''; $('key-reveal').hidden = true;
+  $('fab-node-secret').textContent = ''; $('fab-node-reveal').hidden = true;
+  $('fab-inv-secret').textContent = ''; $('fab-inv-reveal').hidden = true;
+  $('fab-commit-box').hidden = true; $('fab-commit-text').textContent = ''; $('fab-commit-digest').textContent = '';
+  fabPreview = null; fabNodes.length = 0;
+  $('fab-on').hidden = true; $('fab-off').hidden = true;
+  $('fab-error').textContent = ''; $('fab-error').hidden = true;
+  $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true;
+  $('key-resource').innerHTML = ''; $('key-resource-wrap').hidden = true;
   $('whoami').textContent = '';
   $('settings-email').textContent = ''; $('settings-via').textContent = '…';
   for (const id of ['res-name', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'grant-user', 'key-name', 'key-expires', 'settings-name', 'demo-username', 'demo-password']) $(id).value = '';
+  for (const id of ['fab-node-label', 'fab-node-ws', 'fab-inv-node', 'fab-inv-ws', 'fab-inv-purpose', 'fab-accept-token', 'fab-accept-key', 'fab-prev-res', 'fab-prev-consumers', 'fab-prev-models', 'fab-deny-res', 'fab-deny-action', 'fab-authz-res', 'fab-authz-model', 'fab-authz-consumer']) $(id).value = '';
   $('grant-jobs').value = '50'; $('grant-tokens').value = '50000'; $('key-scope').value = 'read';
+  $('fab-prev-tokens').value = '100000'; $('fab-prev-reqs').value = '1000';
   for (const id of ['login-error', 'demo-error', 'resource-error', 'grant-error', 'key-error', 'settings-error']) { const e = $(id); e.textContent = ''; e.hidden = true; }
+  for (const id of ['fab-node-error', 'fab-inv-error', 'fab-accept-error', 'fab-prev-error', 'fab-commit-error', 'fab-deny-error', 'fab-authz-error']) { const e = $(id); e.textContent = ''; e.hidden = true; }
   $('banner').textContent = ''; $('banner').hidden = true;
-  $('demo-banner').hidden = true; $('demo-grants-note').hidden = true; $('demo-keys-note').hidden = true;
+  $('demo-banner').hidden = true; $('demo-grants-note').hidden = true; $('demo-keys-note').hidden = true; $('demo-fab-note').hidden = true;
   $('grant-form').hidden = false;
   document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', b.dataset.tab === 'overview' ? 'true' : 'false'));
   document.querySelectorAll('[role="tabpanel"]').forEach((p) => { p.hidden = p.id !== 'tab-overview'; });
@@ -707,20 +855,47 @@ $('grant-form').addEventListener('submit', async (e) => {
   } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
+$('key-scope').addEventListener('change', () => {
+  $('key-resource-wrap').hidden = $('key-scope').value !== 'heartbeat';
+});
+
 $('key-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const err = $('key-error'); err.hidden = true;
   try {
     const body = { name: $('key-name').value, scope: $('key-scope').value };
     if ($('key-expires').value) body.expiresAt = new Date($('key-expires').value + 'T00:00:00Z').toISOString();
+    if (body.scope === 'heartbeat') {
+      if (!$('key-resource').value) throw new Error('Choose the resource this heartbeat key is bound to.');
+      body.resourceId = $('key-resource').value;
+    }
     const k = await api('/api/keys', { method: 'POST', body: JSON.stringify(body) });
     $('key-secret').textContent = k.secret;
+    // Heartbeat keys reveal a copyable curl example bound to the same
+    // resource; the secret itself is still shown once and never persisted.
+    if (k.scope === 'heartbeat' && k.resourceId) {
+      $('key-curl').textContent = `curl -X POST ${location.origin}/api/resources/${k.resourceId}/heartbeat -H "Authorization: Bearer ${k.secret}" -H "Content-Type: application/json" -d '{"usable":true}'`;
+      $('key-curl-wrap').hidden = false;
+    } else {
+      $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true;
+    }
     $('key-reveal').hidden = false;
     $('key-name').value = ''; $('key-expires').value = '';
     loadKeys();
   } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
-$('key-dismiss').addEventListener('click', () => { $('key-secret').textContent = ''; $('key-reveal').hidden = true; });
+$('key-dismiss').addEventListener('click', () => { $('key-secret').textContent = ''; $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true; $('key-reveal').hidden = true; });
+$('key-curl-copy').addEventListener('click', async () => {
+  try {
+    const text = $('key-curl').textContent || '';
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      banner('Curl example copied.');
+    } else {
+      banner('Select the curl example above to copy it.');
+    }
+  } catch (e) { if (isStale(e)) return; banner('Copy failed: ' + e.message); }
+});
 
 $('settings-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -728,6 +903,91 @@ $('settings-form').addEventListener('submit', async (e) => {
   try {
     const s = await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ displayName: $('settings-name').value }) });
     banner('Saved.'); me.name = s.displayName; $('whoami').textContent = me.name + ' (' + me.email + ')';
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+
+$('fab-node-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('fab-node-error'); err.hidden = true;
+  try {
+    const n = await api('/v1/fabric/nodes', { method: 'POST', headers: idem(), body: JSON.stringify({ label: $('fab-node-label').value, workspace: $('fab-node-ws').value || 'default' }) });
+    $('fab-node-secret').textContent = n.nodeSecret;
+    $('fab-node-reveal').hidden = false;
+    $('fab-node-label').value = ''; $('fab-node-ws').value = '';
+    loadFederation();
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+$('fab-node-dismiss').addEventListener('click', () => { $('fab-node-secret').textContent = ''; $('fab-node-reveal').hidden = true; });
+
+$('fab-inv-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('fab-inv-error'); err.hidden = true;
+  try {
+    const v = await api('/v1/fabric/invitations', { method: 'POST', headers: idem(), body: JSON.stringify({ issuerNode: $('fab-inv-issuer').value, recipientNode: $('fab-inv-node').value.trim(), recipientWorkspace: $('fab-inv-ws').value.trim() || 'default', purpose: $('fab-inv-purpose').value }) });
+    $('fab-inv-secret').textContent = v.token;
+    $('fab-inv-reveal').hidden = false;
+    $('fab-inv-node').value = ''; $('fab-inv-ws').value = ''; $('fab-inv-purpose').value = '';
+    loadFederation();
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+$('fab-inv-dismiss').addEventListener('click', () => { $('fab-inv-secret').textContent = ''; $('fab-inv-reveal').hidden = true; });
+
+$('fab-accept-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('fab-accept-error'); err.hidden = true;
+  const token = $('fab-accept-token').value, nodeKey = $('fab-accept-key').value;
+  $('fab-accept-token').value = ''; $('fab-accept-key').value = '';
+  try {
+    await api('/v1/fabric/invitations/accept', { method: 'POST', headers: idem(), body: JSON.stringify({ token, nodeId: $('fab-accept-node').value, nodeKey }) });
+    banner('Invitation accepted. Connection carries zero resource access until you commit a grant.');
+    loadFederation();
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+
+$('fab-prev-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('fab-prev-error'); err.hidden = true;
+  const csv = (id) => $(id).value.split(',').map((s) => s.trim()).filter(Boolean);
+  try {
+    const p = await api('/v1/fabric/previews', { method: 'POST', headers: idem(), body: JSON.stringify({ connectionId: $('fab-prev-conn').value, resourceIds: csv('fab-prev-res'), consumers: csv('fab-prev-consumers'), models: csv('fab-prev-models'), maxTokens: Number($('fab-prev-tokens').value), maxRequests: Number($('fab-prev-reqs').value) }) });
+    fabPreview = { id: p.id, digest: p.digest };
+    $('fab-commit-text').textContent = p.confirmation;
+    $('fab-commit-digest').textContent = p.digest;
+    $('fab-commit-error').hidden = true;
+    $('fab-commit-box').hidden = false;
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+
+$('fab-commit-go').addEventListener('click', async () => {
+  const err = $('fab-commit-error'); err.hidden = true;
+  if (!fabPreview) { err.textContent = 'Build a preview first.'; err.hidden = false; return; }
+  try {
+    const a = await api('/v1/fabric/approvals', { method: 'POST', headers: idem(), body: JSON.stringify({ previewId: fabPreview.id }) });
+    await api('/v1/fabric/approvals/' + a.id + '/decide', { method: 'POST', headers: idem(), body: JSON.stringify({ decision: 'approve' }) });
+    await api('/v1/fabric/grants', { method: 'POST', headers: idem(), body: JSON.stringify({ approvalId: a.id, previewHash: fabPreview.digest }) });
+    fabPreview = null; $('fab-commit-box').hidden = true;
+    $('fab-prev-res').value = ''; $('fab-prev-consumers').value = ''; $('fab-prev-models').value = '';
+    banner('Grant committed and enforced.'); loadFederation();
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+
+$('fab-deny-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('fab-deny-error'); err.hidden = true;
+  try {
+    await api('/v1/fabric/denies', { method: 'POST', headers: idem(), body: JSON.stringify({ resourceId: $('fab-deny-res').value.trim() || undefined, action: $('fab-deny-action').value.trim() || undefined }) });
+    $('fab-deny-res').value = ''; $('fab-deny-action').value = '';
+    banner('Deny added.'); loadFederation();
+  } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
+});
+
+$('fab-authz-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('fab-authz-error'); err.hidden = true;
+  const out = $('fab-authz-out');
+  try {
+    const r = await api('/v1/fabric/authorization/preview', { method: 'POST', body: JSON.stringify({ nodeId: $('fab-authz-node').value, resourceId: $('fab-authz-res').value.trim(), incarnation: 'gen1', action: 'infer', model: $('fab-authz-model').value.trim(), consumer: $('fab-authz-consumer').value.trim(), maxTokens: 1000 }) });
+    out.innerHTML = `<div class="card"><h2>Decision: ${esc(r.decision)}</h2><p class="muted">${esc(r.code)} · evaluated ${esc(r.evaluated)} grant(s)</p></div>`;
   } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 
@@ -741,6 +1001,7 @@ function showApp() {
   $('grant-form').hidden = demo;
   $('demo-grants-note').hidden = !demo;
   $('demo-keys-note').hidden = !demo;
+  $('demo-fab-note').hidden = !demo;
   loadOverview();
 }
 

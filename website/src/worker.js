@@ -7,7 +7,9 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER } from './lib/quotas.js';
+import { handleFabric, federationEnabled } from './fabric/router.mjs';
+import { schemaReady } from './lib/schema.js';
+import { checkWriteBudget, assertClaimed, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
 const VERSION = '0.4.0';
@@ -43,6 +45,13 @@ function sameOrigin(request) {
 }
 
 const AUTH_BODY_MAX = 64 * 1024;
+// Heartbeat intake bounds (docs/heartbeat-intake.md): the strict
+// {"usable": boolean} body is capped at 1 KiB, and at most one accepted
+// heartbeat per resource per 25s window keeps sparse owner-pushed updates
+// from becoming a write amplifier. The window is enforced inside the atomic
+// intake UPDATE, never by a read-then-write.
+const HEARTBEAT_BODY_MAX = 1024;
+const HEARTBEAT_MIN_INTERVAL_MS = 25 * 1000;
 // Demo auth surface (allowlist): the only /api/auth/* routes a demo session
 // may use are sign-in (both maintained paths), sign-out, and session reads.
 // Everything else — update-user, change-password, link-social, password
@@ -134,6 +143,24 @@ async function ownerName(db, userId) {
   return (u && u.name) || 'Unknown';
 }
 
+async function revokedHeartbeatKey(request, db) {
+  // The heartbeat endpoint reports a revoked key distinctly (401
+  // KEY_REVOKED) instead of the generic 401, so honest senders can tell
+  // "rotate and re-mint" apart from "wrong credential". The presented
+  // secret is verified against the key's verifier BEFORE the revoked state
+  // is disclosed: any other caller gets the generic 401 AUTH_REQUIRED, so
+  // the key id alone is not a revocation oracle.
+  const header = request.headers.get('Authorization') || '';
+  const m = /^Bearer\s+(\S+)$/.exec(header);
+  if (!m) return false;
+  const parts = splitPresented(m[1]);
+  if (!parts) return false;
+  const row = await first(db, 'SELECT verifier, salt, revoked_at FROM key_verifiers WHERE id = ?', parts.id);
+  if (!row || !row.revoked_at) return false;
+  const expect = await verifierFor(parts.secret, row.salt);
+  return timingSafeEqualStr(expect, row.verifier);
+}
+
 async function handleApi(request, env, url) {
   const path = url.pathname;
   const method = request.method;
@@ -149,25 +176,7 @@ async function handleApi(request, env, url) {
     const hasDb = !!env.DB;
     const secretOk = (env.BETTER_AUTH_SECRET || '').length >= 32;
     const urlOk = !!env.BETTER_AUTH_URL;
-    let schemaOk = false;
-    if (hasDb) {
-      try {
-        const rows = await all(env.DB, "SELECT name FROM sqlite_master WHERE type = 'table'");
-        const names = new Set(rows.map((r) => r.name));
-        const tablesOk = ['user', 'session', 'account', 'verification', 'allowlist', 'resources', 'grants', 'key_verifiers', 'jobs', 'usage', 'audit', 'rateLimit', 'write_budget']
-          .every((n) => names.has(n));
-        // Migration contract: required columns must exist, not just tables.
-        // LIMIT 0 probes fail when any column is missing (e.g. 0003/0004
-        // not applied); portable across SQLite/D1 without pragma calls.
-        let colsOk = false;
-        if (tablesOk) {
-          await all(env.DB, 'SELECT username, displayUsername, demo, disabled FROM "user" LIMIT 0');
-          await all(env.DB, 'SELECT id, "key", count, lastRequest FROM rateLimit LIMIT 0');
-          colsOk = true;
-        }
-        schemaOk = tablesOk && colsOk;
-      } catch { schemaOk = false; }
-    }
+    const schemaOk = hasDb && await schemaReady(env.DB, federationEnabled(env));
     const authConfigured = hasDb && secretOk && urlOk;
     return json(200, {
       ok: true, app: 'aipster-app', version: VERSION,
@@ -244,6 +253,10 @@ async function handleApi(request, env, url) {
   const needAuthz = (scope = 'read') => {
     if (actor.kind === 'session') return null;
     if (actor.kind === 'key') {
+      // Least privilege: a heartbeat-scoped key authorizes its own heartbeat
+      // endpoint only. It fails every needAuthz check, closing the
+      // any-key-passes-read shape for this scope.
+      if (actor.key.scope === 'heartbeat') return json(403, { error: 'This API key is heartbeat-scoped; it can only post heartbeats.', code: 'KEY_SCOPE' });
       if (actor.key.scope === 'inference' || scope === 'read') return null;
       return json(403, { error: 'This API key is read-scoped; inference scope required.', code: 'KEY_SCOPE' });
     }
@@ -306,7 +319,139 @@ async function handleApi(request, env, url) {
     }
   }
 
-  // ---- status (read-only readiness strip; no telemetry writer exists) ----
+  // ---- heartbeat intake (owner-confined, key-only) ----
+  // Contract: docs/heartbeat-intake.md. A heartbeat proves reachability
+  // only, never inference acceptance. Auth is API-key ONLY: session cookies
+  // are rejected before any CSRF check, so this endpoint has no CSRF
+  // surface. The key must be heartbeat-scoped and bound to this exact
+  // resource (migration 0013). Every intake check — row existence
+  // (not-deleted), key-owner ownership, owner not disabled (0004), binding
+  // match + key live (not revoked/expired), and the 25s rate window — lives
+  // inside ONE conditional UPDATE, never a read-then-write. The server sets
+  // heartbeat_at=now and online=1 plus the body's usable bit; no other
+  // columns change. Heartbeats never draw the hourly write_budget (they
+  // are charged to separate per-owner + global heartbeat budgets in the same
+  // atomic batch as the resource UPDATE; a rejected heartbeat writes nothing). Aggregate ceilings, 429
+  // codes, and the D1 write-cost calculation live in
+  // docs/heartbeat-quotas.md.
+  {
+    const m = /^\/api\/resources\/([A-Za-z0-9_-]{1,64})\/heartbeat$/.exec(path);
+    if (m && method === 'POST') {
+      const resourceId = m[1];
+      if (actor.kind === 'session') return json(403, { error: 'Heartbeats require a heartbeat-scoped API key; sessions cannot post heartbeats.', code: 'KEY_REQUIRED' });
+      if (actor.kind === 'expired') return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });
+      if (actor.kind !== 'key') {
+        if (await revokedHeartbeatKey(request, db)) return json(401, { error: 'API key revoked.', code: 'KEY_REVOKED' });
+        return json(401, { error: 'Heartbeat API key required.', code: 'AUTH_REQUIRED' });
+      }
+      if (actor.key.scope !== 'heartbeat') return json(403, { error: 'This API key is not heartbeat-scoped.', code: 'KEY_SCOPE' });
+      if (actor.key.resource_id !== resourceId) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      // Strict body: exactly {"usable": boolean} within 1 KiB. Unknown
+      // fields, client timestamps, and any other shape are rejected; the
+      // server is the only writer of heartbeat_at/online/usable.
+      let usable;
+      try {
+        const raw = new TextDecoder().decode(await readBodyBytes(request, HEARTBEAT_BODY_MAX));
+        let data = null;
+        try { data = JSON.parse(raw || 'null'); } catch { data = null; }
+        const keys = data && typeof data === 'object' && !Array.isArray(data) ? Object.keys(data) : null;
+        if (!keys || keys.length !== 1 || keys[0] !== 'usable' || typeof data.usable !== 'boolean') {
+          return json(400, { error: 'Body must be exactly {"usable": boolean}.', code: 'BAD_HEARTBEAT' });
+        }
+        usable = data.usable ? 1 : 0;
+      } catch (error) {
+        if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+        throw error;
+      }
+      // Fast path: a closed 25s window rejects before any budget write.
+      // This probe is an optimization only — the conditional UPDATE below
+      // still enforces the window atomically, so racers cannot slip through.
+      const probe = await first(db, 'SELECT heartbeat_at FROM resources WHERE id = ?', resourceId);
+      if (probe && probe.heartbeat_at) {
+        const last = Date.parse(probe.heartbeat_at);
+        if (Number.isFinite(last)) {
+          const retryMs = HEARTBEAT_MIN_INTERVAL_MS - (Date.now() - last);
+          if (retryMs > 0) {
+            const retrySec = Math.ceil(retryMs / 1000);
+            return json(429, { error: 'Heartbeat too soon; back off and retry.', code: 'HEARTBEAT_TOO_SOON', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+          }
+        }
+      }
+      // Aggregate ceilings (docs/heartbeat-quotas.md). Read-only fast paths
+      // first: a spent global or owner bucket rejects before any write.
+      // Admission is then ONE batch: the resource UPDATE carries every
+      // intake check plus both cap checks, and the owner and global counter
+      // upserts each run only if the statement before changed one row. The
+      // batch is a transaction, so racers serialize: an accepted heartbeat
+      // moves the resource row and both counters by exactly one, and every
+      // loser (cap, window, key, owner or resource) writes zero rows. There
+      // is no claim to refund.
+      const budgets = heartbeatBudgets(env);
+      const hbWindow = heartbeatWindow();
+      const quotaSpent = (code, error) => {
+        const retrySec = secondsUntilNextHour();
+        return json(429, { error, code, retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+      };
+      const globalSpent = () => quotaSpent('HEARTBEAT_GLOBAL_QUOTA', 'Deployment heartbeat budget is spent for the hour; back off and retry.');
+      const ownerSpent = () => quotaSpent('HEARTBEAT_OWNER_QUOTA', 'Heartbeat budget for this owner is spent for the hour; back off and retry.');
+      const globalCount = await heartbeatBucketCount(db, HEARTBEAT_GLOBAL_ID, hbWindow);
+      if (globalCount !== null && globalCount >= budgets.global) return globalSpent();
+      if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return ownerSpent();
+      if (globalCount === null) await pruneHeartbeatBuckets(db, hbWindow);
+      const now = nowIso();
+      // Boundary: a beat exactly one interval old is admitted. The fast path
+      // and the retry calculation treat retryMs = 0 as "no wait needed", so
+      // the atomic UPDATE must admit there too; a strict `<` rejected it and
+      // the classifier, finding no remaining delay, fell through to 404.
+      const windowStart = new Date(Date.now() - HEARTBEAT_MIN_INTERVAL_MS).toISOString();
+      const [claimed, ownerCharge, globalCharge] = await db.batch([
+        db.prepare(
+          `UPDATE resources SET heartbeat_at = ?, online = 1, usable = ?
+           WHERE id = ?
+             AND owner_id = ?
+             AND (heartbeat_at IS NULL OR heartbeat_at <= ?)
+             AND EXISTS (SELECT 1 FROM "user" u WHERE u.id = resources.owner_id AND COALESCE(u.disabled, 0) != 1)
+             AND EXISTS (SELECT 1 FROM key_verifiers k WHERE k.id = ? AND k.resource_id = ? AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at >= ?))
+             AND ${HEARTBEAT_CAPS_SQL}`)
+          .bind(now, usable, resourceId, actor.key.owner_id, windowStart, actor.key.id, resourceId, now,
+            actor.key.owner_id, hbWindow, budgets.owner, hbWindow, budgets.global),
+        ...heartbeatCounterStatements(db, actor.key.owner_id, hbWindow),
+      ]);
+      if (Number(claimed.meta.changes) === 1) {
+        // The batch has committed the heartbeat. If a counter upsert did not
+        // register its change (local D1 always chains changes(); production
+        // D1 is not yet verified), complete the charge rather than leave an
+        // accepted heartbeat uncharged. This charges, never refunds.
+        const [ownerUpsert, globalUpsert] = heartbeatCounterStatements(db, actor.key.owner_id, hbWindow, { unconditional: true });
+        if (Number(ownerCharge.meta.changes) !== 1) await ownerUpsert.run();
+        if (Number(globalCharge.meta.changes) !== 1) await globalUpsert.run();
+        return json(200, { ok: true, id: resourceId, heartbeatAt: now, online: true, usable: usable === 1 });
+      }
+      // Admission lost: nothing was written. Map the reason with read-only
+      // probes. No audit row per heartbeat; the coarse key last_used_at
+      // update in actorFrom is the only trail.
+      if ((await heartbeatBucketCount(db, HEARTBEAT_GLOBAL_ID, hbWindow) ?? 0) >= budgets.global) return globalSpent();
+      if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return ownerSpent();
+      const keyRow = await first(db, 'SELECT revoked_at, expires_at FROM key_verifiers WHERE id = ?', actor.key.id);
+      if (!keyRow || keyRow.revoked_at) return json(401, { error: 'API key revoked.', code: 'KEY_REVOKED' });
+      if (keyRow.expires_at && Date.parse(keyRow.expires_at) < Date.now()) return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });
+      const target = await first(db, 'SELECT owner_id, heartbeat_at FROM resources WHERE id = ?', resourceId);
+      if (!target || target.owner_id !== actor.key.owner_id) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      const owner = await first(db, 'SELECT disabled FROM "user" WHERE id = ?', target.owner_id);
+      if (!owner || Number(owner.disabled) === 1) return json(401, { error: 'Sign-in or API key required.', code: 'AUTH_REQUIRED' });
+      const last = target.heartbeat_at ? Date.parse(target.heartbeat_at) : NaN;
+      if (Number.isFinite(last)) {
+        const retryMs = HEARTBEAT_MIN_INTERVAL_MS - (Date.now() - last);
+        if (retryMs > 0) {
+          const retrySec = Math.ceil(retryMs / 1000);
+          return json(429, { error: 'Heartbeat too soon; back off and retry.', code: 'HEARTBEAT_TOO_SOON', retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+        }
+      }
+      return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+    }
+  }
+
+  // ---- status (read-only readiness strip; written only by heartbeat intake) ----
   if (path === '/api/status' && method === 'GET') {
     const d = needAuthz('read'); if (d) return deny(d);
     // Owner-scoped minimal columns only: free-text cpu/gpu/origin/limits and
@@ -320,7 +465,7 @@ async function handleApi(request, env, url) {
     const nowMs = Date.now();
     const cutoffIso = new Date(nowMs - STALE_AFTER_MS).toISOString();
     const rows = await all(db,
-      'SELECT id, name, kind, online, heartbeat_at FROM resources WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
+      'SELECT id, name, kind, online, usable, heartbeat_at FROM resources WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?',
       me(), MAX_STATUS_ITEMS);
     const agg = await first(db,
       `SELECT COUNT(*) AS total,
@@ -356,7 +501,7 @@ async function handleApi(request, env, url) {
     const items = [];
     for (const g of page.items) {
       const r = await first(db, 'SELECT name FROM resources WHERE id = ?', g.resource_id);
-      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'server-enforced', policyNote: 'Inference-only; bounded quotas checked before every dispatch.' });
+      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'recorded', policyNote: 'Inference-only grant recorded by the owner; quotas are checked when dispatch is enabled. Dispatch is currently disabled.' });
     }
     return json(200, { ...page, items });
   }
@@ -416,7 +561,20 @@ async function handleApi(request, env, url) {
     const d = needSession() || needCsrf(); if (d) return deny(d);
     const body = await readJson(request);
     if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
-    if (!isScope(body.scope)) return json(400, { error: 'Scope must be "read" or "inference".', code: 'BAD_SCOPE' });
+    if (!isScope(body.scope)) return json(400, { error: 'Scope must be "read", "inference", or "heartbeat".', code: 'BAD_SCOPE' });
+    // Heartbeat keys bind to exactly one caller-owned resource at mint
+    // (migration 0013). The demo account cannot mint them: demo telemetry
+    // stays fixture-labeled and can never touch real intake.
+    let heartbeatResourceId = null;
+    if (body.scope === 'heartbeat') {
+      const nd = needNotDemo(); if (nd) return deny(nd);
+      if (!isId(body.resourceId)) return json(400, { error: 'resourceId is required for heartbeat scope.', code: 'BAD_RESOURCE' });
+      const target = await first(db, 'SELECT id FROM resources WHERE id = ? AND owner_id = ?', body.resourceId, me());
+      if (!target) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      heartbeatResourceId = body.resourceId;
+    } else if (body.resourceId !== undefined && body.resourceId !== null) {
+      return json(400, { error: 'resourceId is only valid with heartbeat scope.', code: 'BAD_RESOURCE' });
+    }
     let expiresAt = null;
     if (body.expiresAt !== undefined && body.expiresAt !== null) {
       const t = Date.parse(body.expiresAt);
@@ -429,11 +587,11 @@ async function handleApi(request, env, url) {
     const { id, secret, short } = mintKey(keyPrefix);
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
-      id, me(), body.name.trim(), body.scope, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso(), me());
+    const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
+      id, me(), body.name.trim(), body.scope, heartbeatResourceId, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso(), me());
     assertClaimed(kc, 'key');
-    await audit(db, me(), 'key.create', id, body.scope);
+    await audit(db, me(), 'key.create', id, body.scope === 'heartbeat' ? `heartbeat:${heartbeatResourceId}` : body.scope);
     const row = await first(db, 'SELECT * FROM key_verifiers WHERE id = ?', id);
     return json(201, { ...publicKey(mapKeyRow(row)), secret, oneTime: 'This secret is shown once. It cannot be recovered.' });
   }
@@ -482,8 +640,10 @@ async function handleApi(request, env, url) {
       requests: t.requests + r.requests,
       tokensIn: t.tokensIn + r.tokensIn,
       tokensOut: t.tokensOut + r.tokensOut,
-      modelCostUsd: r.costSource === 'demo-estimate' ? t.modelCostUsd : null,
-      executionCostUsd: r.costSource === 'demo-estimate' ? t.executionCostUsd : null
+      // Unknown is not zero: costs sum only when every row carries a real
+      // number; any unmeasured row makes the total unknown (null).
+      modelCostUsd: t.modelCostUsd === null || r.modelCostUsd === null || r.modelCostUsd === undefined ? null : t.modelCostUsd + r.modelCostUsd,
+      executionCostUsd: t.executionCostUsd === null || r.executionCostUsd === null || r.executionCostUsd === undefined ? null : t.executionCostUsd + r.executionCostUsd
     }), { requests: 0, tokensIn: 0, tokensOut: 0, modelCostUsd: 0, executionCostUsd: 0 });
     return json(200, { items: rows, total: page.total, limit: page.limit, offset: page.offset, totals, note: 'Model cost and execution cost are tracked separately. Unmeasured values stay null (unknown).' });
   }
@@ -510,6 +670,11 @@ async function handleApi(request, env, url) {
     return json(200, page);
   }
 
+  // ---- federation control plane (F1; flag-gated, default off) ----
+  if (path === '/v1/fabric/mcp' || path.startsWith('/v1/fabric/')) {
+    return handleFabric({ request, env, url, actor, db, json, needSession, needCsrf, needAuthz, needNotDemo });
+  }
+
   return json(404, { error: 'Unknown API route.', code: 'NOT_FOUND' });
 }
 
@@ -525,6 +690,7 @@ function mapGrantLite(g) {
 function mapKeyRow(k) {
   return {
     id: k.id, ownerId: k.owner_id, name: k.name, scope: k.scope,
+    resourceId: k.resource_id || null,
     verifier: k.verifier, salt: k.salt, prefix: k.prefix,
     expiresAt: k.expires_at || null, metadata: k.metadata || '',
     createdAt: k.created_at, lastUsedAt: k.last_used_at || null, revokedAt: k.revoked_at || null
@@ -563,7 +729,7 @@ export default {
         }
         return serveApp(request, env, url.pathname);
       }
-      if (url.pathname.startsWith('/api/')) {
+      if (url.pathname.startsWith('/api/') || url.pathname === '/v1/fabric/mcp' || url.pathname.startsWith('/v1/fabric/')) {
         try {
           return await handleApi(request, env, url);
         } catch (error) {

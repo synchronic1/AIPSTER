@@ -94,6 +94,7 @@ async function makeUi({ anonymous = false, platform, touchPoints = 0, userAgent 
   const chooseOs = async (value) => { card().onchange({ target: { dataset: { action: 'os' }, value } }); await flush(); };
   return {
     el, calls, logs, clickTab, flush, press, chooseOs, captured,
+    hasNavigator: typeof context.navigator !== 'undefined',
     resolveDeferred: async () => { deferred(); deferred = null; await flush(); },
     setClipboard: (mode) => { context.navigator.clipboard = clipboards[mode]; },
     logout: async () => { await el('logout').listeners.click(); await flush(); }
@@ -197,16 +198,53 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   const linuxPre = nodesOf(linuxHtml.slice(linuxHtml.indexOf('<pre'), linuxHtml.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
   assert.ok(linuxPre.includes('.venv/bin/python test_installation.py'), 'Advanced follows the picked OS');
   assert.ok(linuxPre.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
+  await mac.press('copy-agent');
+  assert.deepEqual(mac.captured, [], 'Linux remains unqualified even for a synthetic copy action');
   await mac.chooseOs('windows');
   assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['copy-agent'], 'agent setup returns on the qualified platform');
 
-  // Detection unavailable: the tested platform is preselected and labelled.
-  const unknown = await makeUi({ clipboard: 'ok' });
-  await unknown.clickTab('compute');
-  assert.ok(textOf(unknown.el('connect-card').innerHTML).includes('Detection unavailable in this browser'));
-  const cros = await makeUi({ platform: 'CrOS x86_64', clipboard: 'ok' });
-  await cros.clickTab('compute');
-  assert.ok(textOf(cros.el('connect-card').innerHTML).includes('Detection unavailable in this browser'));
+  // Unknown platforms, ChromeOS (whose platform may only say Linux), and a
+  // missing navigator all require an explicit target before showing commands.
+  const unknownTargets = [
+    { name: 'unknown platform', ui: await makeUi({ platform: 'Plan9', clipboard: 'ok' }) },
+    { name: 'ChromeOS with generic Linux platform', ui: await makeUi({
+      platform: 'Linux x86_64',
+      userAgent: 'Mozilla/5.0 (X11; CrOS x86_64 16093.0.0) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+      clipboard: 'ok'
+    }) },
+    { name: 'navigator unavailable', ui: await makeUi() }
+  ];
+  for (const { name, ui } of unknownTargets) {
+    if (name === 'navigator unavailable') assert.equal(ui.hasNavigator, false, 'test has no navigator global');
+    else assert.equal(ui.hasNavigator, true, 'platform is evaluated through navigator');
+    await ui.clickTab('compute');
+    let html = ui.el('connect-card').innerHTML;
+    const text = textOf(html);
+    assert.ok(text.includes('Detection unavailable in this browser'), `${name}: not classified as a supported target`);
+    assert.ok(text.includes('Pick a target system above'), `${name}: target choice is required`);
+    assert.equal(nodesOf(html).filter((n) => n.tagName === 'details' || n.tagName === 'pre').length, 0,
+      `${name}: Advanced/manual instructions stay out of the DOM`);
+    assert.ok(!html.includes('PowerShell') && !html.includes('.\\.venv\\Scripts')
+      && !text.includes('Windows x64 is the only tested platform'), `${name}: no Windows setup instructions are exposed`);
+    const selected = nodesOf(html).filter((n) => n.tagName === 'option' && n.attrs.some((x) => x.name === 'selected'));
+    assert.deepEqual(selected.map((o) => attr(o, 'value')), [''], `${name}: target placeholder is selected`);
+    assert.deepEqual(nodesOf(html).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [],
+      `${name}: no copy action is offered`);
+    await ui.press('copy-agent');
+    assert.deepEqual(ui.captured, [], `${name}: fabricated copy action writes nothing`);
+    assert.ok(!ui.el('connect-card').innerHTML.includes('<textarea'), `${name}: no fallback packet is generated before choosing`);
+
+    await ui.chooseOs('windows');
+    html = ui.el('connect-card').innerHTML;
+    assert.ok(textOf(html).includes('Advanced: manual install'), `${name}: choosing Windows reveals its instructions`);
+    await ui.press('copy-agent');
+    const packet = ui.captured[0] || nodesOf(ui.el('connect-card').innerHTML)
+      .find((n) => n.tagName === 'textarea')?.childNodes.map((c) => c.value || '').join('');
+    assert.ok(packet, `${name}: selected Windows target produces a packet or selectable fallback`);
+    assert.ok(packet.includes('AIPSTER agent setup packet v1.') && packet.includes(WORKER_COMMIT), `${name}: packet uses the pinned worker`);
+    assert.ok(packet.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'), `${name}: packet keeps the worker-only checkout`);
+    assert.equal(ui.captured.length, ui.hasNavigator ? 1 : 0, `${name}: no clipboard write when navigator is unavailable`);
+  }
 
   // A bogus picker value changes nothing.
   await win.chooseOs('bogus');
@@ -227,6 +265,8 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
     assert.deepEqual(picked.map((o) => attr(o, 'value')), [''], 'placeholder preselected so any pick fires');
     assert.ok(textOf(mobHtml).includes('Pick a target computer above'), 'primary gated too');
     assert.ok(textOf(mobHtml).includes('Pick a target computer to check installer availability.'));
+    assert.equal(mobNodes.filter((n) => n.tagName === 'details' || n.tagName === 'pre').length, 0,
+      'manual instructions wait until a phone or tablet target is chosen');
     assert.deepEqual(mobNodes.filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [], 'no install action before an explicit pick');
     await mob.press('copy-agent');
     assert.deepEqual(mob.captured, [], 'fabricated copy on an unpicked phone writes nothing');

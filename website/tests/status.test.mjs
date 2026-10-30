@@ -15,7 +15,9 @@ const iso = (ms) => new Date(ms).toISOString();
 
 test('parseStatusRow accepts minimal authorized rows, rejects malformed ones', () => {
   assert.deepEqual(parseStatusRow({ id: 'r_1', name: 'lab', kind: 'local', online: 1, heartbeat_at: iso(NOW) }),
-    { id: 'r_1', name: 'lab', kind: 'local', online: true, heartbeatAt: iso(NOW) });
+    { id: 'r_1', name: 'lab', kind: 'local', online: true, heartbeatAt: iso(NOW), usable: null });
+  assert.deepEqual(parseStatusRow({ id: 'r_1', name: 'lab', kind: 'local', online: 1, usable: 1, heartbeat_at: iso(NOW) }).usable, true);
+  assert.deepEqual(parseStatusRow({ id: 'r_1', name: 'lab', kind: 'local', online: 1, usable: 0, heartbeat_at: iso(NOW) }).usable, false);
   assert.equal(parseStatusRow(null), null);
   assert.equal(parseStatusRow({ id: 'r_1', name: '', kind: 'local' }), null);
   assert.equal(parseStatusRow({ id: 'r_1', name: 'x'.repeat(81), kind: 'local' }), null);
@@ -94,7 +96,7 @@ test('status is owner-scoped and leaks no free-text or cross-tenant fields', asy
   assert.equal(out.json.demo, false);
   assert.deepEqual(out.json.summary, { total: 1, online: 1, stale: 0, offline: 0, unknown: 0 });
   assert.deepEqual(Object.keys(out.json.items[0]).sort(),
-    ['demoFixture', 'id', 'kind', 'lastSeenAgeMs', 'lastSeenAt', 'liveness', 'name']);
+    ['demoFixture', 'id', 'kind', 'lastSeenAgeMs', 'lastSeenAt', 'liveness', 'name', 'usable']);
   const text = JSON.stringify(out.json);
   assert.ok(!text.includes('bob-box'), 'no other-tenant resource names');
   assert.ok(!/cpu|gpu|origin|limits|verifier|salt|secret/i.test(text.replace(/demoFixture/g, '')), 'no free-text or credential fields');
