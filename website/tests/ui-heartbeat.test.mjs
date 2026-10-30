@@ -88,3 +88,13 @@ test('demo labels are unchanged by heartbeat presence', async () => {
   assert.ok(host.innerHTML.includes('DEMO DATA: simulated fixture, not a live node.'), host.innerHTML);
   assert.ok(host.innerHTML.includes('· DEMO'), host.innerHTML);
 });
+
+test('stale rows never carry present-tense reachability wording', async () => {
+  // Muse W4 round 13: lastSeenAt survives after a worker goes stale,
+  // so a timestamp-presence check kept ATTENTION: reachable forever.
+  const { context, el } = await loadClient();
+  const host = el('probe');
+  context.renderStatus(host, payload([item({ liveness: 'stale', lastSeenAt: new Date(Date.now() - 3600 * 1000).toISOString(), lastSeenAgeMs: 3600000, usable: false })]));
+  assert.ok(!host.innerHTML.includes('ATTENTION: reachable'), host.innerHTML);
+  assert.ok(host.innerHTML.includes('not currently reachable'), host.innerHTML);
+});

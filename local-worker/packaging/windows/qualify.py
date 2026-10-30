@@ -50,73 +50,18 @@ def skip(name, reason):
     print(f"SKIP {name} ({reason})", flush=True)
 
 
-def _ace_text(output, path):
-    """ACE portion of `icacls path` output: line 0 is `path FIRST_ACE`."""
-    lines = (output or "").splitlines()
-    if lines and str(path) in lines[0]:
-        lines[0] = lines[0].replace(str(path), "", 1)
-    elif lines:
-        lines[0] = ""  # unparseable: ignore rather than misread the filename
-    return " ".join(line for line in lines
-                    if line.strip() and "successfully" not in line.lower()
-                    and "failed processing" not in line.lower())
-
-
-def _acl_probe_allows_strip(directory, env):
-    """True when this OS context lets icacls strip inheritance at all.
-
-    Runs the same command the worker uses against a scratch file. If the
-    system refuses even there, user-only ACLs are environmentally
-    impossible (a restricted runner) rather than an app bug.
-    """
-    probe = Path(directory) / "acl-probe.txt"
-    try:
-        probe.write_text("x", encoding="utf-8")
-        user = os.environ.get("USERNAME")
-        if not user:
-            try:
-                user = subprocess.check_output(["whoami"], text=True).strip()
-            except (OSError, subprocess.CalledProcessError):
-                user = None
-        if user:
-            subprocess.run(["icacls", str(probe), "/inheritance:r", "/grant:r", f"{user}:F"],
-                           capture_output=True, text=True, env=env, timeout=60)
-        shown = subprocess.run(["icacls", str(probe)], capture_output=True, text=True,
-                               env=env, timeout=60)
-        aces = _ace_text(shown.stdout, probe)
-        return ("(F)" in aces and "(I)" not in aces and "BUILTIN" not in aces,
-                user, aces)
-    except OSError as exc:
-        return False, None, f"probe error: {exc}"
-    finally:
-        try:
-            probe.unlink()
-        except OSError:
-            pass
-
-
 def check_token_acl(name, token_file, scratch_dir, env):
-    """Strict user-only ACL check with an environment escape hatch.
+    """Strict SID-based read-only verification; inability to secure tokens is a failure."""
+    sys.path.insert(0, str(PACKAGING.parent))
+    from aipster_tray.firstrun import private_token_acl
+    check(name, private_token_acl(token_file))
 
-    Passes hard when the token file is user-ACL-only. On mismatch, probes
-    whether the OS lets icacls strip inheritance at all: a restricted
-    context is recorded as a NOTE (the file still lives under the
-    user-profile directory), while a capable context that still produced
-    weak ACLs is a genuine app failure.
-    """
-    shown = subprocess.run(["icacls", str(token_file)], capture_output=True, text=True,
-                           env=env, timeout=60)
-    aces = _ace_text(shown.stdout, token_file)
-    if "(F)" in aces and "(I)" not in aces and "BUILTIN" not in aces:
-        check(name, True)
-        return
-    strips, user, probe_aces = _acl_probe_allows_strip(scratch_dir, env)
-    if strips:
-        check(name, False, f"user={user} token aces={aces[:300]!r}")
-    else:
-        check(name + " [restricted ACL context; recorded]", True)
-        print(f"NOTE {name}: user={user} OS refused inheritance-strip on scratch probe "
-              f"(probe aces={probe_aces[:200]!r}); token aces={aces[:300]!r}", flush=True)
+
+def private_fixture_directory(path):
+    """Create fresh fixture data through the production owner-provenance contract."""
+    sys.path.insert(0, str(PACKAGING.parent))
+    from aipster_tray.firstrun import private_directory
+    private_directory(Path(path))
 
 
 def free_port():
@@ -324,8 +269,10 @@ def pure_tests():
         check("port_busy True on a bound IPv4 port", port_busy("127.0.0.1", free) is True)
     finally:
         hold.close()
-    check("port_busy False on an unresolvable host (worker reports the config error)",
-          port_busy("nonexistent.invalid", free) is False)
+    from unittest.mock import patch
+    with patch("socket.getaddrinfo", side_effect=socket.gaierror("synthetic resolver failure")):
+        check("port_busy False on an unresolvable host (worker reports the config error)",
+              port_busy("synthetic.invalid", free) is False)
     try:
         v6 = socket.socket(socket.AF_INET6)
         v6.bind(("::1", 0))
@@ -391,7 +338,8 @@ def pure_tests():
         from aipster_tray.firstrun import ensure_private_token
         backend = SimpleNamespace(refresh=lambda *a: None, notify=lambda *a: None)
         with tempfile.TemporaryDirectory(prefix="aipster-reload-") as temp:
-            data = Path(temp)
+            data = Path(temp) / "worker-data"
+            private_fixture_directory(data)
             (data / "config.toml").write_text("[node]\n", encoding="utf-8")
             saved_env = os.environ.get("DENDRITE_API_TOKEN")
             os.environ.pop("DENDRITE_API_TOKEN", None)
@@ -399,11 +347,11 @@ def pure_tests():
                 ctl = Controller(data, backend)
                 ctl.config = data / "config.toml"
                 first_err = ctl._reload()
-                first = os.environ.get("DENDRITE_API_TOKEN")
+                first = ctl.child_env().get(ctl.token_env)
                 rotated = secrets.token_urlsafe(32)
                 (data / "api-token.txt").write_text(rotated + "\n", encoding="utf-8")
                 second_err = ctl._reload()
-                second = os.environ.get("DENDRITE_API_TOKEN")
+                second = ctl.child_env().get(ctl.token_env)
                 check("restart reload picks up a rotated token file",
                       first_err == "" and second_err == "" and bool(first)
                       and second == rotated and first != rotated)
@@ -448,7 +396,7 @@ class TrayLab:
 
     def env_for(self, name):
         data = self.work / name
-        data.mkdir(parents=True, exist_ok=True)
+        private_fixture_directory(data)
         env = scrubbed_env()
         env["AIPSTER_WORKER_DATA"] = str(data)
         return env, data
@@ -875,6 +823,7 @@ def full_profile(setup):
     check("tray is windowed, launcher+cli are console",
           pe_subsystem(tray) == 2 and pe_subsystem(launcher) == 3 and pe_subsystem(cli) == 3,
           f"{pe_subsystem(tray)}/{pe_subsystem(launcher)}/{pe_subsystem(cli)}")
+    check("CPython license ships", (install / "licenses" / "CPYTHON-LICENSE.txt").exists())
     check("licenses ship", (install / "licenses" / "AIPSTER-APACHE-LICENSE.txt").exists()
           and (install / "licenses" / "DENDRITE-LICENSE").exists()
           and (install / "licenses" / "PYINSTALLER-BOOTLOADER-NOTE.txt").exists()
@@ -999,7 +948,7 @@ def full_profile(setup):
         broken_home = work / "broken-home"
         broken_home.mkdir()
         broken_data = broken_home / "AIPSTER-Worker"
-        broken_data.mkdir()
+        private_fixture_directory(broken_data)
         (broken_data / "config.toml").write_text("[node\n", encoding="utf-8")
         broken = run_silent([str(launcher)], scrubbed_env_with_home(broken_home))
         check("broken config exits 2", broken.returncode == 2, f"rc={broken.returncode}")
@@ -1009,7 +958,8 @@ def full_profile(setup):
         cpu_home = work / "cpu-home"
         cpu_home.mkdir()
         cpu_data = cpu_home / "AIPSTER-Worker"
-        (cpu_data / "state").mkdir(parents=True)
+        private_fixture_directory(cpu_data)
+        (cpu_data / "state").mkdir()
         (cpu_data / "logs").mkdir()
         (cpu_data / "fixture.gguf").write_bytes(b"GGUF-fixture-not-a-model")
         cpu_port = free_port()
@@ -1060,10 +1010,20 @@ def full_profile(setup):
     check("reinstall preserves token + marker",
           (home / "AIPSTER-Worker/api-token.txt").read_text(encoding="utf-8").strip() == token_again
           and (home / "AIPSTER-Worker/qual-marker.txt").read_text(encoding="utf-8") == "preserve-me")
+    unrelated = install / "unrelated-user-file.txt"
+    unrelated.write_text("synthetic preserve-me")
     proc = run_silent([str(install / "uninstall.exe"), "/S"], env)
     check("silent uninstall exits 0", proc.returncode == 0, proc.stderr[-500:])
-    check("uninstall completes (async self-copy)", wait_gone(install))
-    check("install dir removed", not install.exists())
+    check("uninstall completes (async self-copy)", wait_gone(install / "uninstall.exe"))
+    check("uninstall removes payload but preserves unrelated user files",
+          not launcher.exists() and unrelated.exists()
+          and unrelated.read_text() == "synthetic preserve-me")
+    unrelated.unlink()
+    try:
+        install.rmdir()  # Empty test directory only; never recursive.
+    except FileNotFoundError:
+        pass  # Async uninstaller may have just removed the now-empty directory.
+    check("empty install directory can be removed", not install.exists())
     check("Start Menu entry removed", not start_menu.exists())
     check("desktop shortcut removed", not desktop_lnk.exists())
     check("app registry removed", not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
@@ -1114,6 +1074,7 @@ def full_profile(setup):
         check("default data dir removed by /REMOVEDATA=1", not removal_marker.exists())
         check("data dir fully gone when it held only the marker", not real_data.exists())
     skip("uninstall data checkbox", "UI-only path; /REMOVEDATA=1 covers the code path headless")
+    uninstall_failure_matrix(setup, env, work, created, procs)
     check("registry fully clean",
           not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY)
           and not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
@@ -1128,6 +1089,127 @@ def full_profile(setup):
     shutil.rmtree(work, ignore_errors=True)
     print(f"\n{len(FAILURES)} failure(s)" + (": " + ", ".join(FAILURES) if FAILURES else ""))
     return 1 if FAILURES else 0
+
+
+def uninstall_failure_matrix(setup, env, work, created, procs):
+    """Failure paths keep the install registered and retryable; never false success.
+
+    Runs uninstall.exe synchronously with _?=<dir> so its real exit code is
+    observed. Only scratch installs, fixture processes and files this run
+    created are touched.
+    """
+    def sync_uninstall(target):
+        return run_silent([str(target / "uninstall.exe"), "/S", f"_?={target}"], env)
+
+    def payload_left(target):
+        return sorted(str(p.relative_to(target)) for p in target.rglob("*")
+                      if p.is_file() and p.name not in ("uninstall.exe", "partial-sentinel.txt"))
+
+    def registered_to(target):
+        return (reg_value(winreg.HKEY_CURRENT_USER, APP_KEY, "InstallDir") == str(target)
+                and str(target / "uninstall.exe") in (reg_value(
+                    winreg.HKEY_CURRENT_USER, UNINSTALL_KEY, "UninstallString") or ""))
+
+    install = work / "app4"
+    proc = run_silent([str(setup), "/S", f"/D={install}"], env)
+    check("failure-matrix install exits 0", proc.returncode == 0, proc.stderr[-500:])
+    created.append(install)
+    sentinel = install / "partial-sentinel.txt"
+    sentinel.write_text("synthetic preserve-me")
+    full = payload_left(install)
+
+    # Running worker: a fixture process with the worker image name (a copy of
+    # PING.EXE, not the real worker) must abort the uninstall untouched.
+    fixture_dir = work / "running-fixture"
+    fixture_dir.mkdir()
+    fake = fixture_dir / "dendrite.exe"
+    shutil.copy2(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE", fake)
+    runner = subprocess.Popen([str(fake), "-n", "120", "127.0.0.1"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(runner)
+    try:
+        proc = sync_uninstall(install)
+        check("uninstall over a running worker exits 2", proc.returncode == 2, str(proc.returncode))
+        check("running-worker abort removes nothing", payload_left(install) == full)
+        check("running-worker abort keeps registration", registered_to(install))
+    finally:
+        runner.terminate()
+        runner.wait(timeout=15)
+
+    # Locked payload: a held DLL (no delete sharing) survives removal. The
+    # uninstall reports failure, keeps registration AND the uninstaller it
+    # points to, and has already removed dendrite.exe (a partial state).
+    locked = next(p for p in sorted(install.rglob("*.dll")))
+    with open(locked, "rb"):
+        proc = sync_uninstall(install)
+        check("locked-payload uninstall exits 2", proc.returncode == 2, str(proc.returncode))
+        check("locked file survives", locked.exists())
+        check("partial removal took dendrite.exe", not (install / "dendrite.exe").exists())
+        check("uninstaller retained after failed removal", (install / "uninstall.exe").exists())
+        check("registration preserved and still points at a working uninstaller",
+              registered_to(install))
+
+    # A foreign directory holding only a copied uninstaller is never adopted,
+    # even while a retained partial install is registered elsewhere.
+    foreign = work / "foreign"
+    foreign.mkdir()
+    (foreign / "unrelated.txt").write_text("synthetic unrelated")
+    shutil.copy2(install / "uninstall.exe", foreign / "uninstall.exe")
+    proc = sync_uninstall(foreign)
+    check("foreign directory uninstall refused (exit 2)", proc.returncode == 2, str(proc.returncode))
+    check("foreign files untouched", (foreign / "unrelated.txt").read_text() == "synthetic unrelated")
+    check("registration unchanged by refused foreign run", registered_to(install))
+
+    # Retry after the lock is released: the retained partial install (no
+    # dendrite.exe) is still recognized and now removes completely.
+    proc = sync_uninstall(install)
+    check("retry after partial cleanup exits 0", proc.returncode == 0, str(proc.returncode))
+    check("retry removes every payload file", payload_left(install) == [], str(payload_left(install)[:5]))
+    check("retry preserves unrelated files", sentinel.read_text() == "synthetic preserve-me")
+    check("retry unregisters", not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+          and not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
+
+    # Denied deletion: Windows lets "delete child" on the parent override a
+    # file's own DELETE deny, so the fixture denies both (file D, parent DC)
+    # for this user. Removing both denies makes the retry succeed.
+    install5 = work / "app5"
+    proc = run_silent([str(setup), "/S", f"/D={install5}"], env)
+    check("denied-deletion install exits 0", proc.returncode == 0, proc.stderr[-500:])
+    created.append(install5)
+    denied = next(p for p in sorted(install5.rglob("*.dll")))
+    user = os.environ.get("USERNAME", "")
+    deny = subprocess.run(["icacls", str(denied), "/deny", f"{user}:(D)"], capture_output=True, text=True)
+    deny_parent = subprocess.run(["icacls", str(denied.parent), "/deny", f"{user}:(DC)"],
+                                 capture_output=True, text=True)
+    check("fixture deny ACLs applied", deny.returncode == 0 and deny_parent.returncode == 0,
+          deny.stdout[-300:] + deny.stderr[-300:] + deny_parent.stdout[-300:] + deny_parent.stderr[-300:])
+    try:
+        proc = sync_uninstall(install5)
+        check("denied-deletion uninstall exits 2", proc.returncode == 2, str(proc.returncode))
+        check("denied file survives", denied.exists())
+        check("denied-deletion keeps working registration", registered_to(install5))
+    finally:
+        subprocess.run(["icacls", str(denied.parent), "/remove:d", user], capture_output=True)
+        subprocess.run(["icacls", str(denied), "/remove:d", user], capture_output=True)
+    proc = sync_uninstall(install5)
+    check("retry after deny removed exits 0", proc.returncode == 0, str(proc.returncode))
+    check("retry removes the denied file and all payload", payload_left(install5) == [])
+    check("registry clean after failure matrix",
+          not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY)
+          and not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
+    # _?= runs in place, so NSIS cannot delete the running uninstaller; remove
+    # the scratch leftovers this matrix created (exact names, never recursive).
+    for target in (install, install5):
+        for leftover in ("uninstall.exe", "partial-sentinel.txt"):
+            try:
+                (target / leftover).unlink()
+            except FileNotFoundError:
+                pass
+        for directory in sorted((p for p in target.rglob("*") if p.is_dir()),
+                                key=lambda p: -len(p.parts)):
+            directory.rmdir()
+        target.rmdir()
+        created.remove(target)
 
 
 def scrubbed_env_with_home(home):
