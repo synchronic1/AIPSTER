@@ -21,6 +21,8 @@ test('migrations create the auth and app tables', () => {
   for (const c of ['user_id', 'window', 'count']) assert.ok(cols('write_budget').includes(c), `write_budget.${c}`);
   assert.ok(names.includes('pairing_codes'), 'missing table pairing_codes (0015)');
   for (const c of ['salt', 'verifier', 'expires_at', 'used_at', 'attempts', 'node_id', 'resource_id']) assert.ok(cols('pairing_codes').includes(c), `pairing_codes.${c}`);
+  assert.ok(names.includes('admin_grants'), 'missing table admin_grants (0016)');
+  for (const c of ['user_id', 'role', 'scope', 'expires_at', 'revoked_at']) assert.ok(cols('admin_grants').includes(c), `admin_grants.${c}`);
   assert.ok(names.includes('idempotency_keys'), 'missing table idempotency_keys (0015)');
   assert.ok(cols('resources').includes('node_id'), 'resources.node_id (0015 pairing identity)');
 });

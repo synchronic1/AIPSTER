@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {parse} from 'parse5';
 
-export const publicFiles=['404.html','_headers','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/heurchain.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','assets/social-preview.png','assets/social-preview.svg','favicon.svg','index.html','release.json','styles.css'].sort();
+export const publicFiles=['404.html','_headers','admin/admin.js','admin/index.html','admin/styles.css','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/heurchain.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','assets/social-preview.png','assets/social-preview.svg','favicon.svg','index.html','release.json','styles.css'].sort();
 
 export const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function files(root,dir=root){const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink(),'Symlinks are outside the public upload policy');const path=resolve(dir,entry.name);if(entry.isDirectory())result.push(...await files(root,path));else{assert(entry.isFile(),'Unexpected asset type');result.push(relative(root,path).replaceAll('\\','/'));}}return result.sort();}
@@ -61,6 +61,11 @@ function checkCss(text, path, ids = new Set()) {
   assert(!/\burl\s*\(/i.test(withoutUrls), 'Malformed CSS URL requires review');
 }
 
+// Reviewed panel shells and their single approved same-origin script each.
+// Adding a shell here is a policy change: it must stay minimal, carry no
+// authority of its own, and keep every API call server-authorized.
+const APPROVED_PANEL_SCRIPTS = new Map([['app/index.html', '/app/app.js'], ['admin/index.html', '/admin/admin.js']]);
+
 function checkMarkup(text, path) {
   const errors = [];
   // The approved diagram export includes this inert XML declaration. Other
@@ -108,8 +113,11 @@ function checkMarkup(text, path) {
     }
     if (tag === 'form') assert(path === 'app/index.html', 'Active forms are outside the static site policy');
     if (tag === 'script') {
-      assert(path === 'app/index.html' && node.namespaceURI === 'http://www.w3.org/1999/xhtml'
-        && attrs.length === 1 && attrs[0].name === 'src' && attrs[0].value === '/app/app.js'
+      // Each panel shell loads exactly its own approved same-origin script
+      // and nothing else: no inline code, no second script, no other page.
+      const approved = APPROVED_PANEL_SCRIPTS.get(path);
+      assert(approved && node.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        && attrs.length === 1 && attrs[0].name === 'src' && attrs[0].value === approved
         && (node.childNodes || []).every(child => child.nodeName === '#text' && !child.value.trim()),
       'Active scripts are outside the static site policy');
       scripts++;
@@ -123,7 +131,7 @@ function checkMarkup(text, path) {
       }
     }
   }
-  if (path === 'app/index.html') assert.equal(scripts, 1, 'The app must load exactly its approved script');
+  if (APPROVED_PANEL_SCRIPTS.has(path)) assert.equal(scripts, 1, 'A panel shell must load exactly its approved script');
 }
 
 export async function checkPublic(root){

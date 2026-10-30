@@ -1,14 +1,16 @@
 /* Built with Meta Muse. */
-// AIPSTER apex Worker: same-origin control-panel API + /app UI on top of the
-// existing static site. Routing: /api/auth/* -> Better Auth, /api/* -> JSON
-// API (errors always JSON, never the static 404 page), /app* -> panel assets,
-// everything else -> ASSETS (landing page preserved byte-for-byte).
+// AIPSTER apex Worker: same-origin control-panel API + /app UI + /admin UI on
+// top of the existing static site. Routing: /api/auth/* -> Better Auth,
+// /api/* -> JSON API (errors always JSON, never the static 404 page),
+// /app* and /admin* -> panel assets, everything else -> ASSETS (landing page
+// preserved byte-for-byte).
 import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET } from './lib/validate.js';
 import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
+import { handleAdmin } from './admin/router.mjs';
 import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
@@ -829,6 +831,11 @@ async function handleApi(request, env, url) {
     return json(200, page);
   }
 
+  // ---- administration API scaffold (deny-by-default; reads unavailable, mutations 501) ----
+  if (path.startsWith('/api/admin/v1/')) {
+    return handleAdmin({ request, env, url, actor, db, json, needCsrf });
+  }
+
   // ---- federation control plane (F1; flag-gated, default off) ----
   if (path === '/v1/fabric/mcp' || path.startsWith('/v1/fabric/')) {
     return handleFabric({ request, env, url, actor, db, json, needSession, needCsrf, needAuthz, needNotDemo });
@@ -971,9 +978,18 @@ function mapKeyRow(k) {
   };
 }
 
+function panelBase(pathname) {
+  if (pathname === '/admin' || pathname === '/admin/' || pathname.startsWith('/admin/')) return '/admin';
+  if (pathname === '/app' || pathname === '/app/' || pathname.startsWith('/app/')) return '/app';
+  return null;
+}
+
 async function serveApp(request, env, pathname) {
-  // /app UI from static assets with app security headers (script-src 'self').
-  const assetPath = pathname === '/app' || pathname === '/app/' ? '/app/index.html' : pathname;
+  // Panel UIs (/app, /admin) from static assets with app security headers
+  // (script-src 'self'). Server authorization still gates every API call;
+  // the shell itself carries no authority.
+  const base = panelBase(pathname) || '/app';
+  const assetPath = pathname === base || pathname === base + '/' ? base + '/index.html' : pathname;
   const url = new URL(request.url);
   const res = await env.ASSETS.fetch(new Request(url.origin + assetPath, { method: request.method }));
   if (!res.ok) return new Response('Not found', { status: 404, headers: { ...baseHeaders(), 'Content-Type': 'text/plain' } });
@@ -991,13 +1007,14 @@ export default {
       // Canonical-host guard for the app shell (mirrors the /api guard):
       // alternate hosts (workers.dev, previews) keep serving public assets
       // but must not become auth entry points.
-      if ((url.pathname === '/app' || url.pathname === '/app/' || url.pathname.startsWith('/app/')) && wrongHost(env, url.origin)) {
+      const panel = panelBase(url.pathname);
+      if (panel && wrongHost(env, url.origin)) {
         return new Response('Forbidden host.', { status: 403, headers: { ...baseHeaders(), 'Content-Type': 'text/plain' } });
       }
-      if (url.pathname === '/app' && request.method === 'GET') {
-        return Response.redirect(url.origin + '/app/', 302);
+      if (panel && url.pathname === panel && request.method === 'GET') {
+        return Response.redirect(url.origin + panel + '/', 302);
       }
-      if (url.pathname === '/app/' || url.pathname.startsWith('/app/')) {
+      if (panel && url.pathname !== panel) {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           return new Response('Method not allowed', { status: 405, headers: baseHeaders() });
         }
