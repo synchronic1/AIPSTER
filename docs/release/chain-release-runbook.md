@@ -92,13 +92,14 @@ not listed here stops the release.
 ## 4. Merge the chain in order
 
 ```powershell
-gh pr merge 29 --repo synchronic1/AIPSTER --merge
+# <sha29>..<sha36>: the full headRefOid values recorded in step 1.
+gh pr merge 29 --repo synchronic1/AIPSTER --merge --match-head-commit <sha29>
 gh pr edit 31 --repo synchronic1/AIPSTER --base main
-gh pr merge 31 --repo synchronic1/AIPSTER --merge
+gh pr merge 31 --repo synchronic1/AIPSTER --merge --match-head-commit <sha31>
 gh pr edit 35 --repo synchronic1/AIPSTER --base main
-gh pr merge 35 --repo synchronic1/AIPSTER --merge
+gh pr merge 35 --repo synchronic1/AIPSTER --merge --match-head-commit <sha35>
 gh pr edit 36 --repo synchronic1/AIPSTER --base main
-gh pr merge 36 --repo synchronic1/AIPSTER --merge
+gh pr merge 36 --repo synchronic1/AIPSTER --merge --match-head-commit <sha36>
 git fetch origin main; git rev-parse origin/main  # = reviewed_sha
 ```
 
@@ -111,6 +112,12 @@ git checkout --detach <reviewed_sha>
 git rev-parse HEAD                     # must equal reviewed_sha
 Get-ChildItem website\migrations\0015_pairing.sql   # must exist
 ```
+
+Each merge is bound to the head SHA that was reviewed: if a branch moved
+after step 1, `--match-head-commit` refuses the merge. Stop there and get
+the new head re-reviewed; never drop the flag or substitute the new SHA
+without that review. Merge only when checks have finished (no pending
+checks), so `gh` merges immediately instead of enabling auto-merge.
 
 Use merge commits (repository process). If any PR shows a conflict, stop:
 resolve only with that branch owner's agreement, re-verify, then resume.
