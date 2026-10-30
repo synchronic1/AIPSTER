@@ -102,6 +102,28 @@
       <div id="catalog-meta" class="muted" role="status"></div>
       <div id="catalog-list" class="grid"></div>
       <div id="asset-detail"></div>
+      <h2>My assets</h2>
+      <p class="muted">Private uploads, visible only to you. Bytes stay quarantined until validation passes.</p>
+      <div id="my-assets" class="grid"></div>
+      <form id="upload-form" class="card">
+        <h2>Upload private asset</h2>
+        <p class="muted">Explicit files only (no archives). Refused: executables, scripts, pickle weights, traversal names. Scaffold cap: 128 MiB per asset.</p>
+        <label>Name <input id="up-name" maxlength="80" required></label>
+        <label>Kind <select id="up-kind"><option value="model">model</option><option value="adapter">adapter</option></select></label>
+        <label>Task <input id="up-task" maxlength="64" placeholder="e.g. text-generation"></label>
+        <label>Format <input id="up-format" maxlength="32" placeholder="e.g. gguf"></label>
+        <label>License <input id="up-license" maxlength="200" placeholder="e.g. apache-2.0"></label>
+        <div id="up-adapter-fields" hidden>
+          <label>Exact base asset id <input id="up-base-id" maxlength="64" placeholder="priv:…"></label>
+          <label>Exact base revision <input id="up-base-rev" maxlength="64"></label>
+          <label>Target modules (comma-separated) <input id="up-modules" maxlength="500" placeholder="q_proj, v_proj"></label>
+          <label>Tokenizer <input id="up-tokenizer" maxlength="200"></label>
+        </div>
+        <label>Files <input id="up-files" type="file" multiple required></label>
+        <p id="upload-error" class="error" role="alert" hidden></p>
+        <div id="upload-progress" class="muted" role="status"></div>
+        <button type="submit">Upload and validate</button>
+      </form>
     </section>
     <section id="tab-federation" role="tabpanel" hidden>
       <h1>Federation</h1>

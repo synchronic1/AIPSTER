@@ -7,7 +7,7 @@
 import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
-import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET } from './lib/validate.js';
+import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET, MAX_BODY_BYTES } from './lib/validate.js';
 import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
@@ -15,6 +15,8 @@ import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
+import { validateManifest, validateRelPath as catalogRelPath, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK } from './lib/catalog/validate.mjs';
+import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
 
 const VERSION = '0.4.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -170,6 +172,60 @@ async function catalogNodeAccess(db, userId, nodeId) {
   const owner = await first(db, 'SELECT disabled FROM "user" WHERE id = ?', r.owner_id);
   if (!owner || Number(owner.disabled) === 1) return null;
   return r;
+}
+
+// Private-asset API shape from a catalog_assets row + its files. The
+// owner check happens before this runs; provenance/card text stays
+// untrusted content for the client to render inert.
+async function privateAssetShape(db, row) {
+  const files = await all(db, 'SELECT relpath, bytes, sha256 FROM catalog_asset_files WHERE asset_id = ?', row.id);
+  const manifest = JSON.parse(row.manifest_json);
+  const license = JSON.parse(row.license_json);
+  return {
+    id: `priv:${row.id}`,
+    source: 'private',
+    repo: row.repo,
+    revision: row.revision,
+    kind: row.kind,
+    task: row.task,
+    arch: row.arch,
+    format: row.format,
+    quant: row.quant,
+    license,
+    gated: false,
+    card: manifest.provenance || '',
+    files: files.map((f) => ({ relpath: f.relpath, bytes: f.bytes, sha256: f.sha256 })),
+    totalBytes: files.reduce((n, f) => n + f.bytes, 0),
+    freshnessAt: row.freshness_at,
+    validation: row.validation,
+    checks: manifest.checks || null,
+    tokenizer: manifest.tokenizer || null,
+    fixture: false,
+    ...(manifest.adapter ? {
+      adapter: {
+        baseAssetId: manifest.adapter.baseAssetId,
+        baseRevision: manifest.adapter.baseRevision,
+        peftType: manifest.adapter.peftType || 'LORA',
+        targetModules: manifest.adapter.targetModules || [],
+        tokenizer: manifest.adapter.tokenizer || null,
+      },
+    } : {}),
+  };
+}
+
+// Lazy upload expiry: sessions past their deadline (and never terminal)
+// move to expired, and their quarantine parts are deleted best-effort
+// (bounded per call). Runs at the top of upload intake, never on a timer.
+async function expireCatalogUploads(db, store, ownerId) {
+  const stale = await all(db, "SELECT id FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'rejected', 'expired') LIMIT 20", ownerId, new Date().toISOString());
+  for (const row of stale) {
+    await run(db, "UPDATE catalog_uploads SET state = 'expired', updated_at = ? WHERE id = ?", new Date().toISOString(), row.id);
+    if (store) {
+      const parts = await store.list(`upload/${row.id}/part/`);
+      for (const p of parts.slice(0, 2010)) await store.del(p.key);
+    }
+  }
+  return stale.length;
 }
 
 // Loads a node's capability snapshot for evaluation. Never invents one:
@@ -937,7 +993,10 @@ async function handleApi(request, env, url) {
         return json(400, { error: 'Asset id is not valid encoding.', code: 'BAD_ASSET' });
       }
       if (repo.startsWith('priv:')) {
-        return json(404, { error: 'Private assets arrive in Phase 2; this id names nothing yet.', code: 'ASSET_NOT_FOUND' });
+        // Owner-only: anything else 404s exactly like a missing id (T1).
+        const row = await first(db, "SELECT * FROM catalog_assets WHERE id = ? AND owner_id = ? AND access = 'private'", repo.slice(5), me());
+        if (!row) return json(404, { error: 'Asset not found.', code: 'ASSET_NOT_FOUND' });
+        return json(200, { ...(await privateAssetShape(db, row)), fixture: false });
       }
       const clean = repo.startsWith('hub:') ? repo.slice(4) : repo;
       if (!validateRepoId(clean)) return json(400, { error: 'Repository must look like org/name.', code: 'BAD_REPO' });
@@ -964,11 +1023,14 @@ async function handleApi(request, env, url) {
       throw error;
     }
     const repo = typeof body.repo === 'string' ? body.repo.slice(0, 200) : '';
+    const assetId = typeof body.assetId === 'string' ? body.assetId.slice(0, 200) : '';
     const nodeId = typeof body.nodeId === 'string' ? body.nodeId.slice(0, 64) : '';
     const runtime = typeof body.runtime === 'string' ? body.runtime.slice(0, 64) : '';
     const context = body.context;
     const concurrency = body.concurrency;
-    if (!validateRepoId(repo)) return json(400, { error: 'repo must look like org/name.', code: 'BAD_REPO' });
+    const refOk = (r) => validateRepoId(r) || /^priv:[A-Za-z0-9_-]{1,64}$/.test(r) || (r.startsWith('hub:') && validateRepoId(r.slice(4)));
+    if ((repo && assetId) || (!repo && !assetId)) return json(400, { error: 'Supply exactly one of repo or assetId.', code: 'BAD_ASSET_REF' });
+    if ((repo && !validateRepoId(repo)) || (assetId && !refOk(assetId))) return json(400, { error: 'Asset ref must be org/name, hub:org/name, or priv:<id>.', code: 'BAD_REPO' });
     if (!isId(nodeId)) return json(400, { error: 'nodeId is required (1..64 id chars).', code: 'BAD_NODE' });
     if (!runtime) return json(400, { error: 'runtime is required.', code: 'BAD_RUNTIME' });
     if (!Number.isSafeInteger(context) || context <= 0 || context > 1048576) {
@@ -979,25 +1041,52 @@ async function handleApi(request, env, url) {
     }
     const adapterRepo = typeof body.adapterRepo === 'string' ? body.adapterRepo.slice(0, 200) : '';
     const baseRepo = typeof body.baseRepo === 'string' ? body.baseRepo.slice(0, 200) : '';
-    if (adapterRepo && !validateRepoId(adapterRepo)) return json(400, { error: 'adapterRepo must look like org/name.', code: 'BAD_REPO' });
-    if (baseRepo && !validateRepoId(baseRepo)) return json(400, { error: 'baseRepo must look like org/name.', code: 'BAD_REPO' });
-    if (adapterRepo && !baseRepo) {
-      return json(400, { error: 'Adapter evaluation needs baseRepo: display names never bind a base.', code: 'ADAPTER_BASE_REQUIRED' });
+    const adapterAssetId = typeof body.adapterAssetId === 'string' ? body.adapterAssetId.slice(0, 200) : '';
+    const baseAssetId = typeof body.baseAssetId === 'string' ? body.baseAssetId.slice(0, 200) : '';
+    for (const [label, v] of [['adapter', adapterRepo || adapterAssetId], ['base', baseRepo || baseAssetId]]) {
+      if (v && !refOk(v)) return json(400, { error: `${label} ref must be org/name, hub:org/name, or priv:<id>.`, code: 'BAD_REPO' });
+    }
+    if ((adapterRepo && adapterAssetId) || (baseRepo && baseAssetId)) {
+      return json(400, { error: 'Supply one ref form per role, not both.', code: 'BAD_ASSET_REF' });
+    }
+    if ((adapterRepo || adapterAssetId) && !(baseRepo || baseAssetId)) {
+      return json(400, { error: 'Adapter evaluation needs an explicit base: display names never bind a base.', code: 'ADAPTER_BASE_REQUIRED' });
     }
     const node = await catalogNodeAccess(db, me(), nodeId);
     if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
     try {
       const fixture = isFixtureEnv(env);
-      const load = async (r) => (fixture ? fixtureDetail(r) : await hubDetail(r, {}));
-      const asset = await load(repo);
-      if (!asset || asset.gated === true) return json(404, { error: 'Model not found or not visible to you.', code: 'ASSET_NOT_FOUND' });
+      // One resolver for hub/fixture/private refs. Private refs re-check
+      // ownership (404 like any missing id); non-validated private bytes
+      // cannot evaluate (AC12).
+      const resolveRef = async (ref, role) => {
+        let asset = null;
+        if (ref.startsWith('priv:')) {
+          const row = await first(db, "SELECT * FROM catalog_assets WHERE id = ? AND owner_id = ? AND access = 'private'", ref.slice(5), me());
+          if (row) asset = await privateAssetShape(db, row);
+        } else {
+          const clean = ref.startsWith('hub:') ? ref.slice(4) : ref;
+          asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, {});
+        }
+        if (!asset || asset.gated === true) return { http: json(404, { error: `${role} not found or not visible to you.`, code: 'ASSET_NOT_FOUND' }) };
+        if (asset.source === 'private' && asset.validation !== 'validated') {
+          return { http: json(422, { error: `${role} is ${asset.validation}, not validated; rejected assets cannot evaluate.`, code: 'ASSET_NOT_VALIDATED' }) };
+        }
+        return { asset };
+      };
+      const resolved = await resolveRef(repo || assetId, 'Model');
+      if (resolved.http) return resolved.http;
+      const asset = resolved.asset;
       let adapterAsset = null;
       let baseAsset = asset;
-      if (adapterRepo) {
-        adapterAsset = await load(adapterRepo);
-        baseAsset = await load(baseRepo);
-        if (!adapterAsset || adapterAsset.gated === true) return json(404, { error: 'Adapter not found or not visible to you.', code: 'ASSET_NOT_FOUND' });
-        if (!baseAsset || baseAsset.gated === true) return json(404, { error: 'Adapter base not found or not visible to you.', code: 'ASSET_NOT_FOUND' });
+      const adapterRef = adapterRepo || adapterAssetId;
+      if (adapterRef) {
+        const a = await resolveRef(adapterRef, 'Adapter');
+        if (a.http) return a.http;
+        const b = await resolveRef(baseRepo || baseAssetId, 'Adapter base');
+        if (b.http) return b.http;
+        adapterAsset = a.asset;
+        baseAsset = b.asset;
       }
       const snap = await catalogSnapshot(db, nodeId);
       const nowMs = Date.now();
@@ -1035,10 +1124,263 @@ async function handleApi(request, env, url) {
       privateAssets: assets ? assets.n : 0,
       activeDeployments: jobs ? jobs.n : 0,
       lastRefresh: (refresh && refresh.at) || null,
-      uploadsAvailable: false,
+      uploadsAvailable: storeAvailable(env),
       deploymentAvailable: false,
-      note: 'Private uploads (Phase 2) and deployment (Phase 3) are not implemented yet.',
+      note: storeAvailable(env) ? 'Uploads persist to the bound store.' : 'Upload bytes wait on object storage (docs/model-catalog/01-plan.md); deployment arrives in Phase 3.',
     });
+  }
+
+  // ---- model catalog, Phase 2: private uploads + validation + My assets ----
+  // Uploads stay private to the owner tenant (T1): every route re-checks
+  // ownership and answers 404 (never 403) for foreign ids. Bytes live in
+  // quarantine until validation passes; without a bound object store the
+  // byte routes report STORAGE_UNPROVISIONED instead of pretending.
+  // Manifests are explicit file lists: traversal, symlinks, archives,
+  // executables, and pickle weights are refused (T5/T6).
+  if (path === '/api/catalog/uploads' && method === 'POST') {
+    const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
+    let body;
+    try {
+      body = await readJson(request, MAX_BODY_BYTES);
+    } catch (error) {
+      if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+      throw error;
+    }
+    if (!isName(body.name)) return json(400, { error: 'Name is required (1..80 chars).', code: 'BAD_NAME' });
+    if (body.kind !== 'model' && body.kind !== 'adapter') return json(400, { error: 'kind must be "model" or "adapter".', code: 'BAD_KIND' });
+    const files = Array.isArray(body.files) ? body.files : null;
+    if (!files || !files.length || files.length > MAX_MANIFEST_FILES) {
+      return json(400, { error: `files must name 1..${MAX_MANIFEST_FILES} explicit paths (no archives).`, code: 'BAD_MANIFEST' });
+    }
+    let total = 0;
+    for (const f of files) {
+      const bad = catalogRelPath(f && f.relpath);
+      if (bad) return json(400, { error: `Refused file name: ${bad}.`, code: 'BAD_PATH' });
+      if (!Number.isSafeInteger(f.bytes) || f.bytes <= 0) return json(400, { error: `Unusable byte count for ${f.relpath}.`, code: 'BAD_MANIFEST' });
+      if (f.bytes > MAX_FILE_BYTES) return json(400, { error: `${f.relpath} exceeds the per-file cap.`, code: 'QUOTA_EXCEEDED' });
+      if (f.sha256 !== undefined && (typeof f.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(f.sha256))) {
+        return json(400, { error: `Unusable sha256 hint for ${f.relpath}; digests are server-computed.`, code: 'BAD_MANIFEST' });
+      }
+      total += f.bytes;
+    }
+    if (total > MAX_ASSET_BYTES) return json(400, { error: 'Asset exceeds the per-asset cap.', code: 'QUOTA_EXCEEDED' });
+    const adapter = body.kind === 'adapter' ? {
+      baseAssetId: typeof body.baseAssetId === 'string' ? body.baseAssetId.slice(0, 64) : '',
+      baseRevision: typeof body.baseRevision === 'string' ? body.baseRevision.slice(0, 64) : '',
+      peftType: typeof body.peftType === 'string' ? body.peftType.slice(0, 16) : 'LORA',
+      targetModules: Array.isArray(body.targetModules) ? body.targetModules.map(String).slice(0, 64) : [],
+      tokenizer: typeof body.tokenizer === 'string' ? body.tokenizer.slice(0, 200) : '',
+    } : null;
+    if (body.kind === 'adapter' && (!adapter.baseAssetId || !adapter.baseRevision)) {
+      return json(400, { error: 'Adapters must declare an exact base asset id and revision.', code: 'ADAPTER_BASE_REQUIRED' });
+    }
+    await expireCatalogUploads(db, byteStore(env), me());
+    const owned = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
+    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')", me());
+    if ((owned ? owned.n : 0) + (inflight ? inflight.n : 0) + total > MAX_ASSET_BYTES) {
+      return json(400, { error: 'Account storage quota exceeded.', code: 'QUOTA_EXCEEDED' });
+    }
+    const now = nowIso();
+    const id = rid('up_');
+    const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+    const manifest = {
+      name: body.name.trim(), kind: body.kind,
+      task: typeof body.task === 'string' ? body.task.slice(0, 64) : 'unknown',
+      arch: typeof body.arch === 'string' ? body.arch.slice(0, 64) : 'unknown',
+      format: typeof body.format === 'string' ? body.format.slice(0, 32) : 'unknown',
+      quant: typeof body.quant === 'string' ? body.quant.slice(0, 32) : 'unknown',
+      license: typeof body.license === 'string' ? body.license.slice(0, 200) : 'unstated:rights-reserved',
+      provenance: typeof body.provenance === 'string' ? body.provenance.slice(0, 2000) : '',
+      tokenizer: typeof body.tokenizer === 'string' ? body.tokenizer.slice(0, 200) : '',
+      adapter,
+      files: files.map((f) => ({ relpath: f.relpath, bytes: f.bytes, sha256: f.sha256 ? String(f.sha256).toLowerCase() : null })),
+    };
+    await run(db, 'INSERT INTO catalog_uploads (id, owner_id, state, quotas_json, manifest_json, byte_ref, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length }), JSON.stringify(manifest), null, expiresAt, now, now);
+    await audit(db, me(), 'catalog.upload.begin', id, `${manifest.kind} ${manifest.name} ${files.length} files ${total} bytes`);
+    return json(201, { id, state: 'uploading', quotas: { totalBytes: total, files: files.length }, expiresAt, chunkMaxBytes: CHUNK_MAX_BYTES, store: storeAvailable(env) ? 'bound' : 'unprovisioned' });
+  }
+  {
+    const m = /^\/api\/catalog\/uploads\/([A-Za-z0-9_-]{1,64})\/(chunk|finalize)$/.exec(path);
+    if (m && (method === 'PUT' || method === 'POST')) {
+      const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
+      const uploadId = m[1];
+      const op = m[2];
+      if (op === 'chunk' && method !== 'PUT') return json(405, { error: 'Chunks use PUT.', code: 'BAD_METHOD' });
+      if (op === 'finalize' && method !== 'POST') return json(405, { error: 'Finalize uses POST.', code: 'BAD_METHOD' });
+      const store = byteStore(env);
+      if (!store) return json(503, { error: 'Object storage is not bound: bytes cannot persist. Manifest intake works; chunk upload waits on provisioning.', code: 'STORAGE_UNPROVISIONED', retryable: false, action: 'Ask the rollout owner to bind object storage (docs/model-catalog/01-plan.md).' });
+      const up = await first(db, 'SELECT * FROM catalog_uploads WHERE id = ? AND owner_id = ?', uploadId, me());
+      if (!up) return json(404, { error: 'Upload not found.', code: 'NOT_FOUND' });
+      if (Date.parse(up.expires_at) <= Date.now() && !['validated', 'rejected'].includes(up.state)) {
+        await expireCatalogUploads(db, store, me());
+        return json(410, { error: 'Upload session expired; start a new one.', code: 'UPLOAD_EXPIRED' });
+      }
+      const manifest = JSON.parse(up.manifest_json);
+      if (op === 'chunk') {
+        if (up.state !== 'uploading') return json(409, { error: `Upload is ${up.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
+        const relpath = (url.searchParams.get('path') || '').slice(0, 512);
+        const declared = manifest.files.find((f) => f.relpath === relpath);
+        if (!declared) return json(400, { error: 'Chunk path is not in the declared manifest.', code: 'BAD_PATH' });
+        const index = Number(url.searchParams.get('index'));
+        if (!Number.isSafeInteger(index) || index < 0 || index > 100000) return json(400, { error: 'Chunk index must be 0..100000.', code: 'BAD_CHUNK' });
+        let bytes;
+        try {
+          bytes = await readBodyBytes(request, CHUNK_MAX_BYTES);
+        } catch (error) {
+          if (error && error.status) return json(error.status, { error: error.message, code: error.code || 'BAD_REQUEST' });
+          throw error;
+        }
+        if (!bytes.byteLength) return json(400, { error: 'Empty chunk refused.', code: 'BAD_CHUNK' });
+        // Idempotent rewrite: re-sending an index overwrites it, so
+        // transport retries never corrupt the assembly (AC13).
+        await store.put(`upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`, new Uint8Array(bytes));
+        await run(db, 'UPDATE catalog_uploads SET updated_at = ? WHERE id = ?', nowIso(), uploadId);
+        return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
+      }
+      // finalize: assemble (bounded), digest, validate, promote atomically.
+      if (up.state === 'validated') {
+        const asset = await first(db, 'SELECT id FROM catalog_assets WHERE id = ?', up.byte_ref);
+        return json(200, { ok: true, uploadId, state: 'validated', assetId: asset ? asset.id : null, duplicate: true });
+      }
+      if (up.state === 'rejected') {
+        return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: manifest.checks || [], duplicate: true });
+      }
+      if (up.state !== 'uploading' && up.state !== 'validating') {
+        return json(409, { error: `Upload is ${up.state}; nothing to finalize.`, code: 'UPLOAD_STATE' });
+      }
+      const totalBytes = manifest.files.reduce((n, f) => n + f.bytes, 0);
+      if (totalBytes > 128 * 1024 * 1024) {
+        return json(413, { error: 'Asset exceeds the 128 MiB scaffold finalize cap; streaming promotion is follow-on work.', code: 'ASSET_TOO_LARGE', retryable: false, action: 'Split the asset or wait for streaming promotion.' });
+      }
+      await run(db, "UPDATE catalog_uploads SET state = 'validating', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+      const parts = await store.list(`upload/${uploadId}/part/`);
+      const assembled = new Map();
+      for (const f of manifest.files) {
+        const mine = parts.filter((p) => p.key.endsWith('/' + f.relpath)).sort((a, b) => (a.key < b.key ? -1 : 1));
+        const got = mine.reduce((n, p) => n + p.size, 0);
+        if (got !== f.bytes) {
+          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+          return json(400, { error: `Incomplete bytes for ${f.relpath}: ${got} of ${f.bytes}. Missing chunks are never skipped.`, code: 'UPLOAD_INCOMPLETE' });
+        }
+        const bufs = [];
+        for (const p of mine) bufs.push(await store.get(p.key));
+        const flat = new Uint8Array(f.bytes);
+        let at = 0;
+        for (const b of bufs) { flat.set(b, at); at += b.length; }
+        const digest = await crypto.subtle.digest('SHA-256', flat);
+        const sha = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
+        if (f.sha256 && f.sha256 !== sha) {
+          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+          return json(400, { error: `Digest mismatch for ${f.relpath}: declared bytes differ from received bytes.`, code: 'DIGEST_MISMATCH' });
+        }
+        f.sha256 = sha;
+        assembled.set(f.relpath, flat);
+      }
+      const peek = (relpath) => {
+        const full = assembled.get(relpath);
+        return full === undefined ? null : full.slice(0, MAX_HEADER_PEEK);
+      };
+      const verdict = validateManifest({ files: manifest.files }, peek, manifest.kind === 'adapter' ? {
+        baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
+        targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+      } : {});
+      manifest.checks = verdict.checks;
+      manifest.validator = verdict.version;
+      if (!verdict.ok) {
+        await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), nowIso(), uploadId);
+        await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
+        return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: verdict.checks });
+      }
+      // Promote: every file lands under the asset prefix before any row
+      // points at it; the DB writes commit in one batch (AC12).
+      const now = nowIso();
+      const assetId = rid('a_');
+      const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
+      const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
+      for (const [relpath, flat] of assembled) await store.put(`asset/${assetId}/${relpath}`, flat);
+      for (const p of parts) await store.del(p.key);
+      manifest.revision = revision;
+      await db.batch([
+        db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
+          VALUES (?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ?)`)
+          .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
+            JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
+            JSON.stringify(manifest), manifest.adapter ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now),
+        ...manifest.files.map((f) => db.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)')
+          .bind(assetId, f.relpath, f.bytes, f.sha256)),
+        db.prepare('UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?')
+          .bind('validated', JSON.stringify(manifest), assetId, now, uploadId),
+      ]);
+      await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
+      return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
+    }
+  }
+  {
+    const m = /^\/api\/catalog\/uploads\/([A-Za-z0-9_-]{1,64})$/.exec(path);
+    if (m && method === 'GET') {
+      const d = needSession(); if (d) return deny(d);
+      const up = await first(db, 'SELECT * FROM catalog_uploads WHERE id = ? AND owner_id = ?', m[1], me());
+      if (!up) return json(404, { error: 'Upload not found.', code: 'NOT_FOUND' });
+      const manifest = JSON.parse(up.manifest_json);
+      let received = null;
+      const store = byteStore(env);
+      if (store && ['uploading', 'quarantined', 'validating'].includes(up.state)) {
+        const parts = await store.list(`upload/${up.id}/part/`);
+        received = manifest.files.map((f) => ({
+          relpath: f.relpath, bytes: f.bytes,
+          got: parts.filter((p) => p.key.endsWith('/' + f.relpath)).reduce((n, p) => n + p.size, 0),
+        }));
+      }
+      return json(200, {
+        id: up.id, state: up.state, manifest: { ...manifest, checks: manifest.checks || undefined },
+        received, assetId: up.byte_ref, checks: manifest.checks || null,
+        expiresAt: up.expires_at, updatedAt: up.updated_at,
+      });
+    }
+  }
+  if (path === '/api/catalog/my-assets' && method === 'GET') {
+    const d = needSession(); if (d) return deny(d);
+    const q = pagination(url);
+    const page = await pageQuery(db, {
+      select: 'SELECT a.*, (SELECT COUNT(*) FROM catalog_asset_files f WHERE f.asset_id = a.id) file_count, (SELECT COALESCE(SUM(bytes), 0) FROM catalog_asset_files f WHERE f.asset_id = a.id) total_bytes',
+      from: "FROM catalog_assets a WHERE a.owner_id = ? AND a.access = 'private'", params: [me()], order: 'ORDER BY a.created_at DESC', ...q,
+    });
+    return json(200, {
+      ...page,
+      items: page.items.map((a) => ({
+        id: `priv:${a.id}`, name: a.repo, kind: a.kind, task: a.task, arch: a.arch,
+        format: a.format, quant: a.quant, revision: a.revision, validation: a.validation,
+        files: a.file_count, totalBytes: a.total_bytes,
+        license: JSON.parse(a.license_json), createdAt: a.created_at,
+      })),
+    });
+  }
+  {
+    const m = /^\/api\/catalog\/assets\/([A-Za-z0-9_-]{1,64})\/validate$/.exec(path);
+    if (m && method === 'POST') {
+      const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
+      const store = byteStore(env);
+      if (!store) return json(503, { error: 'Object storage is not bound: bytes cannot be re-read.', code: 'STORAGE_UNPROVISIONED', retryable: false });
+      const asset = await first(db, "SELECT * FROM catalog_assets WHERE id = ? AND owner_id = ? AND access = 'private'", m[1], me());
+      if (!asset) return json(404, { error: 'Asset not found.', code: 'NOT_FOUND' });
+      const files = await all(db, 'SELECT relpath, bytes, sha256 FROM catalog_asset_files WHERE asset_id = ?', asset.id);
+      const totalBytes = files.reduce((n, f) => n + f.bytes, 0);
+      if (totalBytes > 128 * 1024 * 1024) return json(413, { error: 'Asset exceeds the 128 MiB scaffold validation cap.', code: 'ASSET_TOO_LARGE' });
+      const manifest = JSON.parse(asset.manifest_json);
+      const peek = async (relpath) => store.peek(`asset/${asset.id}/${relpath}`, MAX_HEADER_PEEK);
+      const peeks = new Map();
+      for (const f of files) peeks.set(f.relpath, await peek(f.relpath));
+      const verdict = validateManifest({ files }, (r) => (peeks.has(r) ? peeks.get(r) : null), manifest.kind === 'adapter' ? {
+        baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
+        targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+      } : {});
+      manifest.checks = verdict.checks;
+      manifest.validator = verdict.version;
+      await run(db, 'UPDATE catalog_assets SET validation = ?, manifest_json = ? WHERE id = ?', verdict.ok ? 'validated' : 'rejected', JSON.stringify(manifest), asset.id);
+      await audit(db, me(), 'catalog.asset.revalidate', asset.id, verdict.ok ? 'validated' : 'rejected');
+      return json(200, { ok: verdict.ok, assetId: asset.id, validation: verdict.ok ? 'validated' : 'rejected', checks: verdict.checks });
+    }
   }
 
   // ---- API keys (session only; secrets one-time) ----

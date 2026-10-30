@@ -877,7 +877,7 @@ async function runCompat(asset) {
   loading(out);
   try {
     const body = {
-      repo: asset.repo,
+      ...(asset.id.startsWith('priv:') ? { assetId: asset.id } : { repo: asset.repo }),
       nodeId: $('compat-node').value,
       runtime: $('compat-runtime').value.trim(),
       context: Number($('compat-context').value),
@@ -885,8 +885,8 @@ async function runCompat(asset) {
     };
     const adapterEl = $('compat-adapter');
     if (adapterEl && adapterEl.value.trim()) {
-      body.adapterRepo = adapterEl.value.trim();
-      body.baseRepo = $('compat-base').value.trim();
+      if (adapterEl.value.trim().startsWith('priv:')) body.adapterAssetId = adapterEl.value.trim(); else body.adapterRepo = adapterEl.value.trim();
+      if ($('compat-base').value.trim().startsWith('priv:')) body.baseAssetId = $('compat-base').value.trim(); else body.baseRepo = $('compat-base').value.trim();
     }
     const dec = await api('/api/catalog/compat', { method: 'POST', body: JSON.stringify(body) });
     const rows = (items) => (items || []).map((r) => `<li><strong>${esc(r.code)}</strong> — ${esc(r.message)}${r.resolve ? ' ' + esc(r.resolve) : ''}</li>`).join('');
@@ -908,11 +908,108 @@ async function runCompat(asset) {
   } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; state(out, 'error', e.message); }
 }
 
+async function apiBytes(path, buf) {
+  const gen = generation;
+  let res;
+  try {
+    res = await fetch(path, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Aipster-CSRF': '1' }, body: buf });
+  } catch (e) { if (gen !== generation) throw staleError(); throw e; }
+  if (gen !== generation) throw staleError();
+  let data = null;
+  try { data = await res.json(); } catch { /* non-JSON */ }
+  if (gen !== generation) throw staleError();
+  if (!res.ok) {
+    const code = data && data.code ? ` (${data.code})` : '';
+    throw new Error((data && data.error ? data.error : `Request failed: ${res.status}`) + code);
+  }
+  return data;
+}
+
+async function loadMyAssets() {
+  const host = $('my-assets');
+  loading(host);
+  try {
+    const res = await api('/api/catalog/my-assets?limit=50');
+    if (!res.items.length) {
+      host.innerHTML = '<div class="card"><p class="muted">No private assets yet. Uploads appear here after validation.</p></div>';
+      return;
+    }
+    host.innerHTML = res.items.map((a) => `<div class="card"><h2>${esc(a.name)}</h2>
+      <p class="muted">${esc(a.kind)} · ${esc(a.task)} · ${esc(a.format)} · ${fmtBytes(a.totalBytes)} across ${a.files} file(s)</p>
+      <p><span class="pill ${a.validation === 'validated' ? 'ok' : 'bad'}">${esc(a.validation)}</span> <span class="muted">revision ${esc(String(a.revision).slice(0, 12))}</span></p>
+      <div class="actions"><button type="button" class="btn secondary" data-myasset="${esc(a.id)}">Details</button><button type="button" class="btn secondary" data-revalidate="${esc(a.id)}">Revalidate</button></div></div>`).join('');
+    host.onclick = async (e) => {
+      const ds = e && e.target && e.target.dataset ? e.target.dataset : {};
+      if (ds.myasset) showAssetDetail(ds.myasset);
+      if (ds.revalidate) {
+        const id = ds.revalidate.replace(/^priv:/, '');
+        try {
+          const r = await api(`/api/catalog/assets/${encodeURIComponent(id)}/validate`, { method: 'POST', body: JSON.stringify({}) });
+          state(host, r.ok ? 'ok' : 'warn', `Revalidation: ${r.validation}.`);
+          loadMyAssets();
+        } catch (err) { if (!isStale(err)) state(host, 'error', err.message); }
+      }
+    };
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+let uploadWired = false;
+
+async function runUpload() {
+  const err = $('upload-error');
+  const progress = $('upload-progress');
+  err.hidden = true;
+  progress.textContent = '';
+  try {
+    const input = $('up-files');
+    const files = Array.from((input && input.files) || []);
+    if (!files.length) throw new Error('Choose at least one file.');
+    const kind = $('up-kind').value;
+    const spec = {
+      name: $('up-name').value.trim(),
+      kind,
+      task: $('up-task').value.trim() || 'unknown',
+      format: $('up-format').value.trim() || 'unknown',
+      license: $('up-license').value.trim() || 'unstated:rights-reserved',
+      files: files.map((f) => ({ relpath: f.webkitRelativePath || f.name, bytes: f.size })),
+    };
+    if (kind === 'adapter') {
+      spec.baseAssetId = $('up-base-id').value.trim().replace(/^priv:/, '');
+      spec.baseRevision = $('up-base-rev').value.trim();
+      spec.targetModules = $('up-modules').value.split(',').map((s) => s.trim()).filter(Boolean);
+      spec.tokenizer = $('up-tokenizer').value.trim();
+    }
+    const begun = await api('/api/catalog/uploads', { method: 'POST', body: JSON.stringify(spec) });
+    const CHUNK = 8 * 1024 * 1024;
+    for (const file of files) {
+      const relpath = file.webkitRelativePath || file.name;
+      let index = 0;
+      for (let at = 0; at < file.size; at += CHUNK, index++) {
+        const part = await file.slice(at, Math.min(at + CHUNK, file.size)).arrayBuffer();
+        await apiBytes(`/api/catalog/uploads/${begun.id}/chunk?path=${encodeURIComponent(relpath)}&index=${index}`, part);
+        progress.textContent = `Uploading ${relpath}: ${Math.min(at + CHUNK, file.size)} of ${file.size} bytes`;
+      }
+    }
+    progress.textContent = 'Validating…';
+    const fin = await api(`/api/catalog/uploads/${begun.id}/finalize`, { method: 'POST', body: JSON.stringify({}) });
+    progress.textContent = `Validated: ${spec.name} (${fin.revision.slice(0, 12)}…).`;
+    loadMyAssets();
+  } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; }
+}
+
 async function loadModels() {
   $('demo-models-note').hidden = !(me && me.demo);
   if (!catalogWired) {
     catalogWired = true;
     $('catalog-form').addEventListener('submit', (e) => { e.preventDefault(); runCatalogSearch(); });
+    const demoUpload = !!(me && me.demo);
+    $('upload-form').hidden = demoUpload;
+    if (!uploadWired && !demoUpload) {
+      uploadWired = true;
+      $('up-kind').addEventListener('change', () => { $('up-adapter-fields').hidden = $('up-kind').value !== 'adapter'; });
+      $('upload-form').addEventListener('submit', (e) => { e.preventDefault(); runUpload(); });
+    }
+    loadMyAssets();
   }
   try {
     await catalogNodes($('cat-node'), true);
@@ -1045,7 +1142,10 @@ function resetState() {
   for (const id of ['cat-q', 'cat-task', 'cat-format', 'cat-quant', 'cat-license']) { const el = $(id); if (el) el.value = ''; }
   for (const id of ['cat-kind', 'cat-node', 'cat-compat']) { const el = $(id); if (el) el.selectedIndex = 0; }
   for (const id of ['catalog-list', 'asset-detail']) { const el = $(id); if (el) el.innerHTML = ''; }
+  for (const id of ['up-name', 'up-task', 'up-format', 'up-license', 'up-base-id', 'up-base-rev', 'up-modules', 'up-tokenizer']) { const el = $(id); if (el) el.value = ''; }
+  for (const id of ['my-assets']) { const el = $(id); if (el) el.innerHTML = ''; }
   catalogWired = false;
+  uploadWired = false;
   for (const id of ['fab-node-label', 'fab-node-ws', 'fab-inv-node', 'fab-inv-ws', 'fab-inv-purpose', 'fab-accept-token', 'fab-accept-key', 'fab-prev-res', 'fab-prev-consumers', 'fab-prev-models', 'fab-deny-res', 'fab-deny-action', 'fab-authz-res', 'fab-authz-model', 'fab-authz-consumer']) $(id).value = '';
   $('grant-jobs').value = '50'; $('grant-tokens').value = '50000'; $('key-scope').value = 'read';
   $('fab-prev-tokens').value = '100000'; $('fab-prev-reqs').value = '1000';

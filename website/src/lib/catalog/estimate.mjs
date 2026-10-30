@@ -89,7 +89,7 @@ function checkAdapter(adapter, baseAsset, matrix) {
   if (!baseAsset) {
     return { blocks: [], unknowns: [reason('ADAPTER_BASE_UNKNOWN', 'Adapter base identity is unresolved.', 'Supply the exact base model and revision.')] };
   }
-  if (!adapter.baseRevision || !/^[a-f0-9]{40}$/.test(adapter.baseRevision)) {
+  if (!adapter.baseRevision || !/^[a-f0-9]{40}([a-f0-9]{24})?$/.test(adapter.baseRevision)) {
     unknowns.push(reason('ADAPTER_BASE_REV_UNKNOWN', 'Adapter base revision is not pinned to a commit.', 'Pin the exact base revision.'));
   } else if (baseAsset.revision && adapter.baseRevision !== baseAsset.revision) {
     blocks.push(reason('ADAPTER_BASE_MISMATCH', `Adapter targets base revision ${adapter.baseRevision.slice(0, 12)}…, selected base is ${String(baseAsset.revision).slice(0, 12)}….`, 'Select the matching base revision.'));

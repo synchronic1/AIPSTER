@@ -128,9 +128,10 @@ export async function createTestEnv(overrides = {}) {
   };
   // Fresh worker module per env so the per-isolate auth cache cannot leak DBs.
   const worker = await import(`../src/worker.js?env=${randomBytes(4).toString('hex')}`);
-  const call = (pathname, { method = 'GET', headers = {}, body } = {}) => {
+  const call = (pathname, { method = 'GET', headers = {}, body, rawBody } = {}) => {
     const init = { method, headers: { ...headers } };
-    if (body !== undefined) { init.body = typeof body === 'string' ? body : JSON.stringify(body); init.headers['Content-Type'] = 'application/json'; }
+    if (rawBody !== undefined) { init.body = rawBody; init.headers['Content-Type'] = 'application/octet-stream'; }
+    else if (body !== undefined) { init.body = typeof body === 'string' ? body : JSON.stringify(body); init.headers['Content-Type'] = 'application/json'; }
     return worker.default.fetch(new Request(TEST_URL + pathname, init), env);
   };
   const as = (user) => ({ Cookie: sessionCookieHeader(user.token, TEST_SECRET) });
