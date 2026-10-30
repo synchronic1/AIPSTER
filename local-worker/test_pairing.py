@@ -427,6 +427,34 @@ class Round4Tests(unittest.TestCase):
         self.assertEqual(cm.exception.code, "NETWORK")
         self.assertIsNone(cm.exception.status, "transport fault, owned by the backoff")
 
+    def test_sender_identifies_with_product_user_agent(self):
+        seen = {}
+
+        class UaHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                seen["ua"] = self.headers.get("User-Agent")
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), UaHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        status, _, _ = pairing.post_json(f"http://127.0.0.1:{server.server_port}/x", {}, FAKE_SECRET)
+        self.assertEqual(status, 200)
+        self.assertEqual(seen.get("ua"), pairing.USER_AGENT)
+        self.assertFalse((seen.get("ua") or "").startswith("Python-urllib"), "edge denies default scripting UAs")
+
 
 class Round5Tests(unittest.TestCase):
     """Codex round-5 regressions: fail-closed protection, key fingerprint."""
