@@ -1827,7 +1827,9 @@ async function handleApi(request, env, url) {
       if (totalBytes > 128 * 1024 * 1024) return json(413, { error: 'Asset exceeds the 128 MiB scaffold validation cap.', code: 'ASSET_TOO_LARGE' });
       // Row-growth defense (Codex-sec-P2): revalidation re-reads headers
       // and writes an audit row, so it claims the hourly write budget like
-      // every other mutating route - before any reads or writes.
+      // every other mutating route - before any store reads or writes. (Two
+      // D1 classification SELECTs above necessarily precede it for the
+      // 404/413 refusals.)
       await checkWriteBudget(db, me());
       const manifest = JSON.parse(asset.manifest_json);
       // Intent (review F19): revalidation re-reads bounded header peeks, not

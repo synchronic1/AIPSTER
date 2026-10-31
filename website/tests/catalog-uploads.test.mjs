@@ -749,7 +749,8 @@ test('Codex-P2: an expired claim holder cannot commit (promotion requires promot
   const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
   assert.equal(c.status, 200, c.text);
   // A concurrent intake sweeps this session past its deadline while the
-  // finalizer awaits storage I/O; the sweep preserves byte_ref.
+  // finalizer awaits storage I/O. The simulated sweep flips state only,
+  // isolating the state conjunct (production also clears the token).
   const realDb = t.env.DB;
   let fired = false;
   t.env.DB = {
@@ -770,6 +771,10 @@ test('Codex-P2: an expired claim holder cannot commit (promotion requires promot
   assert.equal(fin.json.code, 'FINALIZE_IN_PROGRESS');
   const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first('n');
   assert.equal(assets, 0, 'the expired holder promotes nothing');
+  const files = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_asset_files').first('n');
+  assert.equal(files, 0, 'no orphan file rows either');
+  const audits = await t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE actor_id = ? AND action = 'catalog.upload.validate'").bind('u_alice').first('n');
+  assert.equal(audits, 0, 'no validation audit for a fenced-out commit');
   const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
   assert.equal(row.state, 'expired', 'the loser leaves the expired verdict alone');
 });
