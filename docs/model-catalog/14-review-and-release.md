@@ -16,12 +16,12 @@
 
 - Phase 0: base record, capability matrix, plan, threat model
   (`docs/model-catalog/00–02`).
-- Phase 1: migration 0017, Hub adapter + fixtures + estimator,
+- Phase 1: migration 0018 (renumbered from 0017 post-DGM-merge), Hub adapter + fixtures + estimator,
   search/detail/compat/capability/summary routes, Models tab +
   Overview card, 30 tests, renders 01–06.
 - Phase 2: validator + byte store, upload session routes, `priv:`
   detail/compat, My assets + upload UI, 14 tests, renders 07–09.
-- Phase 3: migration 0018, fake worker transport, plan/execute/
+- Phase 3: migration 0019 (renumbered from 0018 post-DGM-merge), fake worker transport, plan/execute/
   status/cancel routes, job tracker UI + Deployments list, 19 tests,
   renders 10–13.
 - Receipts: `10-phase1-receipt.md`, `11-phase2-receipt.md`,
@@ -54,7 +54,8 @@
   as new commits only, no history rewrite.
 - Commissioned fresh-context reviews of `b192554..6882227`: code
   HOLD pending F1–F7, security READY. Migration overlap: none —
-  0017/0018 exist only on this branch; main is at 0016.
+  0018/0019 exist only on this branch (renumbered from 0017/0018
+  after the DGM merge); main is at 0017.
 - Triage treated findings as questions-not-bugs; every fix was
   reproduced with a failing deterministic test first (~24 new
   behavior tests; F1/F2 race gates pass 10/10).
@@ -67,7 +68,7 @@
   script intake caps (S-F3/S-F8); cache prune+cap (S-F12); quota
   checks (F5/F15); `BASE_NOT_FOUND` (F18); shard/magic handling
   (S-F6/S-F7); UI resetState + cancelling states (S-F10/F9).
-  F8 stays a documented live-gate (migration 0018 header);
+  F8 stays a documented live-gate (migration 0019 header);
   F14/F18 keep deliberate `needSession` posture; F16
   (GET advances via idempotent receipts) is intentional.
 - Interactive journeys asserted: native-button/focus-visible,
@@ -128,9 +129,10 @@ live worker qualification under this release.
   bare "telemetry"), compat card says "capability-report age …
   snapshot only, not a connected node". Pinned by 2 tests.
 - Migrations verified against current main (not assumed): main is
-  at 0016, 0001–0016 byte-identical on this branch, 0017/0018 are
-  the correct next numbers. New `catalog-d1-runtime.test.mjs`
-  (4 tests) applies 0001–0018 on real local D1 (miniflare),
+  at 0017 post-DGM-merge, 0001–0017 byte-identical on this branch,
+  0018/0019 are the correct next numbers. New
+  `catalog-d1-runtime.test.mjs` (5 tests) applies 0001–0019 on
+  real local D1 (miniflare),
   asserts catalog tables/columns, and proves the N3/admit SQL —
   including under FK enforcement, which local D1 applies and the
   node shim does not (seeds carry real parents).
@@ -139,8 +141,9 @@ live worker qualification under this release.
   0001–0015, `auth_deployed:false` is a hardcoded build
   placeholder (same both sides). PR #47 (0016 + admin scaffold)
   is merged but never deployed: this release carries it, so the
-  migration plan is 0016+0017+0018 post-merge per the chain
-  runbook (backup → journal check → apply → probe → deploy).
+  migration plan was 0016+0017+0018 at discovery time —
+  superseded by the journal-driven plan below (pending entries
+  through 0019) after the DGM merge.
   Admin router reviewed for the carry: deny-by-default, live
   grant re-check, keys/demo fail closed, mutations 501, no
   state changes — prod has no grant rows, so all admin routes
@@ -218,7 +221,7 @@ any `public/` edit and restart dev before trusting a render.
   DEMO/fixture labels, unknown-cost-never-$0, no live claims.
 - UI: `esc()`-only rendering of untrusted content; generation
   fencing; text state labels, not color-only.
-- Migrations: 0017→0018 additive; readiness gates updated; no prod
+- Migrations: 0018→0019 additive; readiness gates updated; no prod
   application in this branch.
 - Hygiene: no secrets, credentials, or machine-private data in the
   branch; attribution comments only.
