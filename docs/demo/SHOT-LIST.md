@@ -13,7 +13,9 @@ account, or credential change is implied by this list.
 ## Setup (before recording)
 
 - Use the deployed build: [https://aipster.net/](https://aipster.net/)
-  (deployed commit `d1de902`, site revision `2026-10-29.2`).
+  (per the release owner's check, production served `06d90bd` at 2026-10-31 21:39 UTC; confirm the current
+  commit in [deployment.json](https://aipster.net/deployment.json) before recording.
+  The README screenshots are a historical capture of `d1de902`).
 - Record at 1440×900 or 1920×1080, browser chrome visible so the URL is
   readable. 60–90 seconds total.
 - Use an authorized test identity (GitHub test account or the seeded demo

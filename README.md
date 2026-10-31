@@ -2,11 +2,18 @@
 
 ## Live demo (verified 2026-10-31)
 
-**Working build:** [https://aipster.net/](https://aipster.net/) — deployed commit
-[`d1de902`](https://github.com/synchronic1/AIPSTER/commit/d1de902eb90067459615714941ea048f719d9edd)
-(site revision `2026-10-29.2`, per [deployment.json](https://aipster.net/deployment.json)).
-Screenshots below are captured from that build on 2026-10-31. Repository `main`
-has since advanced; unmerged work is listed under “Not in this build”.
+**Working build:** [https://aipster.net/](https://aipster.net/). Per the release
+owner's check at 2026-10-31 21:39 UTC, production served commit
+[`06d90bd`](https://github.com/synchronic1/AIPSTER/commit/06d90bdb3cb82a1b15e5b1890992d7cdcc7caff2)
+(site revision `2026-10-29.2`,
+[deploy run 41244040453](https://github.com/synchronic1/AIPSTER/actions/runs/41244040453)).
+Check [deployment.json](https://aipster.net/deployment.json) for the current commit.
+**Historical capture:** the screenshots and viewport measurements below were taken
+on 2026-10-31 (time of day not recorded) from the build deployed then,
+[`d1de902`](https://github.com/synchronic1/AIPSTER/commit/d1de902eb90067459615714941ea048f719d9edd).
+`d1de902..06d90bd` includes control-panel (`app.js`) changes, so the current
+`/app` can differ from those screenshots. Unmerged work is listed under
+“Not in this build”.
 Provenance (2026-10-31): `deployment.json`’s `git_commit` is the build’s
 `GITHUB_SHA` — the deployed source. `release.json`’s `source_commit` (`25bf2ac`)
 pins the messaging source (“User-approved product direction, 2026-10-26”), not the
@@ -17,7 +24,7 @@ asserted by CI (`website/scripts/build.mjs`, `check.mjs`); it measures nothing l
    Worldwide Hackathon sponsor strip, and a Sign in entry point.
 
    ![Landing page at aipster.net: wordmark, “Now you’re the ISP” hero, direction
-   and research sections (captured 2026-10-31 from the deployed build).](docs/demo/landing-1440.png)
+   and research sections (historical capture, 2026-10-31, deployed build d1de902).](docs/demo/landing-1440.png)
 
 2. Choose Sign in → [`/app`](https://aipster.net/app): GitHub OAuth and a seeded
    demo login. Verified live without completing a sign-in: the OAuth handshake
@@ -31,9 +38,9 @@ asserted by CI (`website/scripts/build.mjs`, `check.mjs`); it measures nothing l
    this pass documents both without ruling which is authoritative.
 
    ![Control-panel sign-in screen: GitHub OAuth and demo login options, signed-out
-   state (captured 2026-10-31 from the deployed build).](docs/demo/app-signin-1440.png)
+   state (historical capture, 2026-10-31, deployed build d1de902).](docs/demo/app-signin-1440.png)
 
-Mobile: no document overflow at 320–1440px (measured 2026-10-31);
+Mobile: no document overflow at 320–1440px (measured 2026-10-31 on d1de902);
 see [viewport evidence](docs/demo/VIEWPORTS.md).
 
 3. No recorded video exists yet: follow the [60–90 second shot list](docs/demo/SHOT-LIST.md).
@@ -43,7 +50,10 @@ see [viewport evidence](docs/demo/VIEWPORTS.md).
 (GitHub OAuth handshake + demo-login endpoint, handshake shapes verified),
 authenticated API boundary (`401` without a session), federation UI shell labeled
 fixture-only with no live peers, DGM fixture preview shipped flag-gated and off by
-default, local-worker installer docs.
+default, Fabric adviser
+([PR #58](https://github.com/synchronic1/AIPSTER/pull/58)) shipped flag-gated and off
+by default (fixture-first; per the release owner's 2026-10-31 check of
+production secret names, no provider key was configured), local-worker installer docs.
 **Not in this build:** model/adapter catalog (open
 [PR #50](https://github.com/synchronic1/AIPSTER/pull/50), under review), live inference,
 paid compute, billing, real peer federation.
@@ -55,7 +65,7 @@ standalone Python DGM harness (separate local work, not deployed here).
 **Meta:** this demo pass verified endpoint shapes only and makes no claim about model
 usage. The evidence audit
 ([`docs/META-MODEL-USAGE.md`](https://github.com/synchronic1/AIPSTER/blob/0795de120aab41a8ddaa54d1c50ee3ec0d97f347/docs/META-MODEL-USAGE.md),
-branch `muse/meta-model-usage`, base `main @ ba707e9`) reports no verified Meta model
+merged via [PR #56](https://github.com/synchronic1/AIPSTER/pull/56); audit base `main @ ba707e9`) reports no verified Meta model
 inference: the job API returns `501 INFERENCE_DISABLED`, the native engine adapter is
 unqualified, the running worker is mock, and inventoried operator weights are non-Meta.
 It includes a bounded procedure for checking the reported usage further and does not
