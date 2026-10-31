@@ -23,8 +23,8 @@ From PowerShell in a fresh directory (these commands match the tested Windows x6
 git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
 git sparse-checkout set --no-cone /local-worker/ /LICENSE
-git fetch origin f3e115e0c42fcd83e8a6f2e769de427710f7acc1
-git checkout --detach f3e115e0c42fcd83e8a6f2e769de427710f7acc1
+git fetch origin 3fa309cb08461ea046ee23e801404911c1f3bcc2
+git checkout --detach 3fa309cb08461ea046ee23e801404911c1f3bcc2
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
@@ -76,6 +76,16 @@ inference readiness; `/api/jobs` remains disabled. Choose Done or reopen My
 Compute after pairing to refresh the resource list. If the key is revoked or
 expires, the sender exits asking for a fresh pairing code. `pairing.py status`
 shows secret-free local status and marks old success as stale.
+
+Installed the packaged worker instead of this source checkout? Pair from the
+app: open the AIPSTER Worker tray menu and choose Pair this computer (or run
+`aipster-worker pair` in a terminal) and type the dashboard code when asked.
+The tray supervises the heartbeat sender while serving and shows the pairing
+overlay (unpaired / registered / reachable / stale / repair-required) in the
+menu and `aipster-worker tray status`. A busy daemon port never blocks
+pairing or the sender: they need no local port. There is no automatic
+update; update by reinstalling from a newer reviewed pin (uninstall preserves
+pairing by default).
 Status belongs to the selected pairing generation: a previous sender's status,
 including an in-flight response finishing after re-pairing, is not attributed
 to the new key or resource. Unbound older status records await a fresh heartbeat.
@@ -94,7 +104,8 @@ If any pairing file cannot be removed, unpair exits nonzero and reports
 incomplete cleanup. Stop the sender or other process holding the file, revoke
 the server key, and retry; an already missing file is harmless.
 Preserve unrelated models and engines. This source setup adds no startup task,
-service or automatic update. Packaged launcher integration is still pending.
+service or automatic update. The packaged install pairs from the tray menu
+(Pair this computer) or `aipster-worker pair` and supervises the sender.
 See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
 POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
 

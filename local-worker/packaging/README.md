@@ -61,7 +61,8 @@ packaging/
 
 `aipster-tray.exe` is the primary desktop entry (windowed: no console). It
 runs a hidden controller window, supervises at most one `dendrite serve`
-child, and presents state through a backend:
+child plus the heartbeat sender (`aipster-worker sender`, port-independent),
+and presents state through a backend:
 
 - `backend_win32`: real tray icon (state-colored ICO), popup menu rendered
   from `state.menu_model`, balloon notifications. Needs an interactive
@@ -72,9 +73,12 @@ child, and presents state through a backend:
 
 States describe the **local worker process only**: stopped, starting,
 running, port_busy, error. There is deliberately no connected or
-inference-ready state — pairing is not implemented and dispatch stays
-disabled — and `state.check_honest` fails the import if any shipped template
-overclaims. The menu carries a disabled "Pairing: not implemented" line.
+inference-ready state — dispatch stays disabled — and `state.check_honest`
+fails the import if any shipped template overclaims. Pairing is a separate
+local overlay (unpaired / registered / reachable / stale / repair-required /
+actionable-error) derived from the pairing store plus the sender child; the
+menu carries a Pair action and the overlay lines. A heartbeat proves
+reachability only, never readiness.
 
 Single instance per data directory: a named mutex plus window-message IPC
 (`tray status|start|stop|restart|quit`, also via `aipster-worker tray ...`
@@ -82,14 +86,34 @@ for visible console output). A second launch reuses the running instance
 (status balloon, worker relaunched if stopped) and exits 0; it never starts
 a duplicate worker or fights for the port.
 
-Ownership: the child is spawned with `CREATE_NO_WINDOW`, piped into a
+Ownership: each child is spawned with `CREATE_NO_WINDOW`, piped into a
 size-bounded rotating log (1 MiB x3), and — on normal desktop launches —
 joined to a kill-on-close job object, so a parent crash can never orphan a
-worker. Quit stops the owned child, removes the icon, and exits; nothing
-else is signaled. Crashes restart with backoff (1s/5s/15s, max 3 per 5 min)
-then park in an honest error state; a busy port never restart-loops.
-`data/state.json` records state, detail, pid, endpoint, restarts, and
-version on every transition plus a 30s heartbeat.
+worker or a sender. Quit stops the owned children, removes the icon, and
+exits; nothing else is signaled. Daemon crashes restart with backoff
+(1s/5s/15s, max 3 per 5 min) then park in an honest error state; a busy port
+never restart-loops. The sender runs while serving whenever paired —
+including while the daemon's port is busy — and is never auto-restarted
+after it dies: exit 4 (dead key) surfaces "pair again", other exits surface
+"Start worker runs it again". `data/state.json` records state, detail, pid,
+endpoint, restarts, version, and the pairing overlay on every transition
+plus a 30s heartbeat.
+
+Pairing entry: the windowed tray has no console for the no-echo code prompt,
+so the menu Pair item opens the console launcher (`aipster-worker pair`) in
+its own window; the code is typed there and never passes through the tray.
+`aipster-worker sender` is the supervised foreground sender (the tray
+child); `aipster-worker tray status` shows the pairing overlay key.
+
+Menu actions: Connect runs Start, then opens the pair prompt when unpaired
+(idempotent; port-busy still pairs but reports not-serving). Start serves
+the local worker and runs the sender while paired; Stop stops both and
+keeps the pairing for the next Start. Copy endpoint address copies the
+serving `http://host:port` only — never tokens — and stays disabled while
+stopped. Settings opens `config.toml` from the data directory. The tray
+exposes local inference only: there is no capacity-contribution control,
+and boot autostart stays an explicit installer opt-in (off by default),
+so neither can engage implicitly.
 
 Job-object caveat: under a sandboxed launcher the process already belongs to
 a job that forbids nesting, so assignment fails. That failure is logged with

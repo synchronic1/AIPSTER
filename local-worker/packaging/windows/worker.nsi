@@ -262,7 +262,7 @@ Function un.DataChoice
     Abort
   ${EndIf}
   !insertmacro MUI_HEADER_TEXT "Remove data?" "Choose whether your private worker data goes too."
-  ${NSD_CreateLabel} 0 0 100% 24u "The application files, shortcuts, and settings are always removed. Your data directory holds your config, API token, state, and logs."
+  ${NSD_CreateLabel} 0 0 100% 24u "The application files, shortcuts, and settings are always removed. Your data directory holds your config, API token, pairing, state, and logs."
   Pop $0
   ${NSD_CreateCheckbox} 0 34u 100% 12u "Also remove my worker data in %LOCALAPPDATA%\AIPSTER-Worker"
   Pop $1
@@ -329,6 +329,6 @@ Section "Uninstall"
     DetailPrint "Application removed; the data directory was preserved."
     IfSilent +2
       MessageBox MB_OK|MB_ICONINFORMATION \
-        "Your worker data in %LOCALAPPDATA%\AIPSTER-Worker (config, token, state, logs) was preserved. Delete that folder manually if you want it gone."
+        "Your worker data in %LOCALAPPDATA%\AIPSTER-Worker (config, token, pairing, state, logs) was preserved. Delete that folder manually if you want it gone."
   ${EndIf}
 SectionEnd

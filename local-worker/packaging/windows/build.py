@@ -278,7 +278,17 @@ def main():
                                      env=tray_env, timeout=60)
         if status_proc.returncode != 2:
             raise SystemExit(f"frozen tray status without state: rc={status_proc.returncode}")
-        print("frozen --help + simulated inspect + tray --help/status: OK")
+        # The pairing module must freeze with the launcher: sender --once on
+        # an empty store exercises the frozen import and reports NOT_PAIRED.
+        sender_probe = subprocess.run(
+            [str(app_dir / "aipster-worker.exe"), "sender", "--once",
+             "--data-dir", str(Path(temp) / "sender-data")],
+            capture_output=True, text=True, env=tray_env, timeout=60)
+        if sender_probe.returncode != 2 or "not paired" not in sender_probe.stderr:
+            raise SystemExit(
+                "frozen sender --once without pairing: "
+                f"rc={sender_probe.returncode} err={sender_probe.stderr[-500:]}")
+        print("frozen --help + simulated inspect + tray --help/status + sender entry: OK")
 
     step(8, total, "assemble licenses and icons")
     icons_src = PACKAGING / "icons"

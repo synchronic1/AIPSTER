@@ -203,17 +203,18 @@ async function loadOverview() {
 // instructions on qualified platforms only, and an OS picker that corrects
 // detection. Linked
 // documentation and worker source have immutable pins. The reviewed pairing
-// client retains the #17 local-token and Host/Origin guards; move either pin
-// only with a re-verified re-pin.
+// client retains the #17 local-token and Host/Origin guards and the API
+// edge-compatible sender; move either pin only with a re-verified re-pin.
 // The card renders with no API call and initially holds no credential; the call
 // it ever makes is minting a one-time pairing code when the user clicks Pair,
 // and the code is cleared on Done, tab switch, or sign-out.
-// The Windows installer is packaged and qualified but its release file is not
-// published yet, so there is nothing to download; macOS/Linux are not packaged
-// at all. Progress honestly stops at "Setup needed" until the worker is
-// installed and paired elsewhere.
-const WORKER_COMMIT = 'f3e115e0c42fcd83e8a6f2e769de427710f7acc1';
-const DOCS_COMMIT = 'bcb2e03e8342af8c2c6ddb5bdea1998c7491e45a';
+// The packaged Windows installer predates the API edge-compat fix, so it
+// will not be published; a rebuilt installer is pending qualification and
+// there is nothing to download. macOS/Linux are not packaged at all. The
+// progress stage derives from the tab's inventory snapshot (setup /
+// pairing / reachable); it never claims an unverified state.
+const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
+const DOCS_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
@@ -242,7 +243,7 @@ const INSTALLERS = {
   windows: { available: false, packaged: true, version: '0.1.0',
     sha256: '81f60828bcc89f038f7a0ded16db76bb06f0c64c42942fa9c52b24cb7f503688',
     built_from: 'cee3390bda28ac70ee75f6e432fd633e4f76a9f0',
-    reason: 'packaged; release qualification pending; release upload pending' },
+    reason: 'packaged 0.1.0 build predates the API edge-compat fix; a rebuilt installer is pending qualification and no release file is published' },
   macos: { available: false, reason: 'no verified installer package exists yet' },
   linux: { available: false, reason: 'no verified installer package exists yet' }
 };
@@ -338,7 +339,7 @@ function agentInstructions(os) {
     '',
     'Pinned source - do not substitute another revision:',
     '- Repository: https://github.com/synchronic1/AIPSTER',
-    '- Commit: ' + WORKER_COMMIT + ' (security-fixed: local token required, Host/Origin checked)',
+    '- Commit: ' + WORKER_COMMIT + ' (reviewed: local token required, Host/Origin checked, API edge-compatible sender)',
     '- Worker directory: local-worker/',
     '- Standalone worker background and troubleshooting: ' + WORKER_LINKS.quickstart,
     '- Use the pinned commands below for pairing; do not substitute an older checkout from background documentation.',
@@ -390,6 +391,8 @@ function agentInstructions(os) {
     '  ' + pairing[1],
     '- Mock reports usable=false. Choose Done or reopen My Compute to load the paired resource;',
     '  a heartbeat proves reachability only, never inference readiness.',
+    '- Packaged installs instead: pair from the tray menu (Pair this computer) or with `aipster-worker pair`;',
+    '  the tray starts the sender while serving.',
     '',
     'Step 7 - disconnect and uninstall (I choose when to do this):',
     '- Stop both the sender and daemon terminals with Ctrl+C, then discard the',
@@ -419,6 +422,19 @@ const installerUsable = (inst) => !!(inst && inst.available
 const installerPackaged = (inst) => !!(inst && !inst.available && inst.packaged
   && /^[0-9a-f]{64}$/.test(inst.sha256 || ''));
 
+// Progress stage from the tab's inventory snapshot (same row fields
+// resourceCard reads). The browser cannot observe an install: "setup"
+// covers both not-installed and manual-only rows, "awaiting" covers paired
+// rows with no fresh heartbeat, and "reachable" needs a fresh heartbeat —
+// reachability only, never readiness.
+function connectStage() {
+  const items = connect && connect.inv && connect.inv.items;
+  if (!items || !items.length) return 'setup';
+  if (items.some((r) => r.state && r.state.online && r.heartbeatAt)) return 'reachable';
+  if (items.some((r) => r.state && r.state.authenticated)) return 'awaiting';
+  return 'setup';
+}
+
 function paintConnectCard() {
   const el = $('connect-card');
   if (!connect) { el.innerHTML = ''; el.hidden = true; return; }
@@ -435,7 +451,7 @@ function paintConnectCard() {
   const installingStage = needsTargetSelection(connect)
     ? 'Choose a target to check installer availability.'
     : osPackaged
-    ? 'Pending: the installer is packaged; release qualification pending; the release file is not published yet.'
+    ? 'Pending: the packaged installer predates the API edge-compat fix; a rebuilt installer is pending qualification and there is nothing to download yet.'
     : 'Blocked: no verified installer is packaged yet.';
   const meta = OS_META[connect.os];
   const unpickedTarget = needsTargetSelection(connect);
@@ -455,7 +471,7 @@ function paintConnectCard() {
     : usable
       ? `<a class="btn" href="${esc(inst.url)}">Download installer</a>`
       : packaged
-        ? `<button type="button" class="btn" disabled>Installer pending publication for ${esc(meta.label)}</button>`
+        ? `<button type="button" class="btn" disabled>Installer rebuild pending for ${esc(meta.label)}</button>`
         : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
   const secondary = unpickedTarget ? ''
     : meta.agentQualified
@@ -466,7 +482,9 @@ function paintConnectCard() {
   // would 403, so the card says so up front instead of failing on click.
   const pairBtn = (me && me.demo)
     ? '<button type="button" class="btn secondary" disabled>Pairing unavailable for demo</button>'
-    : '<button type="button" class="btn secondary" data-action="pair">Pair this computer</button>';
+    : connect.pair && connect.pair.phase === 'minting'
+      ? '<button type="button" class="btn secondary" data-action="pair" disabled>Minting…</button>'
+      : '<button type="button" class="btn secondary" data-action="pair">Pair this computer</button>';
   const pairBlock = (() => {
     const p = connect.pair;
     if (!p || p.phase === 'idle') return '';
@@ -482,7 +500,7 @@ function paintConnectCard() {
     : usable
       ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)}: verify the SHA-256 checksum <code>${esc(inst.sha256)}</code> before running it.</p>`
       : packaged
-        ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)} is packaged; release qualification pending (built from <code>${esc((inst.built_from || '').slice(0, 7))}</code>), but the release file is not published yet, so there is nothing to download. Its SHA-256 is <code>${esc(inst.sha256)}</code> — verify it after downloading.</p>`
+        ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)} is packaged (built from <code>${esc((inst.built_from || '').slice(0, 7))}</code>), but that build predates the API edge-compat fix, so it will not be published; a rebuilt installer is pending qualification and there is nothing to download. The unpublished build's SHA-256 is <code>${esc(inst.sha256)}</code> for reference.</p>`
         : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
   let status = '';
   if (connect.phase === 'platforms') {
@@ -492,7 +510,42 @@ function paintConnectCard() {
   } else if (connect.phase === 'copy-failed') {
     const saveNote = connect.saveFailed ? ' The file download failed in this browser, so use the selectable text.' : '';
     status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
+  } else if (connect.phase === 'load-error') {
+    status = `<p class="notice" role="status"><span class="pill warn">Refresh failed</span> ${esc(connect.loadError || 'The resource list could not be loaded.')} <span class="actions"><button type="button" class="btn secondary" data-action="retry-load">Try again</button></span></p>`;
   }
+  // Progress stage: derived from the tab's inventory snapshot (connect.inv),
+  // never from the install the browser cannot observe. Authorizing (a mint
+  // in flight or a code on screen) highlights Pairing without claiming a
+  // link; reachable needs a fresh heartbeat and still claims only
+  // reachability.
+  const stage = connectStage();
+  const authorizing = !!connect.pair && (connect.pair.phase === 'minting' || connect.pair.phase === 'shown');
+  const current = stage === 'reachable' ? 3 : (stage === 'awaiting' || authorizing) ? 2 : 0;
+  const pairingStage = connect.pair && connect.pair.phase === 'minting'
+    ? 'Authorizing: minting a one-time code…'
+    : authorizing
+      ? "Authorizing: code minted — type it into the worker's pair step."
+      : stage === 'awaiting'
+        ? 'Paired, awaiting heartbeat: start the sender, then choose Done to refresh.'
+        : stage === 'reachable'
+          ? 'Linked: the worker is paired and beating.'
+          : "Available: mint a one-time code below, then type it into the worker's pair step. Packaged installs start the sender from the tray; source installs use the manual steps below.";
+  const connectedStage = stage === 'reachable'
+    ? 'Reachable now: fresh heartbeat on file. Reachability only — dispatch stays disabled and nothing can run.'
+    : 'Needs verified worker evidence. A download or a running worker is not proof.';
+  const setupStage = current === 0 ? 'You are here. Not connected.' : 'Setup evidence on file.';
+  const step = (n, title, text) => n === current
+    ? `<li class="now" aria-current="step"><strong>${title}</strong><span class="st muted">${text}</span></li>`
+    : `<li><strong>${title}</strong><span class="st muted">${text}</span></li>`;
+  const progressItems = step(0, 'Setup needed', setupStage)
+    + step(1, 'Installing', installingStage)
+    + step(2, 'Pairing', pairingStage)
+    + step(3, 'Connected', connectedStage);
+  const stagePill = stage === 'reachable'
+    ? '<p><span class="pill ok">Reachable</span></p>'
+    : (stage === 'awaiting' || authorizing)
+      ? '<p><span class="pill warn">Pairing</span></p>'
+      : '<p><span class="pill warn">Setup needed</span></p>';
   const commands = unpickedTarget ? '' : workerCommands(connect.os).map(esc).join('\n');
   const pairingCommands = workerPairingCommands(connect.os);
   const advanced = unpickedTarget ? '' : `<details><summary>Advanced: manual install, source and troubleshooting</summary>
@@ -509,8 +562,9 @@ function paintConnectCard() {
 <p>Mint a one-time pairing code above (10-minute expiry, single use). In a second terminal in the same <code>local-worker</code> directory, run <code>${esc(pairingCommands[0])}</code> and type the code locally. Pairing contacts AIPSTER, registers this computer automatically and stores a private heartbeat key. Do not paste the code or key into an agent chat.</p>
 <p>Pairing does not start the sender. In that terminal, run <code>${esc(pairingCommands[1])}</code> to post reachability heartbeats. The mock stays <code>usable=false</code>; no inference is enabled. Keep this sender terminal open. See the <a href="${esc(L.pairing)}">pairing and sender details</a>.</p>
 <p>Status: <strong>not linked until paired</strong>. Choose Done or reopen My Compute after pairing to load the resource below. Heartbeats prove reachability only, never readiness. Manual entry stays under <strong>Advanced: manual resource registration</strong>. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
-<p class="muted">If the key is revoked or expires, the sender exits asking for a re-pair with a fresh code. Packaged launcher integration is pending with the installer release.</p>
-<details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the old instance or pick a free loopback port in the config.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
+<p>Packaged install? Open the AIPSTER Worker tray menu and choose Pair this computer (or run <code>aipster-worker pair</code> in a terminal), then type the code above when asked. The tray starts the sender for you while serving; update by reinstalling from a newer reviewed pin AIPSTER publishes (uninstall preserves pairing).</p>
+<p class="muted">If the key is revoked or expires, the sender exits asking for a re-pair with a fresh code.</p>
+<details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the other worker through its own controls (never kill it), or pick a free loopback port in the config. Pairing needs no local port, so it stays available.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
 <details><summary>Disconnect and uninstall</summary><p>Stop both sender and daemon terminals with Ctrl+C, then discard the worker-local token. A paired worker also holds an AIPSTER heartbeat key: revoke this resource's key in AIPSTER Keys. Run <code>${esc(pairingCommands[2])}</code> to forget its local pairing; this does not revoke the server key. Then remove only <code>local-worker/.venv</code> and <code>.state</code> if present. Keep unrelated models and engines. This setup adds no service, startup task, global package or automatic update. Keep the daemon on loopback.</p></details>
 </details>`;
   el.innerHTML = `<div class="connect-grid"><div class="connect-rail">
@@ -518,12 +572,9 @@ function paintConnectCard() {
 <svg class="connect-illus" viewBox="0 0 220 150" width="220" height="150" role="img" aria-label="A computer connecting to a three-node inference fabric"><g fill="none" stroke-linecap="round"><rect x="14" y="48" width="76" height="54" rx="6" fill="#0b0e12" stroke="#F2B887" stroke-width="4"/><line x1="38" y1="102" x2="38" y2="114" stroke="#F2B887" stroke-width="4"/><line x1="66" y1="102" x2="66" y2="114" stroke="#F2B887" stroke-width="4"/><line x1="28" y1="114" x2="76" y2="114" stroke="#F2B887" stroke-width="4"/><line x1="90" y1="62" x2="140" y2="48" stroke="#7c9787" stroke-width="4" stroke-dasharray="2 8"/><line x1="90" y1="88" x2="140" y2="102" stroke="#7c9787" stroke-width="4" stroke-dasharray="2 8"/><circle cx="162" cy="42" r="20" fill="#0b0e12" stroke="#98c379" stroke-width="4"/><circle cx="162" cy="108" r="20" fill="#0b0e12" stroke="#98c379" stroke-width="4"/><circle cx="198" cy="75" r="14" fill="#0b0e12" stroke="#98c379" stroke-width="4"/><line x1="162" y1="62" x2="162" y2="88" stroke="#98c379" stroke-width="3"/></g></svg>
 <p class="benefit">Prepare the computer you are using now for future sharing. Installing the worker never shares anything or enables inference by itself.</p>
 <ol class="progress" aria-label="Connection progress">
-<li class="now" aria-current="step"><strong>Setup needed</strong><span class="st muted">You are here. Not connected.</span></li>
-<li><strong>Installing</strong><span class="st muted">${installingStage}</span></li>
-<li><strong>Pairing</strong><span class="st muted">Available: mint a one-time code below, then type it into the worker's pair step. Start the sender using the manual steps afterward.</span></li>
-<li><strong>Connected</strong><span class="st muted">Needs verified worker evidence. A download or a running worker is not proof.</span></li>
+${progressItems}
 </ol>
-<p><span class="pill warn">Setup needed</span></p>
+${stagePill}
 </div><div class="connect-body">
 <p class="lede">Prepare this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then pair it below with a one-time code. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; dispatch is not available, so nothing can run.</p>
 <div class="osrow"><label for="connect-os">Your system</label><select id="connect-os" data-action="os" aria-describedby="connect-os-note">${options}</select><span class="muted" id="connect-os-note">${detectedNote}</span></div>
@@ -562,8 +613,12 @@ function onConnectClick(ev) {
     copyAgentInstructions();
   } else if (action === 'save-instructions') {
     saveInstructions();
-  } else if (action === 'pair' || action === 'pair-again') {
-    mintPairingCode();
+  } else if (action === 'pair') {
+    mintPairingCode(false);
+  } else if (action === 'pair-again') {
+    mintPairingCode(true);
+  } else if (action === 'retry-load') {
+    loadCompute();
   } else if (action === 'pair-done') {
     clearPairingCode();
     // Preserve the current peer's Done refresh, with explicit cancellation of
@@ -639,10 +694,14 @@ async function copyAgentInstructions() {
   paintConnectCard();
 }
 
-async function mintPairingCode() {
+async function mintPairingCode(replace) {
   if (!connect || !me || me.demo) return;
   const gen = generation;
   const card = connect;
+  // Idempotent clicks: a second Pair press while a mint is in flight starts
+  // nothing. An explicit re-mint (pair-again) still supersedes via the op
+  // fence below.
+  if (!replace && card.pair.phase === 'minting') return;
   const op = (card.pair.op = (card.pair.op || 0) + 1);
   card.pair.phase = 'minting';
   card.pair.error = '';
@@ -666,7 +725,7 @@ function renderConnectCard() {
   clearPairingCode();
   const detected = detectOs();
   const os = detected && detected !== 'mobile' ? detected : 'windows';
-  connect = { os, detected, picked: false, phase: 'idle', fallback: '', saveFailed: false, copyOp: 0, pair: { phase: 'idle', code: '', expiresAt: '', error: '', op: 0 } };
+  connect = { os, detected, picked: false, phase: 'idle', fallback: '', saveFailed: false, copyOp: 0, inv: null, loadError: '', pair: { phase: 'idle', code: '', expiresAt: '', error: '', op: 0 } };
   paintConnectCard();
   const el = $('connect-card');
   el.onclick = onConnectClick;
@@ -683,10 +742,17 @@ async function loadCompute() {
   try {
     const inv = await api('/api/inventory?limit=50');
     if (load !== computeLoad) return;
+    // The card reuses this same snapshot for its progress stage: no second
+    // call, and a replaced load never repaints a newer card.
+    if (connect) { connect.inv = inv; paintConnectCard(); }
     el.innerHTML = inv.items.length ? inv.items.map(resourceCard).join('') : '';
     if (!inv.items.length) state(el, '', 'No resources yet. Pair a worker above, or register one manually under Advanced.');
     $('grant-resource').innerHTML = inv.items.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
-  } catch (e) { if (isStale(e) || load !== computeLoad) return; state(el, 'error', e.message); }
+  } catch (e) {
+    if (isStale(e) || load !== computeLoad) return;
+    if (connect) { connect.phase = 'load-error'; connect.loadError = e.message; paintConnectCard(); }
+    state(el, 'error', e.message);
+  }
 }
 
 async function loadShared() {

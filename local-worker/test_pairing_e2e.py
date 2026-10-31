@@ -266,6 +266,35 @@ class PairingE2ETests(unittest.TestCase):
             {"Authorization": "Bearer " + self.pairing_secret(data_dir)})
         self.assertEqual(status, 401, "disabled owner heartbeat rejected")
 
+    def test_launcher_pair_sender_revoke_cycle(self):
+        """Worker-connect W1: the installed console entry pairs/beats/re-pairs."""
+        launcher = [sys.executable, str(ROOT / "packaging" / "windows" / "launcher.py")]
+        user = self.seed_user("e2e-launcher@example.com", "E2E Launcher")
+        data_dir = self.data_dir("launcher")
+        code = self.mint_code(user["cookie"])["code"]
+        proc = subprocess.run(
+            launcher + ["pair", "--api-base", self.bridge.base, "--data-dir", str(data_dir),
+                        "--config", str(MOCK_CONFIG), "--code", code],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("THIS computer", proc.stdout, "consent line precedes the claim")
+        self.assertNotIn(code, proc.stdout + proc.stderr)
+        meta = self.pairing_meta(data_dir)
+        once = subprocess.run(
+            launcher + ["sender", "--once", "--api-base", self.bridge.base,
+                        "--data-dir", str(data_dir), "--config", str(MOCK_CONFIG)],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(once.returncode, 0, once.stderr)
+        self.assertIn("heartbeat ok", once.stdout)
+        status, _ = self.bridge.api("POST", "/__test/revoke-key", {"id": meta["key_id"]})
+        self.assertEqual(status, 200)
+        dead = subprocess.run(
+            launcher + ["sender", "--once", "--api-base", self.bridge.base,
+                        "--data-dir", str(data_dir), "--config", str(MOCK_CONFIG)],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(dead.returncode, 4, "revoked sender demands re-pair: " + dead.stderr)
+        self.assertIn("pair again", dead.stderr)
+
     def test_cli_never_prints_secrets(self):
         user = self.seed_user("e2e-quiet@example.com", "E2E Quiet")
         data_dir = self.data_dir("quiet")

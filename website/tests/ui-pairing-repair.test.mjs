@@ -128,7 +128,7 @@ test('UI repair: pairing checkout uses the published reviewed source pin and qua
   const t = await ui();
   const commands = t.context.workerCommands('windows').join('\n');
   const pin = /git checkout --detach ([a-f0-9]{40})/.exec(commands)[1];
-  assert.equal(pin,'f3e115e0c42fcd83e8a6f2e769de427710f7acc1');
+  assert.equal(pin,'3fa309cb08461ea046ee23e801404911c1f3bcc2');
   assert.match(commands,/sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
   assert.ok(!commands.includes('git clone https://'), 'no full checkout replaces the qualified sparse flow');
   assert.match(t.context.agentInstructions('windows'), /Use the pinned commands below for pairing/);
@@ -156,6 +156,15 @@ test('UI repair: anonymous/demo guards and displayed codes cannot become active 
   t.pending[0]({code:'<script>SYNTHETIC</script>',expiresAt:'<img src=x>'},201); await t.flush();
   assert.ok(!t.el('connect-card').innerHTML.includes('<script>'));
   assert.ok(t.el('connect-card').innerHTML.includes('&lt;script&gt;'));
+});
+
+test('INDEPENDENT UI: double Pair click while minting starts one mint', async () => {
+  const t = await ui({deferred:true});
+  await t.press('pair'); await t.press('pair');
+  assert.equal(t.pending.length,1);
+  t.pending[0]({code:'ONLY-CODE',expiresAt:'2100-01-01T00:00:00Z'},201); await t.flush();
+  assert.ok(t.el('connect-card').innerHTML.includes('ONLY-CODE'));
+  assert.ok(t.el('connect-card').innerHTML.includes('Authorizing: code minted'));
 });
 
 test('INDEPENDENT UI: source instructions start a sender and distinguish paired credential revocation', async () => {
