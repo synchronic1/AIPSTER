@@ -12,6 +12,8 @@ import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, M
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
 import { dgmPreviewEnabled } from './dgm/router.mjs';
+import { advisorEnabled, advisorDescriptor, handleAdvisorPost } from './advisor/router.mjs';
+import { ADVISOR_BODY_MAX } from './advisor/validate.mjs';
 import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 
@@ -572,6 +574,18 @@ async function handleApi(request, env, url) {
     assertClaimed(gc, 'grant');
     await audit(db, me(), 'grant.create', id, `${resource.id} -> ${grantee.email}`);
     return json(201, mapGrantLite(await first(db, 'SELECT * FROM grants WHERE id = ?', id)));
+  }
+  // Fabric adviser (flag-gated). Authorization precedes routing: anonymous
+  // callers get 401 even when the flag is off, so the flag is not an oracle.
+  // Demo sessions are served fixtures by the router, never live calls.
+  if (path === '/api/advisor' && (method === 'GET' || method === 'POST')) {
+    const d = method === 'GET' ? needSession() : (needSession() || needCsrf());
+    if (d) return deny(d);
+    if (!advisorEnabled(env)) return json(404, { error: 'Not found.', code: 'NOT_FOUND' });
+    if (method === 'GET') return json(200, advisorDescriptor(env, { demo: isDemo() }));
+    const body = await readJson(request, ADVISOR_BODY_MAX);
+    const out = await handleAdvisorPost({ db, env, actor, demo: isDemo(), body, now: new Date() });
+    return json(out.status, out.body);
   }
   {
     const m = /^\/api\/grants\/([A-Za-z0-9_-]{1,64})$/.exec(path);

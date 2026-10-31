@@ -840,7 +840,95 @@ async function loadSettings() {
   } catch (e) { if (isStale(e)) return; banner(e.message); }
 }
 
-const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, federation: loadFederation, keys: loadKeys, usage: loadUsage, settings: loadSettings };
+const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, federation: loadFederation, keys: loadKeys, usage: loadUsage, advice: loadAdvice, settings: loadSettings };
+
+// ---- fabric adviser ----
+// Advisory text about owned resources. The panel renders the server
+// descriptor (mode, bounds, outbound fields) before opt-in; submit posts a
+// fenced call with CSRF and renders escaped output plus the receipt. Advice
+// never runs inference: dispatch stays disabled and no model is ever named.
+let advAbort = null;
+let advLastKey = null;
+
+// Tab navigation fences the in-flight advice request but strands its
+// controls (submit disabled, Cancel visible, abort handle cleared). Reset
+// the pending controls on every panel entry so Advice is always
+// submittable; the orphaned response stays fenced and never renders.
+function resetAdvicePending() {
+  if (advAbort) { advAbort.abort(); advAbort = null; }
+  $('adv-cancel').hidden = true; $('adv-submit').disabled = false;
+}
+
+async function loadAdvice() {
+  resetAdvicePending();
+  const gen = generation;
+  const on = $('adv-on'), off = $('adv-off');
+  try {
+    const d = await api('/api/advisor');
+    if (gen !== generation) return;
+    on.hidden = false; off.hidden = true;
+    $('adv-mode').textContent = `Mode: ${d.mode} \u00b7 model: ${d.model} \u00b7 spend cap $${d.spendCapUsd} \u00b7 inference dispatch ${d.inferenceDispatch}`;
+    $('adv-fields').textContent = 'Outbound on submit: task + ' + d.outboundFields.join(', ');
+    const inv = await allInventory();
+    if (gen !== generation) return;
+    $('adv-resources').innerHTML = inv.length ? inv.map((r) =>
+      `<label><input type="checkbox" name="adv-ref" value="${esc(r.id)}"> ${esc(r.name)} <span class="muted">(${esc(r.id)})</span></label>`).join('')
+      : '<p class="muted">No resources yet. Register one under My Compute first.</p>';
+  } catch (e) {
+    if (isStale(e)) return;
+    if (/\(NOT_FOUND\)/.test(e.message)) { on.hidden = true; off.hidden = false; return; }
+    state($('adv-result'), 'error', e.message);
+  }
+}
+
+function renderAdvice(out) {
+  if (!out.advice) {
+    state($('adv-result'), '', (out.note || 'Advice output is not stored.') + ` (mode: ${out.receipt ? out.receipt.mode : 'unknown'}, replay)`);
+    $('adv-retry').hidden = true;
+    return;
+  }
+  const a = out.advice, r = out.receipt;
+  const recs = a.recommendations.map((x) =>
+    `<div class="card"><p><strong>${esc(x.resourceRef)}</strong> \u00b7 model compatibility unknown</p>
+     <p>${esc(x.why)}</p>
+     <p class="muted">evidence: ${x.evidenceRefs.map(esc).join(', ') || 'none'}</p>
+     ${x.unknowns.length ? `<p class="muted">unknowns: ${x.unknowns.map(esc).join(' \u00b7 ')}</p>` : ''}</div>`).join('');
+  const blocked = a.blockedReasons.length ? `<div class="card"><p>Blocked</p><ul>${a.blockedReasons.map((b) => `<li>${esc(b)}</li>`).join('')}</ul></div>` : '';
+  const usage = r.mode === 'fixture' ? 'no provider call' : (r.usage ? `${r.usage.input_tokens}/${r.usage.output_tokens} tok \u00b7 $${r.spendUsdEst}` : 'usage unknown');
+  $('adv-result').innerHTML =
+    `<div class="card"><p>${esc(a.summary)}</p>
+     <p class="muted">mode: ${esc(r.mode)} \u00b7 model: ${esc(r.model)} \u00b7 ${esc(String(r.elapsedMs))}ms \u00b7 validation: ${esc(r.validation)}${r.replay ? ' \u00b7 replay' : ''} \u00b7 ${esc(usage)}</p></div>`
+    + recs + blocked;
+  $('adv-retry').hidden = true;
+}
+
+async function submitAdvice(retryKey) {
+  const err = $('adv-error'); err.textContent = ''; err.hidden = true;
+  if (!$('adv-optin').checked) { err.textContent = 'Confirm the outbound preview before submitting.'; err.hidden = false; return; }
+  const refs = [...document.querySelectorAll('input[name="adv-ref"]')].filter((b) => b.checked).map((b) => b.value);
+  if (!refs.length) { err.textContent = 'Select at least one resource.'; err.hidden = false; return; }
+  const task = $('adv-task').value;
+  const key = retryKey || (crypto.randomUUID ? crypto.randomUUID() : 'op-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+  advLastKey = key;
+  const gen = generation;
+  advAbort = new AbortController();
+  $('adv-cancel').hidden = false; $('adv-submit').disabled = true; $('adv-retry').hidden = true;
+  loading($('adv-result'));
+  try {
+    const out = await api('/api/advisor', { method: 'POST', body: JSON.stringify({ task, refs, opKey: key }), signal: advAbort.signal });
+    if (gen !== generation) return;
+    renderAdvice(out);
+  } catch (e) {
+    if (isStale(e)) return;
+    if (e && e.name === 'AbortError') { state($('adv-result'), 'muted', 'Cancelled. No advice was rendered.'); }
+    else { state($('adv-result'), 'error', e.message); $('adv-retry').hidden = false; }
+  } finally {
+    if (gen === generation) { $('adv-cancel').hidden = true; $('adv-submit').disabled = false; }
+    advAbort = null;
+  }
+}
+
+function cancelAdvice() { if (advAbort) advAbort.abort(); }
 
 // ---- federation ----
 const idem = () => ({ 'Idempotency-Key': (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)) });
@@ -950,6 +1038,12 @@ function resetState() {
   connect = null;
   $('connect-card').innerHTML = ''; $('connect-card').hidden = true;
   $('grant-resource').innerHTML = '';
+  if (advAbort) advAbort.abort(); advAbort = null; advLastKey = null;
+  $('adv-task').value = ''; $('adv-optin').checked = false;
+  $('adv-mode').textContent = ''; $('adv-fields').textContent = '';
+  $('adv-resources').innerHTML = ''; $('adv-result').innerHTML = '';
+  $('adv-on').hidden = true; $('adv-off').hidden = true;
+  $('adv-cancel').hidden = true; $('adv-submit').disabled = false; $('adv-retry').hidden = true;
   $('key-secret').textContent = ''; $('key-reveal').hidden = true;
   $('fab-node-secret').textContent = ''; $('fab-node-reveal').hidden = true;
   $('fab-inv-secret').textContent = ''; $('fab-inv-reveal').hidden = true;
@@ -965,7 +1059,7 @@ function resetState() {
   for (const id of ['fab-node-label', 'fab-node-ws', 'fab-inv-node', 'fab-inv-ws', 'fab-inv-purpose', 'fab-accept-token', 'fab-accept-key', 'fab-prev-res', 'fab-prev-consumers', 'fab-prev-models', 'fab-deny-res', 'fab-deny-action', 'fab-authz-res', 'fab-authz-model', 'fab-authz-consumer']) $(id).value = '';
   $('grant-jobs').value = '50'; $('grant-tokens').value = '50000'; $('key-scope').value = 'read';
   $('fab-prev-tokens').value = '100000'; $('fab-prev-reqs').value = '1000';
-  for (const id of ['login-error', 'demo-error', 'resource-error', 'grant-error', 'key-error', 'settings-error']) { const e = $(id); e.textContent = ''; e.hidden = true; }
+  for (const id of ['login-error', 'demo-error', 'resource-error', 'grant-error', 'key-error', 'settings-error', 'adv-error']) { const e = $(id); e.textContent = ''; e.hidden = true; }
   for (const id of ['fab-node-error', 'fab-inv-error', 'fab-accept-error', 'fab-prev-error', 'fab-commit-error', 'fab-deny-error', 'fab-authz-error']) { const e = $(id); e.textContent = ''; e.hidden = true; }
   $('banner').textContent = ''; $('banner').hidden = true;
   $('demo-banner').hidden = true; $('demo-grants-note').hidden = true; $('demo-keys-note').hidden = true; $('demo-fab-note').hidden = true;
@@ -1073,6 +1167,9 @@ $('key-form').addEventListener('submit', async (e) => {
   } catch (ex) { if (isStale(ex)) return; err.textContent = ex.message; err.hidden = false; }
 });
 $('key-dismiss').addEventListener('click', () => { $('key-secret').textContent = ''; $('key-curl').textContent = ''; $('key-curl-wrap').hidden = true; $('key-reveal').hidden = true; });
+$('adv-form').addEventListener('submit', async (e) => { e.preventDefault(); submitAdvice(); });
+$('adv-cancel').addEventListener('click', () => cancelAdvice());
+$('adv-retry').addEventListener('click', async () => { await submitAdvice(advLastKey); });
 $('key-curl-copy').addEventListener('click', async () => {
   try {
     const text = $('key-curl').textContent || '';
