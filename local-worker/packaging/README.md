@@ -105,6 +105,16 @@ its own window; the code is typed there and never passes through the tray.
 `aipster-worker sender` is the supervised foreground sender (the tray
 child); `aipster-worker tray status` shows the pairing overlay key.
 
+Menu actions: Connect runs Start, then opens the pair prompt when unpaired
+(idempotent; port-busy still pairs but reports not-serving). Start serves
+the local worker and runs the sender while paired; Stop stops both and
+keeps the pairing for the next Start. Copy endpoint address copies the
+serving `http://host:port` only — never tokens — and stays disabled while
+stopped. Settings opens `config.toml` from the data directory. The tray
+exposes local inference only: there is no capacity-contribution control,
+and boot autostart stays an explicit installer opt-in (off by default),
+so neither can engage implicitly.
+
 Job-object caveat: under a sandboxed launcher the process already belongs to
 a job that forbids nesting, so assignment fails. That failure is logged with
 its Win32 reason (`confined=False confine_error=...`), and the strict

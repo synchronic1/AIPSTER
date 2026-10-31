@@ -655,6 +655,129 @@ class SenderSupervisionTests(unittest.TestCase):
         self.assertEqual(child.EXIT_REPAIR_REQUIRED, 4)
 
 
+class TrayConnectActionsTests(unittest.TestCase):
+    """Worker-connect W2: Connect/Settings/copy-address tray actions."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='aipster-connect-')
+        self.addCleanup(self.temp.cleanup)
+        self.data = Path(self.temp.name) / 'worker-data'
+        self.data.mkdir(parents=True)
+        self.logs = []
+        self.backend = HeadlessBackend(self.logs.append)
+        self.ctl = controller.Controller(self.data, self.backend)
+        self.ctl.config = self.data / 'config.toml'
+        self.ctl.loaded = SimpleNamespace(node=SimpleNamespace(
+            host='127.0.0.1', port=free_loopback_port(), token_env='DENDRITE_API_TOKEN'))
+        self.ctl.child = FakeChild()
+        self.ctl.sender = FakeSender()
+        self.ctl.last_heartbeat = time.monotonic()
+
+    def pair_store(self):
+        (self.data / 'pairing.json').write_text('{"resource_id": "r_fake01"}', encoding='utf-8')
+
+    def actions(self, st, endpoint='http://127.0.0.1:8090', detail=''):
+        model = state.menu_model(st, endpoint, detail)
+        return {i['id']: i for i in model if i['kind'] == 'action'}
+
+    def test_menu_carries_connect_settings_and_copy_in_every_state(self):
+        for st in state.STATES:
+            acts = self.actions(st)
+            for aid in ('connect', 'settings', 'copy_endpoint'):
+                self.assertIn(aid, acts, st)
+            self.assertTrue(acts['connect']['enabled'], st)
+            self.assertTrue(acts['settings']['enabled'], st)
+            serving = st in (state.STARTING, state.RUNNING)
+            self.assertEqual(acts['copy_endpoint']['enabled'], serving, st)
+
+    def test_menu_action_labels_are_honest(self):
+        acts = self.actions(state.RUNNING)
+        self.assertEqual(acts['connect']['label'], 'Connect this computer…')
+        self.assertEqual(acts['settings']['label'], 'Settings')
+        self.assertEqual(acts['copy_endpoint']['label'], 'Copy endpoint address')
+        for aid in ('connect', 'settings', 'copy_endpoint'):
+            state.check_honest(acts[aid]['label'])
+
+    def test_copy_endpoint_disabled_without_endpoint_text(self):
+        acts = self.actions(state.RUNNING, endpoint='')
+        self.assertFalse(acts['copy_endpoint']['enabled'])
+
+    def test_menu_dispatches_connect_settings_and_copy(self):
+        self.pair_store()
+        with patch.object(self.ctl, '_reload', return_value=''), \
+             patch.object(controller, 'port_busy', return_value=False):
+            self.ctl.menu_action('connect')
+        kinds = [e[0] for e in self.backend.events]
+        self.assertNotIn('pair_console', kinds)
+        self.ctl.menu_action('settings')
+        self.ctl.menu_action('copy_endpoint')
+        kinds = [e[0] for e in self.backend.events]
+        self.assertIn('open_config', kinds)
+        self.assertIn('copy_text', kinds)
+
+    def test_connect_starts_pairs_and_sender_when_fresh(self):
+        with patch.object(self.ctl, '_reload', return_value=''), \
+             patch.object(controller, 'port_busy', return_value=False):
+            self.assertTrue(self.ctl.connect())
+        self.assertEqual(len(self.ctl.child.started), 1)
+        kinds = [e[0] for e in self.backend.events]
+        self.assertIn('pair_console', kinds)
+        self.assertEqual(self.ctl.state, state.STARTING)
+
+    def test_connect_skips_pair_console_when_paired(self):
+        self.pair_store()
+        with patch.object(self.ctl, '_reload', return_value=''), \
+             patch.object(controller, 'port_busy', return_value=False):
+            self.assertTrue(self.ctl.connect())
+        kinds = [e[0] for e in self.backend.events]
+        self.assertNotIn('pair_console', kinds)
+        self.assertEqual(self.ctl.sender.starts, 1)
+
+    def test_connect_is_idempotent_when_connected(self):
+        self.pair_store()
+        self.ctl.sender._running = True
+        self.ctl.state = state.RUNNING
+        self.assertTrue(self.ctl.connect())
+        self.assertEqual(len(self.ctl.child.started), 0)
+        kinds = [e[0] for e in self.backend.events]
+        self.assertNotIn('pair_console', kinds)
+
+    def test_connect_pairs_even_when_port_busy(self):
+        with patch.object(self.ctl, '_reload', return_value=''), \
+             patch.object(controller, 'port_busy', return_value=True):
+            self.assertFalse(self.ctl.connect())
+        self.assertEqual(self.ctl.state, state.PORT_BUSY)
+        kinds = [e[0] for e in self.backend.events]
+        self.assertIn('pair_console', kinds)
+
+    def test_settings_returns_config_path(self):
+        self.assertEqual(self.ctl.open_settings(), str(self.data / 'config.toml'))
+        self.assertIn(('open_config', str(self.data / 'config.toml')), self.backend.events)
+
+    def test_copy_endpoint_payload_is_secret_free(self):
+        self.ctl.token_value = 'SENTINEL-TOKEN-VALUE'
+        self.assertTrue(self.ctl.copy_endpoint())
+        event = next(e for e in self.backend.events if e[0] == 'copy_text')
+        self.assertEqual(event[1], 'http://127.0.0.1:%d' % self.ctl.loaded.node.port)
+        self.assertNotIn('SENTINEL-TOKEN-VALUE', event[1])
+
+    def test_copy_endpoint_refuses_without_endpoint(self):
+        self.ctl.loaded = None
+        self.assertFalse(self.ctl.copy_endpoint())
+        self.assertNotIn('copy_text', [e[0] for e in self.backend.events])
+
+    def test_sender_reconnects_on_start_after_death(self):
+        self.pair_store()
+        self.ctl.sender._exit = 1
+        self.ctl.sender.last_exit = 1
+        self.ctl.tick()
+        self.assertEqual(self.ctl.sender.starts, 0)
+        with patch.object(self.ctl, '_reload', return_value=''), \
+             patch.object(controller, 'port_busy', return_value=False):
+            self.assertTrue(self.ctl.start_worker())
+        self.assertEqual(self.ctl.sender.starts, 1)
+
+
 class LauncherPairEntryTests(unittest.TestCase):
     """Worker-connect W1: installed console entry for pair/sender."""
 

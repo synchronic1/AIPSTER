@@ -27,6 +27,12 @@ class Backend:
     def open_logs(self, path):
         """Open the logs directory. Returns the path (test hook)."""
 
+    def open_config(self, path):
+        """Open the worker config file. Returns the path (test hook)."""
+
+    def copy_text(self, text):
+        """Copy text to the clipboard. Returns True on success."""
+
     def run_pair_console(self, exe, args):
         """Launch the pair prompt in its own console. Returns (exe, args).
 

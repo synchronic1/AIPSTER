@@ -178,8 +178,14 @@ def menu_model(state, endpoint="", detail="", pairing=None):
     items.append({"kind": "action", "id": "logs", "label": "View logs", "enabled": True})
     items.append({"kind": "action", "id": "pair", "label": "Pair this computer…",
                   "enabled": True})
+    items.append({"kind": "action", "id": "connect", "label": "Connect this computer…",
+                  "enabled": True})
     items.append({"kind": "text", "label": overlay["line"]})
     items.append({"kind": "text", "label": overlay["sender"]})
+    items.append({"kind": "action", "id": "copy_endpoint", "label": "Copy endpoint address",
+                  "enabled": bool(endpoint) and state in (STARTING, RUNNING)})
+    items.append({"kind": "action", "id": "settings", "label": "Settings",
+                  "enabled": True})
     items.append({"kind": "sep"})
     if state == RUNNING or state == STARTING:
         items.append({"kind": "action", "id": "stop", "label": "Stop worker", "enabled": True})

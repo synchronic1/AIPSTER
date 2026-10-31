@@ -243,6 +243,48 @@ class Controller:
             return (sys.executable, [str(launcher), "pair"])
         return None
 
+    def connect(self):
+        """One-click connect: serve locally, pair if needed, beat when paired.
+
+        Idempotent: already serving + paired + sender running is a no-op
+        True. Pairing stays interactive (the console prompt collects the
+        typed code); nothing is auto-minted. Port-busy still pairs (port
+        independent) but returns False: the worker is not serving.
+        """
+        paired = (self.data / "pairing.json").exists()
+        serving = self.state in (st.RUNNING, st.STARTING)
+        sender_up = bool(self.sender is not None and self.sender.running())
+        if paired and serving and sender_up:
+            self.log("connect: already running and paired; nothing to do")
+            return True
+        started = self.start_worker()
+        if not paired:
+            if not self.launch_pair():
+                self.log("connect: worker starting; pair step unavailable")
+                return started
+            self.log("connect: worker starting; pair prompt opened")
+        else:
+            self.log("connect: worker starting; sender runs when serving")
+        return started
+
+    def open_settings(self):
+        """Open the worker config file. Returns the config path."""
+        target = str(self.config) if self.config else ""
+        if not target:
+            self.log("settings unavailable: no config loaded")
+            return ""
+        return self.backend.open_config(target)
+
+    def copy_endpoint(self):
+        """Copy the serving endpoint (host:port only, never secrets)."""
+        text = self.endpoint_label()
+        if not text:
+            self.log("copy endpoint: worker is not serving")
+            return False
+        ok = bool(self.backend.copy_text(text))
+        self.log("endpoint address copied" if ok else "endpoint copy failed")
+        return ok
+
     def launch_pair(self):
         target = self.pair_target()
         if target is None:
@@ -384,6 +426,12 @@ class Controller:
             self.stop_worker()
         elif action == "pair":
             self.launch_pair()
+        elif action == "connect":
+            self.connect()
+        elif action == "settings":
+            self.open_settings()
+        elif action == "copy_endpoint":
+            self.copy_endpoint()
         elif action == "quit":
             self.request_quit()
 
