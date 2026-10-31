@@ -16,7 +16,7 @@ import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
-import { validateManifest, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_PARTS_PER_UPLOAD } from './lib/catalog/validate.mjs';
+import { validateManifest, validateManifestStructure, validateFileBytes, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_MANIFEST_BYTES, MAX_PARTS_PER_UPLOAD, MAX_FINALIZE_FILE_BYTES } from './lib/catalog/validate.mjs';
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
 
@@ -1737,6 +1737,11 @@ async function handleApi(request, env, url) {
       if (totalBytes > 128 * 1024 * 1024) {
         return json(413, { error: 'Asset exceeds the 128 MiB scaffold finalize cap; streaming promotion is follow-on work.', code: 'ASSET_TOO_LARGE', retryable: false, action: 'Split the asset or wait for streaming promotion.' });
       }
+      for (const f of manifest.files) {
+        if (f.bytes > MAX_FINALIZE_FILE_BYTES) {
+          return json(413, { error: `File ${f.relpath} exceeds the 32 MiB per-file scaffold finalize cap; streaming promotion is follow-on work.`, code: 'ASSET_TOO_LARGE', retryable: false, action: 'Split the file or wait for streaming promotion.' });
+        }
+      }
       // Fence token (Codex-P2): Workers have no hard wall-time limit, so
       // a holder stalled past its lease may still be alive when a successor
       // steals the claim. Every commit and reset below is fenced on this
@@ -1783,9 +1788,49 @@ async function handleApi(request, env, url) {
           if (Number(resetParts.meta.changes) !== 1) return claimLost();
           return json(413, { error: `Upload holds more than ${MAX_PARTS_PER_UPLOAD} parts; re-chunk with fewer, larger parts.`, code: 'TOO_MANY_PARTS' });
         }
-        const assembled = new Map();
+        // Grouped parts (Codex-sec-P2): one pass builds the per-path groups
+        // (no per-file filter over the whole prefix - the finalize twin of
+        // the status quadratic). store.list returns key-sorted entries, and
+        // part keys carry fixed-width indexes, so each group is already in
+        // index order.
+        const byRel = new Map();
+        for (const p of parts) {
+          const rel = uploadPartPath(p.key, partPrefix);
+          if (!byRel.has(rel)) byRel.set(rel, []);
+          byRel.get(rel).push(p);
+        }
+        // Single-buffer assembly (Codex-sec-P2): each part lands directly in
+        // the file flat instead of a retained array, and the flat releases
+        // after its digest/screen (pass 1) or asset put (pass 2) - peak is
+        // one flat plus one part, never the whole session. Returns the flat,
+        // or a raced-409 response when the listing went stale under us: a
+        // part vanishing, growing, or shrinking between list and fetch means
+        // a concurrent cleanup moved, so the next attempt re-lists fresh
+        // instead of throwing a 500 or burning a digest strike.
+        const assembleFile = async (mine, f) => {
+          const raced = async () => {
+            const resetRaced = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
+            if (Number(resetRaced.meta.changes) !== 1) return claimLost();
+            return json(409, { error: 'Upload changed during assembly; retry finalize.', code: 'FINALIZE_IN_PROGRESS', retryable: true });
+          };
+          const flat = new Uint8Array(f.bytes);
+          let at = 0;
+          for (const p of mine) {
+            const b = await store.get(p.key);
+            if (b === null || b === undefined || at + b.length > flat.length) return raced();
+            flat.set(b, at);
+            at += b.length;
+          }
+          if (at !== f.bytes) return raced();
+          return flat;
+        };
+        // Pass 1: assemble + digest + screen each file, releasing after
+        // every file. At most one shard-index head (<=1 MiB) is retained
+        // for the manifest-level verdict below.
+        const byteChecks = [];
+        let shard = null;
         for (const f of manifest.files) {
-          const mine = parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).sort((a, b) => (a.key < b.key ? -1 : 1));
+          const mine = byRel.get(f.relpath) || [];
           const order = mine.map((p) => Number(p.key.split('/')[3]));
           if (!order.length || !order.every((v, i) => v === i)) {
             const resetContig = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
@@ -1798,24 +1843,8 @@ async function handleApi(request, env, url) {
             if (Number(resetBytes.meta.changes) !== 1) return claimLost();
             return json(400, { error: `Incomplete bytes for ${f.relpath}: ${got} of ${f.bytes}. Missing chunks are never skipped.`, code: 'UPLOAD_INCOMPLETE' });
           }
-          const bufs = [];
-          for (const p of mine) {
-            const b = await store.get(p.key);
-            if (b === null || b === undefined) {
-              // Raced cleanup (Codex-sec-P2 follow-up): the part vanished
-              // between the assembly list and its fetch - a chunk reclaim
-              // racing this claim, or the sweep against a stale holder.
-              // Reset and report retryable: the next attempt re-lists and
-              // either includes the re-PUT part or reports incomplete.
-              const resetRaced = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
-              if (Number(resetRaced.meta.changes) !== 1) return claimLost();
-              return json(409, { error: 'Upload changed during assembly; retry finalize.', code: 'FINALIZE_IN_PROGRESS', retryable: true });
-            }
-            bufs.push(b);
-          }
-          const flat = new Uint8Array(f.bytes);
-          let at = 0;
-          for (const b of bufs) { flat.set(b, at); at += b.length; }
+          const flat = await assembleFile(mine, f);
+          if (!(flat instanceof Uint8Array)) return flat;
           const digest = await crypto.subtle.digest('SHA-256', flat);
           const sha = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
           if (f.sha256 && f.sha256 !== sha) {
@@ -1842,13 +1871,13 @@ async function handleApi(request, env, url) {
             return json(400, { error: `Digest mismatch for ${f.relpath}: declared bytes differ from received bytes.`, code: 'DIGEST_MISMATCH' });
           }
           f.sha256 = sha;
-          assembled.set(f.relpath, flat);
+          const screened = validateFileBytes(f, flat.slice(0, MAX_HEADER_PEEK));
+          byteChecks.push(...screened.checks);
+          if (screened.screened && f.relpath.toLowerCase().endsWith('.index.json')) {
+            shard = { relpath: f.relpath, head: flat.slice(0, MAX_MANIFEST_BYTES) };
+          }
         }
-        const peek = (relpath) => {
-          const full = assembled.get(relpath);
-          return full === undefined ? null : full.slice(0, MAX_HEADER_PEEK);
-        };
-        const verdict = validateManifest({ files: manifest.files }, peek, manifest.kind === 'adapter' ? {
+        const verdict = validateManifestStructure(manifest, shard, byteChecks, manifest.kind === 'adapter' ? {
           adapter: {
             baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
             targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
@@ -1921,7 +1950,15 @@ async function handleApi(request, env, url) {
         const assetId = rid('a_');
         const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
         const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
-        for (const [relpath, flat] of assembled) await store.put(`asset/${assetId}/${relpath}`, flat);
+        // Pass 2 (Codex-sec-P2): re-assemble each file and put its asset blob,
+        // releasing after every put. The verdict above committed to nothing
+        // yet, so a failure here stays retryable; a part that moved since
+        // pass 1 maps to the same retryable 409 through assembleFile.
+        for (const f of manifest.files) {
+          const flat = await assembleFile(byRel.get(f.relpath) || [], f);
+          if (!(flat instanceof Uint8Array)) return flat;
+          await store.put(`asset/${assetId}/${f.relpath}`, flat);
+        }
         manifest.revision = revision;
         // Pending-cleanup flag commits WITH the verdict (Codex-P2): the
         // inline drain below covers one 2010-slice, and a delete fault or
@@ -1995,18 +2032,32 @@ async function handleApi(request, env, url) {
       if (!up) return json(404, { error: 'Upload not found.', code: 'NOT_FOUND' });
       const manifest = JSON.parse(up.manifest_json);
       let received = null;
+      let truncated = false;
       const store = byteStore(env);
       if (store && ['uploading', 'quarantined', 'validating', 'promoting'].includes(up.state)) {
+        // Metered single-pass received accounting (Codex-sec-P2): the list
+        // is capped like the assembly list (`truncated` tells when it cuts),
+        // one pass builds the per-path totals (no per-file filter over the
+        // whole prefix - 2000 files x 100K parts per unmetered GET before),
+        // and the list claims the hourly write budget first. The transport
+        // never polls this route (it tracks its own progress), so only
+        // manual refreshes pay - repeat abuse 429s instead of re-listing.
+        await checkWriteBudget(db, me());
         const partPrefix = `upload/${up.id}/part/`;
-        const parts = await store.list(partPrefix);
+        const parts = await store.list(partPrefix, MAX_PARTS_PER_UPLOAD + 1);
+        truncated = parts.length > MAX_PARTS_PER_UPLOAD;
+        const totals = new Map();
+        for (const p of parts) {
+          const rel = uploadPartPath(p.key, partPrefix);
+          totals.set(rel, (totals.get(rel) || 0) + p.size);
+        }
         received = manifest.files.map((f) => ({
-          relpath: f.relpath, bytes: f.bytes,
-          got: parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).reduce((n, p) => n + p.size, 0),
+          relpath: f.relpath, bytes: f.bytes, got: totals.get(f.relpath) || 0,
         }));
       }
       return json(200, {
         id: up.id, state: up.state, manifest: { ...manifest, checks: manifest.checks || undefined },
-        received, assetId: up.state === 'validated' ? up.byte_ref : null, checks: manifest.checks || null,
+        received, truncated, assetId: up.state === 'validated' ? up.byte_ref : null, checks: manifest.checks || null,
         expiresAt: up.expires_at, updatedAt: up.updated_at,
       });
     }

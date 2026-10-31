@@ -14,6 +14,13 @@ export const MAX_PARTS_PER_UPLOAD = 100000;
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
 export const MAX_HEADER_PEEK = 64 * 1024;
 export const MAX_FILE_BYTES = 100 * 1024 * 1024 * 1024;
+// Per-file scaffold finalize cap (Codex-sec-P2): finalization assembles
+// one file at a time (single flat + one part + digest workspace), so peak
+// isolate memory is ~2x the largest file plus the bounded parts list
+// (~10 MB at the 100K cap). 32 MiB keeps the worst case near 80 MB,
+// inside the 128 MB isolate with headroom. Streaming promotion (no
+// full assembly) is the documented follow-on for larger files.
+export const MAX_FINALIZE_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_ASSET_BYTES = 500 * 1024 * 1024 * 1024;
 
 // Allowed data-file suffixes for the initial matrix. Archives are refused
@@ -147,7 +154,66 @@ export function checkShardIndex(manifestFiles, indexJson, indexRelpath = '') {
 // Full manifest validation. `peek(relpath)` returns up to MAX_HEADER_PEEK
 // leading bytes or null when the file is absent. Returns { ok, checks[] }
 // with per-check results; ok is false if any check fails.
-export function validateManifest(manifest, peek = () => null, opts = {}) {
+// Per-file structural checks shared by the batched and streaming validators
+// (Codex-sec-P2): path policy, duplicates, size shape, and suffix matrix.
+// Besides the checks it reports the flow facts the legacy order depends on:
+// whether this file proceeds to byte screening, and how many bytes count
+// toward the asset total (path/size-shape failures exclude the file, exactly
+// as the legacy loop's early continues did).
+function structuralFileChecks(f, seen) {
+  const checks = [];
+  const bad = validateRelPath(f && f.relpath);
+  if (bad) {
+    checks.push(check('PATH_POLICY', false, `Refused name ${JSON.stringify((f && f.relpath) || '')}: ${bad}.`));
+    return { checks, byteEligible: false, countedBytes: 0 };
+  }
+  if (seen.has(f.relpath)) checks.push(check('PATH_DUP', false, `Duplicate manifest entry ${f.relpath}.`));
+  seen.add(f.relpath);
+  if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) {
+    checks.push(check('SIZE_SHAPE', false, `Unusable byte count for ${f.relpath}.`));
+    return { checks, byteEligible: false, countedBytes: 0 };
+  }
+  if (f.bytes === 0) checks.push(check('SIZE_ZERO', false, `Empty file ${f.relpath}.`));
+  if (f.bytes > MAX_FILE_BYTES) checks.push(check('SIZE_FILE_CAP', false, `${f.relpath} exceeds the per-file cap.`));
+  if (hasRefusedSuffix(f.relpath)) {
+    checks.push(check('SUFFIX_REFUSED', false, `${f.relpath}: this suffix is outside the support matrix (no archives, executables, scripts, or pickle weights).`));
+    return { checks, byteEligible: false, countedBytes: f.bytes };
+  }
+  if (!hasAllowedSuffix(f.relpath)) {
+    checks.push(check('SUFFIX_UNKNOWN', false, `${f.relpath}: suffix is not in the allowed data set.`));
+    return { checks, byteEligible: false, countedBytes: f.bytes };
+  }
+  return { checks, byteEligible: true, countedBytes: f.bytes };
+}
+
+// Per-file byte screening (Codex-sec-P2): magic + safetensors shape over a
+// bounded head. `screened` reports whether the head passed far enough for
+// shard-index candidacy (missing bytes and refused magic disqualify, exactly
+// as the legacy loop's early continues did; a safetensors-shape failure does
+// not disqualify).
+export function validateFileBytes(f, head) {
+  if (head === null) {
+    return { checks: [check('BYTES_MISSING', false, `Manifest names ${f.relpath} but no bytes arrived.`)], screened: false };
+  }
+  const magic = screenMagic(head);
+  if (magic) {
+    return { checks: [check('MAGIC_REFUSED', false, `${f.relpath}: ${magic}.`)], screened: false };
+  }
+  const checks = [];
+  const st = screenSafetensors(f.relpath, f.bytes, head);
+  if (st) checks.push(check('SAFETENSORS_SHAPE', false, `${f.relpath}: ${st}.`));
+  return { checks, screened: true };
+}
+
+// Manifest-level validation over metadata plus already-screened bytes
+// (Codex-sec-P2): the streaming finalizer screens each file while its bytes
+// are in hand, retains at most one shard-index head (<=1 MiB), and calls here
+// once for the verdict - instead of retaining every file for one batched
+// call. `shard` is { relpath, head } for the qualifying index file or null;
+// `byteChecks` are the streaming per-file results in manifest order. Check
+// SET matches the legacy batched loop; only the order is structural-first
+// (no caller depends on order - every assertion is .some/.ok).
+export function validateManifestStructure(manifest, shard, byteChecks, opts = {}) {
   const checks = [];
   const files = manifest && Array.isArray(manifest.files) ? manifest.files : null;
   if (!files) {
@@ -158,54 +224,16 @@ export function validateManifest(manifest, peek = () => null, opts = {}) {
   if (files.length > MAX_MANIFEST_FILES) checks.push(check('MANIFEST_COUNT', false, `Manifest names ${files.length} files; at most ${MAX_MANIFEST_FILES}.`));
   const seen = new Set();
   let total = 0;
-  let indexFile = null;
   for (const f of files) {
-    const bad = validateRelPath(f && f.relpath);
-    if (bad) {
-      checks.push(check('PATH_POLICY', false, `Refused name ${JSON.stringify((f && f.relpath) || '')}: ${bad}.`));
-      continue;
-    }
-    if (seen.has(f.relpath)) checks.push(check('PATH_DUP', false, `Duplicate manifest entry ${f.relpath}.`));
-    seen.add(f.relpath);
-    if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) {
-      checks.push(check('SIZE_SHAPE', false, `Unusable byte count for ${f.relpath}.`));
-      continue;
-    }
-    if (f.bytes === 0) checks.push(check('SIZE_ZERO', false, `Empty file ${f.relpath}.`));
-    if (f.bytes > MAX_FILE_BYTES) checks.push(check('SIZE_FILE_CAP', false, `${f.relpath} exceeds the per-file cap.`));
-    total += f.bytes;
-    if (hasRefusedSuffix(f.relpath)) {
-      checks.push(check('SUFFIX_REFUSED', false, `${f.relpath}: this suffix is outside the support matrix (no archives, executables, scripts, or pickle weights).`));
-      continue;
-    }
-    if (!hasAllowedSuffix(f.relpath)) {
-      checks.push(check('SUFFIX_UNKNOWN', false, `${f.relpath}: suffix is not in the allowed data set.`));
-      continue;
-    }
-    const head = peek(f.relpath);
-    if (head === null) {
-      checks.push(check('BYTES_MISSING', false, `Manifest names ${f.relpath} but no bytes arrived.`));
-      continue;
-    }
-    const magic = screenMagic(head);
-    if (magic) {
-      checks.push(check('MAGIC_REFUSED', false, `${f.relpath}: ${magic}.`));
-      continue;
-    }
-    const st = screenSafetensors(f.relpath, f.bytes, head);
-    if (st) checks.push(check('SAFETENSORS_SHAPE', false, `${f.relpath}: ${st}.`));
-    if (f.relpath.toLowerCase().endsWith('.index.json')) indexFile = f.relpath;
+    const st = structuralFileChecks(f, seen);
+    checks.push(...st.checks);
+    total += st.countedBytes;
   }
   if (total > MAX_ASSET_BYTES) checks.push(check('SIZE_ASSET_CAP', false, `Asset totals ${total} bytes; at most ${MAX_ASSET_BYTES}.`));
-  if (indexFile) {
-    const head = peek(indexFile);
-    if (head === null) {
-      checks.push(check('SHARD_INDEX_MISSING', false, 'Shard index names bytes that never arrived.'));
-    } else {
-      const text = new TextDecoder().decode(head.slice(0, MAX_MANIFEST_BYTES));
-      const err = checkShardIndex(files, text, indexFile);
-      if (err) checks.push(check('SHARD_INDEX', false, err));
-    }
+  if (shard) {
+    const text = new TextDecoder().decode(shard.head.slice(0, MAX_MANIFEST_BYTES));
+    const err = checkShardIndex(files, text, shard.relpath);
+    if (err) checks.push(check('SHARD_INDEX', false, err));
   }
   if (opts.adapter) {
     const a = opts.adapter;
@@ -217,6 +245,29 @@ export function validateManifest(manifest, peek = () => null, opts = {}) {
     }
     if (!a.tokenizer) checks.push(check('ADAPTER_TOKENIZER_UNDECLARED', false, 'Adapters must declare tokenizer assumptions.'));
   }
+  checks.push(...byteChecks);
   if (!checks.length) checks.push(check('MANIFEST_OK', true, `${files.length} files, ${total} bytes, all structural checks passed.`));
   return { ok: checks.every((c) => c.ok), checks, version: VALIDATOR_VERSION };
+}
+
+export function validateManifest(manifest, peek = () => null, opts = {}) {
+  const files = manifest && Array.isArray(manifest.files) ? manifest.files : null;
+  // Streaming composition: screen each byte-eligible file's head while
+  // walking (retaining only the qualifying shard-index head), then run the
+  // manifest level once. Equivalent to the legacy batched loop except that
+  // SHARD_INDEX_MISSING cannot fire (it required an inconsistent peek - a
+  // head present during screening, absent on re-read - and streaming always
+  // screens heads in hand).
+  const byteChecks = [];
+  let shard = null;
+  const seen = new Set();
+  for (const f of files || []) {
+    const st = structuralFileChecks(f, seen);
+    if (!st.byteEligible) continue;
+    const head = peek(f.relpath);
+    const b = validateFileBytes(f, head);
+    byteChecks.push(...b.checks);
+    if (b.screened && f.relpath.toLowerCase().endsWith('.index.json')) shard = { relpath: f.relpath, head };
+  }
+  return validateManifestStructure(manifest, shard, byteChecks, opts);
 }

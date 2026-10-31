@@ -1617,3 +1617,78 @@ test('Codex-P1: growing overlaps overcount, never undercount', async () => {
   const counted = JSON.parse(row.quotas_json).parts.bytes['model.gguf'];
   assert.ok(counted >= stored, `counters ${counted} never undercount stored ${stored}`);
 });
+
+test('Codex-sec-P2: status caps its part list and says so (truncated)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const N = 100002;
+  const v = await begin(t, t.alice, {
+    name: 'manystatus', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'big.gguf', bytes: N }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < N; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/big.gguf`, new Uint8Array([i & 0xff]));
+  }
+  const st = await readJson(await t.call(`/api/catalog/uploads/${v.json.id}`, { headers: sess(t, t.alice) }));
+  assert.equal(st.status, 200, st.text);
+  assert.equal(st.json.truncated, true, 'over-cap lists report honestly');
+  assert.equal(st.json.received[0].got, 100001, 'received covers the capped list');
+});
+
+test('Codex-sec-P2: live status refreshes claim the write budget', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const v = await begin(t, t.alice, {
+    name: 'metered', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const st = await readJson(await t.call(`/api/catalog/uploads/${v.json.id}`, { headers: sess(t, t.alice) }));
+  assert.equal(st.status, 429, st.text);
+  assert.equal(st.json.code, 'WRITE_RATE_LIMITED');
+});
+
+test('Codex-sec-P2: terminal status stays free (no store work, no budget)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const fin = await roundTrip(t, t.alice, 'done-free', [{ relpath: 'model.gguf', bytes: ggufBytes() }]);
+  assert.equal(fin.status, 201, fin.text);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const st = await readJson(await t.call(`/api/catalog/uploads/${fin.json.uploadId}`, { headers: sess(t, t.alice) }));
+  assert.equal(st.status, 200, st.text);
+  assert.equal(st.json.state, 'validated');
+  assert.equal(st.json.received, null);
+});
+
+test('Codex-sec-P2: a file over the per-file finalize cap refuses before assembly', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const v = await begin(t, t.alice, {
+    name: 'bigfile', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'big.gguf', bytes: 33 * 1024 * 1024 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 413, f.text);
+  assert.equal(f.json.code, 'ASSET_TOO_LARGE');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'uploading', 'metadata refusal takes no claim');
+});
+
+test('Codex-sec-P2: total over the scaffold finalize cap still refuses (kept gate)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const files = [0, 1, 2, 3, 4].map((i) => ({ relpath: `f${i}.gguf`, bytes: 30 * 1024 * 1024 }));
+  const v = await begin(t, t.alice, {
+    name: 'bigtotal', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0', files,
+  });
+  assert.equal(v.status, 201, v.text);
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 413, f.text);
+  assert.equal(f.json.code, 'ASSET_TOO_LARGE');
+});
