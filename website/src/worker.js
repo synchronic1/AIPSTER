@@ -2050,14 +2050,17 @@ async function handleApi(request, env, url) {
         // blob lands - the D1 primary key only backstops after an overwrite.
         // 128-bit ids under the tenant-scoped prefix, refused when a
         // committed row or any live blob already holds the candidate
-        // (bounded retries, then a retryable refusal instead of a reuse).
+        // (bounded retries, then a retryable refusal instead of a reuse). A
+        // list fault counts as taken (fail closed); residual same-tenant
+        // twin overlap needs a 128-bit collision plus concurrency and is
+        // accepted as infeasible (the reclaim fence backstops it anyway).
         let assetId = null;
         for (let i = 0; i < 3 && !assetId; i += 1) {
           const candidate = rid16('a_');
           const taken = await first(db, 'SELECT id FROM catalog_assets WHERE id = ?', candidate);
           if (taken) continue;
-          const clashing = await store.list(await assetPrefix(me(), candidate), 1).catch(() => []);
-          if (clashing.length) continue;
+          const clashing = await store.list(await assetPrefix(me(), candidate), 1).catch(() => null);
+          if (clashing === null || clashing.length) continue;
           assetId = candidate;
         }
         if (!assetId) {
