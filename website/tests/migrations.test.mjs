@@ -23,6 +23,10 @@ test('migrations create the auth and app tables', () => {
   for (const c of ['salt', 'verifier', 'expires_at', 'used_at', 'attempts', 'node_id', 'resource_id']) assert.ok(cols('pairing_codes').includes(c), `pairing_codes.${c}`);
   assert.ok(names.includes('admin_grants'), 'missing table admin_grants (0016)');
   for (const c of ['user_id', 'role', 'scope', 'expires_at', 'revoked_at']) assert.ok(cols('admin_grants').includes(c), `admin_grants.${c}`);
+  assert.ok(names.includes('dgm_preview_runs'), 'missing table dgm_preview_runs (0017)');
+  for (const c of ['task_id', 'created_by', 'fixture', 'held', 'label', 'target', 'status', 'envelope_label', 'advice_reason', 'budget_fits', 'budget_reason', 'settlement', 'gates_json', 'provenance_json', 'created_at', 'updated_at']) assert.ok(cols('dgm_preview_runs').includes(c), `dgm_preview_runs.${c}`);
+  assert.ok(names.includes('dgm_preview_events'), 'missing table dgm_preview_events (0017)');
+  for (const c of ['run_id', 'seq', 'at', 'event', 'body_json']) assert.ok(cols('dgm_preview_events').includes(c), `dgm_preview_events.${c}`);
   assert.ok(names.includes('idempotency_keys'), 'missing table idempotency_keys (0015)');
   assert.ok(cols('resources').includes('node_id'), 'resources.node_id (0015 pairing identity)');
 });
