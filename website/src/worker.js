@@ -1716,8 +1716,10 @@ async function handleApi(request, env, url) {
         }
         // Cumulative file cap, fast path (Codex-sec-P2): one 2000-file
         // manifest must not fan out into 2000 durable rows per budget
-        // claim without bound. The commit batch enforces this atomically
-        // (below); this pre-check fails friendly and early.
+        // claim without bound. The commit batch re-checks this over fresh
+        // committed state (below); this pre-check fails friendly and early.
+        // (Ordering vs the adapter-base refusal below is irrelevant: both
+        // are pre-work refusals with identical reset shapes.)
         const ownedFiles = await first(db, 'SELECT COUNT(*) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
         if (ownedFiles && ownedFiles.n + manifest.files.length > MAX_ASSET_FILES_PER_USER) {
           const resetFiles = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
@@ -1763,19 +1765,25 @@ async function handleApi(request, env, url) {
         const committed = await db.batch([
           db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
             SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?
-            AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
+            AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?) AND asset_id != ?) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
             .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
               JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
-              JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now, uploadId, claimToken, me(), manifest.files.length),
-          ...manifest.files.map((f) => db.prepare(`INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) SELECT ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ? AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
-            .bind(assetId, f.relpath, f.bytes, f.sha256, uploadId, claimToken, me(), manifest.files.length)),
-          db.prepare(`UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND state = 'promoting' AND byte_ref = ? AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
-            .bind('validated', JSON.stringify(manifest), assetId, now, uploadId, claimToken, me(), manifest.files.length),
+              JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now, uploadId, claimToken, me(), assetId, manifest.files.length),
+          ...manifest.files.map((f) => db.prepare(`INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) SELECT ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ? AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?) AND asset_id != ?) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
+            .bind(assetId, f.relpath, f.bytes, f.sha256, uploadId, claimToken, me(), assetId, manifest.files.length)),
+          db.prepare(`UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND state = 'promoting' AND byte_ref = ? AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?) AND asset_id != ?) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
+            .bind('validated', JSON.stringify(manifest), assetId, now, uploadId, claimToken, me(), assetId, manifest.files.length),
         ]);
         // Every statement above carries the same fence + count predicates
-        // over committed state (no changes() chaining), so they pass or
-        // fail together within the batch. On failure, a lost token maps to
-        // the winner outcome; an intact token means the count bound bit.
+        // (no changes() chaining). The count excludes this batch's own
+        // asset id, so each predicate reads committed-others + N no matter
+        // how many of the batch's own rows are already visible: they pass
+        // or fail together, and failures write zero rows. Residual: two
+        // promotions from different uploads share no row to linearize on,
+        // so concurrent bursts can jointly overshoot by up to one manifest
+        // (bounded; same accepted class as the byte over-admission note
+        // above). On failure, a lost token maps to the winner outcome; an
+        // intact live claim means the count bound bit.
         if (Number(committed[committed.length - 1].meta.changes) !== 1) {
           // Count loss holds only while the claim is live (promoting +
           // intact token); any other state means a lost claim (steal,

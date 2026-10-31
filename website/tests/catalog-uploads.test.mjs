@@ -868,3 +868,74 @@ test('Codex-sec-P2: promotion enforces a cumulative per-owner file cap (no row f
   const files = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_asset_files WHERE asset_id = ?').bind('a_seed').first('n');
   assert.equal(files, 10000, 'no file rows escape the cap');
 });
+
+test('Codex-sec-P2: file cap admits exactly at the boundary (no double-count)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO catalog_assets (id, owner_id, freshness_at, created_at) VALUES (?, ?, ?, ?)')
+    .bind('a_seed', 'u_alice', now, now).run();
+  const ins = 'INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)';
+  for (let i = 0; i < 9999; i += 1) {
+    await t.DB.prepare(ins).bind('a_seed', `f${i}.txt`, 1, '').run();
+  }
+  const bytes = new Uint8Array(64).fill(0x47);
+  const b = await begin(t, t.alice, {
+    name: 'at-cap', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: bytes.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
+  assert.equal(c.status, 200, c.text);
+  const fin = await finalize(t, t.alice, b.json.id);
+  assert.equal(fin.status, 201, fin.text);
+  const files = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)').bind('u_alice').first('n');
+  assert.equal(files, 10000, 'boundary admit lands exactly on the cap');
+});
+
+test('Codex-sec-P2: a promotion landing between check and batch loses atomically (zero rows)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO catalog_assets (id, owner_id, freshness_at, created_at) VALUES (?, ?, ?, ?)')
+    .bind('a_seed', 'u_alice', now, now).run();
+  const ins = 'INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)';
+  for (let i = 0; i < 9999; i += 1) {
+    await t.DB.prepare(ins).bind('a_seed', `f${i}.txt`, 1, '').run();
+  }
+  const bytes = new Uint8Array(64).fill(0x47);
+  const b = await begin(t, t.alice, {
+    name: 'raced-cap', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: bytes.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
+  assert.equal(c.status, 200, c.text);
+  // A concurrent promotion lands after this finalize passes its fast path
+  // but before its commit batch runs. (Injected with direct statements:
+  // two overlapping batches in one test env would trip a shim savepoint
+  // artifact - crossed open/close order - that serialized D1
+  // transactions cannot exhibit in production.)
+  const realDb = t.env.DB;
+  let fired = false;
+  t.env.DB = {
+    ...realDb,
+    batch: async (stmts) => {
+      const head = stmts && stmts[0] && stmts[0].sql ? stmts[0].sql : '';
+      if (!fired && head.startsWith('INSERT INTO catalog_assets ')) {
+        fired = true;
+        await realDb.prepare(ins).bind('a_seed', 'racer.txt', 1, '').run();
+      }
+      return realDb.batch(stmts);
+    },
+  };
+  const fin = await finalize(t, t.alice, b.json.id);
+  t.env.DB = realDb;
+  assert.equal(fired, true, 'the rival promotion landed mid-flight');
+  assert.equal(fin.status, 409, fin.text);
+  assert.equal(fin.json.code, 'FILE_LIMIT');
+  const mine = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ? AND id != ?').bind('u_alice', 'a_seed').first('n');
+  assert.equal(mine, 0, 'the atomic loser promotes nothing');
+  const files = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)').bind('u_alice').first('n');
+  assert.equal(files, 10000, 'only the rival row landed');
+});
