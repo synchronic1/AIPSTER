@@ -11,6 +11,21 @@ export function rid(prefix) {
   return prefix + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// 128-bit random ids (Codex-sec-P2): attempt/asset ids guard pre-commit
+// object writes that the D1 primary key only backstops after the fact, so
+// a 32-bit birthday collision is reachable and would let one attempt
+// overwrite or reclaim another tenant's live blobs. 16 bytes keeps random
+// collision infeasible; the reservation gate + reclaim fence in the
+// finalizer handle the remainder. Tests force collisions through the
+// override (same __-hook convention as the fixture stores).
+let rid16Override = null;
+export function __setRid16ForTest(fn) { rid16Override = fn || null; }
+export function rid16(prefix) {
+  if (rid16Override) return rid16Override(prefix);
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return prefix + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 export async function all(db, sql, ...params) {
   const res = await db.prepare(sql).bind(...params).all();
   return res.results || [];

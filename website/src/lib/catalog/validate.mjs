@@ -112,9 +112,9 @@ export function screenSafetensors(relpath, size, peek) {
 }
 
 // Shard-index consistency: every weight file the index names must be
-// present with matching byte counts, and every weight file present must
-// be named (no silent extras, no silent gaps).
-export function checkShardIndex(manifestFiles, indexJson, indexRelpath = '') {
+// present, every weight file present must be named (no silent extras, no
+// silent gaps), and the index total must match tensor payload bytes.
+export function checkShardIndex(manifestFiles, indexJson, indexRelpath = '', payloads = null) {
   let index;
   try {
     index = typeof indexJson === 'string' ? JSON.parse(indexJson) : indexJson;
@@ -143,12 +143,55 @@ export function checkShardIndex(manifestFiles, indexJson, indexRelpath = '') {
     const base = f.relpath.split('/').pop();
     if (f.relpath.toLowerCase().endsWith('.safetensors') && !named.has(f.relpath.toLowerCase())) return `weight file ${base} is unnamed by the shard index`;
   }
+  // Index totals compare against tensor payload, never file lengths
+  // (Codex-P2): HF total_size sums tensor storage, and every serialized
+  // shard adds its JSON header, so file-length equality rejects valid
+  // uploads. Payloads arrive from the streaming screens (the same bytes
+  // the shape check validated); a missing payload means its file already
+  // failed screening, so skipping the total then can never pass a bad
+  // file. Callers without payloads get presence-only checking.
   const total = Number(index.metadata && index.metadata.total_size);
-  if (Number.isSafeInteger(total)) {
-    const sum = manifestFiles.filter((f) => f.relpath.toLowerCase().endsWith('.safetensors')).reduce((n, f) => n + f.bytes, 0);
-    if (sum !== total) return `shard bytes ${sum} disagree with index total ${total}`;
+  if (Number.isSafeInteger(total) && payloads) {
+    let sum = 0;
+    for (const n of named) {
+      const p = payloads.get(n);
+      if (!Number.isSafeInteger(p)) { sum = null; break; }
+      sum += p;
+    }
+    if (sum !== null && sum !== total) return `shard tensor bytes ${sum} disagree with index total ${total}`;
   }
   return null;
+}
+
+// Tensor payload bytes from a validated safetensors header (Codex-P2):
+// the sum of tensor storage extents, which is what HF shard indexes
+// declare in metadata.total_size. Mirrors screenSafetensors' parse guards
+// exactly; returns null unless the header is fully valid.
+export function safetensorsTensorBytes(relpath, size, peek) {
+  if (!relpath.toLowerCase().endsWith('.safetensors')) return null;
+  if (!peek || peek.length < 8) return null;
+  const view = new DataView(peek.buffer, peek.byteOffset, 8);
+  const hlen = Number(view.getBigUint64(0, true));
+  if (!Number.isSafeInteger(hlen) || hlen > MAX_HEADER_PEEK || hlen + 8 > size) return null;
+  if (peek.length < 8 + hlen) return null;
+  let header;
+  try {
+    header = JSON.parse(new TextDecoder().decode(peek.slice(8, 8 + hlen)));
+  } catch {
+    return null;
+  }
+  if (!header || typeof header !== 'object') return null;
+  let total = 0;
+  for (const [name, entry] of Object.entries(header)) {
+    if (name === '__metadata__') continue;
+    if (!entry || !Array.isArray(entry.data_offsets) || entry.data_offsets.length !== 2) return null;
+    const [a, z] = entry.data_offsets;
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(z) || a < 0 || z < a || 8 + hlen + z > size) {
+      return null;
+    }
+    total += z - a;
+  }
+  return total;
 }
 
 // Full manifest validation. `peek(relpath)` returns up to MAX_HEADER_PEEK
@@ -214,7 +257,8 @@ export function validateFileBytes(f, head) {
   const checks = [];
   const st = screenSafetensors(f.relpath, f.bytes, head);
   if (st) checks.push(check('SAFETENSORS_SHAPE', false, `${f.relpath}: ${st}.`));
-  return { checks, screened: true };
+  const tensorBytes = st ? null : safetensorsTensorBytes(f.relpath, f.bytes, head);
+  return { checks, screened: true, tensorBytes };
 }
 
 // Manifest-level validation over metadata plus already-screened bytes
@@ -246,7 +290,7 @@ export function validateManifestStructure(manifest, shard, byteChecks, opts = {}
   if (total > MAX_ASSET_BYTES) checks.push(check('SIZE_ASSET_CAP', false, `Asset totals ${total} bytes; at most ${MAX_ASSET_BYTES}.`));
   if (shard) {
     const text = new TextDecoder().decode(shard.head.slice(0, MAX_MANIFEST_BYTES));
-    const err = checkShardIndex(files, text, shard.relpath);
+    const err = checkShardIndex(files, text, shard.relpath, opts.payloads || null);
     if (err) checks.push(check('SHARD_INDEX', false, err));
   }
   if (opts.adapter) {
@@ -273,13 +317,15 @@ export function validateManifest(manifest, peek = () => null, opts = {}) {
   // head present during screening, absent on re-read - and streaming always
   // screens heads in hand).
   const byteChecks = [];
+  const payloads = new Map();
   let shard = null;
   for (const f of files || []) {
     if (!isByteEligible(f)) continue;
     const head = peek(f.relpath);
     const b = validateFileBytes(f, head);
     byteChecks.push(...b.checks);
+    if (Number.isSafeInteger(b.tensorBytes)) payloads.set(f.relpath.toLowerCase(), b.tensorBytes);
     if (b.screened && f.relpath.toLowerCase().endsWith('.index.json')) shard = { relpath: f.relpath, head };
   }
-  return validateManifestStructure(manifest, shard, byteChecks, opts);
+  return validateManifestStructure(manifest, shard, byteChecks, { ...opts, payloads });
 }

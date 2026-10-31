@@ -210,20 +210,59 @@ export async function hubSearch(params = {}, { token } = {}) {
   return { items: items.slice(offset, offset + limit), total, limit, offset, upstream: 'hub', calls: { metadata: calls, weights: 0 } };
 }
 
+// Hub metadata TTL cache (Codex-sec-P2): hubDetail backs compat decisions
+// whose own cache is keyed on Hub-supplied revision - so every compat
+// request, hit or miss, fetched Hub first, and one tenant replaying
+// identical requests burned unbounded shared outbound quota with no D1
+// write to charge. A small per-isolate TTL cache bounds Hub resolution
+// without any write, so compat cache hits stay read-only. Keyed by repo +
+// token identity (a token must never see another token's gated view); only
+// successful, gated, and 404 responses are cached, never errors. Cached
+// hits report zero upstream calls. 60s TTL bounds the staleness of the
+// revision pins feeding compat fingerprints.
+const HUB_META_TTL_MS = 60 * 1000;
+const HUB_META_MAX = 200;
+const hubMetaCache = new Map();
+export function __resetHubMetaCache() { hubMetaCache.clear(); }
+async function hubCacheKey(repo, token) {
+  if (!token) return `anon\n${repo}`;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`aipster-hub-scope/v1:${token}`));
+  return `${Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')}\n${repo}`;
+}
+function hubCacheStore(key, value) {
+  if (hubMetaCache.size >= HUB_META_MAX) {
+    hubMetaCache.delete(hubMetaCache.keys().next().value);
+  }
+  hubMetaCache.set(key, { at: Date.now(), value });
+}
+
 export async function hubDetail(repo, { token } = {}) {
   if (!isRepoId(repo)) throw hubError(400, 'BAD_REPO', 'Repository must look like org/name.');
+  const cacheKey = await hubCacheKey(repo, token);
+  const cached = hubMetaCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < HUB_META_TTL_MS) {
+    if (cached.value === null) return null;
+    return { ...cached.value, calls: { metadata: 0, weights: 0 } };
+  }
   const res = await hubFetch(`https://${HUB_API_HOST}/api/models/${repo}`, { token });
-  if (res.status === 404) return null;
+  if (res.status === 404) {
+    hubCacheStore(cacheKey, null);
+    return null;
+  }
   if (res.status === 429) throw hubError(502, 'HUB_RATE_LIMITED', 'The model Hub rate-limited this lookup; retry shortly.', { retryable: true });
   if (res.status === 401 || res.status === 403) {
     // Gated repo without (or with insufficient) authorization: report the
     // gate honestly instead of inventing metadata or leaking existence.
-    return { gated: true, repo, upstream: 'hub', calls: { metadata: 1, weights: 0 } };
+    const gated = { gated: true, repo, upstream: 'hub', calls: { metadata: 1, weights: 0 } };
+    hubCacheStore(cacheKey, gated);
+    return gated;
   }
   if (!res.ok) throw hubError(502, 'HUB_ERROR', `The model Hub returned ${res.status}.`, { retryable: res.status >= 500 });
   const raw = await res.json().catch(() => null);
   const asset = normalizeHubModel(raw);
-  return { ...asset, upstream: 'hub', calls: { metadata: 1, weights: 0 } };
+  const out = { ...asset, upstream: 'hub', calls: { metadata: 1, weights: 0 } };
+  hubCacheStore(cacheKey, out);
+  return out;
 }
 
 export function isFixtureEnv(env) {

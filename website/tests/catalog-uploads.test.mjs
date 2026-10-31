@@ -8,7 +8,9 @@ import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex, MAX_ASSET_BYTES } from '../src/lib/catalog/validate.mjs';
-import { __resetFixtureStore, byteStore } from '../src/lib/catalog/store.mjs';
+import { __resetFixtureStore, byteStore, assetKey, assetScope } from '../src/lib/catalog/store.mjs';
+import { __setRid16ForTest } from '../src/lib/store.js';
+import { assetPrefixProtected } from '../src/worker.js';
 import { budgetWindow } from '../src/lib/quotas.js';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
@@ -330,7 +332,7 @@ test('AC11: valid safetensors + shard index pass; mismatch fails', async () => {
   const t = await fx();
   __resetFixtureStore();
   const st = tinySafetensors();
-  const index = { metadata: { total_size: st.length }, weight_map: { w: 'model.safetensors' } };
+  const index = { metadata: { total_size: 8 }, weight_map: { w: 'model.safetensors' } };
   const indexBytes = new TextEncoder().encode(JSON.stringify(index));
   const ok = await roundTrip(t, t.alice, 'sharded', [
     { relpath: 'model.safetensors', bytes: st },
@@ -344,6 +346,13 @@ test('AC11: valid safetensors + shard index pass; mismatch fails', async () => {
   ]);
   assert.equal(bad.status, 422);
   assert.ok(bad.json.checks.some((c) => c.code === 'SHARD_INDEX'), JSON.stringify(bad.json.checks));
+  const wrongTotal = new TextEncoder().encode(JSON.stringify({ metadata: { total_size: 7 }, weight_map: { w: 'model.safetensors' } }));
+  const wrong = await roundTrip(t, t.alice, 'wrongtotal', [
+    { relpath: 'model.safetensors', bytes: st },
+    { relpath: 'model.safetensors.index.json', bytes: wrongTotal },
+  ]);
+  assert.equal(wrong.status, 422);
+  assert.ok(wrong.json.checks.some((c) => c.code === 'SHARD_INDEX' && /tensor bytes 8 disagree with index total 7/.test(c.message)), JSON.stringify(wrong.json.checks));
 });
 
 test('AC11: quotas and chunk bounds enforced', async () => {
@@ -625,7 +634,7 @@ test('Codex-P2: swept rejections stop occupying the expiry batch (no starvation)
 test('Codex-P2: shard-index weight paths resolve against the index location', async () => {
   const st = tinySafetensors();
   const idx = new TextEncoder().encode(JSON.stringify({
-    metadata: { total_size: st.length },
+    metadata: { total_size: 8 },
     weight_map: { w: 'nested/model.safetensors' },
   }));
   const files = [
@@ -831,7 +840,7 @@ test('Codex-sec-P2: unchanged revalidation is idempotent (no rewrite, no audit)'
   assert.equal(await audits(), 0, 'no audit for a no-op revalidation');
   const elf = new Uint8Array(64);
   elf.set([0x7f, 0x45, 0x4c, 0x46], 0);
-  await store.put(`asset/${fin.json.assetId}/m.gguf`, elf);
+  await store.put(await assetKey('u_alice', fin.json.assetId, 'm.gguf'), elf);
   const second = await validate();
   assert.equal(second.status, 200, second.text);
   assert.equal(second.json.validation, 'rejected');
@@ -1890,4 +1899,286 @@ test('Codex-sec-P2: an unreadable row skips reclaim (never delete what might be 
   assert.equal(f.status, 500, f.text);
   const blobs = await store.list('asset/');
   assert.equal(blobs.length, 2, 'unknown outcomes keep their blobs');
+});
+test('Codex-sec-P2: expiry flip precedes the part listing (claim-before-cleanup)', async () => {
+  // Deterministic repro of the list->probe->flip race: a chunk PUT that
+  // passes entry pre-deadline and completes while the sweep is mid-flight
+  // must have its part reclaimed by the sweep's own list (taken after the
+  // claim), never stranded. Pre-fix the sweep listed first, so the part
+  // survived and this test failed on the leftover.
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const b = await begin(t, t.alice, {
+    name: 'race-sweep', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c0 = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  assert.equal(c0.status, 200, c0.text);
+  const past = new Date(Date.now() - 1000).toISOString();
+  const future = new Date(Date.now() + 3600 * 1000).toISOString();
+  // The deadline passes while the chunk body streams: craft expiry, then
+  // complete a chunk inside the sweep flip (entry is re-armed to future so
+  // the PUT passes exactly as a pre-deadline intake would).
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, b.json.id).run();
+  const realPrepare = t.env.DB.prepare;
+  let fired = false;
+  let putStatus = 0;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.startsWith("UPDATE catalog_uploads SET state = 'expired'")) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const bound = realBind(...p);
+        const realRun = bound.run;
+        bound.run = async () => {
+          if (!fired) {
+            fired = true;
+            await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(future, b.json.id).run();
+            const race = await chunk(t, t.alice, b.json.id, 'model.gguf', 1, new Uint8Array(32).fill(0x48));
+            putStatus = race.status;
+            await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, b.json.id).run();
+          }
+          return realRun();
+        };
+        return bound;
+      };
+    }
+    return stmt;
+  };
+  const trig = await begin(t, t.alice, {
+    name: 'trigger', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 't.gguf', bytes: 8 }],
+  });
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(trig.status, 201, trig.text);
+  assert.equal(fired, true, 'the chunk raced the sweep flip');
+  assert.equal(putStatus, 200, 'the in-flight chunk passed while uploading');
+  const parts = await store.list(`upload/${b.json.id}/part/`);
+  assert.equal(parts.length, 0, 'the sweep list (after the claim) reclaimed the raced part');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(row.state, 'expired');
+  assert.equal(row.byte_ref, null, 'fully drained expiries clear the marker');
+  const inflight = await t.DB.prepare("SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL))").bind('u_alice').first();
+  assert.equal(inflight.n, 8, 'only the trigger session holds quota; the expired reservation evaporated');
+});
+
+test('Codex-sec-P2: partial expiry drains converge through the drain marker', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const b = await begin(t, t.alice, {
+    name: 'big-expire', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'f.gguf', bytes: 3000 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  for (let i = 0; i < 2015; i += 1) {
+    await store.put(`upload/${b.json.id}/part/${String(i).padStart(8, '0')}/f.gguf`, new Uint8Array([i % 256]));
+  }
+  const past = new Date(Date.now() - 1000).toISOString();
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, b.json.id).run();
+  const spec = (name) => ({ name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0', files: [{ relpath: 't.gguf', bytes: 8 }] });
+  const t1 = await begin(t, t.alice, spec('trig-1'));
+  assert.equal(t1.status, 201, t1.text);
+  let left = await store.list(`upload/${b.json.id}/part/`);
+  assert.equal(left.length, 5, 'first sweep drains one slice');
+  let row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(row.state, 'expired', 'expiry is claimed on the first sweep');
+  assert.equal(row.byte_ref, 'expired-draining', 'partial drain keeps the marker');
+  const t2 = await begin(t, t.alice, spec('trig-2'));
+  assert.equal(t2.status, 201, t2.text);
+  left = await store.list(`upload/${b.json.id}/part/`);
+  assert.equal(left.length, 0, 'second sweep converges');
+  row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(row.byte_ref, null, 'marker clears once parts reach zero');
+});
+
+test('Codex-sec-P2: asset ids are 128-bit and tenant-scoped', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const fa = await roundTrip(t, t.alice, 'a-asset', [{ relpath: 'm.gguf', bytes: ggufBytes() }]);
+  assert.equal(fa.status, 201, fa.text);
+  assert.match(fa.json.assetId, /^a_[0-9a-f]{32}$/, '128-bit hex asset id');
+  const fb = await roundTrip(t, t.bob, 'b-asset', [{ relpath: 'm.gguf', bytes: ggufBytes() }]);
+  assert.equal(fb.status, 201, fb.text);
+  assert.notEqual(fb.json.assetId, fa.json.assetId);
+  const scopeA = await assetScope('u_alice');
+  const scopeB = await assetScope('u_bob');
+  assert.notEqual(scopeA, scopeB, 'distinct tenants scope distinctly');
+  const blobsA = await store.list(`asset/${scopeA}/`);
+  assert.equal(blobsA.length, 1);
+  assert.ok(blobsA[0].key.startsWith(`asset/${scopeA}/${fa.json.assetId}/`), blobsA[0].key);
+  const blobsB = await store.list(`asset/${scopeB}/`);
+  assert.equal(blobsB.length, 1);
+  const all = await store.list('asset/');
+  assert.equal(all.length, 2, 'no unscoped blobs escape the layout');
+});
+
+test('Codex-sec-P2: colliding attempt ids refuse without touching live blobs (cross-tenant)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const fixed = `a_${'3'.repeat(32)}`;
+  let bobId = null;
+  __setRid16ForTest(() => fixed);
+  try {
+    const fa = await roundTrip(t, t.alice, 'live-asset', [{ relpath: 'm.gguf', bytes: ggufBytes() }]);
+    assert.equal(fa.status, 201, fa.text);
+    assert.equal(fa.json.assetId, fixed);
+    const liveKey = await assetKey('u_alice', fixed, 'm.gguf');
+    const before = await store.get(liveKey);
+    assert.ok(before && before.length === 64);
+    // Bob's attempt draws the same id: the reservation gate refuses before
+    // a single blob lands, and releases his claim for a clean retry.
+    const bb = await begin(t, t.bob, {
+      name: 'rival', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+      files: [{ relpath: 'm.gguf', bytes: 64 }],
+    });
+    assert.equal(bb.status, 201, bb.text);
+    bobId = bb.json.id;
+    const bc = await chunk(t, t.bob, bb.json.id, 'm.gguf', 0, ggufBytes());
+    assert.equal(bc.status, 200, bc.text);
+    const bf = await finalize(t, t.bob, bb.json.id);
+    assert.equal(bf.status, 503, bf.text);
+    assert.equal(bf.json.code, 'ID_EXHAUSTED');
+    const after = await store.get(liveKey);
+    assert.deepEqual(Array.from(after), Array.from(before), "alice's live bytes are untouched");
+    const brow = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(bb.json.id).first();
+    assert.equal(brow.state, 'uploading', 'the refused claim releases for retry');
+    const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_bob').first('n');
+    assert.equal(assets, 0, 'no partial asset rows escape a refused reservation');
+  } finally {
+    __setRid16ForTest(null);
+  }
+  // Fresh ids retry cleanly after the refusal.
+  const again = await finalize(t, t.bob, bobId);
+  assert.equal(again.status, 201, again.text);
+  assert.notEqual(again.json.assetId, fixed);
+});
+
+test('Codex-sec-P2: failed-finalize reclaim cannot cross tenant scopes', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const fa = await roundTrip(t, t.alice, 'live', [{ relpath: 'm.gguf', bytes: ggufBytes() }]);
+  assert.equal(fa.status, 201, fa.text);
+  const liveKey = await assetKey('u_alice', fa.json.assetId, 'm.gguf');
+  const before = await store.get(liveKey);
+  // Bob's finalize loses its claim inside the commit batch (simulating a
+  // steal/expiry race after pass-2 puts): the commit writes zero rows, his
+  // attempt prefix is reclaimed, and alice's live bytes are untouched.
+  const bb = await begin(t, t.bob, {
+    name: 'doomed', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'm.gguf', bytes: 64 }],
+  });
+  assert.equal(bb.status, 201, bb.text);
+  const bc = await chunk(t, t.bob, bb.json.id, 'm.gguf', 0, ggufBytes());
+  assert.equal(bc.status, 200, bc.text);
+  const realBatch = t.env.DB.batch;
+  let fired = false;
+  t.env.DB.batch = async (stmts) => {
+    if (!fired) {
+      fired = true;
+      await t.DB.prepare('UPDATE catalog_uploads SET byte_ref = ? WHERE id = ?').bind('clm_rival', bb.json.id).run();
+    }
+    return realBatch(stmts);
+  };
+  const fin = await finalize(t, t.bob, bb.json.id);
+  t.env.DB.batch = realBatch;
+  assert.equal(fired, true, 'the claim was stolen inside the commit');
+  assert.equal(fin.status, 409, fin.text);
+  assert.equal(fin.json.code, 'FINALIZE_IN_PROGRESS');
+  const after = await store.get(liveKey);
+  assert.deepEqual(Array.from(after), Array.from(before), "alice's live bytes survive bob's reclaim");
+  const scopeB = await assetScope('u_bob');
+  const leftovers = await store.list(`asset/${scopeB}/`);
+  assert.equal(leftovers.length, 0, "bob's failed attempt prefix is fully reclaimed");
+  const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_bob').first('n');
+  assert.equal(assets, 0, 'no asset rows escape a fenced-out commit');
+});
+
+test('Codex-sec-P2: reclaim fence blocks committed and unreadable ids', async () => {
+  const t = await fx();
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO catalog_assets (id, owner_id, freshness_at, created_at) VALUES (?, ?, ?, ?)').bind('a_live', 'u_alice', now, now).run();
+  assert.equal(await assetPrefixProtected(t.DB, 'a_live'), true, 'committed ids are protected');
+  assert.equal(await assetPrefixProtected(t.DB, 'a_missing'), false, 'uncommitted ids reclaim');
+  assert.equal(await assetPrefixProtected({ prepare() { throw new Error('db down'); } }, 'a_live'), true, 'unreadable rows fail closed');
+});
+
+test('Codex-sec-P2: shard-index totals compare against tensor payload, not file bytes', async () => {
+  // The reviewer's repro: an 8-byte tensor in a 70-byte file with an index
+  // declaring total_size 8 is a VALID HF upload, not SHARD_INDEX.
+  const st = tinySafetensors();
+  assert.equal(st.length, 70, 'fixture: 8 payload bytes + 62 header bytes');
+  const files = [
+    { relpath: 'model.safetensors', bytes: st.length },
+    { relpath: 'model.safetensors.index.json', bytes: 0 },
+  ];
+  const peekFor = (total) => (r) => (r === 'model.safetensors' ? st
+    : new TextEncoder().encode(JSON.stringify({ metadata: { total_size: total }, weight_map: { w: 'model.safetensors' } })));
+  files[1].bytes = peekFor(8)('model.safetensors.index.json').length;
+  const v = validateManifest({ files }, peekFor(8));
+  assert.equal(v.ok, true, JSON.stringify(v.checks));
+  const bad = validateManifest({ files }, peekFor(7));
+  assert.equal(bad.ok, false);
+  assert.ok(bad.checks.some((c) => c.code === 'SHARD_INDEX' && /tensor bytes 8 disagree with index total 7/.test(c.message)), JSON.stringify(bad.checks));
+  // Two shards sum their payloads; an unparseable header fails shape (not
+  // the total) without throwing.
+  const st2 = tinySafetensors();
+  const files2 = [
+    { relpath: 'a.safetensors', bytes: st.length },
+    { relpath: 'b.safetensors', bytes: st2.length },
+    { relpath: 'm.index.json', bytes: 0 },
+  ];
+  const idx2 = new TextEncoder().encode(JSON.stringify({ metadata: { total_size: 16 }, weight_map: { w: 'a.safetensors', x: 'b.safetensors' } }));
+  files2[2].bytes = idx2.length;
+  const peek2 = (r) => (r === 'a.safetensors' ? st : (r === 'b.safetensors' ? st2 : idx2));
+  assert.equal(validateManifest({ files: files2 }, peek2).ok, true);
+  const corrupt = new Uint8Array(st);
+  corrupt[20] = 0xff;
+  const peek3 = (r) => (r === 'a.safetensors' ? corrupt : (r === 'b.safetensors' ? st2 : idx2));
+  const v3 = validateManifest({ files: files2 }, peek3);
+  assert.equal(v3.ok, false);
+  assert.ok(v3.checks.some((c) => c.code === 'SAFETENSORS_SHAPE'), JSON.stringify(v3.checks));
+});
+
+test('Codex-sec-P2: exact chunk replays are idempotent (no PUT, no D1 write)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const b = await begin(t, t.alice, {
+    name: 'replay', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'm.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const first = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, ggufBytes());
+  assert.equal(first.status, 200, first.text);
+  const q0 = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  const key = `upload/${b.json.id}/part/00000000/m.gguf`;
+  const stored0 = await store.get(key);
+  // Count reservation writes during the replay: zero proves idempotency.
+  const realPrepare = t.env.DB.prepare;
+  let casWrites = 0;
+  t.env.DB.prepare = (sql) => {
+    if (typeof sql === 'string' && sql.includes('SET quotas_json = ?')) casWrites += 1;
+    return realPrepare(sql);
+  };
+  const replay = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, ggufBytes());
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(replay.status, 200, replay.text);
+  assert.deepEqual(replay.json, { ok: true, uploadId: b.json.id, path: 'm.gguf', index: 0, received: 64 });
+  assert.equal(casWrites, 0, 'identical replays write no counters');
+  const q1 = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(q1.quotas_json, q0.quotas_json, 'counters byte-identical after replay');
+  const stored1 = await store.get(key);
+  assert.deepEqual(Array.from(stored1), Array.from(stored0), 'stored bytes unchanged');
+  // Same-size but different bytes still take the CAS path and replace.
+  const alt = new Uint8Array(64).fill(0x48);
+  const r2 = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, alt);
+  assert.equal(r2.status, 200, r2.text);
+  const stored2 = await store.get(key);
+  assert.deepEqual(Array.from(stored2), Array.from(alt), 'different bytes replace through CAS');
 });

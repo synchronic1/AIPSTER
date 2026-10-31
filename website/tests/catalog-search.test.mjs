@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
-import { assertHubUrl, normalizeHubModel } from '../src/lib/catalog/hub.mjs';
+import { assertHubUrl, normalizeHubModel, hubDetail, __resetHubMetaCache } from '../src/lib/catalog/hub.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 
@@ -169,4 +169,53 @@ test('Hub normalization never invents identity', async () => {
   assert.equal(a.revision, '', 'missing sha stays unpinned, never synthesized');
   assert.equal(a.format, 'gguf');
   assert.equal(a.files[0].sha256, null);
+});
+test('Codex-sec-P2: hub metadata is TTL-cached per repo and token', async () => {
+  __resetHubMetaCache();
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  const model = { id: 'o/m', sha: 'a'.repeat(40), tags: [], siblings: [], likes: 1 };
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { status: 200, ok: true, headers: new Headers(), json: async () => model };
+  };
+  try {
+    const a = await hubDetail('o/m', {});
+    assert.equal(a.repo, 'o/m');
+    assert.deepEqual(a.calls, { metadata: 1, weights: 0 });
+    const b = await hubDetail('o/m', {});
+    assert.equal(calls, 1, 'second identical lookup serves from cache');
+    assert.deepEqual(b.calls, { metadata: 0, weights: 0 }, 'cached hits report zero upstream calls');
+    await hubDetail('o/m', { token: 'tok-user-2' });
+    assert.equal(calls, 2, 'a different token never shares the anonymous view');
+    await hubDetail('other/m', {});
+    assert.equal(calls, 3, 'a different repo fetches');
+  } finally {
+    globalThis.fetch = realFetch;
+    __resetHubMetaCache();
+  }
+});
+
+test('Codex-sec-P2: hub cache stores 404s, never errors', async () => {
+  __resetHubMetaCache();
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  let mode = 404;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (mode === 404) return { status: 404, ok: false, headers: new Headers(), json: async () => null };
+    return { status: 500, ok: false, headers: new Headers(), json: async () => null };
+  };
+  try {
+    assert.equal(await hubDetail('o/gone', {}), null);
+    assert.equal(await hubDetail('o/gone', {}), null);
+    assert.equal(calls, 1, '404s cache: missing repos cannot probe forever');
+    mode = 500;
+    await assert.rejects(() => hubDetail('o/flaky', {}), (e) => e.code === 'HUB_ERROR');
+    await assert.rejects(() => hubDetail('o/flaky', {}), (e) => e.code === 'HUB_ERROR');
+    assert.equal(calls, 3, 'errors never cache: recovery is immediate');
+  } finally {
+    globalThis.fetch = realFetch;
+    __resetHubMetaCache();
+  }
 });

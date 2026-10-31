@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { fixtureSnapshot, fixtureSmallSnapshot } from '../src/lib/catalog/fixtures.mjs';
 import { evaluateCompatibility } from '../src/lib/catalog/estimate.mjs';
+import { budgetWindow } from '../src/lib/quotas.js';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const BASE = 'fixture-org/tiny-base';
@@ -253,4 +254,23 @@ test('Codex-P2: node-reported format, quant, and context restrictions bind the e
   assert.ok(codes.includes('FORMAT_NOT_REPORTED'), JSON.stringify(codes));
   assert.ok(codes.includes('QUANT_NOT_REPORTED'), JSON.stringify(codes));
   assert.ok(codes.includes('CONTEXT_EXCEEDS_NODE'), JSON.stringify(codes));
+});
+test('Codex-sec-P2: spent write budgets reject compat misses but serve hits', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'box');
+  await report(t, node.id, fixtureSnapshot());
+  const body = { repo: GGUF, nodeId: node.id, runtime: 'fixture-llama', context: 2048, concurrency: 1 };
+  const first = await evaluate(t, t.alice, body);
+  assert.equal(first.status, 200, first.text);
+  assert.equal(first.json.cached, false);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const hit = await evaluate(t, t.alice, body);
+  assert.equal(hit.status, 200, hit.text);
+  assert.equal(hit.json.cached, true, 'hits stay read-only on a spent budget');
+  const miss = await evaluate(t, t.alice, { ...body, context: 4096 });
+  assert.equal(miss.status, 429, miss.text);
+  assert.equal(miss.json.code, 'WRITE_RATE_LIMITED');
+  const rows = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_compat_cache WHERE principal = ?').bind('u_alice').first('n');
+  assert.equal(rows, 1, 'the rejected miss wrote no cache row');
 });

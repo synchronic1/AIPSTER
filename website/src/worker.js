@@ -5,7 +5,7 @@
 // /app* and /admin* -> panel assets, everything else -> ASSETS (landing page
 // preserved byte-for-byte).
 import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
-import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
+import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, rid16, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET, MAX_BODY_BYTES } from './lib/validate.js';
 import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, MAX_ASSET_FILES_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
@@ -17,7 +17,7 @@ import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs'
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
 import { validateManifestStructure, validateFileBytes, isByteEligible, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_MANIFEST_BYTES, MAX_PARTS_PER_UPLOAD, MAX_FINALIZE_FILE_BYTES } from './lib/catalog/validate.mjs';
-import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
+import { byteStore, storeAvailable, CHUNK_MAX_BYTES, assetPrefix, assetKey } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
 
 const VERSION = '0.5.0';
@@ -232,6 +232,28 @@ function uploadPartPath(key, prefix) {
   return key.slice(prefix.length + 9);
 }
 
+// Byte equality for idempotent chunk retries. Length is checked by
+// callers first; this compares content only.
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// Reclaim-fence predicate (Codex-sec-P2): true when an asset id is
+// committed (or its row is unreadable) and its prefix must NOT be
+// reclaimed. Exported for unit tests; the finalizer calls it before every
+// attempt-prefix reclaim.
+export async function assetPrefixProtected(db, assetId) {
+  try {
+    return !!(await first(db, 'SELECT id FROM catalog_assets WHERE id = ?', assetId));
+  } catch {
+    return true;
+  }
+}
+
 // Lazy upload expiry: sessions past their deadline (and never terminal)
 // move to expired, and their quarantine parts are deleted best-effort
 // (bounded per call). Runs at the top of upload intake, never on a timer.
@@ -240,9 +262,34 @@ async function expireCatalogUploads(db, store, ownerId) {
   // keep their terminal verdict forever, so without a swept marker they
   // would re-fill every LIMIT 20 batch and starve genuine expiries
   // (Codex-P2). A row leaves the predicate only when fully drained; a
-  // partial drain (>2010 parts) stays for the next sweep.
-  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND ((expires_at <= ? AND state != 'validated') OR (state = 'rejected' AND byte_ref IS NULL) OR (state = 'validated' AND json_extract(manifest_json, '$.cleaned') IS FALSE)) AND state != 'expired' AND (state != 'rejected' OR byte_ref IS NULL) ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
+  // partial drain (>2010 parts) stays for the next sweep. Expired rows
+  // still draining (byte_ref marker, below) re-enter the same way.
+  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND ((expires_at <= ? AND state != 'validated') OR (state = 'rejected' AND byte_ref IS NULL) OR (state = 'validated' AND json_extract(manifest_json, '$.cleaned') IS FALSE)) AND (state != 'expired' OR byte_ref = 'expired-draining') AND (state != 'rejected' OR byte_ref IS NULL) ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
   for (const row of stale) {
+    const now = new Date().toISOString();
+    if (row.state !== 'rejected' && row.state !== 'validated' && row.state !== 'expired') {
+      // Claim expiry BEFORE cleanup (Codex-sec-P2): the old order listed
+      // and deleted parts first, then flipped state. A chunk PUT in flight
+      // across those awaits could reserve, persist, and pass its post-write
+      // check while the row still read uploading (200), after which the
+      // flip excluded the row from every future sweep - uncharged
+      // permanent bytes. Flipping first closes it both ways: a chunk racing
+      // the flip either fails reservation (state-gated CAS) or fails its
+      // post-write check after the flip (410 + self-delete + rollback); a
+      // chunk that already passed (200) persisted before the flip, so this
+      // sweep's list - taken after the claim - still sees and deletes its
+      // part while the expired row drops its reservation from every quota
+      // query. The flip stays conditional on a live state: a promotion that
+      // commits (validated + asset byte_ref) before the flip matches zero
+      // rows and is skipped, and its leftovers stay with the validated
+      // branch. Any other zero-row flip means the row terminally moved
+      // under us; that path owns cleanup, never this sweep. Partial drains
+      // keep the byte_ref marker (mirroring the rejected 'swept' pattern):
+      // the marker is not a fence token, so in-flight finalizers stay
+      // fenced out exactly as the old NULL did.
+      const flipped = await run(db, "UPDATE catalog_uploads SET state = 'expired', byte_ref = 'expired-draining', updated_at = ? WHERE id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", now, row.id);
+      if (Number(flipped.meta.changes) !== 1) continue;
+    }
     let drained = true;
     if (store) {
       const parts = await store.list(`upload/${row.id}/part/`, 2011);
@@ -250,7 +297,6 @@ async function expireCatalogUploads(db, store, ownerId) {
       drained = parts.length <= 2010;
     }
     if (!drained) continue;
-    const now = new Date().toISOString();
     if (row.state === 'rejected') {
       await run(db, "UPDATE catalog_uploads SET byte_ref = 'swept', updated_at = ? WHERE id = ? AND state = 'rejected'", now, row.id);
     } else if (row.state === 'validated') {
@@ -263,17 +309,11 @@ async function expireCatalogUploads(db, store, ownerId) {
       mj.cleaned = true;
       await run(db, "UPDATE catalog_uploads SET manifest_json = ?, updated_at = ? WHERE id = ? AND state = 'validated'", JSON.stringify(mj), now, row.id);
     } else {
-      // Expiry invalidates the fence token (Codex-P2): a finalizer stalled
-      // past its deadline must not commit after the sweep frees its quota.
-      // Clearing here covers every token-gated statement; the commit batch
-      // additionally requires state = 'promoting' (below). The flip is
-      // conditional on a live state (Codex-sec-P2): the store cleanup above
-      // awaits, so a promotion may commit (validated + asset byte_ref)
-      // while this sweep is in flight; an unconditional flip would
-      // overwrite that terminal verdict and orphan the asset row. A missed
-      // flip leaves the committed row untouched, which is correct in both
-      // orders.
-      await run(db, "UPDATE catalog_uploads SET state = 'expired', byte_ref = NULL, updated_at = ? WHERE id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", now, row.id);
+      // Converged drain marker (Codex-sec-P2): the row was claimed expired
+      // before cleanup (above), so reaching here with zero parts left means
+      // the drain is complete - clear the marker. Partial drains keep it
+      // and re-enter through the predicate.
+      await run(db, "UPDATE catalog_uploads SET byte_ref = NULL, updated_at = ? WHERE id = ? AND state = 'expired'", now, row.id);
     }
   }
   return stale.length;
@@ -1431,6 +1471,13 @@ async function handleApi(request, env, url) {
         if (fresh) return json(200, { ...JSON.parse(hit.decision_json), cached: true, fixture });
       }
       const decisionJson = JSON.stringify({ ...decision, cached: false });
+      // Miss metering (Codex-sec-P2): every miss costs an INSERT plus two
+      // hygiene DELETEs and (for hub refs) a Hub metadata fetch, so misses
+      // claim the hourly write budget like any other mutating path - varying
+      // context/concurrency can no longer burn unbounded shared D1 and
+      // outbound quota. Fresh cache hits return above and stay read-only; a
+      // spent budget fails the miss closed (429) instead of writing.
+      await checkWriteBudget(db, me());
       await run(db, `INSERT INTO catalog_compat_cache (cache_key, principal, fingerprint_json, decision_json, expires_at)
         VALUES (?, ?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET decision_json = excluded.decision_json, expires_at = excluded.expires_at`,
         cacheKey, me(), fp, decisionJson, decision.expiresAt);
@@ -1634,6 +1681,16 @@ async function handleApi(request, env, url) {
           if (bytes.byteLength < existingLen) {
             return json(400, { error: `Chunk for ${relpath} index ${index} is smaller than the stored ${existingLen} bytes; same-index re-sends must not shrink - start a new upload to re-chunk.`, code: 'SHRINK_REFUSED', retryable: false });
           }
+          // Idempotent exact retry (Codex-sec-P2): a same-index re-send with
+          // identical bytes is a transport retry, not new data - the bytes
+          // are already stored and counted, so answer 200 with no PUT and no
+          // D1 write. Without this, one budgeted session replays into
+          // unbounded shared R2/D1 operations. Same-size-but-different
+          // bodies still take the CAS path (the sender pays bandwidth equal
+          // to the work), and state was verified uploading just above.
+          if (existing && existing.length === bytes.byteLength && bytesEqual(existing, bytes)) {
+            return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
+          }
           const quotas = JSON.parse(live.quotas_json);
           const pc = quotas.parts || { total: 0, bytes: {} };
           // Prototype-safe counters (Codex-P1): relpaths are client-controlled
@@ -1781,7 +1838,13 @@ async function handleApi(request, env, url) {
       let attemptAssetId = null;
       const reclaimAttemptPrefix = async () => {
         if (!attemptAssetId || !store) return;
-        const blobs = await store.list(`asset/${attemptAssetId}/`, MAX_MANIFEST_FILES + 1).catch(() => []);
+        // Reclaim fence (Codex-sec-P2): the prefix is tenant-scoped and the
+        // id was reservation-gated, but a raced twin could still have
+        // committed under this id after our gate passed. A committed row -
+        // or an unreadable one - skips reclaim: a bounded leak, never a
+        // delete of data whose ownership is uncertain.
+        if (await assetPrefixProtected(db, attemptAssetId)) return;
+        const blobs = await store.list(await assetPrefix(me(), attemptAssetId), MAX_MANIFEST_FILES + 1).catch(() => []);
         for (const b of blobs.slice(0, MAX_MANIFEST_FILES)) {
           await store.del(b.key).catch(() => null);
         }
@@ -1857,6 +1920,7 @@ async function handleApi(request, env, url) {
         // every file. At most one shard-index head (<=1 MiB) is retained
         // for the manifest-level verdict below.
         const byteChecks = [];
+        const payloads = new Map();
         let shard = null;
         for (const f of manifest.files) {
           const mine = byRel.get(f.relpath) || [];
@@ -1903,17 +1967,20 @@ async function handleApi(request, env, url) {
           if (isByteEligible(f)) {
             const screened = validateFileBytes(f, flat.slice(0, MAX_HEADER_PEEK));
             byteChecks.push(...screened.checks);
+            if (Number.isSafeInteger(screened.tensorBytes)) payloads.set(f.relpath.toLowerCase(), screened.tensorBytes);
             if (screened.screened && f.relpath.toLowerCase().endsWith('.index.json')) {
               shard = { relpath: f.relpath, head: flat.slice(0, MAX_MANIFEST_BYTES) };
             }
           }
         }
-        const verdict = validateManifestStructure(manifest, shard, byteChecks, manifest.kind === 'adapter' ? {
+        const verdictOpts = manifest.kind === 'adapter' ? {
           adapter: {
             baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
             targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
           },
-        } : {});
+        } : {};
+        verdictOpts.payloads = payloads;
+        const verdict = validateManifestStructure(manifest, shard, byteChecks, verdictOpts);
         manifest.checks = verdict.checks;
         manifest.validator = verdict.version;
         if (!verdict.ok) {
@@ -1978,7 +2045,28 @@ async function handleApi(request, env, url) {
         // manifest keeps the reference — because Hub parents never exist
         // as local rows and FK enforcement would fail the batch.
         const now = nowIso();
-        const assetId = rid('a_');
+        // Exclusive attempt reservation (Codex-sec-P2): pass-2 blobs land
+        // before the fenced commit, so the id must be gated before a single
+        // blob lands - the D1 primary key only backstops after an overwrite.
+        // 128-bit ids under the tenant-scoped prefix, refused when a
+        // committed row or any live blob already holds the candidate
+        // (bounded retries, then a retryable refusal instead of a reuse).
+        let assetId = null;
+        for (let i = 0; i < 3 && !assetId; i += 1) {
+          const candidate = rid16('a_');
+          const taken = await first(db, 'SELECT id FROM catalog_assets WHERE id = ?', candidate);
+          if (taken) continue;
+          const clashing = await store.list(await assetPrefix(me(), candidate), 1).catch(() => []);
+          if (clashing.length) continue;
+          assetId = candidate;
+        }
+        if (!assetId) {
+          // Release the claim instead of stranding the session: a lost race
+          // here means a successor owns the row, so map to its outcome.
+          const reset = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
+          if (Number(reset.meta.changes) !== 1) return claimLost();
+          return json(503, { error: 'Could not reserve an asset id; retry shortly.', code: 'ID_EXHAUSTED', retryable: true });
+        }
         attemptAssetId = assetId;
         const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
         const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
@@ -1989,7 +2077,7 @@ async function handleApi(request, env, url) {
         for (const f of manifest.files) {
           const flat = await assembleFile(byRel.get(f.relpath) || [], f, f.sha256);
           if (!(flat instanceof Uint8Array)) { await reclaimAttemptPrefix(); return flat; }
-          await store.put(`asset/${assetId}/${f.relpath}`, flat);
+          await store.put(await assetKey(me(), assetId, f.relpath), flat);
         }
         manifest.revision = revision;
         // Pending-cleanup flag commits WITH the verdict (Codex-P2): the
@@ -2154,26 +2242,30 @@ async function handleApi(request, env, url) {
       // the 64KB-1MB band; magic/safetensors screens read the same leading
       // bytes either way.
       const byteChecks = [];
+      const payloads = new Map();
       let shard = null;
       for (const f of files) {
         if (!isByteEligible(f)) continue;
-        const head = await store.peek(`asset/${asset.id}/${f.relpath}`, MAX_HEADER_PEEK);
+        const head = await store.peek(await assetKey(asset.owner_id, asset.id, f.relpath), MAX_HEADER_PEEK);
         const b = validateFileBytes(f, head);
         byteChecks.push(...b.checks);
+        if (Number.isSafeInteger(b.tensorBytes)) payloads.set(f.relpath.toLowerCase(), b.tensorBytes);
         if (b.screened && f.relpath.toLowerCase().endsWith('.index.json')) {
           // Fall back to the screened head: asset blobs are immutable once
           // promoted, so a vanishing blob here is unreachable in practice -
           // but a null head must never throw below.
-          const full = await store.peek(`asset/${asset.id}/${f.relpath}`, MAX_MANIFEST_BYTES);
+          const full = await store.peek(await assetKey(asset.owner_id, asset.id, f.relpath), MAX_MANIFEST_BYTES);
           shard = { relpath: f.relpath, head: full === null || full === undefined ? head : full };
         }
       }
-      const verdict = validateManifestStructure({ files }, shard, byteChecks, manifest.kind === 'adapter' ? {
+      const verdictOpts = manifest.kind === 'adapter' ? {
         adapter: {
           baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
           targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
         },
-      } : {});
+      } : {};
+      verdictOpts.payloads = payloads;
+      const verdict = validateManifestStructure({ files }, shard, byteChecks, verdictOpts);
       // Idempotent revalidation (Codex-sec-P2): an unchanged verdict is a
       // replay, not an event - skip the rewrite and the audit row, mirroring
       // the duplicate-finalize path. Only a changed verdict writes.

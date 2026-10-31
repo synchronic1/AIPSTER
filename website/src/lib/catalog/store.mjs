@@ -89,3 +89,24 @@ export function byteStore(env) {
 export function storeAvailable(env) {
   return !!(env && (env.CATALOG_STORE || isFixtureEnv(env)));
 }
+
+// Tenant-scoped asset paths (Codex-sec-P2): pass-2 blobs land BEFORE the
+// fenced commit, so a bare asset/<id>/ prefix lets one attempt overwrite
+// or reclaim another tenant's live blobs on id collision. Scoping every
+// asset blob under a domain-separated owner hash makes cross-tenant prefix
+// sharing structurally impossible; the reservation gate (committed-row +
+// live-prefix check before any write) and the reclaim fence (committed-row
+// check before any delete) handle the same-tenant remainder. The hash keeps
+// owner ids (whose alphabet is a better-auth internal) out of bucket keys.
+export async function assetScope(ownerId) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`aipster-asset-scope/v1:${ownerId}`));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+
+export async function assetPrefix(ownerId, assetId) {
+  return `asset/${await assetScope(ownerId)}/${assetId}/`;
+}
+
+export async function assetKey(ownerId, assetId, relpath) {
+  return `${await assetPrefix(ownerId, assetId)}${relpath}`;
+}
