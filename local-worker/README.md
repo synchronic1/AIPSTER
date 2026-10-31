@@ -51,6 +51,49 @@ Network access to public Python distribution/PyPI hosts is required on first use
 The locks pin dependency artifacts, not a bit-for-bit native build or a promise
 that upstream distribution hosts will remain available.
 
+## Update an existing source install
+
+Use this procedure when the checkout already has local changes from a reviewed
+pairing overlay (for example, an `f3e115e` checkout with the `adfe357`
+`pairing.py` compatibility fix applied by hand). A plain `git checkout` would
+abort on those local changes; the hash gate below verifies the overlay is
+exactly the reviewed file before discarding it. Run the `git` steps from the
+`AIPSTER` repo root (the directory above `local-worker`):
+
+```powershell
+git status --short
+```
+
+Continue only if the single modified file is `local-worker/pairing.py`. If
+anything else changed, back it up and use a fresh clone instead.
+
+1. Stop the running `heartbeat-loop` sender terminal with Ctrl+C. Old senders
+   hold no lock, so confirm only one sender runs afterwards.
+2. Fetch the reviewed revision (current pin `3fa309c`):
+```powershell
+git fetch origin 3fa309cb08461ea046ee23e801404911c1f3bcc2
+```
+3. Hash-gate the overlay: the LF-normalized local `pairing.py` must equal the
+   reviewed blob:
+```powershell
+$blob = .\local-worker\.venv\Scripts\python.exe -c "import hashlib,pathlib;b=pathlib.Path('local-worker/pairing.py').read_bytes().replace(b'\r\n',b'\n');print(hashlib.sha1(b'blob '+str(len(b)).encode()+b'\x00'+b).hexdigest())"
+$want = git rev-parse 3fa309cb08461ea046ee23e801404911c1f3bcc2:local-worker/pairing.py
+if ($blob.Trim() -ne $want.Trim()) { Write-Output 'STOP: pairing.py does not match the reviewed overlay; use a fresh clone instead' }
+```
+   If it prints STOP, do not continue; use a fresh clone.
+4. Discard the verified overlay:
+```powershell
+git checkout -- local-worker/pairing.py
+```
+5. Move to the reviewed revision:
+```powershell
+git checkout --detach 3fa309cb08461ea046ee23e801404911c1f3bcc2
+```
+6. Keep `.venv` and do not rerun `install.py`: there are no lock or vendor
+   changes between `f3e115e` and `3fa309c`.
+7. Restart one `heartbeat-loop` sender from `local-worker`. Pairing state
+   lives in `%LOCALAPPDATA%\AIPSTER-Worker` and survives the update.
+
 ## Pairing with AIPSTER
 
 Installing never shares anything. To link this computer to your AIPSTER
@@ -77,15 +120,16 @@ Compute after pairing to refresh the resource list. If the key is revoked or
 expires, the sender exits asking for a fresh pairing code. `pairing.py status`
 shows secret-free local status and marks old success as stale.
 
-Installed the packaged worker instead of this source checkout? Pair from the
-app: open the AIPSTER Worker tray menu and choose Pair this computer (or run
-`aipster-worker pair` in a terminal) and type the dashboard code when asked.
-The tray supervises the heartbeat sender while serving and shows the pairing
-overlay (unpaired / registered / reachable / stale / repair-required) in the
-menu and `aipster-worker tray status`. A busy daemon port never blocks
-pairing or the sender: they need no local port. There is no automatic
-update; update by reinstalling from a newer reviewed pin (uninstall preserves
-pairing by default).
+No packaged installer is published yet: the built 0.1.0 package predates the
+API edge-compat fix and will not be published, so tray pairing arrives with
+the next published qualified installer. Until then, packaged installs cannot
+pair; use this source checkout. The published installer will supervise the
+heartbeat sender while serving and show the pairing overlay (unpaired /
+registered / reachable / stale / repair-required) in the menu and
+`aipster-worker tray status`. A busy daemon port never blocks pairing or the
+sender: they need no local port. When AIPSTER publishes a qualified
+installer, update packaged installs by reinstalling from its reviewed pin
+(uninstall preserves pairing by default).
 Status belongs to the selected pairing generation: a previous sender's status,
 including an in-flight response finishing after re-pairing, is not attributed
 to the new key or resource. Unbound older status records await a fresh heartbeat.
@@ -104,8 +148,8 @@ If any pairing file cannot be removed, unpair exits nonzero and reports
 incomplete cleanup. Stop the sender or other process holding the file, revoke
 the server key, and retry; an already missing file is harmless.
 Preserve unrelated models and engines. This source setup adds no startup task,
-service or automatic update. The packaged install pairs from the tray menu
-(Pair this computer) or `aipster-worker pair` and supervises the sender.
+service or automatic update. Packaged-install tray pairing will be documented
+with the published installer.
 See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
 POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
 

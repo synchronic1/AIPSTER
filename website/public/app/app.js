@@ -214,7 +214,7 @@ async function loadOverview() {
 // progress stage derives from the tab's inventory snapshot (setup /
 // pairing / reachable); it never claims an unverified state.
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
-const DOCS_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
+const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
@@ -321,6 +321,10 @@ function agentInstructions(os) {
   const lines = workerCommands(os);
   const pairing = workerPairingCommands(os);
   const fetch = lines.slice(0, 6).map((l) => '  ' + l).join('\n');
+  const packagedPair = installerUsable(INSTALLERS[os])
+    ? ['- Packaged installs instead: pair from the tray menu (Pair this computer) or with `aipster-worker pair`;',
+      '  the tray starts the sender while serving.']
+    : [];
   const tested = os === 'windows'
     ? 'Windows x64 is the only tested platform (mock check only).'
     : 'Only Windows x64 is tested; macOS and Linux steps are untested adaptation, so verify each step before continuing.';
@@ -391,8 +395,7 @@ function agentInstructions(os) {
     '  ' + pairing[1],
     '- Mock reports usable=false. Choose Done or reopen My Compute to load the paired resource;',
     '  a heartbeat proves reachability only, never inference readiness.',
-    '- Packaged installs instead: pair from the tray menu (Pair this computer) or with `aipster-worker pair`;',
-    '  the tray starts the sender while serving.',
+    ...packagedPair,
     '',
     'Step 7 - disconnect and uninstall (I choose when to do this):',
     '- Stop both the sender and daemon terminals with Ctrl+C, then discard the',
@@ -548,6 +551,9 @@ function paintConnectCard() {
       : '<p><span class="pill warn">Setup needed</span></p>';
   const commands = unpickedTarget ? '' : workerCommands(connect.os).map(esc).join('\n');
   const pairingCommands = workerPairingCommands(connect.os);
+  const packagedPairPara = usable
+    ? `<p>Packaged install? Open the AIPSTER Worker tray menu and choose Pair this computer (or run <code>aipster-worker pair</code> in a terminal), then type the code above when asked. The tray starts the sender for you while serving; update by reinstalling from a newer reviewed pin AIPSTER publishes (uninstall preserves pairing).</p>`
+    : '';
   const advanced = unpickedTarget ? '' : `<details><summary>Advanced: manual install, source and troubleshooting</summary>
 <h3>Manual install (${esc(meta.label)})</h3>
 <p>Prerequisites: Git, <code>uv 0.12.12</code> and Python 3.12.14 (<code>uv python install 3.12.14</code>). Use these pairing-capable commands in ${esc(meta.shell)}. The linked <a href="${esc(L.tested)}">standalone tested installation</a> is background and may name an earlier release. The sparse checkout contains the worker and its root <code>LICENSE</code> only:</p>
@@ -562,7 +568,7 @@ function paintConnectCard() {
 <p>Mint a one-time pairing code above (10-minute expiry, single use). In a second terminal in the same <code>local-worker</code> directory, run <code>${esc(pairingCommands[0])}</code> and type the code locally. Pairing contacts AIPSTER, registers this computer automatically and stores a private heartbeat key. Do not paste the code or key into an agent chat.</p>
 <p>Pairing does not start the sender. In that terminal, run <code>${esc(pairingCommands[1])}</code> to post reachability heartbeats. The mock stays <code>usable=false</code>; no inference is enabled. Keep this sender terminal open. See the <a href="${esc(L.pairing)}">pairing and sender details</a>.</p>
 <p>Status: <strong>not linked until paired</strong>. Choose Done or reopen My Compute after pairing to load the resource below. Heartbeats prove reachability only, never readiness. Manual entry stays under <strong>Advanced: manual resource registration</strong>. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
-<p>Packaged install? Open the AIPSTER Worker tray menu and choose Pair this computer (or run <code>aipster-worker pair</code> in a terminal), then type the code above when asked. The tray starts the sender for you while serving; update by reinstalling from a newer reviewed pin AIPSTER publishes (uninstall preserves pairing).</p>
+    ${packagedPairPara}
 <p class="muted">If the key is revoked or expires, the sender exits asking for a re-pair with a fresh code.</p>
 <details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the other worker through its own controls (never kill it), or pick a free loopback port in the config. Pairing needs no local port, so it stays available.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
 <details><summary>Disconnect and uninstall</summary><p>Stop both sender and daemon terminals with Ctrl+C, then discard the worker-local token. A paired worker also holds an AIPSTER heartbeat key: revoke this resource's key in AIPSTER Keys. Run <code>${esc(pairingCommands[2])}</code> to forget its local pairing; this does not revoke the server key. Then remove only <code>local-worker/.venv</code> and <code>.state</code> if present. Keep unrelated models and engines. This setup adds no service, startup task, global package or automatic update. Keep the daemon on loopback.</p></details>
