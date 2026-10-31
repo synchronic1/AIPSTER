@@ -559,3 +559,64 @@ test('Codex-sec-P2: active upload sessions are capped per owner', async () => {
   assert.equal(over.status, 409, over.text);
   assert.equal(over.json.code, 'UPLOAD_LIMIT');
 });
+
+test('Codex-P2: nested paths never charge the root file budget (suffix collision)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const root = new TextEncoder().encode('{"a":1}');
+  const nested = new TextEncoder().encode('{"b":2}{"c":3}');
+  const b = await begin(t, t.alice, {
+    name: 'nested-names', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'config.json', bytes: root.length }, { relpath: 'nested/config.json', bytes: nested.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const n0 = await chunk(t, t.alice, b.json.id, 'nested/config.json', 0, nested.slice(0, 8));
+  assert.equal(n0.status, 200, n0.text);
+  const n1 = await chunk(t, t.alice, b.json.id, 'nested/config.json', 1, nested.slice(8));
+  assert.equal(n1.status, 200, n1.text);
+  // Pre-fix the suffix predicate counts both nested chunks (16) against the
+  // root budget (8) and 413s; same-index masking cannot save index 1.
+  const r0 = await chunk(t, t.alice, b.json.id, 'config.json', 0, root);
+  assert.equal(r0.status, 200, r0.text);
+  const status = await readJson(await t.call(`/api/catalog/uploads/${b.json.id}`, { headers: sess(t, t.alice) }));
+  assert.equal(status.status, 200, status.text);
+  const got = Object.fromEntries(status.json.received.map((r) => [r.relpath, r.got]));
+  assert.deepEqual(got, { 'config.json': root.length, 'nested/config.json': nested.length });
+  const fin = await finalize(t, t.alice, b.json.id);
+  assert.equal(fin.status, 201, fin.text);
+});
+
+test('Codex-P2: swept rejections stop occupying the expiry batch (no starvation)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const old = new Date(Date.now() - 2 * 86400000).toISOString();
+  const past = new Date(Date.now() - 1000).toISOString();
+  const spec = (name) => ({
+    name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  for (let i = 0; i < 20; i += 1) {
+    const b = await begin(t, t.alice, spec(`rej-${i}`));
+    assert.equal(b.status, 201, `rej-${i}: ${b.text}`);
+    await t.DB.prepare('UPDATE catalog_uploads SET state = ?, expires_at = ? WHERE id = ?').bind('rejected', old, b.json.id).run();
+  }
+  const u = await begin(t, t.alice, spec('starved'));
+  assert.equal(u.status, 201, u.text);
+  const uc = await chunk(t, t.alice, u.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  assert.equal(uc.status, 200, uc.text);
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, u.json.id).run();
+  const t1 = await begin(t, t.alice, spec('trigger-1'));
+  const t2 = await begin(t, t.alice, spec('trigger-2'));
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, t1.json.id).run();
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, t2.json.id).run();
+  const s1 = await chunk(t, t.alice, t1.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
+  assert.equal(s1.status, 410, s1.text);
+  const s2 = await chunk(t, t.alice, t2.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
+  assert.equal(s2.status, 410, s2.text);
+  assert.equal((await store.list(`upload/${u.json.id}/part/`)).length, 0, 'the expired uploader is swept, not starved');
+  const urow = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(u.json.id).first();
+  assert.equal(urow.state, 'expired');
+  const rrow = await t.DB.prepare("SELECT state, byte_ref FROM catalog_uploads WHERE owner_id = ? AND state = 'rejected' LIMIT 1").bind('u_alice').first();
+  assert.equal(rrow.state, 'rejected', 'rejected verdicts survive the sweep');
+});

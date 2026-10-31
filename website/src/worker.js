@@ -215,23 +215,40 @@ async function privateAssetShape(db, row) {
   };
 }
 
+// Exact part ownership (Codex-P2): part keys are
+// `upload/{id}/part/{index8}/{relpath}` with a zero-padded 8-digit
+// index. Suffix matching confuses `config.json` with
+// `nested/config.json` (413 false-trips, merged assemblies, wrong
+// received counts); strip the fixed-length head and compare equality.
+// Returns the relpath, or null when the key is outside the prefix.
+function uploadPartPath(key, prefix) {
+  if (!key.startsWith(prefix) || key[prefix.length + 8] !== '/') return null;
+  return key.slice(prefix.length + 9);
+}
+
 // Lazy upload expiry: sessions past their deadline (and never terminal)
 // move to expired, and their quarantine parts are deleted best-effort
 // (bounded per call). Runs at the top of upload intake, never on a timer.
 async function expireCatalogUploads(db, store, ownerId) {
-  // Oldest-first: rejected rows keep matching this predicate (their verdict
-  // never flips), so an unordered LIMIT 20 could starve genuine expiries
-  // once an owner accumulates swept rejections (review follow-up).
-  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'expired') ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
+  // Oldest-first, and swept rejections leave the predicate: rejected rows
+  // keep their terminal verdict forever, so without a swept marker they
+  // would re-fill every LIMIT 20 batch and starve genuine expiries
+  // (Codex-P2). A row leaves the predicate only when fully drained; a
+  // partial drain (>2010 parts) stays for the next sweep.
+  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'expired') AND (state != 'rejected' OR byte_ref IS NULL) ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
   for (const row of stale) {
-    // Rejected rows join the sweep as a crash backstop (Codex-P1): the
-    // reject path deletes parts inline, but a fault between the verdict
-    // write and cleanup would orphan them past the deadline. The verdict
-    // itself is terminal and stays rejected - only bytes are reclaimed.
-    if (row.state !== 'rejected') await run(db, "UPDATE catalog_uploads SET state = 'expired', updated_at = ? WHERE id = ?", new Date().toISOString(), row.id);
+    let drained = true;
     if (store) {
       const parts = await store.list(`upload/${row.id}/part/`);
       for (const p of parts.slice(0, 2010)) await store.del(p.key);
+      drained = parts.length <= 2010;
+    }
+    if (!drained) continue;
+    const now = new Date().toISOString();
+    if (row.state === 'rejected') {
+      await run(db, "UPDATE catalog_uploads SET byte_ref = 'swept', updated_at = ? WHERE id = ?", now, row.id);
+    } else {
+      await run(db, "UPDATE catalog_uploads SET state = 'expired', updated_at = ? WHERE id = ?", now, row.id);
     }
   }
   return stale.length;
@@ -1463,8 +1480,9 @@ async function handleApi(request, env, url) {
         // retries never false-trip; anything beyond declared can never
         // finalize (finalize requires exact fit), so early refusal only
         // rejects doomed writes instead of consuming storage.
-        const prior = await store.list(`upload/${uploadId}/part/`);
-        const mine = prior.filter((p) => p.key.endsWith('/' + relpath));
+        const partPrefix = `upload/${uploadId}/part/`;
+        const prior = await store.list(partPrefix);
+        const mine = prior.filter((p) => uploadPartPath(p.key, partPrefix) === relpath);
         const same = mine.find((p) => Number(p.key.split('/')[3]) === index);
         const current = mine.reduce((n, p) => n + p.size, 0) - (same ? same.size : 0);
         if (current + bytes.byteLength > declared.bytes) {
@@ -1492,10 +1510,11 @@ async function handleApi(request, env, url) {
         return json(413, { error: 'Asset exceeds the 128 MiB scaffold finalize cap; streaming promotion is follow-on work.', code: 'ASSET_TOO_LARGE', retryable: false, action: 'Split the asset or wait for streaming promotion.' });
       }
       await run(db, "UPDATE catalog_uploads SET state = 'validating', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-      const parts = await store.list(`upload/${uploadId}/part/`);
+      const partPrefix = `upload/${uploadId}/part/`;
+      const parts = await store.list(partPrefix);
       const assembled = new Map();
       for (const f of manifest.files) {
-        const mine = parts.filter((p) => p.key.endsWith('/' + f.relpath)).sort((a, b) => (a.key < b.key ? -1 : 1));
+        const mine = parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).sort((a, b) => (a.key < b.key ? -1 : 1));
         const order = mine.map((p) => Number(p.key.split('/')[3]));
         if (!order.length || !order.every((v, i) => v === i)) {
           await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
@@ -1533,15 +1552,18 @@ async function handleApi(request, env, url) {
       manifest.checks = verdict.checks;
       manifest.validator = verdict.version;
       if (!verdict.ok) {
-        await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), nowIso(), uploadId);
-        await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
-        // Reclaim quarantine bytes at reject time (Codex-P1): quota
-        // accounting releases rejected sessions, so their parts must go
-        // too - otherwise every rejection orphans bytes outside quota
-        // and repeated failing uploads bypass the account budget. The
-        // expiry sweep re-covers rejected rows as a crash backstop.
+        // Reclaim quarantine bytes BEFORE the verdict write (Codex-P1):
+        // quota accounting releases rejected sessions, so their parts
+        // must go too - otherwise every rejection orphans bytes outside
+        // quota. Cleanup-first also keeps a store fault retryable (the
+        // session stays validating; no verdict is half-reported). A fully
+        // drained reject is marked byte_ref 'swept' so the expiry sweep
+        // skips it; a partial drain stays NULL for the sweep backstop.
         const doomed = await store.list(`upload/${uploadId}/part/`);
         for (const p of doomed.slice(0, 2010)) await store.del(p.key);
+        const sweptMark = doomed.length <= 2010 ? 'swept' : null;
+        await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), sweptMark, nowIso(), uploadId);
+        await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
         return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: verdict.checks });
       }
       // Quota is re-checked at finalize: a concurrent promotion may have
@@ -1611,15 +1633,16 @@ async function handleApi(request, env, url) {
       let received = null;
       const store = byteStore(env);
       if (store && ['uploading', 'quarantined', 'validating'].includes(up.state)) {
-        const parts = await store.list(`upload/${up.id}/part/`);
+        const partPrefix = `upload/${up.id}/part/`;
+        const parts = await store.list(partPrefix);
         received = manifest.files.map((f) => ({
           relpath: f.relpath, bytes: f.bytes,
-          got: parts.filter((p) => p.key.endsWith('/' + f.relpath)).reduce((n, p) => n + p.size, 0),
+          got: parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).reduce((n, p) => n + p.size, 0),
         }));
       }
       return json(200, {
         id: up.id, state: up.state, manifest: { ...manifest, checks: manifest.checks || undefined },
-        received, assetId: up.byte_ref, checks: manifest.checks || null,
+        received, assetId: up.state === 'validated' ? up.byte_ref : null, checks: manifest.checks || null,
         expiresAt: up.expires_at, updatedAt: up.updated_at,
       });
     }
