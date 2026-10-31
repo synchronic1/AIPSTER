@@ -603,7 +603,8 @@ def _redirect_to_log(data):
     try:
         data = Path(data)
         private_directory(data)
-        (data / "logs").mkdir(exist_ok=True)
+        from .firstrun import private_child_directory
+        private_child_directory(data, "logs")
         handle = open(data / "logs" / "tray.log", "a", encoding="utf-8")
         sys.stdout = handle
         sys.stderr = handle

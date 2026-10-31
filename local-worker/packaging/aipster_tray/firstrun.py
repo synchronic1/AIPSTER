@@ -73,6 +73,25 @@ def private_directory(path):
         raise OSError("cannot establish private worker directory")
 
 
+def private_child_directory(data, name):
+    """Harden a child of a just-verified user-only data dir.
+
+    Fresh children are created with proven-new provenance. A pre-existing
+    child owned by the process's default owner (e.g. Administrators-owned
+    state/logs left by builds that plain-mkdir'd them) is normalized to
+    user-only: inside a just-verified user-only parent only this user (or
+    an administrator, outside the threat boundary) could have created it,
+    links are still refused, and any other owner still fails closed.
+    """
+    path = Path(data) / name
+    try:
+        path.mkdir()
+    except FileExistsError:
+        pass
+    if not _private_path(path, directory=True, created=True):
+        raise OSError("cannot establish private worker directory")
+
+
 def private_token_acl(path):
     """Read-only verification for qualification: SID-based and locale-independent."""
     try:
@@ -123,8 +142,8 @@ def _ensure_private_token(path):
 def ensure_setup(data):
     """Create data dirs + default config. Returns (config_path, fresh_config)."""
     private_directory(data)
-    private_directory(data / "state")
-    private_directory(data / "logs")
+    private_child_directory(data, "state")
+    private_child_directory(data, "logs")
     config = data / "config.toml"
     fresh_config = False
     if not config.exists():

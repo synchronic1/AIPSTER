@@ -788,6 +788,44 @@ class TrayConnectActionsTests(unittest.TestCase):
         self.assertEqual(self.ctl.sender.starts, 1)
 
 
+class FirstrunChildDirTests(unittest.TestCase):
+    """Worker-connect W2b: setup hardens children, adopts legacy shape."""
+
+    def test_ensure_setup_hardens_state_and_logs(self):
+        from private_storage_win32 import protect_path
+        with tempfile.TemporaryDirectory(prefix='aipster-firstrun-') as tmp:
+            data = Path(tmp) / 'worker-data'
+            first.ensure_setup(data)
+            self.assertTrue(protect_path(data / 'state', directory=True, verify=True))
+            self.assertTrue(protect_path(data / 'logs', directory=True, verify=True))
+
+    def test_ensure_setup_adopts_plain_precreated_children(self):
+        from private_storage_win32 import protect_path
+        with tempfile.TemporaryDirectory(prefix='aipster-firstrun-') as tmp:
+            data = Path(tmp) / 'worker-data'
+            first.private_directory(data)
+            (data / 'state').mkdir()
+            (data / 'logs').mkdir()
+            first.ensure_setup(data)
+            self.assertTrue(protect_path(data / 'state', directory=True, verify=True))
+            self.assertTrue(protect_path(data / 'logs', directory=True, verify=True))
+
+    def test_redirect_to_log_adopts_plain_logs_dir(self):
+        from private_storage_win32 import protect_path
+        with tempfile.TemporaryDirectory(prefix='aipster-firstrun-') as tmp:
+            data = Path(tmp) / 'worker-data'
+            data.mkdir()
+            (data / 'logs').mkdir()
+            real_out, real_err = sys.stdout, sys.stderr
+            try:
+                with patch.object(sys, 'stdout', None):
+                    self.assertTrue(controller._redirect_to_log(data))
+            finally:
+                sys.stdout, sys.stderr = real_out, real_err
+            self.assertTrue((data / 'logs' / 'tray.log').exists())
+            self.assertTrue(protect_path(data / 'logs', directory=True, verify=True))
+
+
 class LauncherPairEntryTests(unittest.TestCase):
     """Worker-connect W1: installed console entry for pair/sender."""
 
