@@ -1384,6 +1384,8 @@ test('Codex-P2: a crash after commit still leaves cleanup pending (flag in batch
   const row = await t.DB.prepare('SELECT state, manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
   assert.equal(row.state, 'validated', 'the commit is durable');
   assert.equal(JSON.parse(row.manifest_json).cleaned, false, 'pending cleanup survives the crash');
+  const committed = await store.list('asset/');
+  assert.equal(committed.length, 1, 'committed blobs survive the simulated death (live cleanup must not eat them)');
   const one = await begin(t, t.alice, {
     name: 'trig1', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
     files: [{ relpath: 't.gguf', bytes: 1 }],
@@ -1768,4 +1770,124 @@ test('Codex-P1: pass 2 re-verifies the digest (no unvalidated promote)', async (
   }
   const f2 = await finalize(t, t.alice, v.json.id);
   assert.equal(f2.status, 201, f2.text);
+});
+
+test('Codex-sec-P2: a fenced-out commit reclaims its asset blobs', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'fenced', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'a.gguf', bytes: 1 }, { relpath: 'b.gguf', bytes: 1 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  await store.put(`upload/${v.json.id}/part/00000000/a.gguf`, new Uint8Array([0x47]));
+  await store.put(`upload/${v.json.id}/part/00000000/b.gguf`, new Uint8Array([0x48]));
+  await store.put('asset/rival-asset/x.gguf', new Uint8Array([0x52]));
+  // A rival steals the claim at the commit batch: our fence misses after
+  // pass 2 already copied both blobs.
+  const db = t.env.DB;
+  let fired = false;
+  t.env.DB = {
+    ...db,
+    batch: async (stmts) => {
+      const isCommit = stmts.some((x) => String(x.sql || '').includes('INSERT INTO catalog_assets'));
+      if (isCommit && !fired) {
+        fired = true;
+        const mj = await t.DB.prepare('SELECT manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+        const m = JSON.parse(mj.manifest_json);
+        m.claimLease = new Date().toISOString();
+        await t.DB.prepare('UPDATE catalog_uploads SET byte_ref = ?, manifest_json = ? WHERE id = ?').bind('rival-claim', JSON.stringify(m), v.json.id).run();
+      }
+      return db.batch(stmts);
+    },
+  };
+  const f = await finalize(t, t.alice, v.json.id);
+  t.env.DB = db;
+  assert.equal(fired, true, 'the steal landed at commit');
+  assert.equal(f.status, 409, f.text);
+  assert.equal(f.json.code, 'FINALIZE_IN_PROGRESS');
+  const blobs = await store.list('asset/');
+  assert.equal(blobs.length, 1, 'only the rival blob survives');
+  assert.equal(blobs[0].key, 'asset/rival-asset/x.gguf', 'rival blobs are untouched');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'promoting', 'the rival still owns the session');
+  assert.equal(row.byte_ref, 'rival-claim');
+  const assets = await t.DB.prepare('SELECT COUNT(*) n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first();
+  assert.equal(assets.n, 0, 'zero rows written');
+});
+
+test('Codex-sec-P2: a fault mid-promotion reclaims staged blobs (catch path)', async () => {
+  const t = await fx();
+  const files = new Map();
+  let assetPuts = 0;
+  const bucket = {
+    async put(key, bytes) {
+      if (key.startsWith('asset/')) {
+        assetPuts += 1;
+        if (assetPuts === 2) throw new Error('simulated R2 fault');
+      }
+      files.set(key, bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes));
+    },
+    async get(key, opts) {
+      const v = files.get(key);
+      if (v === undefined) return null;
+      const slice = opts && opts.range ? v.slice(opts.range.offset || 0, (opts.range.offset || 0) + opts.range.length) : v;
+      return { arrayBuffer: async () => slice.slice().buffer };
+    },
+    async delete(key) { files.delete(key); },
+    async list({ prefix, cursor, limit }) {
+      const keys = [...files.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const start = cursor ? Number(cursor) : 0;
+      const page = keys.slice(start, start + (limit || 1000));
+      const end = start + page.length;
+      return { objects: page.map((k) => ({ key: k, size: files.get(k).length })), truncated: end < keys.length, cursor: String(end) };
+    },
+  };
+  t.env.CATALOG_STORE = bucket;
+  const v = await begin(t, t.alice, {
+    name: 'faulty', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'a.gguf', bytes: 1 }, { relpath: 'b.gguf', bytes: 1 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  await bucket.put(`upload/${v.json.id}/part/00000000/a.gguf`, new Uint8Array([0x47]));
+  await bucket.put(`upload/${v.json.id}/part/00000000/b.gguf`, new Uint8Array([0x48]));
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 500, f.text);
+  assert.equal(assetPuts, 2, 'the fault landed on the second blob');
+  const left = [...files.keys()].filter((k) => k.startsWith('asset/'));
+  assert.equal(left.length, 0, 'the first blob is reclaimed on the fault path');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'uploading', 'the claim releases');
+});
+
+test('Codex-sec-P2: an unreadable row skips reclaim (never delete what might be live)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'unknown', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'a.gguf', bytes: 1 }, { relpath: 'b.gguf', bytes: 1 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  await store.put(`upload/${v.json.id}/part/00000000/a.gguf`, new Uint8Array([0x47]));
+  await store.put(`upload/${v.json.id}/part/00000000/b.gguf`, new Uint8Array([0x48]));
+  // The commit batch faults AND the catch probe cannot read the row (DB
+  // fault): the outcome is unknown, so the prefix must survive.
+  const db = t.env.DB;
+  let batchFired = false;
+  const realPrepare = db.prepare.bind(db);
+  t.env.DB = {
+    ...db,
+    prepare: (sql) => (String(sql).startsWith('SELECT state, byte_ref')
+      ? { bind: () => ({ first: async () => { throw new Error('simulated D1 fault'); } }) }
+      : realPrepare(sql)),
+    batch: async () => { batchFired = true; throw new Error('simulated batch fault'); },
+  };
+  const f = await finalize(t, t.alice, v.json.id);
+  t.env.DB = db;
+  assert.equal(batchFired, true, 'the commit never ran');
+  assert.equal(f.status, 500, f.text);
+  const blobs = await store.list('asset/');
+  assert.equal(blobs.length, 2, 'unknown outcomes keep their blobs');
 });

@@ -1768,6 +1768,24 @@ async function handleApi(request, env, url) {
       // paths below reset to uploading before returning; a throw (store
       // or D1 fault) resets in the catch, so every fault stays retryable
       // instead of stranding the upload in promoting until lease expiry.
+      // Attempt-prefix reclaim (Codex-sec-P2): pass-2 blobs land under a
+      // fresh per-attempt asset id BEFORE the fenced commit, so a fenced-out
+      // commit (lost lease, expiry, count bound), a mid-loop raced return,
+      // or a store fault would orphan them outside quota with no rows
+      // pointing at them - repeatably reachable via lease/expiry races. The
+      // commit-fail branch, pass-2 raced returns, and the fault catch below
+      // all reclaim the prefix; the marker clears on commit success, so a
+      // post-commit fault never touches live blobs. The prefix holds at
+      // most one blob per manifest file, and reclaim is best-effort so
+      // cleanup never masks the mapped outcome.
+      let attemptAssetId = null;
+      const reclaimAttemptPrefix = async () => {
+        if (!attemptAssetId || !store) return;
+        const blobs = await store.list(`asset/${attemptAssetId}/`, MAX_MANIFEST_FILES + 1).catch(() => []);
+        for (const b of blobs.slice(0, MAX_MANIFEST_FILES)) {
+          await store.del(b.key).catch(() => null);
+        }
+      };
       try {
         // Attempt budget (Codex-sec-P2): every assembly + hash burns
         // real work, so each claim-winning attempt pays the hourly write
@@ -1961,6 +1979,7 @@ async function handleApi(request, env, url) {
         // as local rows and FK enforcement would fail the batch.
         const now = nowIso();
         const assetId = rid('a_');
+        attemptAssetId = assetId;
         const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
         const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
         // Pass 2 (Codex-sec-P2): re-assemble each file and put its asset blob,
@@ -1969,7 +1988,7 @@ async function handleApi(request, env, url) {
         // pass 1 maps to the same retryable 409 through assembleFile.
         for (const f of manifest.files) {
           const flat = await assembleFile(byRel.get(f.relpath) || [], f, f.sha256);
-          if (!(flat instanceof Uint8Array)) return flat;
+          if (!(flat instanceof Uint8Array)) { await reclaimAttemptPrefix(); return flat; }
           await store.put(`asset/${assetId}/${f.relpath}`, flat);
         }
         manifest.revision = revision;
@@ -1987,9 +2006,9 @@ async function handleApi(request, env, url) {
         // committed fence token, so a holder that lost its lease mid-flight
         // writes zero rows. No changes() chaining: each predicate reads
         // committed state independently, which is sound on every D1.
-        // (Asset blobs put above stay orphans on a fenced-out commit, and on
-        // any mid-loop raced return before the batch: one bounded footprint
-        // per attempt, with no rows pointing at it.)
+        // (Asset blobs put above are reclaimed on a fenced-out commit or
+        // any mid-loop raced return by the attempt-prefix cleanup; the
+        // marker clears on commit success.)
         const committed = await db.batch([
           db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
             SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?
@@ -2013,6 +2032,10 @@ async function handleApi(request, env, url) {
         // above). On failure, a lost token maps to the winner outcome; an
         // intact live claim means the count bound bit.
         if (Number(committed[committed.length - 1].meta.changes) !== 1) {
+          // No rows landed, but the blobs did: reclaim the attempt
+          // prefix before mapping the outcome, whatever it is.
+          await reclaimAttemptPrefix();
+          attemptAssetId = null;
           // Count loss holds only while the claim is live (promoting +
           // intact token); any other state means a lost claim (steal,
           // expiry, or a successor verdict) and maps to its outcome.
@@ -2020,6 +2043,8 @@ async function handleApi(request, env, url) {
           if (!cur || cur.state !== 'promoting' || cur.byte_ref !== claimToken) return claimLost();
           throw capError('files');
         }
+        // Committed: post-commit faults must not touch these blobs.
+        attemptAssetId = null;
         // Incremental quarantine cleanup (Codex-sec-P2): the commit above
         // is durable, but deleting every part inline hangs big sessions
         // (each delete is a store round trip). Drain one sweep slice here;
@@ -2033,6 +2058,13 @@ async function handleApi(request, env, url) {
         await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
         return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
       } catch (error) {
+        // A fault inside the batch call itself may follow committed rows
+        // (the call throws after the writes land), and a real death there
+        // runs no cleanup at all: reclaim only when the row positively
+        // shows a non-commit. An unreadable row (DB fault) skips reclaim:
+        // never delete what might be live.
+        const failed = await first(db, 'SELECT state, byte_ref FROM catalog_uploads WHERE id = ?', uploadId).catch(() => null);
+        if (failed && (failed.state !== 'validated' || failed.byte_ref !== attemptAssetId)) await reclaimAttemptPrefix();
         await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND state = 'promoting' AND byte_ref = ?", nowIso(), uploadId, claimToken);
         throw error;
       }
