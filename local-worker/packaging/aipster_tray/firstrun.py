@@ -123,8 +123,8 @@ def _ensure_private_token(path):
 def ensure_setup(data):
     """Create data dirs + default config. Returns (config_path, fresh_config)."""
     private_directory(data)
-    (data / "state").mkdir(exist_ok=True)
-    (data / "logs").mkdir(exist_ok=True)
+    private_directory(data / "state")
+    private_directory(data / "logs")
     config = data / "config.toml"
     fresh_config = False
     if not config.exists():
