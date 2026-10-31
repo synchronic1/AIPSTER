@@ -574,8 +574,8 @@ test('Codex-P2: nested paths never charge the root file budget (suffix collision
   assert.equal(n0.status, 200, n0.text);
   const n1 = await chunk(t, t.alice, b.json.id, 'nested/config.json', 1, nested.slice(8));
   assert.equal(n1.status, 200, n1.text);
-  // Pre-fix the suffix predicate counts both nested chunks (16) against the
-  // root budget (8) and 413s; same-index masking cannot save index 1.
+  // Pre-fix the suffix predicate counts both nested chunks (14) against the
+  // root budget (7) and 413s; same-index masking cannot save index 1.
   const r0 = await chunk(t, t.alice, b.json.id, 'config.json', 0, root);
   assert.equal(r0.status, 200, r0.text);
   const status = await readJson(await t.call(`/api/catalog/uploads/${b.json.id}`, { headers: sess(t, t.alice) }));
@@ -619,4 +619,5 @@ test('Codex-P2: swept rejections stop occupying the expiry batch (no starvation)
   assert.equal(urow.state, 'expired');
   const rrow = await t.DB.prepare("SELECT state, byte_ref FROM catalog_uploads WHERE owner_id = ? AND state = 'rejected' LIMIT 1").bind('u_alice').first();
   assert.equal(rrow.state, 'rejected', 'rejected verdicts survive the sweep');
+  assert.equal(rrow.byte_ref, 'swept', 'swept rejections are marked out of the predicate');
 });
