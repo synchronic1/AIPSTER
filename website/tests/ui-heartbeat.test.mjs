@@ -1,4 +1,4 @@
-﻿/* Built with Meta Muse. Exact-client probe for the heartbeat strip copy:
+/* Built with Meta Muse. Exact-client probe for the heartbeat strip copy:
  * loads the checked-in public/app/app.js in a stub DOM (same pattern as
  * ui-session.test.mjs) and asserts renderStatus presents heartbeat-seen
  * resources as reachability-only, usable=false with distinct not-ready

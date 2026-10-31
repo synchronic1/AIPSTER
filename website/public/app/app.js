@@ -1,4 +1,4 @@
-﻿/* Built with Meta Muse. */
+/* Built with Meta Muse. */
 // Control-panel client. Session cookie is httpOnly; sign-in is GitHub OAuth
 // for public GitHub registration or the seeded demo username/password (same sessions).
 // Mutations carry a custom CSRF header (never a secret). API secrets are

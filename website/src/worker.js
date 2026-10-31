@@ -1,4 +1,4 @@
-﻿﻿/* Built with Meta Muse. */
+﻿/* Built with Meta Muse. */
 // AIPSTER apex Worker: same-origin control-panel API + /app UI + /admin UI on
 // top of the existing static site. Routing: /api/auth/* -> Better Auth,
 // /api/* -> JSON API (errors always JSON, never the static 404 page),
