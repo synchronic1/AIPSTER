@@ -1297,9 +1297,19 @@ async function handleApi(request, env, url) {
       const fp = JSON.stringify(decision.fingerprint);
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${me()}\n${fp}`));
       const cacheKey = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
-      const hit = await first(db, 'SELECT decision_json, expires_at FROM catalog_compat_cache WHERE cache_key = ? AND principal = ?', cacheKey, me());
+      const hit = await first(db, 'SELECT decision_json, expires_at, fingerprint_json FROM catalog_compat_cache WHERE cache_key = ? AND principal = ?', cacheKey, me());
       if (hit && Date.parse(hit.expires_at) > nowMs) {
-        return json(200, { ...JSON.parse(hit.decision_json), cached: true, fixture });
+        // A cached decision must not outlive its telemetry: the
+        // fingerprint pins the report timestamp, not its freshness, so
+        // re-check the snapshot age on every hit (Codex-P2). Missing or
+        // unparseable timestamps miss (fail closed → fresh evaluation).
+        let fresh = false;
+        try {
+          const fp = JSON.parse(hit.fingerprint_json || '{}');
+          const at = Date.parse(fp.snapshotAt);
+          fresh = Number.isFinite(at) && nowMs - at <= TELEMETRY_FRESH_MS;
+        } catch { fresh = false; }
+        if (fresh) return json(200, { ...JSON.parse(hit.decision_json), cached: true, fixture });
       }
       const decisionJson = JSON.stringify({ ...decision, cached: false });
       await run(db, `INSERT INTO catalog_compat_cache (cache_key, principal, fingerprint_json, decision_json, expires_at)
@@ -1433,6 +1443,19 @@ async function handleApi(request, env, url) {
           throw error;
         }
         if (!bytes.byteLength) return json(400, { error: 'Empty chunk refused.', code: 'BAD_CHUNK' });
+        // Quota defense-in-depth (Codex-P1): bound what one file can
+        // persist to its declared bytes BEFORE storing. Same-index
+        // replacement subtracts the old bytes first, so transport
+        // retries never false-trip; anything beyond declared can never
+        // finalize (finalize requires exact fit), so early refusal only
+        // rejects doomed writes instead of consuming storage.
+        const prior = await store.list(`upload/${uploadId}/part/`);
+        const mine = prior.filter((p) => p.key.endsWith('/' + relpath));
+        const same = mine.find((p) => Number(p.key.split('/')[3]) === index);
+        const current = mine.reduce((n, p) => n + p.size, 0) - (same ? same.size : 0);
+        if (current + bytes.byteLength > declared.bytes) {
+          return json(413, { error: `Chunk exceeds the declared ${declared.bytes} bytes for ${relpath} (${current} already stored).`, code: 'QUOTA_EXCEEDED' });
+        }
         // Idempotent rewrite: re-sending an index overwrites it, so
         // transport retries never corrupt the assembly (AC13).
         await store.put(`upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`, new Uint8Array(bytes));
@@ -1488,8 +1511,10 @@ async function handleApi(request, env, url) {
         return full === undefined ? null : full.slice(0, MAX_HEADER_PEEK);
       };
       const verdict = validateManifest({ files: manifest.files }, peek, manifest.kind === 'adapter' ? {
-        baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
-        targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+        adapter: {
+          baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
+          targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+        },
       } : {});
       manifest.checks = verdict.checks;
       manifest.validator = verdict.version;
@@ -1525,24 +1550,32 @@ async function handleApi(request, env, url) {
       }
       // Promote: every file lands under the asset prefix before any row
       // points at it; the DB writes commit in one batch (AC12).
+      // Quarantine is cleaned only AFTER the batch commits, so a failed
+      // promote stays retryable (Codex-P2). External (`org/model`,
+      // `hub:`) adapter bases leave the local base FK null — the
+      // manifest keeps the reference — because Hub parents never exist
+      // as local rows and FK enforcement would fail the batch.
       const now = nowIso();
       const assetId = rid('a_');
       const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
       const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
       for (const [relpath, flat] of assembled) await store.put(`asset/${assetId}/${relpath}`, flat);
-      for (const p of parts) await store.del(p.key);
       manifest.revision = revision;
+      const baseIsExternal = manifest.adapter
+        ? (manifest.adapter.baseAssetId.includes('/') || manifest.adapter.baseAssetId.startsWith('hub:'))
+        : false;
       await db.batch([
         db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
           VALUES (?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ?)`)
           .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
             JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
-            JSON.stringify(manifest), manifest.adapter ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now),
+            JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now),
         ...manifest.files.map((f) => db.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)')
           .bind(assetId, f.relpath, f.bytes, f.sha256)),
         db.prepare('UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?')
           .bind('validated', JSON.stringify(manifest), assetId, now, uploadId),
       ]);
+      for (const p of parts) await store.del(p.key);
       await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
       return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
     }
@@ -1607,8 +1640,10 @@ async function handleApi(request, env, url) {
       const peeks = new Map();
       for (const f of files) peeks.set(f.relpath, await peek(f.relpath));
       const verdict = validateManifest({ files }, (r) => (peeks.has(r) ? peeks.get(r) : null), manifest.kind === 'adapter' ? {
-        baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
-        targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+        adapter: {
+          baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
+          targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+        },
       } : {});
       manifest.checks = verdict.checks;
       manifest.validator = verdict.version;

@@ -183,6 +183,78 @@ test('F18: adapter finalize requires a resolvable base asset', async () => {
   assert.equal(good.status, 201, good.text);
 });
 
+test('Codex-P2: adapter finalize enforces modules/tokenizer declaration', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const base = await roundTrip(t, t.alice, 'real-base', [{ relpath: 'model.gguf', bytes: ggufBytes() }]);
+  assert.equal(base.status, 201, base.text);
+  const bare = await roundTrip(t, t.alice, 'bare-adapter', [{ relpath: 'adapter.gguf', bytes: ggufBytes() }], {
+    kind: 'adapter', baseAssetId: base.json.assetId, baseRevision: 'ab'.repeat(32),
+  });
+  assert.equal(bare.status, 422, bare.text);
+  assert.ok(bare.json.checks.some((c) => c.code === 'ADAPTER_MODULES_UNDECLARED'));
+  assert.ok(bare.json.checks.some((c) => c.code === 'ADAPTER_TOKENIZER_UNDECLARED'));
+});
+
+test('Codex-P2: external adapter bases leave the local base FK null', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const fin = await roundTrip(t, t.alice, 'hub-adapter', [{ relpath: 'adapter.gguf', bytes: ggufBytes() }], {
+    kind: 'adapter', baseAssetId: 'hub:fixture-org/tiny-base', baseRevision: 'ab'.repeat(32),
+    targetModules: ['q_proj'], tokenizer: 'base-tok',
+  });
+  assert.equal(fin.status, 201, fin.text);
+  const row = await t.DB.prepare('SELECT base_asset_id, manifest_json FROM catalog_assets WHERE id = ?').bind(fin.json.assetId).first();
+  assert.equal(row.base_asset_id, null, 'external base leaves local FK null');
+  assert.equal(JSON.parse(row.manifest_json).adapter.baseAssetId, 'hub:fixture-org/tiny-base', 'manifest preserves the hub ref');
+});
+
+test('Codex-P2: quarantine survives a failed promote batch (finalize retry works)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const b = await begin(t, t.alice, {
+    name: 'retry', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  await chunk(t, t.alice, b.json.id, 'model.gguf', 0, ggufBytes(64));
+  const realDb = t.env.DB;
+  let fired = false;
+  t.env.DB = {
+    ...realDb,
+    batch: async (stmts) => {
+      const head = stmts && stmts[0] && stmts[0].sql ? stmts[0].sql : '';
+      if (!fired && head.startsWith('INSERT INTO catalog_assets ')) { fired = true; throw new Error('boom-promote'); }
+      return realDb.batch(stmts);
+    },
+  };
+  const boom = await finalize(t, t.alice, b.json.id);
+  assert.equal(fired, true, 'the promote batch took the fault');
+  assert.equal(boom.status, 500, boom.text);
+  t.env.DB = realDb;
+  const retry = await finalize(t, t.alice, b.json.id);
+  assert.equal(retry.status, 201, retry.text);
+});
+
+test('Codex-P1: chunk bytes past the declared file size are refused before storing', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const b = await begin(t, t.alice, {
+    name: 'capped', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 8 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c0 = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, ggufBytes(8));
+  assert.equal(c0.status, 200, c0.text);
+  const over = await chunk(t, t.alice, b.json.id, 'model.gguf', 1, ggufBytes(8));
+  assert.equal(over.status, 413, over.text);
+  assert.equal(over.json.code, 'QUOTA_EXCEEDED');
+  const dup = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, ggufBytes(8));
+  assert.equal(dup.status, 200, dup.text, 'same-index replacement still allowed');
+  const st = await readJson(await t.call(`/api/catalog/uploads/${b.json.id}`, { headers: sess(t, t.alice) }));
+  assert.equal(st.json.received[0].got, 8, 'over-quota bytes never persisted');
+});
+
 test('S-F6: shard accounting is case-insensitive like the suffix policy', async () => {
   const err = checkShardIndex(
     [{ relpath: 'MODEL.SAFETENSORS', bytes: 100 }],

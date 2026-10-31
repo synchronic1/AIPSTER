@@ -76,6 +76,20 @@ test('estimated-compatible on a fitting node; validated is never returned', asyn
   assert.ok(!['validated'].includes(res.json.state), 'no recorded qualification exists in Phase 1');
 });
 
+test('Codex-P2: a cached decision never outlives its telemetry freshness', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot(), 298_000); // 2s inside the 5-min window
+  const body = { repo: GGUF, nodeId: node.id, runtime: 'fixture-llama', context: 2048, concurrency: 1 };
+  const first = await evaluate(t, t.alice, body);
+  assert.equal(first.json.state, 'estimated-compatible', first.text);
+  assert.equal(first.json.cached, false);
+  await new Promise((r) => setTimeout(r, 3000)); // telemetry crosses stale; cache TTL has not
+  const second = await evaluate(t, t.alice, body);
+  assert.equal(second.json.state, 'unknown', second.text);
+  assert.equal(second.json.cached, false, 'stale telemetry misses the cache');
+});
+
 test('AC06: two nodes never combine; evaluation uses exactly the named node', async () => {
   const t = await fx();
   const small = await register(t, t.alice, 'small');
