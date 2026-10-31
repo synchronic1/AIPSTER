@@ -227,3 +227,30 @@ test('S-F12: compat writes prune expired rows and cap per-principal growth', asy
   assert.ok(rows.results.length <= 200, `cache capped, got ${rows.results.length}`);
   assert.ok(!rows.results.some((r) => r.cache_key === 'expired-1'), 'expired row pruned');
 });
+
+test('Codex-P2: a runtime the node does not report never estimates compatible (route)', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'bare-box');
+  await report(t, node.id, fixtureSnapshot({ runtimes: [] }));
+  const res = await evaluate(t, t.alice, { repo: GGUF, nodeId: node.id, runtime: 'fixture-llama', context: 2048, concurrency: 1 });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.state, 'blocked', JSON.stringify(res.json));
+  assert.ok(res.json.blocking.some((r) => r.code === 'RUNTIME_NOT_REPORTED'), JSON.stringify(res.json.blocking));
+});
+
+test('Codex-P2: node-reported format, quant, and context restrictions bind the estimate (unit)', async () => {
+  const snap = fixtureSnapshot({
+    runtimes: [{ name: 'fixture-llama', version: '0.1.0', formats: ['safetensors'], quants: ['Q8_0'], maxContext: 1024, adapters: [] }],
+  });
+  const dec = evaluateCompatibility({
+    asset: { id: GGUF, revision: 'a'.repeat(40), format: 'gguf', quant: 'Q4_K_M', totalBytes: 1024 },
+    settings: { context: 2048, concurrency: 1, runtime: 'fixture-llama' },
+    snapshot: snap, snapshotAgeMs: 1000, snapshotAt: new Date().toISOString(),
+    nodeId: 'n_x', principal: 'u_x', nowMs: Date.now(),
+  });
+  assert.equal(dec.state, 'blocked', JSON.stringify(dec.blocking || dec.unknown));
+  const codes = dec.blocking.map((r) => r.code);
+  assert.ok(codes.includes('FORMAT_NOT_REPORTED'), JSON.stringify(codes));
+  assert.ok(codes.includes('QUANT_NOT_REPORTED'), JSON.stringify(codes));
+  assert.ok(codes.includes('CONTEXT_EXCEEDS_NODE'), JSON.stringify(codes));
+});

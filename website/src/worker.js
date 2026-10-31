@@ -219,9 +219,13 @@ async function privateAssetShape(db, row) {
 // move to expired, and their quarantine parts are deleted best-effort
 // (bounded per call). Runs at the top of upload intake, never on a timer.
 async function expireCatalogUploads(db, store, ownerId) {
-  const stale = await all(db, "SELECT id FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'rejected', 'expired') LIMIT 20", ownerId, new Date().toISOString());
+  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'expired') LIMIT 20", ownerId, new Date().toISOString());
   for (const row of stale) {
-    await run(db, "UPDATE catalog_uploads SET state = 'expired', updated_at = ? WHERE id = ?", new Date().toISOString(), row.id);
+    // Rejected rows join the sweep as a crash backstop (Codex-P1): the
+    // reject path deletes parts inline, but a fault between the verdict
+    // write and cleanup would orphan them past the deadline. The verdict
+    // itself is terminal and stays rejected - only bytes are reclaimed.
+    if (row.state !== 'rejected') await run(db, "UPDATE catalog_uploads SET state = 'expired', updated_at = ? WHERE id = ?", new Date().toISOString(), row.id);
     if (store) {
       const parts = await store.list(`upload/${row.id}/part/`);
       for (const p of parts.slice(0, 2010)) await store.del(p.key);
@@ -1521,6 +1525,13 @@ async function handleApi(request, env, url) {
       if (!verdict.ok) {
         await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), nowIso(), uploadId);
         await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
+        // Reclaim quarantine bytes at reject time (Codex-P1): quota
+        // accounting releases rejected sessions, so their parts must go
+        // too - otherwise every rejection orphans bytes outside quota
+        // and repeated failing uploads bypass the account budget. The
+        // expiry sweep re-covers rejected rows as a crash backstop.
+        const doomed = await store.list(`upload/${uploadId}/part/`);
+        for (const p of doomed.slice(0, 2010)) await store.del(p.key);
         return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: verdict.checks });
       }
       // Quota is re-checked at finalize: a concurrent promotion may have

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex, MAX_ASSET_BYTES } from '../src/lib/catalog/validate.mjs';
-import { __resetFixtureStore } from '../src/lib/catalog/store.mjs';
+import { __resetFixtureStore, byteStore } from '../src/lib/catalog/store.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const GGUF = 'fixture-org/tiny-instruct-gguf';
@@ -480,4 +480,50 @@ test('validator units: names, magic, headers, shard math', async () => {
   assert.equal(dup.ok, false);
   const missing = validateManifest({ files: [{ relpath: 'a.gguf', bytes: 8 }] }, () => null);
   assert.equal(missing.ok, false);
+});
+
+test('Codex-P1: a rejected session reclaims its quarantine bytes with its quota', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const bad = new Uint8Array(64).fill(0x42);
+  const b = await begin(t, t.alice, {
+    name: 'bad-bin', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'weights.bin', bytes: bad.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'weights.bin', 0, bad);
+  assert.equal(c.status, 200, c.text);
+  const fin = await finalize(t, t.alice, b.json.id);
+  assert.equal(fin.status, 422, fin.text);
+  assert.equal(fin.json.code, 'ASSET_REJECTED');
+  assert.ok(fin.json.checks.some((x) => x.code === 'SUFFIX_REFUSED'), JSON.stringify(fin.json.checks));
+  const parts = await store.list(`upload/${b.json.id}/part/`);
+  assert.equal(parts.length, 0, 'reject reclaims quarantine bytes, matching the released quota');
+});
+
+test('Codex-P1: the expiry sweep reclaims rejected orphans without flipping the verdict', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const past = new Date(Date.now() - 1000).toISOString();
+  const a = await begin(t, t.alice, {
+    name: 'crash-orphan', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'weights.bin', bytes: 32 }],
+  });
+  assert.equal(a.status, 201, a.text);
+  const ac = await chunk(t, t.alice, a.json.id, 'weights.bin', 0, new Uint8Array(32).fill(0x42));
+  assert.equal(ac.status, 200, ac.text);
+  await t.DB.prepare('UPDATE catalog_uploads SET state = ?, expires_at = ? WHERE id = ?').bind('rejected', past, a.json.id).run();
+  const bb = await begin(t, t.alice, {
+    name: 'sweep-trigger', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  assert.equal(bb.status, 201, bb.text);
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, bb.json.id).run();
+  const touch = await chunk(t, t.alice, bb.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
+  assert.equal(touch.status, 410, touch.text);
+  assert.equal((await store.list(`upload/${a.json.id}/part/`)).length, 0, 'sweep reclaims rejected orphans');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(a.json.id).first();
+  assert.equal(row.state, 'rejected', 'the rejected verdict survives the sweep');
 });

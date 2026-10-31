@@ -139,6 +139,43 @@ export function evaluateCompatibility(input) {
     blocks.push(reason('SETTINGS_INVALID', 'Context and concurrency must be positive.', 'Supply positive settings.'));
   }
 
+  // Node-reported runtimes (Codex-P2): the global matrix says what is
+  // tested anywhere; the node's own fresh report says what THIS node
+  // offers. A runtime the node does not report - or restrictions it
+  // reports that the asset violates - fails closed. Only fresh
+  // snapshots bind: stale/missing telemetry already decides unknown
+  // below and must not gain a second verdict.
+  const snapEarly = input.snapshot || null;
+  const ageEarly = input.snapshotAgeMs;
+  const snapFresh = !!(snapEarly && Number.isSafeInteger(ageEarly) && ageEarly >= 0 && ageEarly <= TELEMETRY_FRESH_MS);
+  if (entry && snapFresh) {
+    const reported = Array.isArray(snapEarly.runtimes) ? snapEarly.runtimes : null;
+    if (!reported) {
+      unknowns.push(reason('RUNTIMES_UNREADABLE', 'Capability report runtimes are unreadable.', 'Re-report node capabilities.'));
+    } else {
+      const nodeRt = reported.find((r) => r && r.name === settings.runtime) || null;
+      if (!nodeRt) {
+        blocks.push(reason('RUNTIME_NOT_REPORTED', `Node reports no ${settings.runtime} runtime.`, 'Report the runtime from the worker or choose a reported one.'));
+      } else {
+        if (Array.isArray(nodeRt.formats) && !nodeRt.formats.includes(asset.format)) {
+          blocks.push(reason('FORMAT_NOT_REPORTED', `Format ${asset.format} is not in the node's ${nodeRt.name} formats.`, 'Choose a node-reported format/runtime pair.'));
+        } else if (!Array.isArray(nodeRt.formats)) {
+          unknowns.push(reason('NODE_FORMATS_UNDECLARED', `Node ${nodeRt.name} declares no formats.`, 'Re-report node capabilities with runtime formats.'));
+        }
+        if (asset.quant !== 'unknown') {
+          if (Array.isArray(nodeRt.quants) && !nodeRt.quants.includes(asset.quant)) {
+            blocks.push(reason('QUANT_NOT_REPORTED', `Quantization ${asset.quant} is not in the node's ${nodeRt.name} quants.`, 'Choose a node-reported quantization.'));
+          } else if (!Array.isArray(nodeRt.quants)) {
+            unknowns.push(reason('NODE_QUANTS_UNDECLARED', `Node ${nodeRt.name} declares no quants.`, 'Re-report node capabilities with runtime quants.'));
+          }
+        }
+        if (Number.isSafeInteger(nodeRt.maxContext) && nodeRt.maxContext >= 0 && context > nodeRt.maxContext) {
+          blocks.push(reason('CONTEXT_EXCEEDS_NODE', `Context ${context} exceeds the node's ${nodeRt.name} maximum ${nodeRt.maxContext}.`, 'Lower the context length.'));
+        }
+      }
+    }
+  }
+
   // Adapter checks (AC08).
   if (input.adapterAsset) {
     const r = checkAdapter(input.adapterAsset.adapter, input.baseAsset || asset, entry || { name: settings.runtime, adapters: [] });
