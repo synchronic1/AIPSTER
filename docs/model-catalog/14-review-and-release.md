@@ -4,8 +4,10 @@
 
 ## Scope
 
-- Branch: `muse/model-catalog` (LOCAL-ONLY, never pushed).
-- Base: `47444a5` (main, Merge PR #47 admin-scaffold).
+- Branch: `muse/model-catalog` (release lane).
+- Base: `47444a5` (main, Merge PR #47 admin-scaffold);
+  merged main `3fa309c` (Merge PR #49 DGM fixture preview)
+  via merge commit (3 mechanical migration-list unions).
 - Commits: `b192554` (Phase 0) → `f1b1a05` (Phase 1) →
   `173268d` (Phase 2) → `3d9a1b3` (Phase 3) → (this commit, Phase 4 docs).
 - Worktree: `aipster-catalog/` beside the main checkout.
@@ -27,12 +29,13 @@
 
 ## Evidence (all local, fixture-only)
 
-- `npm run check` PASS, `npm test` 1002/1002 PASS, `npm run build`
+- `npm run check` PASS, `npm test` 1043/1043 PASS, `npm run build`
   PASS, `npm run bundle` dry-run PASS (final re-run after last edit,
   quiescent tree, preview stopped, port 8791 verified free). One
   transient full-run flake observed earlier (node worker init
   failure in an unrelated file's runner, green alone and on
-  re-run); recorded, not hidden. Check manifest `7b5c389a…`.
+  re-run); recorded, not hidden. Check manifest `bc4fb01f…`
+  (post-DGM-merge tree; 1002 catalog-side + ~41 DGM tests).
 - Renders 01–13: real headless-Edge captures against local fixture
   `wrangler dev` (owner session, seeded `render-box` telemetry).
 - Renders 14–20: interactive CDP-driven Edge journeys, same fixture
@@ -147,31 +150,43 @@ live worker qualification under this release.
   PR → CI green → independent reviews → merge with
   `--match-head-commit`, no self-approval. No open PRs and no
   competing catalog writer at release start.
-- DGM collision (found by code review during this pass, after the
-  initial survey): branch `muse/dgm-fixture-preview`
-  (`9978ac3`) carries `0017_dgm_preview.sql` (tables
-  `dgm_preview_*`, disjoint from catalog tables) behind DRAFT PR
-  #49. Same migration number, different file — no table overlap,
-  renumber-only coordination. Merge order is catalog-first: this
-  lane ships under Peter's direction with a gated candidate while
-  #49 is draft; DGM renumbers to 0019 on rebase after this
-  merges. No DMs were available/used for cross-lane agreement;
-  the order is recorded here and in the catalog PR, and the
-  merger MUST re-verify immediately before merging (main still
-  `47444a5`, #49 still draft/open — if #49 merged first, this
-  branch renumbers to 0019/0020 instead and re-gates).
+- DGM collision, RESOLVED DGM-first: code review found branch
+  `muse/dgm-fixture-preview` carrying `0017_dgm_preview.sql`
+  (tables `dgm_preview_*`, disjoint from catalog tables) behind
+  DRAFT PR #49 — same migration number as catalog's 0017. The
+  merge-time re-verification gate then caught #49 merging to
+  main (`3fa309c`) mid-pass, so the documented fallback ran:
+  catalog renumbered 0017/0018 → 0018/0019 (files, headers,
+  shim list, tests, docs; F8 comment now points at the 0019
+  header) and merged `origin/main` via merge commit. The 3
+  merge conflicts were mechanical migration-list unions
+  (d1-shim, federation-main-upgrade, integration-boundaries
+  count 19); worker.js/schema.js auto-merged cleanly (DGM
+  import + version 0.5.0 + readiness arg compose with the
+  catalog tables already in the readiness contract). The
+  renumber commit also strips the last worker.js BOM (a
+  stacked second BOM the first strip missed), adds
+  FAT_CIGAM_64, and fixes the seeded-shape comment. Reviewed
+  commits keep their SHAs (merge, not rebase); only the merge
+  resolution + renumber are new surface.
 - Release-candidate reviews: security READY on `c374be8` (no
   medium+ findings; 4 infos, no action). Code review on
   `c374be8`: code fully verified + suite independently
-  re-run green, verdict HOLD solely for the DGM process
-  collision above. Code findings 2 (runtime SQL hand-mirrored),
-  3 (PK-conflict comment overstated), 4 (release guard should
-  also check post-state), and 8 (FAT_CIGAM unscreened) are all
-  fixed in the follow-up commit: `TRANSITION_SQL` exported from
-  the worker and imported by the runtime test, release guarded
-  on marker + post-state with a stale-loser regression proof,
-  comments corrected, fat-magic family completed. BOM churn
-  flagged by both reviews is stripped (encoding-only commit).
+  re-run green, verdict HOLD solely for the extrinsic DGM
+  process collision (now resolved above). Code findings 2
+  (runtime SQL hand-mirrored), 3 (PK-conflict comment
+  overstated), 4 (release guard should also check
+  post-state), and 8 (FAT_CIGAM unscreened) are all fixed:
+  `TRANSITION_SQL` exported from the worker and imported by
+  the runtime test, release guarded on marker + post-state
+  with a stale-loser regression proof, comments corrected,
+  fat-magic family completed (incl. FAT_CIGAM_64). Focused
+  delta re-review: READY for `f95758e` (2 low + 3 info, none
+  blocking; the lows/infos are the BOM remainder, an off-by-one
+  in a doc contingency line, FAT_CIGAM_64, and two comment
+  wordings — all folded into the renumber commit). BOM churn
+  flagged by both reviews is stripped (encoding-only commit
+  plus the final stacked-BOM removal).
 
 ## Local reproduction
 
@@ -228,19 +243,20 @@ gh pr create --base main --head muse/model-catalog --title "…" --body "…"
 ```
 
 Merge prerequisites: independent review clearance of the exact SHAs;
-CI green; DGM 0017 collision coordinated catalog-first with a
-merge-time re-verification (main still `47444a5`, PR #49 still
-draft/open — see the release pass above); files overlap the chain
-lane — coordinate with the release owner before merge.
+CI green; main still `3fa309c` at merge (re-verify: no new merge
+since the branch's merge commit); files overlap the chain lane —
+coordinate with the release owner before merge.
 
 Deploy prerequisites: D1 backup (private dir, never committed);
-confirm prod journal exactly 0001–0015; apply 0016 (carried #47,
-never deployed) + 0017→0018 in filename order; readiness probe
-(journal rows, `admin_grants` + catalog tables present); no new
-secrets (uses `BETTER_AUTH_SECRET`; `CATALOG_STORE` binding
-deferred by design); health/readiness + smoke (login, admin
-routes fail closed without grants, compat unknown without
-telemetry, plan refusal live, catalog fixture journeys).
+read the live prod journal and apply every pending migration in
+filename order (expect 0016 admin + 0017 DGM + 0018/0019 catalog
+unless a newer deploy already applied some — never assume);
+readiness probe (journal rows, `admin_grants` + `dgm_preview_*` +
+catalog tables present); no new secrets (uses `BETTER_AUTH_SECRET`;
+`CATALOG_STORE` binding deferred by design); health/readiness +
+smoke (login, admin routes fail closed without grants, compat
+unknown without telemetry, plan refusal live, catalog fixture
+journeys).
 
 Rollback: restore the D1 backup; redeploy the previous release.
 Migrations are additive (new tables/columns only).
@@ -249,7 +265,8 @@ Migrations are additive (new tables/columns only).
 
 R2 provisioning, credential enrollment, paid calls, live
 inference, live worker qualification. Push, PR, coordinated merge,
-prod migration (0016+0017+0018), and deploy are authorized under
-the release pass above and proceed through the normal process
-(CI green, independent reviews recorded, `--match-head-commit`,
-no self-approval, runbook-order migration + deploy).
+prod migration (pending journal entries through 0019), and deploy
+are authorized under the release pass above and proceed through
+the normal process (CI green, independent reviews recorded,
+`--match-head-commit`, no self-approval, runbook-order migration
++ deploy).
