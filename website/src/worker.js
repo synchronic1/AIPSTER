@@ -1987,8 +1987,9 @@ async function handleApi(request, env, url) {
         // committed fence token, so a holder that lost its lease mid-flight
         // writes zero rows. No changes() chaining: each predicate reads
         // committed state independently, which is sound on every D1.
-        // (Asset blobs put above stay orphans on a fenced-out commit: one
-        // bounded footprint per lease steal, with no rows pointing at it.)
+        // (Asset blobs put above stay orphans on a fenced-out commit, and on
+        // any mid-loop raced return before the batch: one bounded footprint
+        // per attempt, with no rows pointing at it.)
         const committed = await db.batch([
           db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
             SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?
