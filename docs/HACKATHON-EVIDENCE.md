@@ -1,15 +1,29 @@
 # AIPSTER hackathon evidence
 
-Evidence checked on 2026-10-31. This packet separates the public Cloudflare
+Evidence checked on 2026-10-31 (time of day not recorded). This packet separates the public Cloudflare
 site, the local worker, and the standalone Python prototype. It does not infer
 live model execution from configuration, fixtures, or screenshots.
 
-## Demo and version tuple
+## Current release tuple (release-owner update, 2026-10-31 21:39 UTC)
+
+After this packet was written, PRs #52, #53, #57, #58 and #56 merged and
+deployed. At 2026-10-31 21:39 UTC, `main` and production were both
+[`06d90bdb3cb82a1b15e5b1890992d7cdcc7caff2`](https://github.com/synchronic1/AIPSTER/commit/06d90bdb3cb82a1b15e5b1890992d7cdcc7caff2):
+[main checks 41243684037](https://github.com/synchronic1/AIPSTER/actions/runs/41243684037)
+succeeded, and
+[production deploy 41244040453](https://github.com/synchronic1/AIPSTER/actions/runs/41244040453)
+succeeded. Its live verification reported `git_commit` 06d90bd, source manifest
+SHA-256 `41bbe413f63f58668431c4334bf70689688d769ebdeab4a2c040f2c709091c53`,
+26 assets, and anonymous access denied. The Fabric adviser (#58) shipped
+flag-gated and off. No signed-in session, live inference or Meta model call is
+claimed. The table below is the original snapshot, kept as historical evidence.
+
+## Demo and version tuple (historical snapshot, 2026-10-31, time not recorded)
 
 | Surface | Source identity | Verification and result | Boundary |
 |---|---|---|---|
 | Public Cloudflare site | [deployed source](https://github.com/synchronic1/AIPSTER/tree/d1de902eb90067459615714941ea048f719d9edd/website); Worker `VERSION` `0.5.0`; site revision `2026-10-29.2` | [Production deploy run 41206389611](https://github.com/synchronic1/AIPSTER/actions/runs/41206389611) succeeded. Live [`deployment.json`](https://aipster.net/deployment.json) identifies commit `d1de902eb90067459615714941ea048f719d9edd` and source manifest SHA-256 `3e676f47c2df98588ce781954dcf3eacf6491dff9fa7bc5e02ad78b2fa278b30`. | Landing page and sign-in shell load. No authenticated session was available; no signed-in screen or live inference is claimed. |
-| Current AIPSTER source | [`main` at `0430104`](https://github.com/synchronic1/AIPSTER/commit/043010469cdaa5d7e532fab93afdeca5d3520a92) | [Public site checks 41224609696](https://github.com/synchronic1/AIPSTER/actions/runs/41224609696) passed `npm run check`, `npm test`, `npm run build`, and the local Wrangler `npm run bundle` dry run. The website tree is unchanged from the deployed `d1de902`; the later main change is in `local-worker/`. | A passing build or bundle dry run is not a production deploy. |
+| Source at snapshot (`0430104`) | [`main` at `0430104`](https://github.com/synchronic1/AIPSTER/commit/043010469cdaa5d7e532fab93afdeca5d3520a92) | [Public site checks 41224609696](https://github.com/synchronic1/AIPSTER/actions/runs/41224609696) passed `npm run check`, `npm test`, `npm run build`, and the local Wrangler `npm run bundle` dry run. At that snapshot the website tree was unchanged from the deployed `d1de902` and the later main change was in `local-worker/`. This no longer holds: later merges (including #58) changed `website/`. | A passing build or bundle dry run is not a production deploy. |
 | Standalone local worker | [`local-worker/`](https://github.com/synchronic1/AIPSTER/tree/043010469cdaa5d7e532fab93afdeca5d3520a92/local-worker); mock config [`configs/mock.toml`](https://github.com/synchronic1/AIPSTER/blob/043010469cdaa5d7e532fab93afdeca5d3520a92/local-worker/configs/mock.toml) | [Windows mock-install run 41209814151](https://github.com/synchronic1/AIPSTER/actions/runs/41209814151) passed on `5d91c1f32dbe79a1345cdb5c48d9b10332b6e0a9`, which is included in current main. It installed the worker and passed the installation and pairing test commands in CI. | The fixture uses `kind = "mock"` and model `mock-summary`; output is simulated. The [quickstart](https://github.com/synchronic1/AIPSTER/blob/043010469cdaa5d7e532fab93afdeca5d3520a92/local-worker/README.md) says this is not an AIPSTER execution connection and `/api/jobs` remains disabled. No native model or inference was tested. |
 | Cloudflare DGM preview | [`preview.mjs`](https://github.com/synchronic1/AIPSTER/blob/043010469cdaa5d7e532fab93afdeca5d3520a92/website/src/dgm/preview.mjs), [`router.mjs`](https://github.com/synchronic1/AIPSTER/blob/043010469cdaa5d7e532fab93afdeca5d3520a92/website/src/dgm/router.mjs), and [API tests](https://github.com/synchronic1/AIPSTER/blob/043010469cdaa5d7e532fab93afdeca5d3520a92/website/tests/dgm-preview-api.test.mjs) | Covered by the passing public-site test run above. Tests use an in-memory D1 shim and deterministic fixtures. | The route is flag-gated (`DGM_PREVIEW_ENABLED === "1"`); every evaluation is labeled `fixture`. This is not the Python harness, live DGM evaluation, or inference. Production activation was not established. |
 | Python DGM prototype | Separate local `stack/` repository, HEAD `be4cd305be29beeac35514baa8aae69ac072ea13`; dirty, no configured remote, not part of public AIPSTER main | The local `stack/README.md` gives `uv run python scripts/demo_mock.py` and `uv run pytest tests/coord -q`. Its `TASK-RESULT-NEXT.md` reports 172 passed, 0 failed, 0 skipped, 0 blocked, but does not pin that result to a clean source SHA. | The local README labels this pre-event prototype and says results use Dendrite mock workers (`simulated: true`) and no real model has run. The local tree is dirty, so the reported test result is not a clean, commit-reproducible release result. |
@@ -23,7 +37,7 @@ live model execution from configuration, fixtures, or screenshots.
   counts; no skip count is asserted here.
 - **Historical failure:** site-check run 41213604017 failed on an earlier
   model-catalog PR SHA (`d2f3d16`); a later check on `c271088` succeeded
-  (41215470047), and current main checks succeeded. The older failure log was
+  (41215470047), and main checks at that time succeeded. The older failure log was
   not inspected, so no root cause is asserted.
 - **Not run:** no heavy local suite, live inference, model download, GPU test,
   or signed-in end-to-end test was performed for this packet.
@@ -57,17 +71,24 @@ completed. Unauthenticated `GET /api/inventory` and `GET /api/keys` returned
 401; `GET /api/auth/get-session` returned `null`. No authorized test identity
 was available, so demo login and signed-in behavior remain unverified.
 
-**Release metadata needs owner reconciliation:** the live `deployment.json`
-identifies `d1de902` but says `auth_deployed: false`. Live OAuth initiation
+**Release metadata (historical observation, d1de902):** the live `deployment.json`
+identified `d1de902` but said `auth_deployed: false`. Live OAuth initiation
 currently redirects to GitHub, and the live `release.json` also says
 `auth_deployed: false` while naming older `source_commit` `25bf2ac`. Treat
 `deployment.json` as the deployed code identity; clarify what the auth flag
-means before claiming public signed-in functionality.
+means before claiming public signed-in functionality. *Resolved by source
+inspection (release owner, 2026-10-31):* `auth_deployed: false` is a hardcoded
+build placeholder (`website/scripts/build.mjs`, asserted by `check.mjs`), and
+`release.json`'s `source_commit` pins the messaging source. Neither measures
+whether live sign-in works.
 
 The README draft reviewed is Muse commit
 `3fba9fac4e6da6be61b055e3650d2d14a370de2f` on `muse/demo-readme-hackathon`,
 now published in [PR #54](https://github.com/synchronic1/AIPSTER/pull/54) and
-not yet merged. I did not edit that branch. Its two screenshot assets and
+not yet merged. I did not edit that branch. *Scope note:* this audit covers
+`3fba9fa` only. PR #54 later changed (for example `1919b14`, which added the
+scaffold qualification and auth-placeholder wording), and those later heads are
+not reviewed here. Its two screenshot assets and
 shot-list path exist in the commit, and the screenshots visually match the
 public landing and sign-in shell. No recorded video link or video asset was
 present; the draft correctly offers a 60–90 second shot list and identifies
