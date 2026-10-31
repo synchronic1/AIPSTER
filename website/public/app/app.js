@@ -214,7 +214,7 @@ async function loadOverview() {
 // progress stage derives from the tab's inventory snapshot (setup /
 // pairing / reachable); it never claims an unverified state.
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
-const DOCS_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
+const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
   quickstart: DOCS_TREE + 'README.md',
