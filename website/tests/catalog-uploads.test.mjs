@@ -1709,3 +1709,63 @@ test('Codex-sec-P2: suffix-refused files report suffix, not magic (no double scr
   assert.ok(f.json.checks.some((x) => x.code === 'SUFFIX_REFUSED'), JSON.stringify(f.json.checks));
   assert.ok(!f.json.checks.some((x) => x.code === 'MAGIC_REFUSED'), JSON.stringify(f.json.checks));
 });
+
+test('Codex-P1: pass 2 re-verifies the digest (no unvalidated promote)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'swap', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'a.gguf', bytes: 8 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < 8; i++) {
+    const c = await chunk(t, t.alice, v.json.id, 'a.gguf', i, new Uint8Array([0x47]));
+    assert.equal(c.status, 200, c.text);
+  }
+  // Swap the first four parts for ELF magic between the two passes: same
+  // length, unvalidated bytes. The hook lands on the first DB read after
+  // pass 1 (the quota re-check); the test-side store shares the isolate
+  // map with the worker's, so the write is visible to pass 2.
+  const realPrepare = t.env.DB.prepare;
+  let fired = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.includes('FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets')) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realFirst = b.first;
+        b.first = async (...a) => {
+          if (!fired) {
+            fired = true;
+            const elf = [0x7f, 0x45, 0x4c, 0x46];
+            for (let i = 0; i < 4; i++) {
+              await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/a.gguf`, new Uint8Array([elf[i]]));
+            }
+          }
+          return realFirst(...a);
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const f1 = await finalize(t, t.alice, v.json.id);
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(fired, true, 'the swap landed between passes');
+  assert.equal(f1.status, 409, f1.text);
+  assert.equal(f1.json.code, 'FINALIZE_IN_PROGRESS');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'uploading', 'the claim releases for the retry');
+  const assets = await t.DB.prepare('SELECT COUNT(*) n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first();
+  assert.equal(assets.n, 0, 'nothing committed');
+  const blobs = await store.list('asset/');
+  assert.equal(blobs.length, 0, 'no asset bytes written');
+  // Convergence: restore the validated bytes and the retry promotes.
+  for (let i = 0; i < 4; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/a.gguf`, new Uint8Array([0x47]));
+  }
+  const f2 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f2.status, 201, f2.text);
+});

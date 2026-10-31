@@ -1806,8 +1806,14 @@ async function handleApi(request, env, url) {
         // or a raced-409 response when the listing went stale under us: a
         // part vanishing, growing, or shrinking between list and fetch means
         // a concurrent cleanup moved, so the next attempt re-lists fresh
-        // instead of throwing a 500 or burning a digest strike.
-        const assembleFile = async (mine, f) => {
+        // instead of throwing a 500 or burning a digest strike. Pass 2 also
+        // passes the pass-1 digest (Codex-P1): a chunk PUT that reserved
+        // before the claim can land between the two passes, and a
+        // same-length replacement sails through the length guards - so the
+        // re-assembled bytes re-hash and must match before anything
+        // promotes. Digest-match means byte-identical to the screened
+        // bytes, so no re-screening is needed.
+        const assembleFile = async (mine, f, expectedSha = null) => {
           const raced = async () => {
             const resetRaced = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
             if (Number(resetRaced.meta.changes) !== 1) return claimLost();
@@ -1822,6 +1828,11 @@ async function handleApi(request, env, url) {
             at += b.length;
           }
           if (at !== f.bytes) return raced();
+          if (expectedSha !== null) {
+            const reDigest = await crypto.subtle.digest('SHA-256', flat);
+            const reSha = Array.from(new Uint8Array(reDigest), (x) => x.toString(16).padStart(2, '0')).join('');
+            if (reSha !== expectedSha) return raced();
+          }
           return flat;
         };
         // Pass 1: assemble + digest + screen each file, releasing after
@@ -1957,7 +1968,7 @@ async function handleApi(request, env, url) {
         // yet, so a failure here stays retryable; a part that moved since
         // pass 1 maps to the same retryable 409 through assembleFile.
         for (const f of manifest.files) {
-          const flat = await assembleFile(byRel.get(f.relpath) || [], f);
+          const flat = await assembleFile(byRel.get(f.relpath) || [], f, f.sha256);
           if (!(flat instanceof Uint8Array)) return flat;
           await store.put(`asset/${assetId}/${f.relpath}`, flat);
         }
