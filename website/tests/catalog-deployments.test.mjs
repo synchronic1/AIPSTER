@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson, TEST_SECRET } from './d1-shim.mjs';
 import { fixtureSnapshot, fixtureSmallSnapshot } from '../src/lib/catalog/fixtures.mjs';
+import { budgetWindow } from '../src/lib/quotas.js';
 import { __resetFixtureTransport, __fixtureDispatchCount, __fixtureUncancel, __fixtureAckCancel, __fixtureWasCancelled, workerTransport } from '../src/lib/catalog/transport.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
@@ -881,4 +882,50 @@ test('N7: repeat cancel while cancelling replays without a self-transition', asy
   assert.equal(second.json.state, 'cancelling');
   assert.equal(second.json.duplicate, true);
   assert.equal(second.json.events.length, n0, 'no cancelling→cancelling event lands');
+});
+
+test('Codex-sec-P2: spent write budgets reject plan creation before any write', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const p = await plan(t, t.alice, { nodeId: node.id });
+  assert.equal(p.status, 429, p.text);
+  assert.equal(p.json.code, 'WRITE_RATE_LIMITED');
+  const audits = await t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE actor_id = ? AND action = 'catalog.plan.create'").bind('u_alice').first('n');
+  assert.equal(audits, 0, 'no per-plan audit row escapes the budget');
+});
+
+test('Codex-sec-P2: spent write budgets reject deployment admission before any write', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  assert.equal(p.status, 201, p.text);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const d = await execute(t, t.alice, 'op-key-budget-1', p.json.planToken);
+  assert.equal(d.status, 429, d.text);
+  assert.equal(d.json.code, 'WRITE_RATE_LIMITED');
+  const rows = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_deployments WHERE owner_id = ?').bind('u_alice').first('n');
+  assert.equal(rows, 0, 'no deployment, reservation, or event rows escape the budget');
+});
+
+test('Codex-P2: deleting a resource removes its capability snapshot and reservations', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'doomed-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  assert.equal(p.status, 201, p.text);
+  const d = await execute(t, t.alice, 'op-key-doom-1', p.json.planToken);
+  assert.equal(d.status, 202, d.text);
+  const del = await readJson(await t.call(`/api/inventory/${node.id}`, { method: 'DELETE', headers: sess(t, t.alice) }));
+  assert.equal(del.status, 200, del.text);
+  const snap = await t.DB.prepare('SELECT COUNT(*) AS n FROM node_capabilities WHERE node_id = ?').bind(node.id).first('n');
+  assert.equal(snap, 0, 'capability snapshot goes with its resource (no FK orphan)');
+  const res = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_reservations WHERE node_id = ?').bind(node.id).first('n');
+  assert.equal(res, 0, 'reservations go with their node');
 });

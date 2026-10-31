@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { fixtureSnapshot } from '../src/lib/catalog/fixtures.mjs';
+import { heartbeatWindow } from '../src/lib/quotas.js';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 
@@ -147,4 +148,19 @@ test('capability reads follow owner/grant access; missing rows are explicit', as
   assert.equal(g.status, 201, g.text);
   const bobOk = await get(t.bob);
   assert.equal(bobOk.status, 200, 'live grant permits reads');
+});
+
+test('Codex-sec-P2: spent heartbeat budgets reject capability reports before any write', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'box');
+  const key = await mintHeartbeat(t, t.alice, node.id);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', heartbeatWindow(), 500).run();
+  const res = await post(t, node.id, key.secret, validBody());
+  assert.equal(res.status, 429, res.text);
+  assert.equal(res.json.code, 'HEARTBEAT_OWNER_QUOTA');
+  const snap = await t.DB.prepare('SELECT COUNT(*) AS n FROM node_capabilities WHERE node_id = ?').bind(node.id).first('n');
+  assert.equal(snap, 0, 'no snapshot row escapes the budget');
+  const r = await t.DB.prepare('SELECT heartbeat_at FROM resources WHERE id = ?').bind(node.id).first();
+  assert.equal(r.heartbeat_at, null, 'liveness is untouched by a rejected report');
 });

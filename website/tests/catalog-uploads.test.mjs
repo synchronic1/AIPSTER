@@ -621,3 +621,18 @@ test('Codex-P2: swept rejections stop occupying the expiry batch (no starvation)
   assert.equal(rrow.state, 'rejected', 'rejected verdicts survive the sweep');
   assert.equal(rrow.byte_ref, 'swept', 'swept rejections are marked out of the predicate');
 });
+
+test('Codex-P2: shard-index weight paths resolve against the index location', async () => {
+  const st = tinySafetensors();
+  const idx = new TextEncoder().encode(JSON.stringify({
+    metadata: { total_size: st.length },
+    weight_map: { w: 'nested/model.safetensors' },
+  }));
+  const files = [
+    { relpath: 'nested/model.safetensors', bytes: st.length },
+    { relpath: 'model.safetensors.index.json', bytes: idx.length },
+  ];
+  const peek = (r) => (r === 'nested/model.safetensors' ? st : (r === 'model.safetensors.index.json' ? idx : null));
+  const v = validateManifest({ files }, peek);
+  assert.equal(v.ok, true, JSON.stringify(v.checks));
+});

@@ -103,7 +103,7 @@ export function screenSafetensors(relpath, size, peek) {
 // Shard-index consistency: every weight file the index names must be
 // present with matching byte counts, and every weight file present must
 // be named (no silent extras, no silent gaps).
-export function checkShardIndex(manifestFiles, indexJson) {
+export function checkShardIndex(manifestFiles, indexJson, indexRelpath = '') {
   let index;
   try {
     index = typeof indexJson === 'string' ? JSON.parse(indexJson) : indexJson;
@@ -112,14 +112,25 @@ export function checkShardIndex(manifestFiles, indexJson) {
   }
   const map = (index && index.weight_map) || {};
   if (!map || typeof map !== 'object' || !Object.keys(map).length) return 'shard index has no weight map';
-  const named = new Set(Object.values(map).map((v) => String(v).toLowerCase()));
-  const present = new Set(manifestFiles.filter((f) => f.relpath.toLowerCase().endsWith('.safetensors')).map((f) => f.relpath.split('/').pop().toLowerCase()));
+  // Weight values resolve against the index location (Codex-P2): bare
+  // names sit beside the index, values with a directory are asset-root
+  // paths. Manifest paths compare whole, never by basename: comparing
+  // basenames rejects valid nested layouts (`nested/model.safetensors`
+  // against a root index) and could confuse two same-named shards.
+  const indexDir = indexRelpath.includes('/') ? indexRelpath.slice(0, indexRelpath.lastIndexOf('/')) : '';
+  const resolve = (v) => {
+    const s = String(v);
+    if (s.includes('/')) return s.toLowerCase();
+    return (indexDir ? indexDir + '/' + s : s).toLowerCase();
+  };
+  const named = new Set(Object.values(map).map(resolve));
+  const present = new Set(manifestFiles.filter((f) => f.relpath.toLowerCase().endsWith('.safetensors')).map((f) => f.relpath.toLowerCase()));
   for (const n of named) {
     if (!present.has(n)) return `shard index names missing file ${n}`;
   }
   for (const f of manifestFiles) {
     const base = f.relpath.split('/').pop();
-    if (f.relpath.toLowerCase().endsWith('.safetensors') && !named.has(base.toLowerCase())) return `weight file ${base} is unnamed by the shard index`;
+    if (f.relpath.toLowerCase().endsWith('.safetensors') && !named.has(f.relpath.toLowerCase())) return `weight file ${base} is unnamed by the shard index`;
   }
   const total = Number(index.metadata && index.metadata.total_size);
   if (Number.isSafeInteger(total)) {
@@ -188,7 +199,7 @@ export function validateManifest(manifest, peek = () => null, opts = {}) {
       checks.push(check('SHARD_INDEX_MISSING', false, 'Shard index names bytes that never arrived.'));
     } else {
       const text = new TextDecoder().decode(head.slice(0, MAX_MANIFEST_BYTES));
-      const err = checkShardIndex(files, text);
+      const err = checkShardIndex(files, text, indexFile);
       if (err) checks.push(check('SHARD_INDEX', false, err));
     }
   }

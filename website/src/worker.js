@@ -712,12 +712,18 @@ async function handleApi(request, env, url) {
       // wrong credential) instead of vanishing into AUTH_REQUIRED. Grants
       // and jobs cannot dangle (NOT NULL references), so their rows are
       // deleted; the audit trail (grant.create, resource.delete) records
-      // what existed. Pairing claims keep their history with resource_id
+      // what existed. Capability snapshots and held reservations reference
+      // the node by FK (0018/0019), so their rows are deleted too; without
+      // this the batch fails under FK enforcement and the node cannot be
+      // removed. Deployment history rows carry no FK and are retained.
+      // Pairing claims keep their history with resource_id
       // nulled, which the reclaim path treats as invalid. The heartbeat
       // intake's row-existence check rejects further beats either way.
       const now = nowIso();
       const owned = `EXISTS(SELECT 1 FROM resources r JOIN "user" u ON u.id = r.owner_id WHERE r.id = ? AND r.owner_id = ? AND u.disabled = 0)`;
       const deleted = await db.batch([
+        db.prepare(`DELETE FROM node_capabilities WHERE node_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        db.prepare(`DELETE FROM catalog_reservations WHERE node_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM jobs WHERE (resource_id = ? OR grant_id IN (SELECT id FROM grants WHERE resource_id = ?)) AND ${owned}`).bind(r.id, r.id, r.id, me()),
         db.prepare(`DELETE FROM grants WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(now, r.id, r.id, me()),
@@ -726,7 +732,7 @@ async function handleApi(request, env, url) {
         db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
         db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
       ]);
-      if (Number(deleted[5].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      if (Number(deleted[7].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       return json(200, { ok: true });
     }
   }
@@ -894,9 +900,10 @@ async function handleApi(request, env, url) {
       }
       const capError = validateCapabilityBody(body);
       if (capError) return json(400, capError);
-      // Cost guard (not security): at most one report per 25s window per
-      // node keeps telemetry from becoming a write amplifier. A lost race
-      // only permits an extra authentic write, never a wrong one.
+      // Cost guard fast path: at most one report per 25s window per node.
+      // This probe is an optimization only - the conditional UPDATE below
+      // still enforces the window atomically, so racers cannot slip
+      // through on a shared prior timestamp.
       const prev = await first(db, 'SELECT reported_at FROM node_capabilities WHERE node_id = ?', resourceId);
       if (prev && prev.reported_at) {
         const last = Date.parse(prev.reported_at);
@@ -904,14 +911,77 @@ async function handleApi(request, env, url) {
           return json(429, { error: 'Capability report too soon; back off and retry.', code: 'CAPABILITIES_TOO_SOON', retryAfterSec: 25 }, { 'Retry-After': '25' });
         }
       }
+      // Aggregate ceilings (Codex-sec-P2): reports draw from the shared
+      // heartbeat budgets, so N nodes cannot multiply past the owner and
+      // global write ceilings. Mirror of the heartbeat intake: read-only
+      // fast paths, then ONE batch where the liveness UPDATE carries the
+      // window + caps + key checks, the snapshot upsert runs only on
+      // admission, and the counters chain behind it. An accepted report
+      // moves every statement by exactly one; every loser (cap, window,
+      // key, owner or resource) writes zero rows. There is no claim to
+      // refund. Tail note: the admission UPDATE moves heartbeat_at while
+      // the window reads reported_at, so a same-millisecond collision can
+      // spuriously lose admission and classify 404; the next retry wins.
+      const budgets = heartbeatBudgets(env);
+      const hbWindow = heartbeatWindow();
+      const quotaSpent = (code, error) => {
+        const retrySec = secondsUntilNextHour();
+        return json(429, { error, code, retryAfterSec: retrySec }, { 'Retry-After': String(retrySec) });
+      };
+      const globalCount = await heartbeatBucketCount(db, HEARTBEAT_GLOBAL_ID, hbWindow);
+      if (globalCount !== null && globalCount >= budgets.global) return quotaSpent('HEARTBEAT_GLOBAL_QUOTA', 'Deployment heartbeat budget is spent for the hour; back off and retry.');
+      if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return quotaSpent('HEARTBEAT_OWNER_QUOTA', 'Heartbeat budget for this owner is spent for the hour; back off and retry.');
+      if (globalCount === null) await pruneHeartbeatBuckets(db, hbWindow);
       const now = nowIso();
-      await run(db, `INSERT INTO node_capabilities (node_id, schema_version, reported_at, os, arch, runtimes_json, mem_json, disk_json, workload_json)
-        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(node_id) DO UPDATE SET schema_version = 1, reported_at = excluded.reported_at, os = excluded.os, arch = excluded.arch,
-        runtimes_json = excluded.runtimes_json, mem_json = excluded.mem_json, disk_json = excluded.disk_json, workload_json = excluded.workload_json`,
-        resourceId, now, body.os, body.arch, JSON.stringify(body.runtimes), JSON.stringify(body.mem), JSON.stringify(body.disk), JSON.stringify(body.workload || {}));
-      await run(db, 'UPDATE resources SET heartbeat_at = ?, online = 1 WHERE id = ?', now, resourceId);
-      return json(200, { ok: true, nodeId: resourceId, reportedAt: now, schemaVersion: 1 });
+      const windowStart = new Date(Date.now() - HEARTBEAT_MIN_INTERVAL_MS).toISOString();
+      const [claimed, , ownerCharge, globalCharge] = await db.batch([
+        db.prepare(
+          `UPDATE resources SET heartbeat_at = ?, online = 1 WHERE id = ?
+             AND owner_id = ?
+             AND ((SELECT reported_at FROM node_capabilities WHERE node_id = ?) IS NULL
+               OR (SELECT reported_at FROM node_capabilities WHERE node_id = ?) <= ?)
+             AND EXISTS (SELECT 1 FROM "user" u WHERE u.id = resources.owner_id AND COALESCE(u.disabled, 0) != 1)
+             AND EXISTS (SELECT 1 FROM key_verifiers k WHERE k.id = ? AND k.resource_id = ? AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at >= ?))
+             AND ${HEARTBEAT_CAPS_SQL}`)
+          .bind(now, resourceId, actor.key.owner_id, resourceId, resourceId, windowStart, actor.key.id, resourceId, now,
+            actor.key.owner_id, hbWindow, budgets.owner, hbWindow, budgets.global),
+        db.prepare(
+          `INSERT INTO node_capabilities (node_id, schema_version, reported_at, os, arch, runtimes_json, mem_json, disk_json, workload_json)
+           SELECT ?, 1, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1
+           ON CONFLICT(node_id) DO UPDATE SET schema_version = 1, reported_at = excluded.reported_at, os = excluded.os, arch = excluded.arch,
+           runtimes_json = excluded.runtimes_json, mem_json = excluded.mem_json, disk_json = excluded.disk_json, workload_json = excluded.workload_json`)
+          .bind(resourceId, now, body.os, body.arch, JSON.stringify(body.runtimes), JSON.stringify(body.mem), JSON.stringify(body.disk), JSON.stringify(body.workload || {})),
+        ...heartbeatCounterStatements(db, actor.key.owner_id, hbWindow),
+      ]);
+      if (Number(claimed.meta.changes) === 1) {
+        // The batch has committed the report. If a counter upsert did not
+        // register its change (a same-millisecond identical upsert moves
+        // zero rows), complete the charge rather than leave an accepted
+        // report uncharged. This charges, never refunds.
+        const [ownerUpsert, globalUpsert] = heartbeatCounterStatements(db, actor.key.owner_id, hbWindow, { unconditional: true });
+        if (Number(ownerCharge.meta.changes) !== 1) await ownerUpsert.run();
+        if (Number(globalCharge.meta.changes) !== 1) await globalUpsert.run();
+        return json(200, { ok: true, nodeId: resourceId, reportedAt: now, schemaVersion: 1 });
+      }
+      // Admission lost: nothing was written. Map the reason with read-only
+      // probes, mirroring the heartbeat classifier.
+      if ((await heartbeatBucketCount(db, HEARTBEAT_GLOBAL_ID, hbWindow) ?? 0) >= budgets.global) return quotaSpent('HEARTBEAT_GLOBAL_QUOTA', 'Deployment heartbeat budget is spent for the hour; back off and retry.');
+      if ((await heartbeatBucketCount(db, actor.key.owner_id, hbWindow) ?? 0) >= budgets.owner) return quotaSpent('HEARTBEAT_OWNER_QUOTA', 'Heartbeat budget for this owner is spent for the hour; back off and retry.');
+      const keyRow = await first(db, 'SELECT revoked_at, expires_at FROM key_verifiers WHERE id = ?', actor.key.id);
+      if (!keyRow || keyRow.revoked_at) return json(401, { error: 'API key revoked.', code: 'KEY_REVOKED' });
+      if (keyRow.expires_at && Date.parse(keyRow.expires_at) < Date.now()) return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });
+      const targetNow = await first(db, 'SELECT owner_id FROM resources WHERE id = ?', resourceId);
+      if (!targetNow || targetNow.owner_id !== actor.key.owner_id) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      const ownerNow = await first(db, 'SELECT disabled FROM "user" WHERE id = ?', targetNow.owner_id);
+      if (!ownerNow || Number(ownerNow.disabled) === 1) return json(401, { error: 'Sign-in or API key required.', code: 'AUTH_REQUIRED' });
+      const last = await first(db, 'SELECT reported_at FROM node_capabilities WHERE node_id = ?', resourceId);
+      if (last && last.reported_at) {
+        const at = Date.parse(last.reported_at);
+        if (Number.isFinite(at) && HEARTBEAT_MIN_INTERVAL_MS - (Date.now() - at) > 0) {
+          return json(429, { error: 'Capability report too soon; back off and retry.', code: 'CAPABILITIES_TOO_SOON', retryAfterSec: 25 }, { 'Retry-After': '25' });
+        }
+      }
+      return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
     }
     if (m && method === 'GET') {
       const d = needAuthz('read'); if (d) return deny(d);
@@ -1770,6 +1840,10 @@ async function handleApi(request, env, url) {
     if (decision.state !== 'estimated-compatible') {
       return json(422, { error: `Compatibility is ${decision.state}; only estimated-compatible configurations plan.`, code: 'COMPAT_NOT_MET', decision });
     }
+    // Row-growth defense (Codex-sec-P2): every plan inserts an audit row,
+    // so creation claims the hourly write budget like every other mutating
+    // route (429 when spent, before any write).
+    await checkWriteBudget(db, me());
     const nowMs = Date.now();
     const payload = {
       v: 1, principal: me(),
@@ -1891,6 +1965,12 @@ async function handleApi(request, env, url) {
     if (needBytes > avail) {
       return json(409, { error: 'Node memory is over-reserved by concurrent work; retry when capacity frees.', code: 'RESERVATION_EXHAUSTED', availableBytes: avail, neededBytes: needBytes });
     }
+    // Row-growth defense (Codex-sec-P2, adjacent to plans): admission
+    // inserts deployment + reservation + event + audit rows. The active
+    // caps bound concurrent rows only; terminal rows accumulate. Claim the
+    // hourly write budget after all refusals, before the batch. Duplicate
+    // replays return above, unbilled: they insert nothing.
+    await checkWriteBudget(db, me());
     const now = nowIso();
     const id = rid('dep_');
     const opId = rid('wop_');
