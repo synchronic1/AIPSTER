@@ -1,4 +1,4 @@
-/* Built with Meta Muse. */
+﻿/* Built with Meta Muse. */
 // Fabric adviser tests: input validation, redacted snapshots, output
 // contract, admission/idempotency, fixture/live boundary, denial matrix,
 // abuse cases and stale-state fencing. Fixtures only; no provider calls.
@@ -53,7 +53,7 @@ function row(over = {}) {
     capabilities_json: JSON.stringify(['text-generation', 'FETCH http://evil/x', 'nota cap!', 'a'.repeat(60)]),
     limits_json: JSON.stringify({ addr: '10.0.0.9' }),
     scope: 'private', verification_json: JSON.stringify({ note: 'operator secret' }),
-    credits_json: JSON.stringify({ balance: 99 }), origin: 'rack-4', created_at: '2026-01-01T00:00:00.000Z',
+    credits_json: JSON.stringify({ balance: 424242 }), origin: 'rack-4', created_at: '2026-01-01T00:00:00.000Z',
     ...over,
   };
 }
@@ -69,7 +69,10 @@ test('advisor snapshot: redacts everything but allowlisted facts', () => {
   assert.equal(e.usable, true);
   assert.deepEqual(snap.restrictions, ['dispatch-disabled', 'model-compatibility-unknown']);
   const text = JSON.stringify(snap);
-  for (const leak of ['res_secret_id', 'SECRET-NAME', 'u_alice', 'host-01', '10.0.0.9', 'operator secret', '99', 'rack-4', 'evil', 'nota cap']) {
+  // Leak tokens use long digit runs: ISO-8601 timestamps (generatedAt) max
+  // out at 4 contiguous digits, so '424242' can never false-positive on
+  // the clock the way '99' did on millisecond .099/.99x reads (flake).
+  for (const leak of ['res_secret_id', 'SECRET-NAME', 'u_alice', 'host-01', '10.0.0.9', 'operator secret', '424242', 'rack-4', 'evil', 'nota cap']) {
     assert.ok(!text.includes(leak), `leaked: ${leak}`);
   }
 });
@@ -519,15 +522,17 @@ async function advisorBucketCount(t) {
   return Number(r.n);
 }
 
-// Test-only D1 wrapper: resource-row reads park on `gate` (simulating a
-// request whose async inventory reads stall across a UTC-hour boundary)
-// while every other statement runs through untouched. Only FROM resources
-// statements are wrapped, so admission batches keep their exact shape.
-function delayResourceReads(db, gate) {
+// Test-only D1 wrapper: statements matching `pattern` park on `gate`
+// (simulating a request stalled mid-flight) while everything else runs
+// through untouched. Non-matching statements keep their exact shape, so
+// admission batches are never distorted. `onPark` fires (latched) when the
+// first matching statement parks, so tests can interleave deterministically.
+function delayDbReads(db, gate, pattern, onPark) {
+  let parked = false;
   return {
     prepare: (sql) => {
       const stmt = db.prepare(sql);
-      if (!/FROM\s+resources\b/i.test(sql)) return stmt;
+      if (!pattern.test(sql)) return stmt;
       return {
         bind: (...params) => {
           const bound = stmt.bind(...params);
@@ -535,7 +540,11 @@ function delayResourceReads(db, gate) {
             get: (target, prop) => {
               const v = target[prop];
               if (typeof v !== 'function') return v;
-              return async (...a) => { await gate; return v.apply(bound, a); };
+              return async (...a) => {
+                if (!parked) { parked = true; if (onPark) onPark(); }
+                await gate;
+                return v.apply(bound, a);
+              };
             },
           });
         },
@@ -543,6 +552,10 @@ function delayResourceReads(db, gate) {
     },
     batch: (stmts) => db.batch(stmts),
   };
+}
+
+function delayResourceReads(db, gate) {
+  return delayDbReads(db, gate, /FROM\s+resources\b/i, null);
 }
 
 function liveAdviceStub(calls) {
@@ -636,7 +649,7 @@ test('advisor admission: rejections write no buckets; expired buckets pruned', a
   assert.ok(keys.includes(`u_alice|${advisorWindow(now)}`));
   assert.ok(keys.includes(`advisor:global|${advisorTokWindow(now)}`));
   // Exhaust the deployment request budget, then a fresh tenant's claim must
-  // fail without creating any rows — not even empty buckets.
+  // fail without creating any rows â€” not even empty buckets.
   await t.DB.prepare('UPDATE write_budget SET count = 1000000 WHERE user_id = ? AND window = ?').bind('advisor:global', advisorWindow(now)).run();
   const before = await t.DB.prepare('SELECT COUNT(*) n FROM write_budget').first();
   await assert.rejects(claimOp(t.DB, 'u_new', 'rej-1', 'd-rej', { env: t.env, now }), (e) => e.code === 'REQUEST_BUDGET');
@@ -655,21 +668,21 @@ test('advisor rollover: delayed reads bill the admission hour, never a pruned on
   const bob = { kind: 'session', user: { id: 'u_bob' } };
   const calls = { n: 0 };
   // Exhaust alice's H1 request budget (owner cap is 1).
-  const h1 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H1.', refs: ['r_alice1'], opKey: 'roll-h1' }, now: ROLL_H1, admissionNow: ROLL_H1, fetchImpl: liveAdviceStub(calls) });
+  const h1 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H1.', refs: ['r_alice1'], opKey: 'roll-h1' }, now: ROLL_H1, clock: () => ROLL_H1, fetchImpl: liveAdviceStub(calls) });
   assert.equal(h1.status, 200);
   assert.equal(calls.n, 1);
   // Bob's H2 claim prunes every H1 bucket (the prune has no tenant filter).
-  const h2bob = await handleAdvisorPost({ db: t.DB, env: t.env, actor: bob, body: { task: 'H2.', refs: ['r_bob1'], opKey: 'roll-h2b' }, now: ROLL_H2, admissionNow: ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  const h2bob = await handleAdvisorPost({ db: t.DB, env: t.env, actor: bob, body: { task: 'H2.', refs: ['r_bob1'], opKey: 'roll-h2b' }, now: ROLL_H2, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
   assert.equal(h2bob.status, 200);
   // Alice's request arrived in H1 but its resource reads stall past the boundary.
   let release;
   const gate = new Promise((res) => { release = res; });
-  const pending = handleAdvisorPost({ db: delayResourceReads(t.DB, gate), env: t.env, actor: alice, body: { task: 'Slow.', refs: ['r_alice1'], opKey: 'roll-slow' }, now: ROLL_H1, admissionNow: ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  const pending = handleAdvisorPost({ db: delayResourceReads(t.DB, gate), env: t.env, actor: alice, body: { task: 'Slow.', refs: ['r_alice1'], opKey: 'roll-slow' }, now: ROLL_H1, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
   release();
   const out = await pending;
   assert.equal(out.status, 200);
   assert.equal(calls.n, 3);
-  // Billed to the decision hour (H2), which had budget — H1 stays pruned,
+  // Billed to the decision hour (H2), which had budget â€” H1 stays pruned,
   // never resurrected with a fresh zero-read admission.
   const h2count = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('u_alice', advisorWindow(ROLL_H2)).first();
   assert.equal(Number(h2count && h2count.count), 1);
@@ -684,15 +697,15 @@ test('advisor rollover: delayed requests cannot evade an exhausted decision hour
   const { advisorWindow } = await import('../src/advisor/admission.mjs');
   const alice = { kind: 'session', user: { id: 'u_alice' } };
   const calls = { n: 0 };
-  const h1 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H1.', refs: ['r_alice1'], opKey: 'ev-h1' }, now: ROLL_H1, admissionNow: ROLL_H1, fetchImpl: liveAdviceStub(calls) });
+  const h1 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H1.', refs: ['r_alice1'], opKey: 'ev-h1' }, now: ROLL_H1, clock: () => ROLL_H1, fetchImpl: liveAdviceStub(calls) });
   assert.equal(h1.status, 200);
   // Alice's H2 claim prunes H1 and exhausts her H2 budget in one move.
-  const h2 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H2.', refs: ['r_alice1'], opKey: 'ev-h2' }, now: ROLL_H2, admissionNow: ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  const h2 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H2.', refs: ['r_alice1'], opKey: 'ev-h2' }, now: ROLL_H2, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
   assert.equal(h2.status, 200);
   assert.equal(calls.n, 2);
   let release;
   const gate = new Promise((res) => { release = res; });
-  const pending = handleAdvisorPost({ db: delayResourceReads(t.DB, gate), env: t.env, actor: alice, body: { task: 'Slow.', refs: ['r_alice1'], opKey: 'ev-slow' }, now: ROLL_H1, admissionNow: ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  const pending = handleAdvisorPost({ db: delayResourceReads(t.DB, gate), env: t.env, actor: alice, body: { task: 'Slow.', refs: ['r_alice1'], opKey: 'ev-slow' }, now: ROLL_H1, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
   release();
   await assert.rejects(pending, (e) => e.code === 'REQUEST_BUDGET');
   assert.equal(calls.n, 2);
@@ -711,7 +724,7 @@ test('advisor rollover: concurrent delayed requests share one admission hour', a
   const calls = { n: 0 };
   let release;
   const gate = new Promise((res) => { release = res; });
-  const mk = (opKey) => handleAdvisorPost({ db: delayResourceReads(t.DB, gate), env: t.env, actor: alice, body: { task: 'Race.', refs: ['r_alice1'], opKey }, now: ROLL_H1, admissionNow: ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  const mk = (opKey) => handleAdvisorPost({ db: delayResourceReads(t.DB, gate), env: t.env, actor: alice, body: { task: 'Race.', refs: ['r_alice1'], opKey }, now: ROLL_H1, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
   const p1 = mk('cc-1');
   const p2 = mk('cc-2');
   release();
@@ -720,4 +733,82 @@ test('advisor rollover: concurrent delayed requests share one admission hour', a
   assert.deepEqual(statuses, [200, 429]);
   assert.equal(calls.n, 1);
 });
+
+test('advisor rollover: pre-batch stall retries in the new hour', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1', ADVISOR_LIVE: '1', MODEL_API_KEY: 'stub-key', ADVISOR_SPEND_CAP_USD: '1', ADVISOR_OWNER_PER_HOUR: '1' });
+  await seedResources(t);
+  const { handleAdvisorPost } = await import('../src/advisor/router.mjs');
+  const { advisorWindow, advisorTokWindow } = await import('../src/advisor/admission.mjs');
+  const alice = { kind: 'session', user: { id: 'u_alice' } };
+  const bob = { kind: 'session', user: { id: 'u_bob' } };
+  const calls = { n: 0 };
+  const h1 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H1.', refs: ['r_alice1'], opKey: 'pb-h1' }, now: ROLL_H1, clock: () => ROLL_H1, fetchImpl: liveAdviceStub(calls) });
+  assert.equal(h1.status, 200);
+  // Slow request decides H1, then stalls inside admission pre-batch work
+  // (the initial op lookup) while the new hour lands and prunes H1.
+  let release, park;
+  const gate = new Promise((res) => { release = res; });
+  const parked = new Promise((res) => { park = res; });
+  let ticks = 0;
+  const pending = handleAdvisorPost({ db: delayDbReads(t.DB, gate, /SELECT op_key, input_digest, state, receipt_json FROM advisor_ops/, park), env: t.env, actor: alice, body: { task: 'Slow.', refs: ['r_alice1'], opKey: 'pb-slow' }, now: ROLL_H1, clock: () => (++ticks === 1 ? ROLL_H1 : ROLL_H2), fetchImpl: liveAdviceStub(calls) });
+  await parked;
+  const h2bob = await handleAdvisorPost({ db: t.DB, env: t.env, actor: bob, body: { task: 'H2.', refs: ['r_bob1'], opKey: 'pb-h2b' }, now: ROLL_H2, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  assert.equal(h2bob.status, 200);
+  release();
+  const out = await pending;
+  assert.equal(out.status, 200);
+  assert.equal(calls.n, 3);
+  // Retried and billed in H2 â€” H1 stays pruned, never resurrected.
+  const h2count = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('u_alice', advisorWindow(ROLL_H2)).first();
+  assert.equal(Number(h2count && h2count.count), 1);
+  const h1rows = await t.DB.prepare('SELECT COUNT(*) n FROM write_budget WHERE window = ? OR window = ?').bind(advisorWindow(ROLL_H1), advisorTokWindow(ROLL_H1)).first();
+  assert.equal(Number(h1rows.n), 0);
+});
+
+test('advisor rollover: stale retry into an exhausted hour is rejected', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1', ADVISOR_LIVE: '1', MODEL_API_KEY: 'stub-key', ADVISOR_SPEND_CAP_USD: '1', ADVISOR_OWNER_PER_HOUR: '1' });
+  await seedResources(t);
+  const { handleAdvisorPost } = await import('../src/advisor/router.mjs');
+  const { advisorWindow } = await import('../src/advisor/admission.mjs');
+  const alice = { kind: 'session', user: { id: 'u_alice' } };
+  const calls = { n: 0 };
+  const h1 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H1.', refs: ['r_alice1'], opKey: 'sr-h1' }, now: ROLL_H1, clock: () => ROLL_H1, fetchImpl: liveAdviceStub(calls) });
+  assert.equal(h1.status, 200);
+  // Alice's H2 claim prunes H1 and exhausts her H2 budget in one move.
+  const h2 = await handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'H2.', refs: ['r_alice1'], opKey: 'sr-h2' }, now: ROLL_H2, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  assert.equal(h2.status, 200);
+  assert.equal(calls.n, 2);
+  let release, park;
+  const gate = new Promise((res) => { release = res; });
+  const parked = new Promise((res) => { park = res; });
+  let ticks = 0;
+  const pending = handleAdvisorPost({ db: delayDbReads(t.DB, gate, /SELECT op_key, input_digest, state, receipt_json FROM advisor_ops/, park), env: t.env, actor: alice, body: { task: 'Slow.', refs: ['r_alice1'], opKey: 'sr-slow' }, now: ROLL_H1, clock: () => (++ticks === 1 ? ROLL_H1 : ROLL_H2), fetchImpl: liveAdviceStub(calls) });
+  await parked;
+  release();
+  await assert.rejects(pending, (e) => e.code === 'REQUEST_BUDGET' && e.status === 429);
+  assert.equal(calls.n, 2);
+  const mine = await t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('u_alice', advisorWindow(ROLL_H2)).first();
+  assert.equal(Number(mine.count), 1);
+});
+
+test('advisor rollover: persistently stale clock fails closed after bounded retries', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1', ADVISOR_LIVE: '1', MODEL_API_KEY: 'stub-key', ADVISOR_SPEND_CAP_USD: '1', ADVISOR_OWNER_PER_HOUR: '1' });
+  await seedResources(t);
+  const { handleAdvisorPost } = await import('../src/advisor/router.mjs');
+  const { advisorWindow, advisorTokWindow } = await import('../src/advisor/admission.mjs');
+  const alice = { kind: 'session', user: { id: 'u_alice' } };
+  const bob = { kind: 'session', user: { id: 'u_bob' } };
+  const calls = { n: 0 };
+  const h2bob = await handleAdvisorPost({ db: t.DB, env: t.env, actor: bob, body: { task: 'H2.', refs: ['r_bob1'], opKey: 'sc-h2b' }, now: ROLL_H2, clock: () => ROLL_H2, fetchImpl: liveAdviceStub(calls) });
+  assert.equal(h2bob.status, 200);
+  // The decision clock is stuck in H1 while H2 buckets exist: every attempt
+  // is stale, so admission must fail closed without touching the provider.
+  await assert.rejects(handleAdvisorPost({ db: t.DB, env: t.env, actor: alice, body: { task: 'Stuck.', refs: ['r_alice1'], opKey: 'sc-stuck' }, now: ROLL_H1, clock: () => ROLL_H1, fetchImpl: liveAdviceStub(calls) }),
+    (e) => e.code === 'STALE_ADMISSION_WINDOW' && e.status === 429);
+  assert.equal(calls.n, 1);
+  const h1rows = await t.DB.prepare('SELECT COUNT(*) n FROM write_budget WHERE window = ? OR window = ?').bind(advisorWindow(ROLL_H1), advisorTokWindow(ROLL_H1)).first();
+  assert.equal(Number(h1rows.n), 0);
+});
+
+
 

@@ -13,8 +13,12 @@
 // long; live calls cap at 20s). Uncertain rows are never auto-pruned: the
 // no-duplicate-charge guarantee for lost live responses is durable.
 // write_budget buckets are created only by admitted claims (the charging
-// upsert) and every claim prunes expired adv/ + adv-tok/ buckets, so the
-// shared table cannot grow without bound from rejected or idle hours.
+// upsert) and every ADMITTED claim prunes expired adv/ + adv-tok/ buckets,
+// so the shared table cannot grow without bound from rejected or idle
+// hours. Pruning after (never before) the gate is load-bearing: the gate
+// refuses any hour older than the newest bucket present, which is exactly
+// the set a prune could have deleted — so a judged hour's counters are
+// always intact, and stale decisions retry instead of misreading zeros.
 import { first, run, nowIso } from '../lib/store.js';
 import { httpError } from '../lib/validate.js';
 import { budgetWindow } from '../lib/quotas.js';
@@ -99,74 +103,102 @@ function fromRow(row, digest) {
  * estimate; outputTokens reserves the provider output maximum.
  * Returns {outcome:'claimed'} or a replay/in-progress/uncertain outcome;
  * throws 409/429 otherwise. Never double-charges, never refunds.
- * `now` is the admission-DECISION instant (never request arrival): bucket
- * selection, charging, pruning and op timestamps all derive from this one
- * value, so a decision can neither bill nor prune a different hour than
- * the one it judged.
+ *
+ * Rollover safety: no timestamp survives the async work before the atomic
+ * batch, so the gate VALIDATES its own window instead of trusting one
+ * computed earlier. The gate admits in hour H only when no newer advisor
+ * bucket exists; bucket pruning runs only after a successful admission.
+ * Together: pruned hours always have newer buckets present, so a decision
+ * can never judge deleted (zero-read) counters — it goes stale and retries
+ * with a fresh instant (bounded), or fails closed. `clock` supplies the
+ * decision instant per attempt (tests pin it); without one, pinned `now`
+ * is reused every attempt.
  */
-export async function claimOp(db, tenant, opKey, digest, { inputTokens = 0, outputTokens = 0, env = null, now = new Date() } = {}) {
+export async function claimOp(db, tenant, opKey, digest, { inputTokens = 0, outputTokens = 0, env = null, now = new Date(), clock = null } = {}) {
   const found = await existingOp(db, tenant, opKey);
   if (found) return fromRow(found, digest);
-  const at = now.toISOString();
+  const clockFn = typeof clock === 'function' ? clock : () => now;
   const budgets = advisorBudgets(env);
-  const reqWin = advisorWindow(now);
-  const tokWin = advisorTokWindow(now);
   const reserve = (Number.isSafeInteger(inputTokens) && inputTokens >= 0 ? inputTokens : 0)
     + (Number.isSafeInteger(outputTokens) && outputTokens >= 0 ? outputTokens : 0);
-  // Bounded hygiene before claiming (see module header): stale ops plus
-  // expired advisor buckets. Each prefix is bounded by its own current
-  // window ('adv-tok/…' sorts before 'adv/…', so one bound cannot cover
-  // both). The current hour is never pruned.
-  await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('delivered','failed') AND created_at < ?",
-    tenant, new Date(now.getTime() - OP_TTL_MS).toISOString());
-  await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching') AND created_at < ?",
-    tenant, new Date(now.getTime() - LEAK_TTL_MS).toISOString());
-  await run(db, "DELETE FROM write_budget WHERE window LIKE 'adv/%' AND window < ?", reqWin);
-  await run(db, "DELETE FROM write_budget WHERE window LIKE 'adv-tok/%' AND window < ?", tokWin);
-  const gate = db.prepare(
-    `INSERT INTO advisor_ops (tenant_id, op_key, input_digest, state, receipt_json, created_at, updated_at)
-     SELECT ?, ?, ?, 'reserved', NULL, ?, ? WHERE
-     COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) < ?
-     AND COALESCE((SELECT count FROM write_budget WHERE user_id = '${ADVISOR_GLOBAL_ID}' AND window = ?), 0) < ?
-     AND COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) + ? <= ?
-     AND COALESCE((SELECT count FROM write_budget WHERE user_id = '${ADVISOR_GLOBAL_ID}' AND window = ?), 0) + ? <= ?
-     AND NOT EXISTS (SELECT 1 FROM advisor_ops WHERE tenant_id = ? AND op_key = ?)
-     AND NOT EXISTS (SELECT 1 FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching'))`
-  ).bind(tenant, opKey, digest, at, at,
-    tenant, reqWin, budgets.reqOwner,
-    reqWin, budgets.reqGlobal,
-    tenant, tokWin, reserve, budgets.tokOwner,
-    tokWin, reserve, budgets.tokGlobal,
-    tenant, opKey, tenant);
-  let results;
-  try {
-    results = await db.batch([gate,
-      chargeStmt(db, tenant, reqWin, 1),
-      chargeStmt(db, ADVISOR_GLOBAL_ID, reqWin, 1),
-      chargeStmt(db, tenant, tokWin, reserve),
-      chargeStmt(db, ADVISOR_GLOBAL_ID, tokWin, reserve)]);
-  } catch {
-    // Lost a concurrent race (PK or otherwise): fall through to the same
-    // disambiguation as a clean gate miss. No partial rows survive: the
-    // batch is atomic and every charge chains on the gate.
-    results = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const atDate = clockFn();
+    const reqWin = advisorWindow(atDate);
+    const tokWin = advisorTokWindow(atDate);
+    // Bounded op hygiene before claiming (see module header). Bucket
+    // pruning deliberately runs only AFTER admission (below): a pre-gate
+    // prune could delete the hour a concurrent gate is judging.
+    await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('delivered','failed') AND created_at < ?",
+      tenant, new Date(atDate.getTime() - OP_TTL_MS).toISOString());
+    await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching') AND created_at < ?",
+      tenant, new Date(atDate.getTime() - LEAK_TTL_MS).toISOString());
+    const gate = db.prepare(
+      `INSERT INTO advisor_ops (tenant_id, op_key, input_digest, state, receipt_json, created_at, updated_at)
+       SELECT ?, ?, ?, 'reserved', NULL, ?, ? WHERE
+       COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) < ?
+       AND COALESCE((SELECT count FROM write_budget WHERE user_id = '${ADVISOR_GLOBAL_ID}' AND window = ?), 0) < ?
+       AND COALESCE((SELECT count FROM write_budget WHERE user_id = ? AND window = ?), 0) + ? <= ?
+       AND COALESCE((SELECT count FROM write_budget WHERE user_id = '${ADVISOR_GLOBAL_ID}' AND window = ?), 0) + ? <= ?
+       AND NOT EXISTS (SELECT 1 FROM advisor_ops WHERE tenant_id = ? AND op_key = ?)
+       AND NOT EXISTS (SELECT 1 FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching'))
+       AND NOT EXISTS (SELECT 1 FROM write_budget WHERE window LIKE 'adv/%' AND window > ?)
+       AND NOT EXISTS (SELECT 1 FROM write_budget WHERE window LIKE 'adv-tok/%' AND window > ?)`
+    ).bind(tenant, opKey, digest, atDate.toISOString(), atDate.toISOString(),
+      tenant, reqWin, budgets.reqOwner,
+      reqWin, budgets.reqGlobal,
+      tenant, tokWin, reserve, budgets.tokOwner,
+      tokWin, reserve, budgets.tokGlobal,
+      tenant, opKey, tenant,
+      reqWin, tokWin);
+    let results;
+    try {
+      results = await db.batch([gate,
+        chargeStmt(db, tenant, reqWin, 1),
+        chargeStmt(db, ADVISOR_GLOBAL_ID, reqWin, 1),
+        chargeStmt(db, tenant, tokWin, reserve),
+        chargeStmt(db, ADVISOR_GLOBAL_ID, tokWin, reserve)]);
+    } catch {
+      // Lost a concurrent race (PK or otherwise): fall through to the same
+      // disambiguation as a clean gate miss. No partial rows survive: the
+      // batch is atomic and every charge chains on the gate.
+      results = null;
+    }
+    if (results && Number(results[0].meta.changes) === 1) {
+      // Admitted: now prune hours older than the judged hour. Best-effort
+      // on purpose — admission already committed, so a prune failure must
+      // not fail the claim; the next admitted claim re-prunes. Each prefix
+      // is bounded by its own window ('adv-tok/…' sorts before 'adv/…').
+      try {
+        await run(db, "DELETE FROM write_budget WHERE window LIKE 'adv/%' AND window < ?", reqWin);
+        await run(db, "DELETE FROM write_budget WHERE window LIKE 'adv-tok/%' AND window < ?", tokWin);
+      } catch { /* hygiene only; next admission re-prunes */ }
+      return { outcome: 'claimed' };
+    }
+    // Gate missed: map the cause with best-effort reads. Every mapping is
+    // a 409/429 that never duplicates a charge; races may mislabel which
+    // bound bit, never whether the call may proceed. Staleness is checked
+    // before any budget read: a stale hour's counters may be pruned, so
+    // only the op-table checks (key/sibling, never pruned by the hour)
+    // may precede it.
+    const raced = await existingOp(db, tenant, opKey);
+    if (raced) return fromRow(raced, digest);
+    const flying = await first(db, "SELECT op_key FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching')", tenant);
+    if (flying) throw httpError(429, 'Another advice request is already in flight. Retry shortly with the same key.', 'OP_IN_FLIGHT');
+    const newer = await first(db, "SELECT 1 AS x FROM write_budget WHERE (window LIKE 'adv/%' AND window > ?) OR (window LIKE 'adv-tok/%' AND window > ?) LIMIT 1", reqWin, tokWin);
+    if (newer) {
+      if (attempt < 2) continue;
+      throw httpError(429, 'Advice budgets rolled to a new hour during admission. Retry.', 'STALE_ADMISSION_WINDOW');
+    }
+    const spent = async (id, win, cap, add) => {
+      const r = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, win);
+      return Number(r ? r.count : 0) + add > cap;
+    };
+    if (await spent(tenant, tokWin, budgets.tokOwner, reserve) || await spent(ADVISOR_GLOBAL_ID, tokWin, budgets.tokGlobal, reserve)) {
+      throw httpError(429, 'Advice token budget for this hour is exhausted.', 'TOKEN_BUDGET');
+    }
+    throw httpError(429, 'Advice request budget for this hour is exhausted.', 'REQUEST_BUDGET');
   }
-  if (results && Number(results[0].meta.changes) === 1) return { outcome: 'claimed' };
-  // Gate missed: map the cause with best-effort reads. Every mapping is a
-  // 409/429 that never duplicates a charge; races may mislabel which bound
-  // bit, never whether the call may proceed.
-  const raced = await existingOp(db, tenant, opKey);
-  if (raced) return fromRow(raced, digest);
-  const flying = await first(db, "SELECT op_key FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching')", tenant);
-  if (flying) throw httpError(429, 'Another advice request is already in flight. Retry shortly with the same key.', 'OP_IN_FLIGHT');
-  const spent = async (id, win, cap, add) => {
-    const r = await first(db, 'SELECT count FROM write_budget WHERE user_id = ? AND window = ?', id, win);
-    return Number(r ? r.count : 0) + add > cap;
-  };
-  if (await spent(tenant, tokWin, budgets.tokOwner, reserve) || await spent(ADVISOR_GLOBAL_ID, tokWin, budgets.tokGlobal, reserve)) {
-    throw httpError(429, 'Advice token budget for this hour is exhausted.', 'TOKEN_BUDGET');
-  }
-  throw httpError(429, 'Advice request budget for this hour is exhausted.', 'REQUEST_BUDGET');
+  throw httpError(429, 'Advice budgets rolled to a new hour during admission. Retry.', 'STALE_ADMISSION_WINDOW');
 }
 
 /** Conditional state transition; only the listed from-states may move. */
