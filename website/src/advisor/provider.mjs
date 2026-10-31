@@ -120,18 +120,30 @@ function extractText(wire) {
 }
 
 /**
- * One bounded live advice call. fetchImpl is injectable so tests prove the
- * boundary without network (zero external calls in dev/tests/CI).
- * Throws sanitized 502/504/402 errors; never leaks key, headers or raw body.
+ * Pre-claim live bounds check. The route runs this BEFORE admission so
+ * envelope/input/spend rejections charge nothing and write nothing;
+ * runLive repeats it as defense in depth. Single source of truth: both
+ * callers share these exact bounds, codes and messages.
  */
-export async function runLive({ fetchImpl = fetch, apiKey, snapshot, task, refs, spendCapUsd = 0, deadlineMs = ADVISOR_DEADLINE_MS }) {
-  const { url, body } = buildLiveRequest(snapshot, task);
+export function preflightLiveRequest(snapshot, task, spendCapUsd = 0) {
+  const { body } = buildLiveRequest(snapshot, task);
   const payload = JSON.stringify(body);
   if (payload.length > ADVISOR_ENVELOPE_MAX) throw httpError(502, 'Advice request exceeded the envelope bound.', 'ENVELOPE_TOO_LARGE');
   const inputTokens = estimateTokens(payload);
   if (inputTokens > ADVISOR_INPUT_TOKEN_BOUND) throw httpError(502, 'Advice input exceeds the token bound.', 'INPUT_UNBOUNDED');
   const maxSpend = estimateSpendUsd(inputTokens, ADVISOR_OUTPUT_MAX_TOKENS);
   if (!(spendCapUsd > 0) || maxSpend > spendCapUsd) throw httpError(402, 'Advice spend cap does not cover this call.', 'SPEND_EXCEEDED');
+  return { payload, inputTokens, maxSpend };
+}
+
+/**
+ * One bounded live advice call. fetchImpl is injectable so tests prove the
+ * boundary without network (zero external calls in dev/tests/CI).
+ * Throws sanitized 502/504/402 errors; never leaks key, headers or raw body.
+ */
+export async function runLive({ fetchImpl = fetch, apiKey, snapshot, task, refs, spendCapUsd = 0, deadlineMs = ADVISOR_DEADLINE_MS }) {
+  const { payload } = preflightLiveRequest(snapshot, task, spendCapUsd);
+  const url = ADVISOR_RESPONSES_URL;
   let response;
   try {
     response = await fetchImpl(url, {

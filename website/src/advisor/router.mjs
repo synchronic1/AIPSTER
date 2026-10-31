@@ -13,7 +13,7 @@ import {
 import { claimOp, markOp, advisorSpendCapUsd } from './admission.mjs';
 import {
   ADVISOR_MODEL, ADVISOR_OUTPUT_MAX_TOKENS, ADVISOR_INPUT_TOKEN_BOUND,
-  liveEnabled, runFixture, runLive, estimateTokens, estimateSpendUsd, buildLiveRequest,
+  liveEnabled, runFixture, runLive, preflightLiveRequest,
 } from './provider.mjs';
 
 export function advisorEnabled(env) {
@@ -80,8 +80,7 @@ export async function handleAdvisorPost({ db, env, actor, demo = false, body, no
   // budget is touched, so rejections charge nothing and write nothing.
   let inputTokens = 0;
   if (live) {
-    const payload = JSON.stringify(buildLiveRequest(snapshot, task).body);
-    inputTokens = estimateTokens(payload);
+    inputTokens = preflightLiveRequest(snapshot, task, advisorSpendCapUsd(env)).inputTokens;
   }
   const claim = await claimOp(db, tenant, key, digest, {
     inputTokens, outputTokens: live ? ADVISOR_OUTPUT_MAX_TOKENS : 0, env, now,
@@ -92,6 +91,15 @@ export async function handleAdvisorPost({ db, env, actor, demo = false, body, no
       const advice = runFixture(snapshot, task);
       validateAdvice(advice, { refs: aliases });
       return { status: 200, body: { advice, receipt: receiptFor({ key, live, out: {}, elapsedMs: 0, replay: true, env }), replay: true } };
+    }
+    if (claim.state === 'failed') {
+      // A failed op replays its stored failure, never a success-shaped
+      // receipt: no new provider call, and the caller keeps the actionable
+      // error and code. Status/code come from our own stored receipt.
+      const err = claim.receipt && typeof claim.receipt.error === 'string' && claim.receipt.error ? claim.receipt.error : 'PROVIDER_ERROR';
+      const saved = claim.receipt && Number.isSafeInteger(claim.receipt.status) ? claim.receipt.status : 0;
+      const status = saved >= 400 && saved <= 599 ? saved : 502;
+      throw httpError(status, `The original advice call failed (${err}); this replay makes no new provider call. Use a new key to retry.`, err);
     }
     return { status: 200, body: { advice: null, receipt: { ...claim.receipt, replay: true }, replay: true, note: 'Advice outputs are not stored; this replay returns the original receipt only.' } };
   }
@@ -122,7 +130,8 @@ export async function handleAdvisorPost({ db, env, actor, demo = false, body, no
     // failures (rejections, malformed output, exhausted caps) close failed.
     const uncertain = e && (e.code === 'PROVIDER_TIMEOUT' || e.code === 'PROVIDER_UNREACHABLE');
     await markOp(db, tenant, key, ['fetching'], uncertain ? 'uncertain' : 'failed', {
-      opKey: key, mode: 'live', error: e && e.code ? e.code : 'PROVIDER_ERROR', at: new Date().toISOString(),
+      opKey: key, mode: 'live', error: e && e.code ? e.code : 'PROVIDER_ERROR',
+      status: e && Number.isSafeInteger(e.status) ? e.status : 502, at: new Date().toISOString(),
     });
     throw e;
   }

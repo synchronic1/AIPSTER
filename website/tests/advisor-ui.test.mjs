@@ -238,3 +238,50 @@ test('advisor ui: shell carries the panel, opt-in default and live region', asyn
   assert.ok(result.includes('aria-live'), 'result needs a live region');
   assert.equal((shell.match(/<script/g) || []).length, 1);
 });
+
+test('advisor ui: tab switch mid-submit cannot strand the panel', async () => {
+  let release;
+  const gate = new Promise((res) => { release = res; });
+  const ui = adviseUi({ get: () => descriptor(), post: async () => { await gate; return Response.json(adviceResponse()); } });
+  await vm.runInContext('loadAdvice()', ui.context);
+  ui.el('adv-optin').checked = true;
+  const box = makeEl('input', null);
+  box.checked = true; box.value = 'r_a';
+  ui.registerSelect('input[name="adv-ref"]', [box]);
+  ui.el('adv-task').value = 't';
+  const pending = vm.runInContext('submitAdvice()', ui.context);
+  await vm.runInContext('generation++', ui.context); // switch tabs mid-submit
+  release();
+  await pending;
+  assert.ok(!ui.el('adv-result').innerHTML.includes('Consider r1'), 'stale response rendered');
+  // Re-entering the panel resets the pending controls…
+  await vm.runInContext('loadAdvice()', ui.context);
+  assert.equal(ui.el('adv-submit').disabled, false);
+  assert.equal(ui.el('adv-cancel').hidden, true);
+  // …and the panel submits again.
+  await vm.runInContext('submitAdvice()', ui.context);
+  assert.equal(ui.calls.filter((c) => c.init.method === 'POST').length, 2);
+  assert.match(ui.el('adv-result').innerHTML, /Consider r1/);
+
+  // Same guarantee when the user returns while the call is still pending:
+  // re-entry aborts the orphan instead of stranding the controls.
+  let release2;
+  const gate2 = new Promise((res) => { release2 = res; });
+  const ui2 = adviseUi({ get: () => descriptor(), post: async () => { await gate2; return Response.json(adviceResponse()); } });
+  await vm.runInContext('loadAdvice()', ui2.context);
+  ui2.el('adv-optin').checked = true;
+  const box2 = makeEl('input', null);
+  box2.checked = true; box2.value = 'r_a';
+  ui2.registerSelect('input[name="adv-ref"]', [box2]);
+  ui2.el('adv-task').value = 't';
+  const pending2 = vm.runInContext('submitAdvice()', ui2.context);
+  await vm.runInContext('generation++', ui2.context);
+  await vm.runInContext('loadAdvice()', ui2.context);
+  release2();
+  await pending2;
+  assert.ok(!ui2.el('adv-result').innerHTML.includes('Consider r1'), 'stale response rendered');
+  assert.equal(ui2.el('adv-submit').disabled, false);
+  assert.equal(ui2.el('adv-cancel').hidden, true);
+  await vm.runInContext('submitAdvice()', ui2.context);
+  assert.equal(ui2.calls.filter((c) => c.init.method === 'POST').length, 2);
+});

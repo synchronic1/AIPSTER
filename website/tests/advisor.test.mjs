@@ -514,3 +514,90 @@ test('advisor stale fencing: telemetry drift turns a retry into a changed replay
   assert.equal(retry.json.code, 'CHANGED_REPLAY');
 });
 
+async function advisorBucketCount(t) {
+  const r = await t.DB.prepare("SELECT COUNT(*) n FROM write_budget WHERE window LIKE 'adv/%' OR window LIKE 'adv-tok/%'").first();
+  return Number(r.n);
+}
+
+test('advisor live: zero spend cap rejects before admission charges anything', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1', ADVISOR_LIVE: '1', MODEL_API_KEY: 'stub-key' });
+  await seedResources(t);
+  const { handleAdvisorPost } = await import('../src/advisor/router.mjs');
+  let calls = 0;
+  const actor = { kind: 'session', user: { id: 'u_alice' } };
+  await assert.rejects(handleAdvisorPost({
+    db: t.DB, env: t.env, actor,
+    body: { task: 't', refs: ['r_alice1'], opKey: 'cap-0' },
+    fetchImpl: async () => { calls += 1; throw new Error('must not fetch'); },
+  }), (e) => e.code === 'SPEND_EXCEEDED');
+  assert.equal(calls, 0);
+  assert.equal(await opCount(t), 0);
+  assert.equal(await advisorBucketCount(t), 0);
+});
+
+test('advisor live: oversized inputs reject before admission charges anything', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1', ADVISOR_LIVE: '1', MODEL_API_KEY: 'stub-key', ADVISOR_SPEND_CAP_USD: '100' });
+  const now = new Date().toISOString();
+  const caps = JSON.stringify(Array(10).fill('c'.repeat(41)));
+  const refs = [];
+  for (let i = 0; i < 20; i++) {
+    const id = `r_heavy${i}`;
+    refs.push(id);
+    await t.DB.prepare('INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, capabilities_json, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .bind(id, 'u_alice', `Heavy ${i}`, 'local', 'rack', 'cpu', '', caps, 1, 1, 1, 1, now, now).run();
+  }
+  const { handleAdvisorPost } = await import('../src/advisor/router.mjs');
+  let calls = 0;
+  const actor = { kind: 'session', user: { id: 'u_alice' } };
+  await assert.rejects(handleAdvisorPost({
+    db: t.DB, env: t.env, actor,
+    body: { task: 't'.repeat(1000), refs, opKey: 'big-1' },
+    fetchImpl: async () => { calls += 1; throw new Error('must not fetch'); },
+  }), (e) => e.code === 'INPUT_UNBOUNDED');
+  assert.equal(calls, 0);
+  assert.equal(await opCount(t), 0);
+  assert.equal(await advisorBucketCount(t), 0);
+});
+
+test('advisor live: failed replay returns the stored failure without a new call', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1', ADVISOR_LIVE: '1', MODEL_API_KEY: 'stub-key', ADVISOR_SPEND_CAP_USD: '1' });
+  await seedResources(t);
+  const { handleAdvisorPost } = await import('../src/advisor/router.mjs');
+  let calls = 0;
+  const stub = async () => { calls += 1; return new Response('{"oops":1}', { status: 429 }); };
+  const actor = { kind: 'session', user: { id: 'u_alice' } };
+  const body = { task: 'Flaky.', refs: ['r_alice1'], opKey: 'fail-1' };
+  await assert.rejects(handleAdvisorPost({ db: t.DB, env: t.env, actor, body, fetchImpl: stub }),
+    (e) => e.code === 'PROVIDER_RATE_LIMITED' && e.status === 503);
+  assert.equal(calls, 1);
+  await assert.rejects(handleAdvisorPost({ db: t.DB, env: t.env, actor, body, fetchImpl: stub }),
+    (e) => e.code === 'PROVIDER_RATE_LIMITED' && e.status === 503);
+  assert.equal(calls, 1);
+});
+
+test('advisor admission: rejections write no buckets; expired buckets pruned', async () => {
+  const t = await createTestEnv({ ADVISOR_ENABLED: '1' });
+  const { claimOp, advisorWindow, advisorTokWindow } = await import('../src/advisor/admission.mjs');
+  const now = new Date();
+  const old = new Date(now.getTime() - 3 * 3600 * 1000);
+  const oldReq = advisorWindow(old), oldTok = advisorTokWindow(old);
+  await t.DB.prepare('INSERT INTO write_budget (user_id, window, count) VALUES (?, ?, ?)').bind('u_gone', oldReq, 3).run();
+  await t.DB.prepare('INSERT INTO write_budget (user_id, window, count) VALUES (?, ?, ?)').bind('advisor:global', oldTok, 9).run();
+  const res = await claimOp(t.DB, 'u_alice', 'prune-1', 'd-prune', { env: t.env, now });
+  assert.equal(res.outcome, 'claimed');
+  const left = await t.DB.prepare("SELECT user_id, window FROM write_budget WHERE window LIKE 'adv/%' OR window LIKE 'adv-tok/%'").all();
+  const keys = left.results.map((r) => `${r.user_id}|${r.window}`);
+  assert.ok(!keys.some((k) => k.includes(oldReq) || k.includes(oldTok)), `expired buckets survive: ${keys}`);
+  assert.ok(keys.includes(`u_alice|${advisorWindow(now)}`));
+  assert.ok(keys.includes(`advisor:global|${advisorTokWindow(now)}`));
+  // Exhaust the deployment request budget, then a fresh tenant's claim must
+  // fail without creating any rows — not even empty buckets.
+  await t.DB.prepare('UPDATE write_budget SET count = 1000000 WHERE user_id = ? AND window = ?').bind('advisor:global', advisorWindow(now)).run();
+  const before = await t.DB.prepare('SELECT COUNT(*) n FROM write_budget').first();
+  await assert.rejects(claimOp(t.DB, 'u_new', 'rej-1', 'd-rej', { env: t.env, now }), (e) => e.code === 'REQUEST_BUDGET');
+  const after = await t.DB.prepare('SELECT COUNT(*) n FROM write_budget').first();
+  assert.equal(Number(after.n), Number(before.n));
+  const mine = await t.DB.prepare('SELECT COUNT(*) n FROM write_budget WHERE user_id = ?').bind('u_new').first();
+  assert.equal(Number(mine.n), 0);
+});
+

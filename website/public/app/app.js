@@ -850,7 +850,17 @@ const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShar
 let advAbort = null;
 let advLastKey = null;
 
+// Tab navigation fences the in-flight advice request but strands its
+// controls (submit disabled, Cancel visible, abort handle cleared). Reset
+// the pending controls on every panel entry so Advice is always
+// submittable; the orphaned response stays fenced and never renders.
+function resetAdvicePending() {
+  if (advAbort) { advAbort.abort(); advAbort = null; }
+  $('adv-cancel').hidden = true; $('adv-submit').disabled = false;
+}
+
 async function loadAdvice() {
+  resetAdvicePending();
   const gen = generation;
   const on = $('adv-on'), off = $('adv-off');
   try {

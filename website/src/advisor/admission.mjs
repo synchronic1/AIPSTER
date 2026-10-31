@@ -12,6 +12,9 @@
 // reserved/fetching rows older than 1h (no legitimate call lives that
 // long; live calls cap at 20s). Uncertain rows are never auto-pruned: the
 // no-duplicate-charge guarantee for lost live responses is durable.
+// write_budget buckets are created only by admitted claims (the charging
+// upsert) and every claim prunes expired adv/ + adv-tok/ buckets, so the
+// shared table cannot grow without bound from rejected or idle hours.
 import { first, run, nowIso } from '../lib/store.js';
 import { httpError } from '../lib/validate.js';
 import { budgetWindow } from '../lib/quotas.js';
@@ -63,7 +66,8 @@ function chargeStmt(db, id, window, amount) {
   // Chained on changes() = 1 like the heartbeat counters: the charge lands
   // only when the statement before it (gate, then each prior charge)
   // changed exactly one row, so all charges commit with an admitted op or
-  // none do. Buckets are pre-ensured, so this always takes the UPDATE path.
+  // none do. The upsert creates the hourly bucket on first admitted use,
+  // so rejections write nothing — not even empty rows.
   return db.prepare(
     `INSERT INTO write_budget (user_id, window, count) SELECT ?, ?, ? WHERE changes() = 1
      ON CONFLICT (user_id, window) DO UPDATE SET count = count + excluded.count`
@@ -100,19 +104,21 @@ export async function claimOp(db, tenant, opKey, digest, { inputTokens = 0, outp
   const found = await existingOp(db, tenant, opKey);
   if (found) return fromRow(found, digest);
   const at = now.toISOString();
-  // Bounded hygiene before claiming (see module header).
-  await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('delivered','failed') AND created_at < ?",
-    tenant, new Date(now.getTime() - OP_TTL_MS).toISOString());
-  await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching') AND created_at < ?",
-    tenant, new Date(now.getTime() - LEAK_TTL_MS).toISOString());
   const budgets = advisorBudgets(env);
   const reqWin = advisorWindow(now);
   const tokWin = advisorTokWindow(now);
   const reserve = (Number.isSafeInteger(inputTokens) && inputTokens >= 0 ? inputTokens : 0)
     + (Number.isSafeInteger(outputTokens) && outputTokens >= 0 ? outputTokens : 0);
-  for (const [id, win] of [[tenant, reqWin], [ADVISOR_GLOBAL_ID, reqWin], [tenant, tokWin], [ADVISOR_GLOBAL_ID, tokWin]]) {
-    await run(db, 'INSERT OR IGNORE INTO write_budget (user_id, window, count) VALUES (?, ?, 0)', id, win);
-  }
+  // Bounded hygiene before claiming (see module header): stale ops plus
+  // expired advisor buckets. Each prefix is bounded by its own current
+  // window ('adv-tok/…' sorts before 'adv/…', so one bound cannot cover
+  // both). The current hour is never pruned.
+  await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('delivered','failed') AND created_at < ?",
+    tenant, new Date(now.getTime() - OP_TTL_MS).toISOString());
+  await run(db, "DELETE FROM advisor_ops WHERE tenant_id = ? AND state IN ('reserved','fetching') AND created_at < ?",
+    tenant, new Date(now.getTime() - LEAK_TTL_MS).toISOString());
+  await run(db, "DELETE FROM write_budget WHERE window LIKE 'adv/%' AND window < ?", reqWin);
+  await run(db, "DELETE FROM write_budget WHERE window LIKE 'adv-tok/%' AND window < ?", tokWin);
   const gate = db.prepare(
     `INSERT INTO advisor_ops (tenant_id, op_key, input_digest, state, receipt_json, created_at, updated_at)
      SELECT ?, ?, ?, 'reserved', NULL, ?, ? WHERE
