@@ -186,6 +186,18 @@ function structuralFileChecks(f, seen) {
   return { checks, byteEligible: true, countedBytes: f.bytes };
 }
 
+// Byte-screening eligibility (Codex-sec-P2): a file's head is screened only
+// when its path, size shape, and suffix pass - mirroring the legacy loop's
+// early continues. Duplicates do not gate screening (legacy screened them).
+// Keep the four conditions in sync with structuralFileChecks' early exits.
+export function isByteEligible(f) {
+  if (validateRelPath(f && f.relpath)) return false;
+  if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) return false;
+  if (hasRefusedSuffix(f.relpath)) return false;
+  if (!hasAllowedSuffix(f.relpath)) return false;
+  return true;
+}
+
 // Per-file byte screening (Codex-sec-P2): magic + safetensors shape over a
 // bounded head. `screened` reports whether the head passed far enough for
 // shard-index candidacy (missing bytes and refused magic disqualify, exactly
@@ -212,6 +224,8 @@ export function validateFileBytes(f, head) {
 // call. `shard` is { relpath, head } for the qualifying index file or null;
 // `byteChecks` are the streaming per-file results in manifest order. Check
 // SET matches the legacy batched loop; only the order is structural-first
+// (revalidate stringifies checks for idempotence, so the first post-upgrade
+// revalidation writes once more - self-healing, no action needed).
 // (no caller depends on order - every assertion is .some/.ok).
 export function validateManifestStructure(manifest, shard, byteChecks, opts = {}) {
   const checks = [];
@@ -260,10 +274,8 @@ export function validateManifest(manifest, peek = () => null, opts = {}) {
   // screens heads in hand).
   const byteChecks = [];
   let shard = null;
-  const seen = new Set();
   for (const f of files || []) {
-    const st = structuralFileChecks(f, seen);
-    if (!st.byteEligible) continue;
+    if (!isByteEligible(f)) continue;
     const head = peek(f.relpath);
     const b = validateFileBytes(f, head);
     byteChecks.push(...b.checks);

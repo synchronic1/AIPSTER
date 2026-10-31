@@ -1692,3 +1692,20 @@ test('Codex-sec-P2: total over the scaffold finalize cap still refuses (kept gat
   assert.equal(f.status, 413, f.text);
   assert.equal(f.json.code, 'ASSET_TOO_LARGE');
 });
+
+test('Codex-sec-P2: suffix-refused files report suffix, not magic (no double screen)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const v = await begin(t, t.alice, {
+    name: 'evil', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'evil.bin', bytes: 8 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const mz = new Uint8Array([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00]);
+  const c = await chunk(t, t.alice, v.json.id, 'evil.bin', 0, mz);
+  assert.equal(c.status, 200, c.text);
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 422, f.text);
+  assert.ok(f.json.checks.some((x) => x.code === 'SUFFIX_REFUSED'), JSON.stringify(f.json.checks));
+  assert.ok(!f.json.checks.some((x) => x.code === 'MAGIC_REFUSED'), JSON.stringify(f.json.checks));
+});
