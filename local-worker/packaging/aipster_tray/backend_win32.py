@@ -186,6 +186,9 @@ class Win32Backend(Backend):
                 if not handle:
                     raise OSError("GlobalAlloc failed")
                 locked = kernel.GlobalLock(handle)
+                if not locked:
+                    kernel.GlobalFree(handle)
+                    raise OSError("GlobalLock failed")
                 ctypes.memmove(locked, data, len(data))
                 kernel.GlobalUnlock(handle)
                 if not user32.SetClipboardData(CF_UNICODETEXT, handle):

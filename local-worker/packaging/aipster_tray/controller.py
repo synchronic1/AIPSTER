@@ -257,6 +257,10 @@ class Controller:
         if paired and serving and sender_up:
             self.log("connect: already running and paired; nothing to do")
             return True
+        if paired and serving:
+            revived = self.start_sender()
+            self.log("connect: sender revived" if revived else "connect: sender failed to start")
+            return revived
         started = self.start_worker()
         if not paired:
             if not self.launch_pair():

@@ -733,7 +733,7 @@ class TrayConnectActionsTests(unittest.TestCase):
         self.assertNotIn('pair_console', kinds)
         self.assertEqual(self.ctl.sender.starts, 1)
 
-    def test_connect_is_idempotent_when_connected(self):
+    def test_connect_is_idempotent_when_running_paired_with_sender(self):
         self.pair_store()
         self.ctl.sender._running = True
         self.ctl.state = state.RUNNING
@@ -749,6 +749,16 @@ class TrayConnectActionsTests(unittest.TestCase):
         self.assertEqual(self.ctl.state, state.PORT_BUSY)
         kinds = [e[0] for e in self.backend.events]
         self.assertIn('pair_console', kinds)
+
+    def test_connect_revives_dead_sender_when_serving(self):
+        self.pair_store()
+        self.ctl.state = state.RUNNING
+        self.ctl.sender._running = False
+        self.ctl.sender._exit = 1
+        self.ctl.sender.last_exit = 1
+        self.assertTrue(self.ctl.connect())
+        self.assertEqual(self.ctl.sender.starts, 1)
+        self.assertEqual(len(self.ctl.child.started), 0)
 
     def test_settings_returns_config_path(self):
         self.assertEqual(self.ctl.open_settings(), str(self.data / 'config.toml'))
