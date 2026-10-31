@@ -1604,10 +1604,15 @@ async function handleApi(request, env, url) {
         // early), and finalize stays exact because it assembles from the
         // store, never from counters.
         const key = `upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`;
-        const existing = await store.get(key);
-        const existingLen = existing ? existing.length : 0;
         let reserved = false;
+        let usedNew = false;
+        let usedCredit = 0;
         for (let attempt = 0; attempt < 3 && !reserved; attempt += 1) {
+          // Fresh replace pre-read per attempt: a conflict means a rival
+          // moved, so re-derive the credit instead of reusing a stale one.
+          // The winning attempt's values freeze below for rollback.
+          const existing = await store.get(key);
+          const existingLen = existing ? existing.length : 0;
           const live = await first(db, 'SELECT state, quotas_json FROM catalog_uploads WHERE id = ?', uploadId);
           if (!live || live.state !== 'uploading') {
             if (!live || live.state === 'expired') {
@@ -1615,7 +1620,7 @@ async function handleApi(request, env, url) {
             }
             return json(409, { error: `Upload is ${live.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
           }
-          // Immutable chunk sizes (Codex-P1): a same-index PUT smaller than
+          // No shrinking replaces (Codex-P1): a same-index PUT smaller than
           // the stored part is refused. Replacement credits come from a
           // pre-read that overlapping PUTs can share, so two shrinking
           // replaces would each subtract the original bytes and manufacture
@@ -1623,9 +1628,11 @@ async function handleApi(request, env, url) {
           // legitimate replace) and growing replaces net zero or positive
           // per op under any interleave - counters can only meet or exceed
           // truth, never manufacture credit - so only the shrinking
-          // direction needs the gate. Re-chunking starts a new session.
+          // direction needs the gate. (A stale pre-read can still land a
+          // true shrink against grown truth; the credit then under-counts,
+          // which stays fail-closed.) Re-chunking starts a new session.
           if (bytes.byteLength < existingLen) {
-            return json(400, { error: `Chunk for ${relpath} index ${index} is smaller than the stored ${existingLen} bytes; chunk sizes are immutable within a session - start a new upload to re-chunk.`, code: 'SHRINK_REFUSED', retryable: false });
+            return json(400, { error: `Chunk for ${relpath} index ${index} is smaller than the stored ${existingLen} bytes; same-index re-sends must not shrink - start a new upload to re-chunk.`, code: 'SHRINK_REFUSED', retryable: false });
           }
           const quotas = JSON.parse(live.quotas_json);
           const pc = quotas.parts || { total: 0, bytes: {} };
@@ -1651,7 +1658,7 @@ async function handleApi(request, env, url) {
           pc.bytes[relpath] = fileBytes;
           quotas.parts = pc;
           const wrote = await run(db, 'UPDATE catalog_uploads SET quotas_json = ?, updated_at = ? WHERE id = ? AND state = ? AND quotas_json = ?', JSON.stringify(quotas), nowIso(), uploadId, 'uploading', live.quotas_json);
-          if (Number(wrote.meta.changes) === 1) reserved = true;
+          if (Number(wrote.meta.changes) === 1) { reserved = true; usedNew = !existing; usedCredit = existingLen; }
         }
         if (!reserved) {
           return json(409, { error: 'Chunk raced concurrent writes; retry the chunk.', code: 'UPLOAD_STATE', retryable: true });
@@ -1669,8 +1676,8 @@ async function handleApi(request, env, url) {
             const pc = quotas.parts || { total: 0, bytes: {} };
             pc.bytes = Object.assign(Object.create(null), pc.bytes || {});
             const have = Object.hasOwn(pc.bytes, relpath) ? pc.bytes[relpath] : 0;
-            pc.total = Math.max(0, (pc.total || 0) - (existing ? 0 : 1));
-            pc.bytes[relpath] = Math.max(0, have - (bytes.byteLength - existingLen));
+            pc.total = Math.max(0, (pc.total || 0) - (usedNew ? 1 : 0));
+            pc.bytes[relpath] = Math.max(0, have - (bytes.byteLength - usedCredit));
             quotas.parts = pc;
             const undone = await run(db, 'UPDATE catalog_uploads SET quotas_json = ? WHERE id = ? AND quotas_json = ?', JSON.stringify(quotas), uploadId, live.quotas_json);
             if (Number(undone.meta.changes) === 1) return;

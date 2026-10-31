@@ -1505,6 +1505,8 @@ test('Codex-P1: a terminal flip between reserve and put reclaims and rolls back'
 // Barrier: force two chunk PUTs to compute off one base before either
 // writes, guaranteeing overlap regardless of scheduling. Latch: retries
 // pass straight through (no deadlock when a PUT refuses pre-CAS).
+// Constraint: use only where both PUTs reach the gate or neither does;
+// exactly one gated write would hang the waiter forever.
 function casBarrier(t) {
   const realPrepare = t.env.DB.prepare;
   let arrived = 0;
@@ -1594,7 +1596,10 @@ test('Codex-P1: growing overlaps overcount, never undercount', async () => {
   const t = await fx();
   __resetFixtureStore();
   const store = byteStore(t.env);
-  const id = await seedOnePart(t, 'grow', 32);
+  // Declared 64: the loser's retry re-reads the key, which may hit (exact
+  // replace accounting) or miss (new-key accounting) depending on the
+  // winner's put timing; both admit and both stay fail-closed.
+  const id = await seedOnePart(t, 'grow', 64);
   const restore = casBarrier(t);
   const [a, b] = await Promise.all([
     chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(20).fill(0x48)),
