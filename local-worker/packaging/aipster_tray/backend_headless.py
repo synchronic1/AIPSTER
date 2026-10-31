@@ -35,3 +35,8 @@ class HeadlessBackend(Backend):
     def open_logs(self, path):
         self.log(f"backend=headless open_logs suppressed path={path}")
         return str(path)
+
+    def run_pair_console(self, exe, args):
+        self.events.append(("pair_console", str(exe), " ".join(args)))
+        self.log(f"backend=headless pair_console suppressed exe={exe} args={' '.join(args)}")
+        return (str(exe), list(args))

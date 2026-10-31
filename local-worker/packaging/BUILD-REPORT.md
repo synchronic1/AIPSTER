@@ -1,6 +1,22 @@
 <!-- Built with Meta Muse; isolated Codex review and repair evidence below. -->
 # Windows worker build report
 
+## 2026-10-31: packaged builds superseded (edge-compat fix, unpublished)
+
+The `cee3390` and `939e216` artifacts below (and the CI `76443dd` build)
+all predate `adfe357` ("Send product User-Agent from worker pairing /
+heartbeat sender"), so their frozen pairing client still sends the default
+scripting UA and eats the API edge refusal (Cloudflare 1010) on claim and
+heartbeat. None of them may be published: the dashboard no longer presents
+the packaged build as pending-publication (it reports a rebuild pending
+qualification), and the reviewed source pin moved to `3fa309c` (first
+origin/main HEAD containing the fix; `USER_AGENT` verified in-tree).
+
+The release owner must rebuild from a post-fix merge commit, re-qualify
+(including the new pair/sender coverage in `qualify.py` and
+`test_packaging.py`), then publish and wire that exact verified artifact.
+Nothing below is deleted: the superseded hashes stay as history.
+
 ## Takeover rebuilt artifact (local, unsigned, unpublished)
 
 Uninstall repair: running-process gate, payload-first removal order, exact

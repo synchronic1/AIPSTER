@@ -367,6 +367,36 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
+def edge_block_marker(status, raw, content_type):
+    """Sanitized diagnosis for a non-JSON HTTP error body. Never echoes bytes.
+
+    An edge/CDN/proxy refusal (e.g. Cloudflare HTML on 403) carries no API
+    payload; reporting only the status left users with a generic
+    CLAIM_FAILED. The marker names the status plus a fixed content class
+    derived from the Content-Type header and the first non-space byte, and
+    hints at the pre-API block. Response bytes are never included.
+    """
+    claimed = (content_type or "").split(";")[0].strip().lower()
+    first = raw.lstrip()[:1]
+    if "html" in claimed or first == "<":
+        kind = "HTML"
+    elif "json" in claimed:
+        kind = "unparseable JSON"
+    elif "text" in claimed or (first and first.isprintable()):
+        kind = "text"
+    elif not raw.strip():
+        kind = "empty"
+    else:
+        kind = "binary"
+    return {
+        "code": "EDGE_BLOCKED",
+        "error": (f"API refused with a non-JSON {kind} error page "
+                  f"(HTTP {status}); the request was blocked before reaching "
+                  f"the API (edge or proxy). Update the worker and retry; "
+                  f"no response content is shown."),
+    }
+
+
 def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
     """POST JSON, returning (status, body-dict, retry-after)."""
     data = json.dumps(payload).encode("utf-8")
@@ -379,6 +409,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             status = response.status
             raw = response.read().decode("utf-8", "replace")
             retry_after = response.headers.get("Retry-After")
+            content_type = response.headers.get("Content-Type")
     except HTTPError as exc:
         try:
             if 300 <= exc.code < 400:
@@ -386,6 +417,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             raw = exc.read().decode("utf-8", "replace")
             status = exc.code
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            content_type = exc.headers.get("Content-Type") if exc.headers else None
         except (http.client.HTTPException, OSError) as fault:
             raise PairingError(None, "NETWORK", "incomplete API response") from fault
         finally:
@@ -393,12 +425,20 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
     except (URLError, TimeoutError, socket.timeout, OSError, http.client.HTTPException) as exc:
         # A truncated response belongs to the same bounded transport backoff.
         raise PairingError(None, "NETWORK", "API transport failed") from exc
+    parsed = True
     try:
         body = json.loads(raw) if raw.strip() else {}
     except ValueError:
         body = {}
+        parsed = False
     if not isinstance(body, dict):
         body = {}
+        parsed = False
+    if not parsed and status >= 400:
+        # Error statuses without an API payload are edge/proxy refusals, not
+        # API verdicts: surface the sanitized marker instead of a bare {} that
+        # callers would render as a generic CLAIM_FAILED/HEARTBEAT_FAILED.
+        body = edge_block_marker(status, raw, content_type)
     retry_sec = None
     for candidate in (body.get("retryAfterSec"), retry_after):
         try:
@@ -675,6 +715,13 @@ def cmd_heartbeat(args, loop):
     interval = max(args.interval, HEARTBEAT_MIN_INTERVAL_SEC)
     failures = 0
     first_beat = True
+    if loop and hasattr(sys.stdout, "reconfigure"):
+        # Supervised senders pipe stdout to the tray log: line-buffer so
+        # each beat lands promptly instead of sitting in the block buffer.
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            pass
     while True:
         if not first_beat:
             # Reload every beat: unpair stops the sender instead of beating on
@@ -861,17 +908,27 @@ def build_parser():
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "pair":
-        return cmd_pair(args)
-    if args.command == "heartbeat-once":
-        return cmd_heartbeat(args, loop=False)
-    if args.command == "heartbeat-loop":
-        return cmd_heartbeat(args, loop=True)
-    if args.command == "status":
-        return cmd_status(args)
-    if args.command == "unpair":
-        return cmd_unpair(args)
+    try:
+        args = parser.parse_args(argv)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    try:
+        if args.command == "pair":
+            return cmd_pair(args)
+        if args.command == "heartbeat-once":
+            return cmd_heartbeat(args, loop=False)
+        if args.command == "heartbeat-loop":
+            return cmd_heartbeat(args, loop=True)
+        if args.command == "status":
+            return cmd_status(args)
+        if args.command == "unpair":
+            return cmd_unpair(args)
+    except KeyboardInterrupt:
+        # Ctrl+C stops the sender cleanly: no traceback, no partial claim
+        # (pair's manifest commit is atomic under the pair mutex).
+        print("interrupted", file=sys.stderr)
+        return 130
     parser.print_help()
     return EXIT_USAGE
 

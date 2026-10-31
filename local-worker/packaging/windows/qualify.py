@@ -215,7 +215,9 @@ def pure_tests():
         actions = [i["id"] for i in model if i["kind"] == "action"]
         if not labels[0].startswith("AIPSTER Worker — "):
             ok = False
-        if st.PAIRING_LINE not in labels:
+        if st.UNPAIRED_LINE not in labels:
+            ok = False
+        if "pair" not in actions:
             ok = False
         if not {"dashboard", "logs", "quit"} <= set(actions):
             ok = False
@@ -224,13 +226,14 @@ def pure_tests():
             ok = False
         for item in model:
             if item["kind"] == "action" and item["id"] in ("dashboard", "logs", "quit",
-                                                           "start", "stop"):
+                                                           "start", "stop", "pair"):
                 for word in st.FORBIDDEN_STATUS_WORDS:
                     if word in item["label"].lower():
                         ok = False
     check("menu model per state (toggle, pairing line, no overclaim)", ok)
     events = {e: st.balloon_for(e, "running", "8090") for e in
-              ("reuse", "restarted", "giveup", "port_busy", "started", "stopped")}
+              ("reuse", "restarted", "giveup", "port_busy", "started", "stopped",
+               "paired", "pair_again", "sender_stopped")}
     check("balloon text for every event",
           all(title == "AIPSTER Worker" and len(body) > 10 for title, body in events.values()))
     try:
@@ -382,6 +385,31 @@ def pure_tests():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+    sys.path.insert(0, str(PACKAGING.parent.parent))
+    with tempfile.TemporaryDirectory(prefix="aipster-overlay-") as temp:
+        data = Path(temp) / "worker-data"
+        data.mkdir()
+        overlay = st.pairing_overlay(data)
+        check("unpaired data dir reads unpaired", overlay["key"] == "unpaired")
+        model = st.menu_model("running", "", "", overlay)
+        kinds = [(i["kind"], i.get("id") or i.get("label", "")) for i in model]
+        check("menu carries the pair action plus overlay lines",
+              ("action", "pair") in kinds and ("text", overlay["line"]) in kinds)
+        payload = st.write_state(data / "state.json", "running", "", 1, "127.0.0.1",
+                                 8090, 0, "v", pairing=overlay)
+        check("state file carries the pairing overlay",
+              payload["pairing"]["key"] == "unpaired"
+              and "pairing=unpaired" in st.describe(payload))
+    nsi = (PACKAGING / "worker.nsi").read_text(encoding="utf-8")
+    check("uninstall preserves pairing data by default",
+          "StrCpy $RemoveData 0" in nsi
+          and nsi.count('RMDir /r "$LOCALAPPDATA\\AIPSTER-Worker"') == 1
+          and "(config, token, pairing, state, logs) was preserved" in nsi)
+    launcher_src = (PACKAGING / "launcher.py").read_text(encoding="utf-8")
+    spec_src = (PACKAGING / "dendrite.spec").read_text(encoding="utf-8")
+    check("pairing module freezes with the launcher",
+          "from pairing import main" in launcher_src
+          and "str(PACKAGING.parent)" in spec_src)
 
 
 # ------------------------------------------------------- tray behavior matrix
@@ -555,10 +583,13 @@ def tray_matrix(app_dir, work):
               "confined=True" in tray_log_text
               or ("confined=False" in tray_log_text and "confine_error=" in tray_log_text))
         token = (data / "api-token.txt").read_text(encoding="utf-8").strip()
+        sender_log = data / "logs" / "sender.log"
         haystacks = [(data / "logs" / "tray.log").read_text(encoding="utf-8", errors="replace"),
                      (data / "logs" / "worker.log").read_text(encoding="utf-8", errors="replace"),
-                     (data / "state.json").read_text(encoding="utf-8")]
-        check("token value absent from tray log, worker log, state file",
+                     (data / "state.json").read_text(encoding="utf-8"),
+                     sender_log.read_text(encoding="utf-8", errors="replace")
+                     if sender_log.exists() else ""]
+        check("token value absent from tray/sender/worker logs, state file",
               all(token not in hay for hay in haystacks))
 
         # T8: quit stops everything owned (tray + worker + port).
@@ -755,6 +786,140 @@ def tray_matrix(app_dir, work):
             pass
     finally:
         lab5.quit_all()
+
+    # T13: frozen pair + sender supervision against the e2e bridge (needs node).
+    lab6 = TrayLab(app_dir, work)
+    website = PACKAGING.parent.parent.parent / "website"
+    bridge_script = website / "scripts" / "pairing-e2e-bridge.mjs"
+    if not (shutil.which("node") and bridge_script.exists()
+            and (website / "node_modules" / "better-auth").exists()):
+        skip("frozen pair/sender/bridge matrix", "needs node + website/node_modules")
+        return
+    bridge = subprocess.Popen(["node", str(bridge_script)], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, cwd=str(website))
+    try:
+        base = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            line = bridge.stdout.readline()
+            if not line:
+                break
+            if line.startswith("BRIDGE_READY"):
+                base = f"http://127.0.0.1:{line.split('port=')[1].strip()}"
+                break
+        check("pair bridge starts", base is not None)
+        if base is None:
+            return
+
+        def api(method, path, body=None, headers=None):
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(
+                base + path, data=data, method=method,
+                headers={"Content-Type": "application/json", **(headers or {})})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as res:
+                    return res.status, json.loads(res.read().decode() or "{}")
+            except urllib.error.HTTPError as exc:
+                try:
+                    payload = json.loads(exc.read().decode() or "{}")
+                except ValueError:
+                    payload = {}
+                return exc.code, payload
+
+        status, seeded = api("POST", "/__test/seed-user",
+                             {"email": "qual-t13@example.invalid", "name": "qual13"})
+        cookie = (seeded or {}).get("cookie")
+        check("bridge seeds a fixture user", status == 200 and bool(cookie))
+        status, minted = api("POST", "/api/pairing/codes", {"ttlMinutes": 10},
+                             {"Cookie": cookie or "", "X-Aipster-CSRF": "1"})
+        code = (minted or {}).get("code")
+        check("bridge mints a fixture code", status == 201 and bool(code))
+        if not code:
+            return
+        env, data = lab6.env_for("tray-pair")
+        pair = run_silent([str(lab6.worker_exe), "pair", "--api-base", base,
+                           "--code", code], env, timeout=120)
+        meta_file = data / "pairing.json"
+        check("frozen pair claims through the launcher entry",
+              pair.returncode == 0 and meta_file.exists(), f"rc={pair.returncode}")
+        check("pair prints no code or key material",
+              code not in pair.stdout and code not in pair.stderr
+              and "heartbeatKey" not in pair.stdout)
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            key_file = data / meta.get("key_file", "")
+        except (OSError, ValueError):
+            meta, key_file = {}, data / "missing"
+        sys.path.insert(0, str(PACKAGING.parent))
+        from aipster_tray.firstrun import private_token_acl
+        check("paired credential files are user-private",
+              meta_file.exists() and private_token_acl(meta_file)
+              and key_file.exists() and private_token_acl(key_file))
+        once = run_silent([str(lab6.worker_exe), "sender", "--once", "--api-base", base],
+                          env, timeout=120)
+        check("frozen sender posts one beat",
+              once.returncode == 0 and "heartbeat ok" in once.stdout,
+              f"rc={once.returncode}")
+        status, _ = api("POST", "/__test/revoke-key", {"id": meta.get("key_id")})
+        check("bridge revokes the fixture key", status == 200)
+        dead = run_silent([str(lab6.worker_exe), "sender", "--once", "--api-base", base],
+                          env, timeout=120)
+        check("revoked sender demands re-pair (exit 4)",
+              dead.returncode == 4 and "pair again" in dead.stderr,
+              f"rc={dead.returncode}")
+        # Re-pair for the supervised run below (fresh code, same node).
+        status, minted2 = api("POST", "/api/pairing/codes", {"ttlMinutes": 10},
+                              {"Cookie": cookie, "X-Aipster-CSRF": "1"})
+        code2 = (minted2 or {}).get("code")
+        repair = run_silent([str(lab6.worker_exe), "pair", "--api-base", base,
+                             "--code", code2 or ""], env, timeout=120) if code2 else None
+        check("re-pair restores the sender credential",
+              bool(code2) and repair is not None and repair.returncode == 0)
+        # Clear the 25s server beat window so the supervised sender's first
+        # beat succeeds instead of honestly recording a 429 rate-limit.
+        status, _ = api("POST", "/__test/backdate-heartbeat",
+                        {"id": meta.get("resource_id"), "at": "2020-01-01T00:00:00.000Z"})
+        check("beat window cleared for the supervised run", status == 200)
+        pair_port = free_port()
+        (data / "config.toml").write_text(
+            f'[node]\nid = "tray-pair"\nhost = "127.0.0.1"\nport = {pair_port}\n'
+            'state_dir = "state"\n\n[[runtimes]]\nid = "mock"\nkind = "mock"\ngpu_layers = 0\n'
+            '\n[[models]]\nid = "mock-summary"\nruntime = "mock"\ncapabilities = ["summarize"]\n',
+            encoding="utf-8")
+        proc = lab6.launch(env)
+        payload = wait_state(data, "running", timeout=45)
+        check("paired tray reaches running",
+              bool(payload and payload["state"] == "running"))
+        deadline = time.monotonic() + 30
+        overlay_key, sender_beat = None, False
+        while time.monotonic() < deadline:
+            current = read_state_file(data)
+            overlay_key = (current or {}).get("pairing", {}).get("key")
+            sender_log = data / "logs" / "sender.log"
+            if sender_log.exists():
+                sender_beat = "heartbeat ok" in sender_log.read_text(
+                    encoding="utf-8", errors="replace")
+            if overlay_key == "reachable" and sender_beat:
+                break
+            time.sleep(1)
+        check("supervised sender beats; overlay reads reachable",
+              overlay_key == "reachable" and sender_beat,
+              f"overlay={overlay_key} beat={sender_beat}")
+        lab6.cli(env, "quit")
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        try:
+            bridge.terminate()
+            bridge.wait(timeout=10)
+        except Exception:
+            try:
+                bridge.kill()
+            except Exception:
+                pass
+        lab6.quit_all()
 
 
 # ------------------------------------------------------------- full profile

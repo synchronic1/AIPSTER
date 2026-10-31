@@ -26,3 +26,12 @@ class Backend:
 
     def open_logs(self, path):
         """Open the logs directory. Returns the path (test hook)."""
+
+    def run_pair_console(self, exe, args):
+        """Launch the pair prompt in its own console. Returns (exe, args).
+
+        The windowed tray has no console for the no-echo code prompt, so
+        pairing runs in the console launcher (`aipster-worker pair`), which
+        prompts, claims, and reports the paired resource id / key prefix
+        only. Headless records the launch without spawning anything.
+        """

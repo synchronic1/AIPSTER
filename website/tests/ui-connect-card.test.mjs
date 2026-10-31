@@ -19,9 +19,9 @@ import { checkPublic } from '../scripts/check.mjs';
 
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
-const WORKER_COMMIT = 'f3e115e0c42fcd83e8a6f2e769de427710f7acc1';
+const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
-const DOCS_COMMIT = 'bcb2e03e8342af8c2c6ddb5bdea1998c7491e45a';
+const DOCS_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
@@ -186,7 +186,7 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const primaryBtn = buttons.find((b) => !attr(b, 'data-action'));
   assert.ok(primaryBtn, 'primary action is present');
   assert.ok(primaryBtn.attrs.some((x) => x.name === 'disabled'), 'unavailable installer is a disabled action, not a fake download');
-  assert.equal(nodeText(primaryBtn), 'Installer pending publication for Windows x64');
+  assert.equal(nodeText(primaryBtn), 'Installer rebuild pending for Windows x64');
   const selects = nodes.filter((n) => n.tagName === 'select');
   assert.equal(selects.length, 1, 'one OS picker');
   assert.equal(attr(selects[0], 'data-action'), 'os');
@@ -206,8 +206,8 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const head = card.innerHTML.slice(0, card.innerHTML.indexOf('<details'));
   assert.ok(!head.includes('<pre') && !head.includes('git clone') && !head.includes('DENDRITE_API_TOKEN'), 'no runbook above Advanced');
   const text = textOf(card.innerHTML);
-  for (const phrase of ['Connect your computer', 'Installer pending publication for Windows x64', 'Set up with my agent',
-    'Installer for Windows x64 0.1.0', 'packaged; release qualification pending', 'nothing to download',
+  for (const phrase of ['Connect your computer', 'Installer rebuild pending for Windows x64', 'Set up with my agent',
+    'Installer for Windows x64 0.1.0', 'will not be published', 'rebuilt installer is pending qualification', 'nothing to download',
     'Setup needed', 'Installing', 'Pairing', 'Connected', 'You are here. Not connected.',
     'AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant',
     'Advanced: manual install, source and troubleshooting', 'ganglion-dendrite 0.1.0', WORKER_COMMIT]) {
@@ -297,7 +297,8 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
 
   // A bogus picker value changes nothing.
   await win.chooseOs('bogus');
-  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64 0.1.0 is packaged; release qualification pending'));
+  assert.ok(textOf(win.el('connect-card').innerHTML).includes('Installer for Windows x64 0.1.0 is packaged'));
+  assert.ok(textOf(win.el('connect-card').innerHTML).includes('will not be published'));
 
   // Phones and tablets are directed to the computer they want to connect,
   // with no install action until they explicitly pick a target computer.
@@ -411,8 +412,8 @@ test('packaged-but-unpublished installer shows version/checksum with no download
   const before = ui.calls.length;
   const html = ui.el('connect-card').innerHTML;
   const text = textOf(html);
-  assert.ok(text.includes('Installer pending publication for Windows x64'), 'disabled per-platform action');
-  assert.ok(text.includes('packaged; release qualification pending') && text.includes('nothing to download'), 'visible explanation');
+  assert.ok(text.includes('Installer rebuild pending for Windows x64'), 'disabled per-platform action');
+  assert.ok(text.includes('will not be published') && text.includes('rebuilt installer is pending qualification') && text.includes('nothing to download'), 'visible explanation');
   assert.ok(text.includes('0.1.0') && text.includes('81f60828bcc89f038f7a0ded16db76bb06f0c64c42942fa9c52b24cb7f503688'), 'reviewed build version + exact checksum shown');
   assert.ok(!/Download installer/.test(text), 'no live download label while unpublished');
   const linksBefore = cardLinks(html);
@@ -440,12 +441,12 @@ test('progress never claims an unverified installed, paired or connected state',
   assert.equal(current.length, 1, 'exactly one current stage');
   assert.ok(nodeText(current[0]).startsWith('Setup needed'), 'Setup needed is the current stage');
   const progressText = textOf(progressHtml);
-  assert.ok(progressText.includes('Pending: the installer is packaged; release qualification pending; the release file is not published yet.'));
+  assert.ok(progressText.includes('Pending: the packaged installer predates the API edge-compat fix; a rebuilt installer is pending qualification and there is nothing to download yet.'));
   await ui.chooseOs('macos');
   const macProgress = textOf(ui.el('connect-card').innerHTML.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0]);
   assert.ok(macProgress.includes('Blocked: no verified installer is packaged yet.'));
   assert.ok(progressText.includes('Available: mint a one-time code below'), 'pairing is offered, not blocked');
-  assert.ok(progressText.includes('Start the sender using the manual steps afterward.'));
+  assert.ok(progressText.includes('Packaged installs start the sender from the tray; source installs use the manual steps below.'));
   assert.ok(!progressText.includes('not merged or deployed') && !progressText.includes('not implemented'), 'no stale blocked-pairing copy');
   assert.ok(!/pairing support/i.test(progressText), 'heartbeat intake is never called pairing support');
   assert.ok(progressText.includes('Needs verified worker evidence. A download or a running worker is not proof.'));
@@ -558,7 +559,7 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
     'security-fixed revision', 'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified',
     'untested', 'separate prerequisites', 'Mint a one-time pairing code above',
     'not linked until paired', 'Advanced: manual resource registration',
-    'pairing.py heartbeat-loop', 'Packaged launcher integration is pending',
+    'pairing.py heartbeat-loop', 'Packaged install?', 'aipster-worker pair', 'tray starts the sender',
     'Disconnect and uninstall', 'Troubleshooting', 'worker and its root LICENSE only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
@@ -775,4 +776,81 @@ test('key management renders when the inventory walk fails', async () => {
   assert.ok(html.includes('my-read-key'), 'key card renders despite inventory failure: ' + html);
   assert.ok(html.includes('data-revkey'), 'Revoke control stays available');
   assert.ok(ui.el('key-resource').innerHTML.includes('unavailable'), 'dropdown degrades honestly');
+});
+
+test('progress stage derives from inventory: setup, pairing, reachable', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  const currentOf = (html) => {
+    const progressHtml = html.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0];
+    const current = nodesOf(progressHtml).filter((n) => n.tagName === 'li' && n.attrs.some((x) => x.name === 'aria-current' && x.value === 'step'));
+    assert.equal(current.length, 1, 'exactly one current stage');
+    return nodeText(current[0]);
+  };
+  let html = ui.el('connect-card').innerHTML;
+  assert.ok(currentOf(html).startsWith('Setup needed'), 'no rows: Setup needed');
+  assert.ok(html.includes('<span class="pill warn">Setup needed</span>'));
+  const now = new Date().toISOString();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_wait', 'u_alice', 'n_wait', 'wait-box', 'local', 'paired', 'c', 'g', 1, 1, 0, 0, null, now).run();
+  await ui.clickTab('compute');
+  await ui.settleList('wait-box', 'awaiting row renders');
+  html = ui.el('connect-card').innerHTML;
+  assert.ok(currentOf(html).startsWith('Pairing'), 'paired row without a beat highlights Pairing');
+  assert.ok(textOf(html).includes('Paired, awaiting heartbeat'));
+  assert.ok(html.includes('<span class="pill warn">Pairing</span>'));
+  await ui.db.prepare('UPDATE resources SET online = 1, heartbeat_at = ? WHERE id = ?').bind(now, 'r_wait').run();
+  await ui.clickTab('compute');
+  await ui.settleList('wait-box', 'fresh beat renders');
+  html = ui.el('connect-card').innerHTML;
+  assert.ok(currentOf(html).startsWith('Connected'), 'fresh beat highlights Connected');
+  assert.ok(textOf(html).includes('Reachable now: fresh heartbeat on file'));
+  assert.ok(html.includes('<span class="pill ok">Reachable</span>'));
+  const rest = textOf(html.replace(html.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0], ''));
+  assert.ok(!/\bconnected\b/i.test(rest.replace(/not connected/gi, '')), 'never claims connected outside the stepper');
+  assert.ok(!/\bready\b|\bonline\b/i.test(rest.replace(/offline/gi, '')), 'never claims readiness or liveness');
+});
+
+test('double Pair click while minting starts one mint', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  const before = ui.calls.length;
+  ui.el('connect-card').onclick({ target: { dataset: { action: 'pair' } } });
+  ui.el('connect-card').onclick({ target: { dataset: { action: 'pair' } } });
+  const text = await ui.settle('dup mint');
+  assert.ok(text.includes('Code minted'));
+  assert.deepEqual(ui.calls.slice(before), ['POST /api/pairing/codes'], 'second click starts nothing');
+});
+
+test('authorizing highlights Pairing without claiming a link', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  await ui.clickTab('compute');
+  await ui.press('pair');
+  await ui.settle('authorizing');
+  const html = ui.el('connect-card').innerHTML;
+  const progressHtml = html.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0];
+  const current = nodesOf(progressHtml).filter((n) => n.tagName === 'li' && n.attrs.some((x) => x.name === 'aria-current' && x.value === 'step'));
+  assert.equal(current.length, 1);
+  assert.ok(nodeText(current[0]).startsWith('Pairing'));
+  assert.ok(textOf(progressHtml).includes('Authorizing: code minted'));
+  assert.ok(html.includes('<span class="pill warn">Pairing</span>'));
+});
+
+test('inventory failure is an actionable error with a bounded manual retry', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', failPaths: ['/api/inventory'] });
+  await ui.clickTab('compute');
+  await ui.settleList('injected failure', 'list shows the failure');
+  const text = textOf(ui.el('connect-card').innerHTML);
+  assert.ok(text.includes('Refresh failed'), 'card names the failure');
+  assert.ok(text.includes('Try again'), 'manual retry offered');
+  const count = () => ui.calls.filter((c) => c === 'GET /api/inventory?limit=50').length;
+  const before = count();
+  await ui.flush();
+  assert.equal(count(), before, 'no automatic retry loop');
+  await ui.press('retry-load');
+  const deadline = Date.now() + 10000;
+  while (count() < before + 1 && Date.now() < deadline) await new Promise(setImmediate);
+  assert.equal(count(), before + 1, 'one inventory read per retry press');
+  await ui.settleList('injected failure', 'retry re-renders the failure');
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes('Refresh failed'), 'error persists honestly');
 });

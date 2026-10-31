@@ -113,7 +113,8 @@ class Win32Backend(Backend):
     def _popup(self):
         user32 = _user32()
         items = st.menu_model(self.controller.state, self.controller.endpoint_label(),
-                              self.controller.detail)
+                              self.controller.detail,
+                              getattr(self.controller, "pairing", None))
         menu = user32.CreatePopupMenu()
         actions = {}
         try:
@@ -161,6 +162,17 @@ class Win32Backend(Backend):
         except (OSError, AttributeError) as exc:
             self.log(f"backend=win32 open_logs failed: {exc}")
         return str(path)
+
+    def run_pair_console(self, exe, args):
+        # ShellExecute "open" on the console launcher spawns a visible
+        # console window with the no-echo prompt; the tray stays windowed.
+        # The code is typed there, never passes through the tray, and is
+        # never logged. Every call is guarded like the other openers.
+        try:
+            _shell().ShellExecuteW(None, "open", str(exe), " ".join(args), None, 1)
+        except (OSError, AttributeError) as exc:
+            self.log(f"backend=win32 run_pair_console failed: {exc}")
+        return (str(exe), list(args))
 
     # -- internals ----------------------------------------------------------
     def _tooltip(self, state, detail=""):
