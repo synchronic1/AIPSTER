@@ -144,6 +144,9 @@ export async function routingDigests(features, ranked) {
     maxTokens: Number.isSafeInteger(f.maxTokens) ? f.maxTokens : null,
     kinds: Array.isArray(f.kinds) ? [...f.kinds].sort() : null,
   });
-  const candidateDigest = await canonicalDigest((Array.isArray(ranked) ? ranked : []).map((r) => [r.alias, r.resourceId, r.score, r.policyVersion]));
+  // Time-stable by design: scores decay with heartbeat age, so including
+  // them would invalidate the cache on every read. The digest pins the
+  // candidate SET (aliases + ids + policy); TTL bounds ranking staleness.
+  const candidateDigest = await canonicalDigest((Array.isArray(ranked) ? ranked : []).map((r) => [r.alias, r.resourceId, r.policyVersion]));
   return { featureDigest, candidateDigest };
 }

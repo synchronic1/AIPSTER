@@ -50,12 +50,14 @@ export function resolveAdvicePolicy(env = {}, tenantPolicy = null) {
  *   failure:{code,status}|null, receipt:{opId,mode,model,usage,spendUsdEst,
  *   latencyMs,priceRef,attempted:boolean}}
  */
-export async function requestAdvice({ db, env = {}, tenant, request, ranked, tenantPolicy = null, fetchImpl = fetch, apiKey = null } = {}) {
+export async function requestAdvice({ db, env = {}, tenant, request, ranked, tenantPolicy = null, fetchImpl = fetch, apiKey = null, nowMs = null } = {}) {
   if (!db || typeof tenant !== 'string' || !tenant) throw new Error('db and tenant required.');
   if (!request || typeof request.requestId !== 'string' || !Number.isSafeInteger(request.deadlineMs)) throw new Error('valid request required.');
   const list = ranked && Array.isArray(ranked.ranked) ? ranked.ranked : null;
   if (!list) throw new Error('ranked candidates required.');
-  const t0 = Date.now();
+  const pinned = Number.isFinite(nowMs);
+  const now = () => (pinned ? nowMs : Date.now());
+  const t0 = now();
   const policy = resolveAdvicePolicy(env, tenantPolicy);
   const fallbackOrder = list.map((r) => r.alias);
   const base = (failure, attempted, spendUsdEst, usage) => ({
@@ -66,7 +68,7 @@ export async function requestAdvice({ db, env = {}, tenant, request, ranked, ten
     receipt: {
       opId: request.requestId, mode: policy.mode, model: policy.model,
       usage: usage || { inputTokens: null, outputTokens: null, source: 'none' },
-      spendUsdEst, latencyMs: Date.now() - t0,
+      spendUsdEst, latencyMs: now() - t0,
       priceRef: { version: META_PRICES.version, source: META_PRICES.source },
       attempted,
     },
@@ -75,7 +77,7 @@ export async function requestAdvice({ db, env = {}, tenant, request, ranked, ten
   if (!policy.enabled) return base({ code: 'ADVICE_DISALLOWED', status: 200 }, false, 0);
   if (!policy.contributorAllowed) return base({ code: 'ADVICE_DISALLOWED', status: 200 }, false, 0);
   if (list.length < policy.minCandidates) return base({ code: 'ADVICE_SKIPPED', status: 200 }, false, 0);
-  if (request.deadlineMs <= Date.now()) return base({ code: 'DEADLINE_EXCEEDED', status: 200 }, false, 0);
+  if (request.deadlineMs <= now()) return base({ code: 'DEADLINE_EXCEEDED', status: 200 }, false, 0);
 
   const envelope = list.map(toEnvelopeCandidate);
   const payload = JSON.stringify(envelope);
@@ -86,12 +88,12 @@ export async function requestAdvice({ db, env = {}, tenant, request, ranked, ten
 
   const inputTokens = estimateTokens(payload);
   try {
-    await claimAdviceBudget(db, tenant, { inputTokens, outputTokens: RANK_OUTPUT_MAX_TOKENS, env });
+    await claimAdviceBudget(db, tenant, { inputTokens, outputTokens: RANK_OUTPUT_MAX_TOKENS, env, clock: () => new Date(now()) });
   } catch (e) {
     return base({ code: (e && e.code) || 'ROUTE_ADVICE_REQUEST_BUDGET', status: 429 }, false, 0);
   }
 
-  const remaining = Math.min(request.deadlineMs, Date.now() + policy.allowanceMs) - Date.now();
+  const remaining = Math.min(request.deadlineMs, now() + policy.allowanceMs) - now();
   if (remaining <= 0) return base({ code: 'DEADLINE_EXCEEDED', status: 200 }, false, 0);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), remaining);
@@ -117,7 +119,7 @@ export async function requestAdvice({ db, env = {}, tenant, request, ranked, ten
       receipt: {
         opId: request.requestId, mode: policy.mode, model: policy.model, usage: finalUsage,
         spendUsdEst: spendFor(finalUsage.inputTokens, finalUsage.outputTokens, policy.mode),
-        latencyMs: Date.now() - t0,
+        latencyMs: now() - t0,
         priceRef: { version: META_PRICES.version, source: META_PRICES.source },
         attempted: true,
       },
