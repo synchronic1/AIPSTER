@@ -11,6 +11,7 @@ import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, ht
 import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
+import { dgmPreviewEnabled } from './dgm/router.mjs';
 import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
@@ -19,7 +20,7 @@ import { validateManifest, validateRelPath as catalogRelPath, MAX_MANIFEST_FILES
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
 const APP_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
@@ -541,7 +542,7 @@ async function handleApi(request, env, url) {
     const hasDb = !!env.DB;
     const secretOk = (env.BETTER_AUTH_SECRET || '').length >= 32;
     const urlOk = !!env.BETTER_AUTH_URL;
-    const schemaOk = hasDb && await schemaReady(env.DB, federationEnabled(env));
+    const schemaOk = hasDb && await schemaReady(env.DB, federationEnabled(env), dgmPreviewEnabled(env));
     const authConfigured = hasDb && secretOk && urlOk;
     return json(200, {
       ok: true, app: 'aipster-app', version: VERSION,

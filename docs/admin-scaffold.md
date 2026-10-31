@@ -65,5 +65,14 @@ production pass after that release:
 
 `website/tests/admin-scaffold.test.mjs` (12 tests): denial matrix,
 grant edges, role separation, CSRF-before-501 ordering,
-no-state-change, unknown-route non-leakage, panel headers. Run `npm
+no-state-change, unknown-route non-leakage, panel headers. The mount
+also serves the flag-gated DGM fixture-preview slice (see below). Run `npm
 test` from `website/`.
+
+## DGM fixture preview (0.5.0)
+
+`/api/admin/v1/dgm/preview/*` behind `DGM_PREVIEW_ENABLED` (dark by
+default), permission `admin.dgm.preview` on `operations_observer` and
+`engineering_reviewer`. Unlike the scaffold, preview creates and
+transitions are real D1 mutations (budget-charged, audited); the five
+disabled actions stay 501. Full record: `docs/dgm-fixture-preview.md`.

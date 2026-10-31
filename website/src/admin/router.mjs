@@ -14,6 +14,7 @@
 // module. Elevation, audit writes, and out-of-band grant issuance are
 // Milestone 1 work; their absence is reported, not silently skipped.
 import { all } from '../lib/store.js';
+import { handleDgmPreview } from '../dgm/router.mjs';
 
 // PRD Section 5 roles. Unknown role values authorize nothing.
 export const ADMIN_ROLES = [
@@ -35,7 +36,7 @@ export const ADMIN_SCOPE = 'platform';
 const ROLE_PERMISSIONS = {
   operations_observer: new Set([
     'admin.status', 'admin.overview.read', 'admin.fabrics.read', 'admin.resources.read',
-    'admin.metrics.read', 'admin.operations.read', 'admin.coverage.read'
+    'admin.metrics.read', 'admin.operations.read', 'admin.coverage.read', 'admin.dgm.preview'
   ]),
   access_administrator: new Set([
     'admin.status', 'admin.access.read', 'admin.access.suspend', 'admin.access.restore',
@@ -44,7 +45,7 @@ const ROLE_PERMISSIONS = {
   security_reviewer: new Set(['admin.status', 'admin.audit.read']),
   support_triager: new Set(['admin.status', 'admin.tickets.read', 'admin.tickets.manage']),
   engineering_reviewer: new Set([
-    'admin.status', 'admin.engineering.read', 'admin.engineering.export', 'admin.engineering.assign'
+    'admin.status', 'admin.engineering.read', 'admin.engineering.export', 'admin.engineering.assign', 'admin.dgm.preview'
   ]),
   role_grant_authority: new Set(['admin.status'])
 };
@@ -297,5 +298,11 @@ export async function handleAdmin(ctx) {
   // to unauthorized callers, so path existence is not an oracle.
   const gate = await requireAdmin(ctx, 'admin.status');
   if (gate.status) return send(ctx, gate.status, gate.body);
+  // DGM fixture preview (flag-gated, dark by default). requireAdmin is
+  // passed through the context so the preview router needs no import cycle.
+  if (path === '/api/admin/v1/dgm/preview/status' || path.startsWith('/api/admin/v1/dgm/preview/')) {
+    const out = await handleDgmPreview({ ...ctx, requireAdmin: (permission) => requireAdmin(ctx, permission) });
+    if (out) return out;
+  }
   return send(ctx, 404, { error: 'Unknown admin route.', code: 'NOT_FOUND' });
 }

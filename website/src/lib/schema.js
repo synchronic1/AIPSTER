@@ -1,6 +1,7 @@
 // Readiness contract for the routes compiled into this worker. Keep this in
 // step with required migration columns; table existence alone is insufficient.
-// Federation's additive contract is required only when its router is enabled.
+// Federation's and the DGM preview's additive contracts are required only
+// when their routers are enabled.
 const appSchema = {
   user: 'id name email emailVerified image createdAt updatedAt username displayUsername demo disabled',
   session: 'id expiresAt token createdAt updatedAt ipAddress userAgent userId',
@@ -63,13 +64,25 @@ function probe(schema) {
   return `SELECT 1 FROM ${Object.keys(schema).map(table => `"${table}"`).join(', ')} WHERE ${conjunction(columns.map(column => column + ' IS NULL'))} LIMIT 0`;
 }
 
-const appProbe = probe(appSchema), federationProbe = probe(federationSchema);
+// DGM fixture-preview tables (migration 0017). Column lists must match the
+// migration exactly; table existence alone is insufficient.
+const dgmPreviewTables = {
+  dgm_preview_runs: 'id task_id created_by fixture held label target status envelope_label advice_reason budget_fits budget_reason settlement gates_json provenance_json created_at updated_at',
+  dgm_preview_events: 'id run_id seq at event body_json'
+};
 
-export async function schemaReady(db, federationEnabled = false) {
+const appProbe = probe(appSchema), federationProbe = probe(federationSchema);
+const dgmProbe = probe({ ...appSchema, ...dgmPreviewTables });
+const federationDgmProbe = probe({ ...federationSchema, ...dgmPreviewTables });
+
+export async function schemaReady(db, federationEnabled = false, dgmPreviewEnabled = false) {
   try {
     // One read-only statement resolves all required tables/columns at prepare
     // time. LIMIT 0 does not scan application data, even for the joined probe.
-    const result = await db.prepare(federationEnabled ? federationProbe : appProbe).all();
+    const statement = federationEnabled
+      ? (dgmPreviewEnabled ? federationDgmProbe : federationProbe)
+      : (dgmPreviewEnabled ? dgmProbe : appProbe);
+    const result = await db.prepare(statement).all();
     return result.success !== false;
   } catch {
     return false;
