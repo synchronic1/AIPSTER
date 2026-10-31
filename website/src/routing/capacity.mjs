@@ -19,7 +19,12 @@ function exhausted() {
 }
 
 /**
- * Atomically hold jobs+tokens on one grant for one op.
+ * Hold jobs+tokens on one grant for one op. The conditional charge UPDATE
+ * is the single atomic decision point (concurrent racers serialize on it;
+ * the winner is read from its own meta.changes, never from cross-statement
+ * changes() chaining, which concurrent batches can interleave). A crash
+ * between charge and row insert leaks quota conservatively (fail-closed);
+ * the op ledger records every hold for audit. Rejected gates insert no row.
  * @returns the held reservation row.
  * @throws ROUTE_CAPACITY_REVOKED / ROUTE_CAPACITY_EXHAUSTED.
  */
@@ -32,32 +37,38 @@ export async function reserveCapacity(db, { opId, tenant, grantId, jobs, tokens,
   if (!g || g.revoked_at !== null) throw httpError(409, 'Grant revoked or missing.', 'ROUTE_CAPACITY_REVOKED');
   if (g.grantee_id !== tenant) throw httpError(403, 'Grant is not yours.', 'ROUTE_CAPACITY_REVOKED');
   if (!(await grantPartiesSameSide(db, g))) throw httpError(409, 'Grant crosses the demo boundary.', 'ROUTE_CAPACITY_REVOKED');
-  const res = await run(db,
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const id = rid('rsv_');
+  const at = new Date(now).toISOString();
+  const charge = await run(db,
     `UPDATE grants SET used_jobs = used_jobs + ?, used_tokens = used_tokens + ?
      WHERE id = ? AND revoked_at IS NULL AND used_jobs + ? <= max_jobs AND used_tokens + ? <= max_tokens`,
     jobs, tokens, grantId, jobs, tokens);
-  if (Number(res.meta.changes) !== 1) {
+  if (Number(charge.meta.changes) !== 1) {
     const again = await first(db, 'SELECT revoked_at FROM grants WHERE id = ?', grantId);
     if (!again || again.revoked_at !== null) throw httpError(409, 'Grant revoked or missing.', 'ROUTE_CAPACITY_REVOKED');
     throw exhausted();
   }
-  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
-  const id = rid('rsv_');
   await run(db,
     'INSERT INTO routing_reservations (id, op_id, tenant_id, grant_id, jobs, tokens, state, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    id, opId, tenant, grantId, jobs, tokens, 'held', new Date(now).toISOString(), new Date(now + ttlMs).toISOString());
+    id, opId, tenant, grantId, jobs, tokens, 'held', at, new Date(now + ttlMs).toISOString());
   return { id, opId, tenant, grantId, jobs, tokens, state: 'held' };
 }
 
-/** Release every held reservation for one op. Idempotent. Returns count. */
+/**
+ * Release every held reservation for one op. Each refund is a conditional
+ * flip whose winner (read from its own meta.changes) performs the counter
+ * refund — no cross-statement changes() chaining, so concurrent releasers
+ * (explicit vs explicit, explicit vs sweep) refund exactly once under any
+ * interleave. A crash between flip and refund leaks conservatively
+ * (fail-closed). Idempotent. Returns count.
+ */
 export async function releaseCapacity(db, { opId, reason = 'release' } = {}) {
   if (typeof opId !== 'string' || !opId) throw new Error('opId required.');
   const held = await db.prepare("SELECT * FROM routing_reservations WHERE op_id = ? AND state = 'held'").bind(opId).all();
   let n = 0;
   for (const r of (held.results || [])) {
-    await run(db, 'UPDATE grants SET used_jobs = MAX(0, used_jobs - ?), used_tokens = MAX(0, used_tokens - ?) WHERE id = ?', r.jobs, r.tokens, r.grant_id);
-    await run(db, "UPDATE routing_reservations SET state = 'released' WHERE id = ? AND state = 'held'", r.id);
-    n += 1;
+    n += await flipAndRefund(db, r.id, r.grant_id, r.jobs, r.tokens, 'released');
   }
   return n;
 }
@@ -69,11 +80,16 @@ export async function sweepReservations(db, nowMs = null) {
   const stale = await db.prepare("SELECT * FROM routing_reservations WHERE state = 'held' AND expires_at < ?").bind(iso).all();
   let n = 0;
   for (const r of (stale.results || [])) {
-    await run(db, 'UPDATE grants SET used_jobs = MAX(0, used_jobs - ?), used_tokens = MAX(0, used_tokens - ?) WHERE id = ?', r.jobs, r.tokens, r.grant_id);
-    await run(db, "UPDATE routing_reservations SET state = 'expired' WHERE id = ? AND state = 'held'", r.id);
-    n += 1;
+    n += await flipAndRefund(db, r.id, r.grant_id, r.jobs, r.tokens, 'expired');
   }
   return n;
+}
+
+async function flipAndRefund(db, id, grantId, jobs, tokens, toState) {
+  const flip = await run(db, 'UPDATE routing_reservations SET state = ? WHERE id = ? AND state = \'held\'', toState, id);
+  if (Number(flip.meta.changes) !== 1) return 0;
+  await run(db, 'UPDATE grants SET used_jobs = MAX(0, used_jobs - ?), used_tokens = MAX(0, used_tokens - ?) WHERE id = ?', jobs, tokens, grantId);
+  return 1;
 }
 
 /**

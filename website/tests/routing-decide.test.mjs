@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestEnv, readJson } from './d1-shim.mjs';
-import { commitDecision, getOpByRequest, expireOps } from '../src/routing/ledger.mjs';
+import { claimRequest, finalizeDecision, getOpByRequest, expireOps } from '../src/routing/ledger.mjs';
 import { reserveCapacity, releaseCapacity, sweepReservations, reserveCascade } from '../src/routing/capacity.mjs';
 import { putCached, getCached, sweepCache, cacheKeyFor } from '../src/routing/cache.mjs';
 import { decideRoute } from '../src/routing/decide.mjs';
@@ -46,19 +46,23 @@ function rankResponse(rankedIds) {
   };
 }
 
-test('routing ledger: commit, idempotent replay, expiry', async () => {
+test('routing ledger: claim, finalize, replay, steal, expiry', async () => {
   const t = await createTestEnv({});
-  const first = await commitDecision(t.DB, { opId: 'op_1', tenant: 'u_alice', requestId: 'req_1', ranking: ['r1'], source: 'fallback', digests: { featureDigest: 'f', candidateDigest: 'c' }, nowMs: NOW });
-  assert.equal(first.outcome, 'committed');
-  const replay = await commitDecision(t.DB, { opId: 'op_2', tenant: 'u_alice', requestId: 'req_1', ranking: ['r2'], source: 'advice', digests: { featureDigest: 'f', candidateDigest: 'c' }, nowMs: NOW });
+  const c1 = await claimRequest(t.DB, { opId: 'op_1', tenant: 'u_alice', requestId: 'req_1', nowMs: NOW });
+  assert.equal(c1.outcome, 'leader');
+  await assert.rejects(claimRequest(t.DB, { opId: 'op_2', tenant: 'u_alice', requestId: 'req_1', nowMs: NOW }), (e) => e.code === 'ROUTE_OP_IN_FLIGHT');
+  const fin = await finalizeDecision(t.DB, { opId: 'op_1', tenant: 'u_alice', requestId: 'req_1', ranking: ['r1'], source: 'fallback', digests: { featureDigest: 'f', candidateDigest: 'c' }, nowMs: NOW });
+  assert.equal(fin.state, 'admitted');
+  const replay = await claimRequest(t.DB, { opId: 'op_3', tenant: 'u_alice', requestId: 'req_1', nowMs: NOW });
   assert.equal(replay.outcome, 'replay');
   assert.equal(replay.op.id, 'op_1');
   assert.deepEqual(JSON.parse(replay.op.ranking_json).ranking, ['r1']);
-  const got = await getOpByRequest(t.DB, 'u_alice', 'req_1');
-  assert.equal(got.id, 'op_1');
   assert.equal(await getOpByRequest(t.DB, 'u_bob', 'req_1'), null);
-  assert.equal(await expireOps(t.DB, NOW + 3600 * 1000 + 1), 1);
-  assert.equal((await getOpByRequest(t.DB, 'u_alice', 'req_1')).state, 'expired');
+  await claimRequest(t.DB, { opId: 'op_4', tenant: 'u_alice', requestId: 'req_2', nowMs: NOW });
+  const steal = await claimRequest(t.DB, { opId: 'op_5', tenant: 'u_alice', requestId: 'req_2', nowMs: NOW + 61000 });
+  assert.equal(steal.outcome, 'leader');
+  assert.equal(steal.op.id, 'op_5');
+  assert.equal(await expireOps(t.DB, NOW + 3600 * 1000 + 1), 2);
 });
 
 test('routing capacity: reserve, overdraw, revoke, release, double-release', async () => {
@@ -181,6 +185,73 @@ test('routing decide: cached, fallback, degraded-stale, and empty paths', async 
     const out = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: { model: 'm', kinds: ['cluster'] }, fetchImpl: async () => { calls += 1; throw new Error('must not call'); }, nowMs: NOW });
     assert.equal(out.source, 'none');
     assert.equal(out.failure.code, 'NO_CANDIDATES');
+    assert.equal(calls, 0);
+  }
+});
+
+test('routing capacity: concurrent releases refund exactly once, no row on reject', async () => {
+  const t = await createTestEnv({});
+  await seed(t);
+  await reserveCapacity(t.DB, { opId: 'op_x1', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW });
+  await reserveCapacity(t.DB, { opId: 'op_x2', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW });
+  const [a, b] = await Promise.all([
+    releaseCapacity(t.DB, { opId: 'op_x1' }),
+    releaseCapacity(t.DB, { opId: 'op_x1' }),
+  ]);
+  assert.deepEqual([a, b].sort(), [0, 1]);
+  const u = { ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rb').first()) };
+  assert.deepEqual(u, { used_jobs: 1, used_tokens: 100 });
+  await assert.rejects(reserveCapacity(t.DB, { opId: 'op_x3', tenant: 'u_alice', grantId: 'g_rc', jobs: 99, tokens: 99, nowMs: NOW }), (e) => e.code === 'ROUTE_CAPACITY_EXHAUSTED');
+  const rows = await t.DB.prepare('SELECT COUNT(*) n FROM routing_reservations WHERE op_id = ?').bind('op_x3').first();
+  assert.equal(Number(rows.n), 0);
+});
+
+test('routing decide: concurrent same-request callers cause one provider call', async () => {
+  const t = await createTestEnv(ENV);
+  await seed(t);
+  let release, park;
+  const gate = new Promise((res) => { release = res; });
+  const parked = new Promise((res) => { park = res; });
+  let calls = 0;
+  const fetchImpl = async () => { calls += 1; park(); await gate; return new Response(JSON.stringify(rankResponse(['r1', 'r2'])), { status: 200 }); };
+  const feat = { model: 'm', kinds: ['local'], requestId: 'req_race' };
+  const winner = decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: feat, fetchImpl, nowMs: NOW });
+  await parked;
+  const loser = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: feat, fetchImpl, nowMs: NOW });
+  assert.equal(loser.failure.code, 'ROUTE_OP_IN_FLIGHT');
+  assert.equal(loser.source, 'none');
+  release();
+  const won = await winner;
+  assert.equal(won.source, 'advice');
+  assert.equal(calls, 1);
+  const replay = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: feat, fetchImpl, nowMs: NOW });
+  assert.equal(replay.replay, true);
+  assert.equal(calls, 1);
+});
+
+test('routing decide: live clock in production, scripted clock proves rechecks', async () => {
+  // Production shape: no clock injected, real timestamps, fresh heartbeats.
+  {
+    const t = await createTestEnv(ENV);
+    await seed(t);
+    await t.DB.prepare('UPDATE resources SET heartbeat_at = ?').bind(new Date().toISOString()).run();
+    const out = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: { model: 'm' }, fetchImpl: async () => new Response(JSON.stringify(rankResponse(['r1', 'r2'])), { status: 200 }) });
+    assert.equal(out.source, 'advice');
+    assert.equal(out.executable, false);
+  }
+  // Scripted clock: time jumps past the absolute deadline after eligibility,
+  // so the orchestrator falls back without calling. Call positions: claim,
+  // request, eligibility, cache-get, advice-recheck, then the rest lapsed.
+  {
+    const t = await createTestEnv(ENV);
+    await seed(t);
+    const script = [NOW, NOW, NOW, NOW, NOW + 999999];
+    let i = 0;
+    const clock = () => script[Math.min(i++, script.length - 1)];
+    let calls = 0;
+    const out = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: { model: 'm' }, fetchImpl: async () => { calls += 1; throw new Error('must not call'); }, clock });
+    assert.equal(out.source, 'fallback');
+    assert.equal(out.failure.code, 'DEADLINE_EXCEEDED');
     assert.equal(calls, 0);
   }
 });

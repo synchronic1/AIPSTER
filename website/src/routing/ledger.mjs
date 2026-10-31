@@ -1,23 +1,59 @@
 /* Built with Meta Muse. */
-// Durable routing-op ledger: every routing decision commits exactly one op
-// row (or replays the stored one). States: admitted (a ranking exists,
-// whatever its source), rejected (no candidates), expired (past TTL).
-// Same (tenant, requestId) always returns the stored op: retries never
-// duplicate decisions, reservations, or provider calls.
+// Durable routing-op ledger with leader election per request id. States:
+// proposed (claimed, side effects in flight) -> admitted (a ranking
+// exists) | rejected (no candidates) | expired (past TTL). Same (tenant,
+// requestId) always serves one outcome: the claim winner performs budget
+// charges, provider calls and reservations; duplicates replay the stored
+// outcome or get ROUTE_OP_IN_FLIGHT while the winner runs. A claim whose
+// leader dies expires quickly and becomes stealable, so no request id
+// wedges permanently.
+import { httpError } from '../lib/validate.js';
 import { first, run } from '../lib/store.js';
 
 export const ROUTING_OP_TTL_MS = 3600 * 1000;
+export const ROUTING_CLAIM_TTL_MS = 60000;
 
 const SOURCES = ['advice', 'cached', 'fallback', 'degraded-stale', 'none'];
 
 /**
- * Commit a decision or replay the stored one for this request id.
- * @returns {{outcome:'committed'|'replay', op:object}}
+ * Claim one request id. Exactly one caller becomes leader; the rest get
+ * the stored outcome (replay) or ROUTE_OP_IN_FLIGHT while it runs.
+ * @returns {{outcome:'leader'|'replay', op:object}}
+ * @throws 429 ROUTE_OP_IN_FLIGHT when the winner is still running.
  */
-export async function commitDecision(db, { opId, tenant, requestId, ranking, source, failure = null, outcome = null, digests = {}, policyVersion = 'route/v1', ttlMs = ROUTING_OP_TTL_MS, nowMs = null } = {}) {
+export async function claimRequest(db, { opId, tenant, requestId, nowMs = null } = {}) {
   if (typeof opId !== 'string' || !opId) throw new Error('opId required.');
   if (typeof tenant !== 'string' || !tenant) throw new Error('tenant required.');
   if (typeof requestId !== 'string' || !requestId) throw new Error('requestId required.');
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const at = new Date(now).toISOString();
+  const ins = await run(db,
+    `INSERT INTO routing_ops (id, tenant_id, request_id, state, source, ranking_json, failure_code, feature_digest, candidate_digest, policy_version, created_at, updated_at, expires_at)
+     VALUES (?, ?, ?, 'proposed', 'none', ?, NULL, NULL, NULL, 'route/v1', ?, ?, ?)
+     ON CONFLICT (tenant_id, request_id) DO NOTHING`,
+    opId, tenant, requestId, JSON.stringify({ ranking: [], source: 'none', failure: null, outcome: null }),
+    at, at, new Date(now + ROUTING_CLAIM_TTL_MS).toISOString());
+  if (Number(ins.meta.changes) === 1) return { outcome: 'leader', op: await getOpByRequest(db, tenant, requestId) };
+  const row = await getOpByRequest(db, tenant, requestId);
+  if (!row) throw httpError(429, 'Another route decision is running for this request. Retry with the same request id.', 'ROUTE_OP_IN_FLIGHT');
+  if (row.state === 'admitted' || row.state === 'rejected') return { outcome: 'replay', op: row };
+  // Proposed or expired: steal only when the claim lapsed, else back off.
+  const lapsed = row.state === 'expired' || Date.parse(row.expires_at) <= now;
+  if (!lapsed) throw httpError(429, 'Another route decision is running for this request. Retry with the same request id.', 'ROUTE_OP_IN_FLIGHT');
+  const steal = await run(db,
+    "UPDATE routing_ops SET id = ?, state = 'proposed', updated_at = ?, expires_at = ? WHERE tenant_id = ? AND request_id = ? AND state IN ('proposed','expired')",
+    opId, at, new Date(now + ROUTING_CLAIM_TTL_MS).toISOString(), tenant, requestId);
+  if (Number(steal.meta.changes) === 1) return { outcome: 'leader', op: await getOpByRequest(db, tenant, requestId) };
+  const again = await getOpByRequest(db, tenant, requestId);
+  if (again && (again.state === 'admitted' || again.state === 'rejected')) return { outcome: 'replay', op: again };
+  throw httpError(429, 'Another route decision is running for this request. Retry with the same request id.', 'ROUTE_OP_IN_FLIGHT');
+}
+
+/**
+ * Finalize the leader's claim with the served outcome. Only the owning
+ * proposed row moves; anything else means the claim lapsed mid-flight.
+ */
+export async function finalizeDecision(db, { opId, tenant, requestId, ranking, source, failure = null, outcome = null, digests = {}, policyVersion = 'route/v1', ttlMs = ROUTING_OP_TTL_MS, nowMs = null } = {}) {
   if (!SOURCES.includes(source)) throw new Error('unknown source.');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   const at = new Date(now).toISOString();
@@ -28,28 +64,32 @@ export async function commitDecision(db, { opId, tenant, requestId, ranking, sou
     outcome: outcome && typeof outcome === 'object' ? outcome : null,
   };
   const res = await run(db,
-    `INSERT INTO routing_ops (id, tenant_id, request_id, state, source, ranking_json, failure_code, feature_digest, candidate_digest, policy_version, created_at, updated_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT (tenant_id, request_id) DO NOTHING`,
-    opId, tenant, requestId, row.ranking.length > 0 ? 'admitted' : 'rejected', source,
-    JSON.stringify(row), row.failure ? row.failure.code : null,
-    digests.featureDigest || null, digests.candidateDigest || null, policyVersion,
-    at, at, new Date(now + ttlMs).toISOString());
-  if (Number(res.meta.changes) === 1) {
-    return { outcome: 'committed', op: await getOpByRequest(db, tenant, requestId) };
-  }
-  return { outcome: 'replay', op: await getOpByRequest(db, tenant, requestId) };
+    `UPDATE routing_ops SET state = ?, source = ?, ranking_json = ?, failure_code = ?, feature_digest = ?, candidate_digest = ?, policy_version = ?, updated_at = ?, expires_at = ?
+     WHERE tenant_id = ? AND request_id = ? AND id = ? AND state = 'proposed'`,
+    row.ranking.length > 0 ? 'admitted' : 'rejected', source, JSON.stringify(row),
+    row.failure ? row.failure.code : null, digests.featureDigest || null, digests.candidateDigest || null,
+    policyVersion, at, new Date(now + ttlMs).toISOString(), tenant, requestId, opId);
+  if (Number(res.meta.changes) !== 1) throw httpError(503, 'Routing claim lapsed before commit.', 'ROUTE_OP_SUPERSEDED');
+  return getOpByRequest(db, tenant, requestId);
+}
+
+/** Best-effort cancel of our own pending claim (leader error path). */
+export async function cancelClaim(db, { opId, tenant, requestId, nowMs = null } = {}) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  await run(db,
+    "UPDATE routing_ops SET state = 'expired', updated_at = ? WHERE tenant_id = ? AND request_id = ? AND id = ? AND state = 'proposed'",
+    new Date(now).toISOString(), tenant, requestId, opId);
 }
 
 export async function getOpByRequest(db, tenant, requestId) {
   return first(db, 'SELECT * FROM routing_ops WHERE tenant_id = ? AND request_id = ?', tenant, requestId);
 }
 
-/** Flip past-TTL admitted/rejected ops to expired. Returns rows flipped. */
+/** Flip past-TTL rows (including stale claims) to expired. Returns count. */
 export async function expireOps(db, nowMs = null) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   const res = await run(db,
-    "UPDATE routing_ops SET state = 'expired', updated_at = ? WHERE state IN ('admitted','rejected') AND expires_at < ?",
+    "UPDATE routing_ops SET state = 'expired', updated_at = ? WHERE state IN ('proposed','admitted','rejected') AND expires_at < ?",
     new Date(now).toISOString(), new Date(now).toISOString());
   return Number(res.meta.changes);
 }
