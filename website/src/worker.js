@@ -8,7 +8,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET, MAX_BODY_BYTES } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, MAX_ASSET_FILES_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
 import { dgmPreviewEnabled } from './dgm/router.mjs';
@@ -1714,6 +1714,16 @@ async function handleApi(request, env, url) {
           if (Number(resetQuota.meta.changes) !== 1) return claimLost();
           return json(400, { error: 'Account storage quota exceeded by a concurrent promotion; retry after cleanup.', code: 'QUOTA_EXCEEDED' });
         }
+        // Cumulative file cap, fast path (Codex-sec-P2): one 2000-file
+        // manifest must not fan out into 2000 durable rows per budget
+        // claim without bound. The commit batch enforces this atomically
+        // (below); this pre-check fails friendly and early.
+        const ownedFiles = await first(db, 'SELECT COUNT(*) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
+        if (ownedFiles && ownedFiles.n + manifest.files.length > MAX_ASSET_FILES_PER_USER) {
+          const resetFiles = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
+          if (Number(resetFiles.meta.changes) !== 1) return claimLost();
+          throw capError('files');
+        }
         if (manifest.kind === 'adapter') {
           // The declared base must resolve to an owned asset (F18).
           // Hub-form bases pass through: offline verification is impossible
@@ -1752,16 +1762,28 @@ async function handleApi(request, env, url) {
         // bounded footprint per lease steal, with no rows pointing at it.)
         const committed = await db.batch([
           db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
-            SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?`)
+            SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?
+            AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
             .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
               JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
-              JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now, uploadId, claimToken),
-          ...manifest.files.map((f) => db.prepare("INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) SELECT ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?")
-            .bind(assetId, f.relpath, f.bytes, f.sha256, uploadId, claimToken)),
-          db.prepare("UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND state = 'promoting' AND byte_ref = ?")
-            .bind('validated', JSON.stringify(manifest), assetId, now, uploadId, claimToken),
+              JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now, uploadId, claimToken, me(), manifest.files.length),
+          ...manifest.files.map((f) => db.prepare(`INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) SELECT ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ? AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
+            .bind(assetId, f.relpath, f.bytes, f.sha256, uploadId, claimToken, me(), manifest.files.length)),
+          db.prepare(`UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND state = 'promoting' AND byte_ref = ? AND (SELECT COUNT(*) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)) + ? <= ${MAX_ASSET_FILES_PER_USER}`)
+            .bind('validated', JSON.stringify(manifest), assetId, now, uploadId, claimToken, me(), manifest.files.length),
         ]);
-        if (Number(committed[committed.length - 1].meta.changes) !== 1) return claimLost();
+        // Every statement above carries the same fence + count predicates
+        // over committed state (no changes() chaining), so they pass or
+        // fail together within the batch. On failure, a lost token maps to
+        // the winner outcome; an intact token means the count bound bit.
+        if (Number(committed[committed.length - 1].meta.changes) !== 1) {
+          // Count loss holds only while the claim is live (promoting +
+          // intact token); any other state means a lost claim (steal,
+          // expiry, or a successor verdict) and maps to its outcome.
+          const cur = await first(db, 'SELECT state, byte_ref FROM catalog_uploads WHERE id = ?', uploadId);
+          if (!cur || cur.state !== 'promoting' || cur.byte_ref !== claimToken) return claimLost();
+          throw capError('files');
+        }
         for (const p of parts) await store.del(p.key);
         await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
         return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });

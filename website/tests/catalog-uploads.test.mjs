@@ -841,3 +841,30 @@ test('Codex-sec-P2: unchanged revalidation is idempotent (no rewrite, no audit)'
   assert.equal(third.json.duplicate, true, 'stable rejected verdict replays idempotently');
   assert.equal(await audits(), 1);
 });
+
+test('Codex-sec-P2: promotion enforces a cumulative per-owner file cap (no row fan-out)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const now = new Date().toISOString();
+  await t.DB.prepare('INSERT INTO catalog_assets (id, owner_id, freshness_at, created_at) VALUES (?, ?, ?, ?)')
+    .bind('a_seed', 'u_alice', now, now).run();
+  const ins = 'INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)';
+  for (let i = 0; i < 10000; i += 1) {
+    await t.DB.prepare(ins).bind('a_seed', `f${i}.txt`, 1, '').run();
+  }
+  const bytes = new Uint8Array(64).fill(0x47);
+  const b = await begin(t, t.alice, {
+    name: 'over-cap', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: bytes.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
+  assert.equal(c.status, 200, c.text);
+  const fin = await finalize(t, t.alice, b.json.id);
+  assert.equal(fin.status, 409, fin.text);
+  assert.equal(fin.json.code, 'FILE_LIMIT');
+  const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first('n');
+  assert.equal(assets, 1, 'no asset row escapes the cap');
+  const files = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_asset_files WHERE asset_id = ?').bind('a_seed').first('n');
+  assert.equal(files, 10000, 'no file rows escape the cap');
+});
