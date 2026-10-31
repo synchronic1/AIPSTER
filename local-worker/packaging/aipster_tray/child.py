@@ -274,6 +274,7 @@ def assign_kill_on_close(pid):
 
 
 EXIT_REPAIR_REQUIRED = 4  # sender key revoked/expired: pair again (pairing.EXIT_*)
+EXIT_SENDER_RUNNING = 6  # another process holds sender.lock (pairing.EXIT_*)
 
 
 def sender_argv(bundle, data_dir):
