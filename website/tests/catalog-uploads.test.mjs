@@ -656,3 +656,83 @@ test('Codex-P2: overlapping finalizes promote exactly once (exclusive claim)', a
   const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first('n');
   assert.equal(assets, 1, 'exactly one asset promoted');
 });
+
+test('Codex-sec-P2: concurrent begins admit aggregate bytes atomically (no TOCTOU)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const G = 1024 * 1024 * 1024;
+  const spec = (name) => ({
+    name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [0, 1, 2, 3, 4].map((i) => ({ relpath: `shard-${i}.gguf`, bytes: 100 * G })),
+  });
+  // Barrier: hold both admissions at the INSERT until each has passed its
+  // read-checks, forcing the pre-fix TOCTOU window deterministically.
+  const realPrepare = t.env.DB.prepare;
+  let gate;
+  const gatePromise = new Promise((res) => { gate = res; });
+  let arrived = 0;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.startsWith('INSERT INTO catalog_uploads ')) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realRun = b.run;
+        b.run = async () => {
+          arrived += 1;
+          if (arrived >= 2) gate();
+          else await gatePromise;
+          return realRun();
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const [a, b] = await Promise.all([begin(t, t.alice, spec('race-a')), begin(t, t.alice, spec('race-b'))]);
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  const codes = [a.status, b.status].sort();
+  assert.deepEqual(codes, [201, 400], `one winner, one quota loser: ${a.status} vs ${b.status}`);
+  const loser = a.status === 400 ? a : b;
+  assert.equal(loser.json.code, 'QUOTA_EXCEEDED');
+  const admitted = await t.DB.prepare("SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) AS n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')").bind('u_alice').first('n');
+  assert.ok(admitted <= 500 * G, `admitted ${admitted} stays within the 500 GiB budget`);
+});
+
+test('Codex-P2: a stale claim holder cannot commit after a lease steal (fence token)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const bytes = new Uint8Array(64).fill(0x47);
+  const b = await begin(t, t.alice, {
+    name: 'fenced', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: bytes.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
+  assert.equal(c.status, 200, c.text);
+  // Intruder steals the lease after the victim claims but before its
+  // commit batch runs: rewrite byte_ref at the promote batch head.
+  const realDb = t.env.DB;
+  let fired = false;
+  t.env.DB = {
+    ...realDb,
+    batch: async (stmts) => {
+      const head = stmts && stmts[0] && stmts[0].sql ? stmts[0].sql : '';
+      if (!fired && head.startsWith('INSERT INTO catalog_assets ')) {
+        fired = true;
+        await realDb.prepare('UPDATE catalog_uploads SET byte_ref = ? WHERE id = ?').bind('clm_intruder', b.json.id).run();
+      }
+      return realDb.batch(stmts);
+    },
+  };
+  const fin = await finalize(t, t.alice, b.json.id);
+  t.env.DB = realDb;
+  assert.equal(fired, true, 'the intruder struck at the promote batch');
+  assert.equal(fin.status, 409, fin.text);
+  assert.equal(fin.json.code, 'FINALIZE_IN_PROGRESS');
+  const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first('n');
+  assert.equal(assets, 0, 'the fenced holder promotes nothing');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(row.state, 'promoting', 'the intruder claim is untouched by the loser');
+  assert.equal(row.byte_ref, 'clm_intruder');
+});
