@@ -99,6 +99,10 @@ function fromRow(row, digest) {
  * estimate; outputTokens reserves the provider output maximum.
  * Returns {outcome:'claimed'} or a replay/in-progress/uncertain outcome;
  * throws 409/429 otherwise. Never double-charges, never refunds.
+ * `now` is the admission-DECISION instant (never request arrival): bucket
+ * selection, charging, pruning and op timestamps all derive from this one
+ * value, so a decision can neither bill nor prune a different hour than
+ * the one it judged.
  */
 export async function claimOp(db, tenant, opKey, digest, { inputTokens = 0, outputTokens = 0, env = null, now = new Date() } = {}) {
   const found = await existingOp(db, tenant, opKey);

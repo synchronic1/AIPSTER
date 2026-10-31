@@ -59,7 +59,7 @@ function receiptFor({ key, live, out, elapsedMs, replay, env }) {
   };
 }
 
-export async function handleAdvisorPost({ db, env, actor, demo = false, body, now = new Date(), fetchImpl } = {}) {
+export async function handleAdvisorPost({ db, env, actor, demo = false, body, now = new Date(), admissionNow = null, fetchImpl } = {}) {
   const tenant = actor.user.id;
   const { task, refs, opKey } = checkAdvisorBody(body);
   const key = opKey || rid('op_');
@@ -82,8 +82,17 @@ export async function handleAdvisorPost({ db, env, actor, demo = false, body, no
   if (live) {
     inputTokens = preflightLiveRequest(snapshot, task, advisorSpendCapUsd(env)).inputTokens;
   }
+  // Admission uses the DECISION instant, never arrival time: the async
+  // resource reads above can stall across a UTC-hour boundary, and a new
+  // hour's claim prunes older buckets immediately. Judging a delayed
+  // request against its arrival hour would read pruned (zero) counters for
+  // exhausted budgets and admit a provider call it must not make. The
+  // decision instant feeds bucket selection, charging, pruning and op
+  // timestamps from one value, so the admission operation and the selected
+  // bucket cannot disagree. Tests pin the clock via admissionNow.
+  const atDecision = admissionNow instanceof Date && !Number.isNaN(admissionNow.getTime()) ? admissionNow : new Date();
   const claim = await claimOp(db, tenant, key, digest, {
-    inputTokens, outputTokens: live ? ADVISOR_OUTPUT_MAX_TOKENS : 0, env, now,
+    inputTokens, outputTokens: live ? ADVISOR_OUTPUT_MAX_TOKENS : 0, env, now: atDecision,
   });
   if (claim.outcome === 'replay') {
     if (!live) {
