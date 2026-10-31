@@ -9,7 +9,7 @@
 
 ## Delivered
 
-- Migration `0017_model_catalog.sql`: `node_capabilities`, `catalog_assets`,
+- Migration `0018_model_catalog.sql`: `node_capabilities`, `catalog_assets`,
   `catalog_asset_files`, `catalog_uploads`, `catalog_compat_cache`,
   `catalog_deployments`, `catalog_deployment_events`. Readiness contract
   (`schema.js`) + test shim + migration-count assertions updated.
@@ -46,7 +46,7 @@
 
 1. Compat-cache fingerprint omitted the adapter base → stale cross-base
    replay. Fixed (base in fingerprint) + regression test.
-2. Partial-schema health tests + migration-count assertions needed 0017
+2. Partial-schema health tests + migration-count assertions needed 0018
    (readiness covers compiled routes). Updated, not weakened.
 
 ## Renders (`docs/model-catalog/renders/`)

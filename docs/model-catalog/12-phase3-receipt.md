@@ -9,7 +9,7 @@
 
 ## Delivered
 
-- `migrations/0018_model_catalog_reservations.sql`: `catalog_reservations`
+- `migrations/0019_model_catalog_reservations.sql`: `catalog_reservations`
   (byte holds per deployment), `catalog_deployments`, `catalog_deployment_events`.
 - `src/lib/catalog/transport.mjs`: worker lifecycle seam. No real worker
   implements the protocol, so live dispatch fails closed with

@@ -49,7 +49,7 @@ before(async () => {
 
 after(async () => { await mf.dispose(); });
 
-test('catalog migrations 0001-0018 apply on real local D1 with the N3 columns', async () => {
+test('catalog migrations 0001-0019 apply on real local D1 with the N3 columns', async () => {
   const tables = (await db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()).results.map((r) => r.name);
   for (const t of ['node_capabilities', 'catalog_assets', 'catalog_asset_files', 'catalog_uploads', 'catalog_compat_cache', 'catalog_deployments', 'catalog_deployment_events', 'catalog_reservations']) {
     assert.ok(tables.includes(t), `missing table ${t}`);
@@ -116,9 +116,10 @@ test('admit batch on real D1: deployment+reservation+event commit parent-first u
 });
 
 test('N3 batch on real D1: constraint failure rolls the whole batch back (atomicity)', async () => {
-  // Seeds a marker collision no reachable race produces (a serialized
-  // loser zero-rows the marker guard first); the point proved is batch
-  // atomicity under constraint failure, the backstop behind the guards.
+  // Seeds a marker collision no serialized race produces in this shape
+  // (a loser zero-rows the marker guard first; only a same-ms same-target
+  // coincidence PK-conflicts); the point proved is batch atomicity under
+  // constraint failure, the backstop behind the guards.
   await seedJob('dep_n3c', 'admitted');
   await db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?,?,?,?,?,?)')
     .bind('ev_dep_n3c_admitted_staging', 'dep_n3c', new Date().toISOString(), 'admitted', 'staging', 'pre-existing').run();

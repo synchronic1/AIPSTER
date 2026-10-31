@@ -1,4 +1,4 @@
-﻿/* Built with Meta Muse. */
+/* Built with Meta Muse. */
 // AIPSTER apex Worker: same-origin control-panel API + /app UI + /admin UI on
 // top of the existing static site. Routing: /api/auth/* -> Better Auth,
 // /api/* -> JSON API (errors always JSON, never the static 404 page),
@@ -1500,7 +1500,7 @@ async function handleApi(request, env, url) {
       // Quota is re-checked at finalize: a concurrent promotion may have
       // landed since begin (F15). owned + inflight (self included) is the
       // post-promote footprint. Two racing finalizes can still both pass
-      // (check-then-act): like F8 (see the 0018 header), true admission
+      // (check-then-act): like F8 (see the 0019 header), true admission
       // atomicity needs a live-gate transport — over-admission is bounded
       // to one footprint and visible to every later check (N5).
       const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());

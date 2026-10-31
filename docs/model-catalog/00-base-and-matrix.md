@@ -28,7 +28,7 @@
 | Upload/validation pipeline | MISSING | No upload session, quarantine, validator, manifest, or asset tables |
 | Compatibility estimator | MISSING | No memory model, no runtime capability matrix |
 | Runtime support (llama.cpp/vLLM/…) | MISSING | No runtime integration, qualified or otherwise |
-| Migration chain head | IMPLEMENTED | `0001`–`0016` applied; next free number `0017` |
+| Migration chain head | IMPLEMENTED | `0001`–`0017` applied; next free number `0018` |
 | Test/check gates | IMPLEMENTED | `npm run check/test/build/bundle`; 74 website test files; `check.mjs` public-site gates |
 
 ## Initial support matrix (Phase 1–3)
@@ -57,11 +57,11 @@ fixtures. Everything real starts UNKNOWN — never green.
    The heartbeat intake is security-critical with a strict body; widening it
    risks the atomic admission guarantees. New `POST /api/resources/:id/capabilities`
    (same heartbeat-key auth, versioned capability schema) + `node_capabilities`
-   table in migration 0017. Heartbeat stays untouched.
+   table in migration 0018. Heartbeat stays untouched.
 4. **New catalog tables; don't overload inference `jobs`.**
    `catalog_assets`, `catalog_asset_files`, `catalog_uploads`,
    `catalog_compat_cache`, `catalog_deployments`, `catalog_deployment_events`
-   in 0017. Inference `jobs` keeps its disabled semantics.
+   in 0018. Inference `jobs` keeps its disabled semantics.
 5. **Demo accounts: browse fixtures only.** No uploads, no plans, no jobs —
    consistent with existing demo guards (`demo` flag checks).
 6. **HF tokens session-only in Phase 1.** No persistence until a reviewed

@@ -1,5 +1,5 @@
 -- Built with Meta Muse.
--- Migration 0018: deployment reservations. A reservation holds node bytes
+-- Migration 0019: deployment reservations. A reservation holds node bytes
 -- for one deployment from admission until terminal state (or release on
 -- failure/cancel/revoke). Held bytes are subtracted from availability by
 -- every later admission. Honesty note (review F8): admission reads held

@@ -211,6 +211,7 @@ test('N7: magic screen covers big-endian Mach-O variants', async () => {
   assert.ok(screenMagic(new Uint8Array([0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0])), 'BE Mach-O 64-bit refused');
   assert.ok(screenMagic(new Uint8Array([0xca, 0xfe, 0xba, 0xbf, 0, 0, 0, 0])), 'Mach-O 64-bit fat refused');
   assert.ok(screenMagic(new Uint8Array([0xbe, 0xba, 0xfe, 0xca, 0, 0, 0, 0])), 'Mach-O FAT_CIGAM refused');
+  assert.ok(screenMagic(new Uint8Array([0xbf, 0xba, 0xfe, 0xca, 0, 0, 0, 0])), 'Mach-O FAT_CIGAM_64 refused');
 });
 
 test('AC11: traversal, bad suffixes, hostile bytes, and bad manifests fail closed', async () => {
