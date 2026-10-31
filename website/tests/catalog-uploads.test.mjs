@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex, MAX_ASSET_BYTES } from '../src/lib/catalog/validate.mjs';
-import { __resetFixtureStore, byteStore, assetKey, assetScope } from '../src/lib/catalog/store.mjs';
+import { __resetFixtureStore, byteStore, assetKey, assetScope, __failAssetListsForTest } from '../src/lib/catalog/store.mjs';
 import { __setRid16ForTest } from '../src/lib/store.js';
 import { assetPrefixProtected } from '../src/worker.js';
 import { budgetWindow } from '../src/lib/quotas.js';
@@ -2181,4 +2181,41 @@ test('Codex-sec-P2: exact chunk replays are idempotent (no PUT, no D1 write)', a
   assert.equal(r2.status, 200, r2.text);
   const stored2 = await store.get(key);
   assert.deepEqual(Array.from(stored2), Array.from(alt), 'different bytes replace through CAS');
+});
+test('Codex-sec-P2: attempt gate fails closed on prefix-list faults', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const spec = (name) => ({ name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0', files: [{ relpath: 'm.gguf', bytes: 64 }] });
+  // One fault: the gate skips the candidate and reserves the next id.
+  const b1 = await begin(t, t.alice, spec('fault-once'));
+  assert.equal(b1.status, 201, b1.text);
+  const c1 = await chunk(t, t.alice, b1.json.id, 'm.gguf', 0, ggufBytes());
+  assert.equal(c1.status, 200, c1.text);
+  __failAssetListsForTest(1);
+  let f1;
+  try {
+    f1 = await finalize(t, t.alice, b1.json.id);
+  } finally {
+    __failAssetListsForTest(0);
+  }
+  assert.equal(f1.status, 201, f1.text);
+  // Total fault: every gate probe fails -> retryable 503, claim released.
+  const b2 = await begin(t, t.alice, spec('fault-all'));
+  assert.equal(b2.status, 201, b2.text);
+  const c2 = await chunk(t, t.alice, b2.json.id, 'm.gguf', 0, ggufBytes());
+  assert.equal(c2.status, 200, c2.text);
+  __failAssetListsForTest(9);
+  let f2;
+  try {
+    f2 = await finalize(t, t.alice, b2.json.id);
+  } finally {
+    __failAssetListsForTest(0);
+  }
+  assert.equal(f2.status, 503, f2.text);
+  assert.equal(f2.json.code, 'ID_EXHAUSTED');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(b2.json.id).first();
+  assert.equal(row.state, 'uploading', 'the refused claim releases for retry');
+  // The session retries cleanly once the store recovers.
+  const f3 = await finalize(t, t.alice, b2.json.id);
+  assert.equal(f3.status, 201, f3.text);
 });

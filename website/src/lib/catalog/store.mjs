@@ -14,6 +14,13 @@ export function __resetFixtureStore() {
   memoryBuckets.clear();
 }
 
+// Fault injection for fail-closed list handling (tests only): the next n
+// `asset/`-prefixed lists on the fixture backend reject instead of
+// answering. Tests reset with (0) in a finally. Part-prefix lists are
+// never affected, so finalize reaches its attempt gate deterministically.
+let failAssetLists = 0;
+export function __failAssetListsForTest(n) { failAssetLists = n; }
+
 function memoryStore() {
   const bucketId = 'fixture';
   if (!memoryBuckets.has(bucketId)) memoryBuckets.set(bucketId, new Map());
@@ -39,6 +46,10 @@ function memoryStore() {
       // callers pass cap + 1 and treat a full page as over-cap. The memory
       // backend still scans its (test-scale) map; R2 stops paginating
       // early, which is where the bound matters.
+      if (prefix.startsWith('asset/') && failAssetLists > 0) {
+        failAssetLists -= 1;
+        throw new Error('injected list fault');
+      }
       const out = [];
       for (const [k, v] of files) if (k.startsWith(prefix)) out.push({ key: k, size: v.length });
       out.sort((a, b) => (a.key < b.key ? -1 : 1));
