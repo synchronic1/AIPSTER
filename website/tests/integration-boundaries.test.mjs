@@ -24,7 +24,7 @@ async function apply(db,file){
 }
 for(const heartbeatFirst of [false,true])test(`sprint integration: real-D1: heartbeat migration ${heartbeatFirst?'before':'after'} federation preserves identity,budget,columns`,async c=>{
  const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response("synthetic")}}',compatibilityDate:'2026-10-01',d1Databases:{DB:'migration-order'},outboundService:()=>new Response('blocked',{status:403})}));c.after(()=>mf.dispose());const db=await mf.getD1Database('DB');
- const files=(await readdir(new URL('../migrations/',import.meta.url))).filter(x=>x.endsWith('.sql')).sort();assert.deepEqual(files,MIGRATION_FILES);assert.equal(new Set(files.map(x=>x.split('_')[0])).size,17);
+ const files=(await readdir(new URL('../migrations/',import.meta.url))).filter(x=>x.endsWith('.sql')).sort();assert.deepEqual(files,MIGRATION_FILES);assert.equal(new Set(files.map(x=>x.split('_')[0])).size,19);
  for(const file of files.slice(0,5))await apply(db,file);
  await db.prepare('INSERT INTO "user"(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,1,?,?)').bind('order-user','synthetic','order@synthetic.invalid','2026-01-01','2026-01-01').run();
  await db.prepare('INSERT INTO write_budget VALUES(?,?,17)').bind('order-user','2026-10-28T00').run();
