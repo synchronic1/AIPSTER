@@ -1620,28 +1620,25 @@ async function handleApi(request, env, url) {
         const accounted = await run(db, 'UPDATE catalog_uploads SET quotas_json = ?, updated_at = ? WHERE id = ? AND state = ?', JSON.stringify(quotas), nowIso(), uploadId, 'uploading');
         if (Number(accounted.meta.changes) !== 1) {
           const cur = await first(db, 'SELECT state FROM catalog_uploads WHERE id = ?', uploadId);
-          if (!cur || cur.state === 'expired' || cur.state === 'rejected' || cur.state === 'validated') {
-            // Terminal-or-gone: verdict cleanups may have listed before our
-            // part landed (a swept mark or missing cleaned flag would then
-            // strand it), and no live finalizer can be listing now, so the
-            // part is ours alone to reclaim.
-            await store.del(key).catch(() => {});
-            if (!cur || cur.state === 'expired') {
-              return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
-            }
-            return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
-          }
-          if (cur.state === 'uploading') {
+          if (cur && cur.state === 'uploading') {
             // A finalize reset landed between our write and re-read: the
             // session is usable again but this chunk lost its accounting.
-            // The part stays (prefix cleanup owns it); the client retries
-            // the chunk, which re-accounts as a same-index replace.
+            // The part stays - no list is in flight anymore (the resetter
+            // is done), so every future terminal path lists fresh and
+            // includes it - and the client retries the chunk, which
+            // re-accounts as a same-index replace.
             return json(409, { error: 'Chunk raced a concurrent finalize; retry the chunk.', code: 'UPLOAD_STATE', retryable: true });
           }
-          // Promoting/validating/quarantined: a live finalizer or the sweep
-          // owns the whole prefix (terminal paths always list fresh), so
-          // deleting here could remove a part a finalizer already listed
-          // and turn assembly into a 500. Leave the part, report the state.
+          // Every other miss reclaims the part. Skipping the delete on a
+          // live state would strand it: the finalizer's lists run BEFORE
+          // its verdict write, so a part landing after the list is missed
+          // by verdict cleanup and then marked swept/unflagged forever.
+          // Deleting can only remove a part a live finalizer listed, and
+          // assembly treats that as a retryable race (below), never a 500.
+          await store.del(key).catch(() => {});
+          if (!cur || cur.state === 'expired') {
+            return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
+          }
           return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
         }
         return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
@@ -1733,7 +1730,20 @@ async function handleApi(request, env, url) {
             return json(400, { error: `Incomplete bytes for ${f.relpath}: ${got} of ${f.bytes}. Missing chunks are never skipped.`, code: 'UPLOAD_INCOMPLETE' });
           }
           const bufs = [];
-          for (const p of mine) bufs.push(await store.get(p.key));
+          for (const p of mine) {
+            const b = await store.get(p.key);
+            if (b === null || b === undefined) {
+              // Raced cleanup (Codex-sec-P2 follow-up): the part vanished
+              // between the assembly list and its fetch - a chunk reclaim
+              // racing this claim, or the sweep against a stale holder.
+              // Reset and report retryable: the next attempt re-lists and
+              // either includes the re-PUT part or reports incomplete.
+              const resetRaced = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
+              if (Number(resetRaced.meta.changes) !== 1) return claimLost();
+              return json(409, { error: 'Upload changed during assembly; retry finalize.', code: 'FINALIZE_IN_PROGRESS', retryable: true });
+            }
+            bufs.push(b);
+          }
           const flat = new Uint8Array(f.bytes);
           let at = 0;
           for (const b of bufs) { flat.set(b, at); at += b.length; }

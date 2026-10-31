@@ -1222,7 +1222,7 @@ test('Codex-sec-P2: big promotions clean incrementally and converge via the swee
   assert.equal(JSON.parse(done.manifest_json).cleaned, true);
 });
 
-test('Codex-sec-P2 follow-up: a chunk racing a live finalize keeps its part (409, no delete)', async () => {
+test('Codex-sec-P2 follow-up: a chunk racing a live finalize is reclaimed (409, part deleted)', async () => {
   const t = await fx();
   __resetFixtureStore();
   const store = byteStore(t.env);
@@ -1261,7 +1261,7 @@ test('Codex-sec-P2 follow-up: a chunk racing a live finalize keeps its part (409
   assert.equal(c1.status, 409, c1.text);
   assert.equal(c1.json.code, 'UPLOAD_STATE');
   const parts = await store.list(`upload/${v.json.id}/part/`);
-  assert.equal(parts.length, 2, 'the live finalizer owns the prefix; nothing is un-listed');
+  assert.equal(parts.length, 1, 'skipping the delete would strand the part when the verdict lands first');
 });
 
 test('Codex-sec-P2 follow-up: the chunk path enforces the heuristic session cap', async () => {
@@ -1279,4 +1279,52 @@ test('Codex-sec-P2 follow-up: the chunk path enforces the heuristic session cap'
   const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
   assert.equal(c.status, 413, c.text);
   assert.equal(c.json.code, 'TOO_MANY_PARTS');
+});
+
+test('Codex-sec-P2 follow-up: assembly racing a cleanup retries (409), never 500s', async () => {
+  const t = await fx();
+  // Fake R2 bucket: deletes the second part while the first is fetched,
+  // simulating a chunk reclaim landing mid-assembly, deterministically.
+  const files = new Map();
+  let gets = 0;
+  let victim = null;
+  const bucket = {
+    async put(key, bytes) { files.set(key, bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes)); },
+    async get(key, opts) {
+      gets += 1;
+      if (gets === 1 && victim) files.delete(victim);
+      const v = files.get(key);
+      if (v === undefined) return null;
+      const slice = opts && opts.range ? v.slice(opts.range.offset || 0, (opts.range.offset || 0) + opts.range.length) : v;
+      return { arrayBuffer: async () => slice.slice().buffer };
+    },
+    async delete(key) { files.delete(key); },
+    async list({ prefix, cursor, limit }) {
+      const keys = [...files.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const start = cursor ? Number(cursor) : 0;
+      const page = keys.slice(start, start + (limit || 1000));
+      const end = start + page.length;
+      return { objects: page.map((k) => ({ key: k, size: files.get(k).length })), truncated: end < keys.length, cursor: String(end) };
+    },
+  };
+  t.env.CATALOG_STORE = bucket;
+  const v = await begin(t, t.alice, {
+    name: 'raced', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'a.gguf', bytes: 2 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  await bucket.put(`upload/${v.json.id}/part/00000000/a.gguf`, new Uint8Array([0x47]));
+  victim = `upload/${v.json.id}/part/00000001/a.gguf`;
+  await bucket.put(victim, new Uint8Array([0x47]));
+  const f1 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f1.status, 409, f1.text);
+  assert.equal(f1.json.code, 'FINALIZE_IN_PROGRESS');
+  assert.equal(f1.json.retryable, true);
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'uploading', 'the claim releases for the retry');
+  // Convergence: re-PUT the lost part (as the chunk client would) and the
+  // retry promotes normally.
+  await bucket.put(victim, new Uint8Array([0x47]));
+  const f2 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f2.status, 201, f2.text);
 });
