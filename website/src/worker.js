@@ -1615,6 +1615,18 @@ async function handleApi(request, env, url) {
             }
             return json(409, { error: `Upload is ${live.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
           }
+          // Immutable chunk sizes (Codex-P1): a same-index PUT smaller than
+          // the stored part is refused. Replacement credits come from a
+          // pre-read that overlapping PUTs can share, so two shrinking
+          // replaces would each subtract the original bytes and manufacture
+          // negative quota. Same-size retries (the transport's only
+          // legitimate replace) and growing replaces net zero or positive
+          // per op under any interleave - counters can only meet or exceed
+          // truth, never manufacture credit - so only the shrinking
+          // direction needs the gate. Re-chunking starts a new session.
+          if (bytes.byteLength < existingLen) {
+            return json(400, { error: `Chunk for ${relpath} index ${index} is smaller than the stored ${existingLen} bytes; chunk sizes are immutable within a session - start a new upload to re-chunk.`, code: 'SHRINK_REFUSED', retryable: false });
+          }
           const quotas = JSON.parse(live.quotas_json);
           const pc = quotas.parts || { total: 0, bytes: {} };
           // Prototype-safe counters (Codex-P1): relpaths are client-controlled

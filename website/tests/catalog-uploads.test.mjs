@@ -1501,3 +1501,112 @@ test('Codex-P1: a terminal flip between reserve and put reclaims and rolls back'
   assert.equal(pc.total, 0, 'the reservation rolls back');
   assert.equal(Object.hasOwn(pc.bytes, 'model.gguf') ? pc.bytes['model.gguf'] : 0, 0);
 });
+
+// Barrier: force two chunk PUTs to compute off one base before either
+// writes, guaranteeing overlap regardless of scheduling. Latch: retries
+// pass straight through (no deadlock when a PUT refuses pre-CAS).
+function casBarrier(t) {
+  const realPrepare = t.env.DB.prepare;
+  let arrived = 0;
+  let gate;
+  const gatePromise = new Promise((resolve) => { gate = resolve; });
+  let gated = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.includes('SET quotas_json = ?')) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realRun = b.run;
+        b.run = async () => {
+          if (!gated) {
+            arrived += 1;
+            if (arrived === 1) await gatePromise;
+            else { gated = true; gate(); }
+          }
+          return realRun();
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  return () => { t.env.DB = { ...t.env.DB, prepare: realPrepare }; };
+}
+
+async function seedOnePart(t, name, declared) {
+  const v = await begin(t, t.alice, {
+    name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: declared }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(16).fill(0x47));
+  assert.equal(c.status, 200, c.text);
+  return v.json.id;
+}
+
+test('Codex-P1: shrinking replaces are refused, concurrently and exactly', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const id = await seedOnePart(t, 'shrink', 16);
+  const restore = casBarrier(t);
+  const [a, b] = await Promise.all([
+    chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(1).fill(0x48)),
+    chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(1).fill(0x49)),
+  ]);
+  restore();
+  assert.equal(a.status, 400, a.text);
+  assert.equal(b.status, 400, b.text);
+  assert.equal(a.json.code, 'SHRINK_REFUSED');
+  assert.equal(b.json.code, 'SHRINK_REFUSED');
+  assert.equal(a.json.retryable, false, 'resending cannot help; re-chunk in a new session');
+  const parts = await store.list(`upload/${id}/part/`);
+  assert.equal(parts.length, 1, 'refusals store nothing');
+  assert.equal(parts[0].size, 16, 'the original part is untouched');
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(id).first();
+  const pc = JSON.parse(row.quotas_json).parts;
+  assert.equal(pc.bytes['model.gguf'], 16, 'no credit manufactured');
+  assert.equal(pc.total, 1);
+  const next = await chunk(t, t.alice, id, 'model.gguf', 1, new Uint8Array(16).fill(0x47));
+  assert.equal(next.status, 413, 'no phantom quota for a fresh index');
+});
+
+test('Codex-P1: identical overlapping retries stay exact', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const id = await seedOnePart(t, 'retry', 16);
+  const restore = casBarrier(t);
+  const [a, b] = await Promise.all([
+    chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(16).fill(0x47)),
+    chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(16).fill(0x47)),
+  ]);
+  restore();
+  assert.equal(a.status, 200, a.text);
+  assert.equal(b.status, 200, b.text);
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(id).first();
+  const pc = JSON.parse(row.quotas_json).parts;
+  assert.equal(pc.bytes['model.gguf'], 16);
+  assert.equal(pc.total, 1);
+});
+
+test('Codex-P1: growing overlaps overcount, never undercount', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const id = await seedOnePart(t, 'grow', 32);
+  const restore = casBarrier(t);
+  const [a, b] = await Promise.all([
+    chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(20).fill(0x48)),
+    chunk(t, t.alice, id, 'model.gguf', 0, new Uint8Array(20).fill(0x49)),
+  ]);
+  restore();
+  assert.equal(a.status, 200, a.text);
+  assert.equal(b.status, 200, b.text);
+  const parts = await store.list(`upload/${id}/part/`);
+  const stored = parts.reduce((n, p) => n + p.size, 0);
+  assert.equal(stored, 20, 'one key holds one body');
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(id).first();
+  const counted = JSON.parse(row.quotas_json).parts.bytes['model.gguf'];
+  assert.ok(counted >= stored, `counters ${counted} never undercount stored ${stored}`);
+});
