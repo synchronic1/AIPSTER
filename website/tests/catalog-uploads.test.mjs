@@ -1328,3 +1328,176 @@ test('Codex-sec-P2 follow-up: assembly racing a cleanup retries (409), never 500
   const f2 = await finalize(t, t.alice, v.json.id);
   assert.equal(f2.status, 201, f2.text);
 });
+
+test('Codex-P1: magic relpaths cannot bypass per-file byte counters', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const v = await begin(t, t.alice, {
+    name: 'magic', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: '__proto__', bytes: 1 }, { relpath: 'constructor', bytes: 1 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (const name of ['__proto__', 'constructor']) {
+    const c1 = await chunk(t, t.alice, v.json.id, name, 0, new Uint8Array([0x47]));
+    assert.equal(c1.status, 200, c1.text);
+    const c2 = await chunk(t, t.alice, v.json.id, name, 1, new Uint8Array([0x47]));
+    assert.equal(c2.status, 413, `${name}: second byte refused`);
+    assert.equal(c2.json.code, 'QUOTA_EXCEEDED');
+  }
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  const bytes = JSON.parse(row.quotas_json).parts.bytes;
+  for (const name of ['__proto__', 'constructor']) {
+    assert.equal(Object.hasOwn(bytes, name), true, `${name} recorded as own counter`);
+    assert.equal(bytes[name], 1);
+  }
+});
+
+test('Codex-P2: a crash after commit still leaves cleanup pending (flag in batch)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'crash', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'big.gguf', bytes: 2011 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < 2011; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/big.gguf`, new Uint8Array([0x47]));
+  }
+  // Simulate death after the commit batch but before quarantine cleanup:
+  // the commit batch is the first batch call in finalize.
+  const db = t.env.DB;
+  let fired = false;
+  t.env.DB = {
+    ...db,
+    batch: async (stmts) => {
+      const out = await db.batch(stmts);
+      const isCommit = stmts.some((x) => String(x.sql || '').includes('INSERT INTO catalog_assets'));
+      if (isCommit && !fired) { fired = true; throw new Error('simulated crash after commit'); }
+      return out;
+    },
+  };
+  const f = await finalize(t, t.alice, v.json.id);
+  t.env.DB = db;
+  assert.equal(fired, true, 'the crash landed after commit');
+  assert.equal(f.status, 500, f.text);
+  const row = await t.DB.prepare('SELECT state, manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'validated', 'the commit is durable');
+  assert.equal(JSON.parse(row.manifest_json).cleaned, false, 'pending cleanup survives the crash');
+  const one = await begin(t, t.alice, {
+    name: 'trig1', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 't.gguf', bytes: 1 }],
+  });
+  assert.equal(one.status, 201, one.text);
+  const mid = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(mid.length, 1, 'one sweep slice drains per intake');
+  const two = await begin(t, t.alice, {
+    name: 'trig2', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 't.gguf', bytes: 1 }],
+  });
+  assert.equal(two.status, 201, two.text);
+  const left = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(left.length, 0, 'the sweep converges the stranded quarantine');
+  const done = await t.DB.prepare('SELECT manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(JSON.parse(done.manifest_json).cleaned, true);
+});
+
+test('Codex-P1: overlapping chunks serialize accounting (one 200, one 413)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'overlap', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 16 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  // Barrier: force both PUTs to read before either writes, guaranteeing the
+  // overlap regardless of scheduling. Latch: retries pass straight through.
+  const realPrepare = t.env.DB.prepare;
+  let arrived = 0;
+  let gate;
+  const gatePromise = new Promise((resolve) => { gate = resolve; });
+  let gated = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.includes('SET quotas_json = ?')) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realRun = b.run;
+        b.run = async () => {
+          if (!gated) {
+            arrived += 1;
+            if (arrived === 1) await gatePromise;
+            else { gated = true; gate(); }
+          }
+          return realRun();
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const [a, b] = await Promise.all([
+    chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(16).fill(0x47)),
+    chunk(t, t.alice, v.json.id, 'model.gguf', 1, new Uint8Array(16).fill(0x48)),
+  ]);
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  const statuses = [a.status, b.status].sort((x, y) => x - y);
+  assert.deepEqual(statuses, [200, 413], 'exactly one chunk admits');
+  const loser = a.status === 413 ? a : b;
+  assert.equal(loser.json.code, 'QUOTA_EXCEEDED');
+  const parts = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(parts.length, 1, 'the refused chunk stored nothing');
+  assert.equal(parts.reduce((n, p) => n + p.size, 0), 16);
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  const pc = JSON.parse(row.quotas_json).parts;
+  assert.equal(pc.total, 1);
+  assert.equal(pc.bytes['model.gguf'], 16);
+});
+
+test('Codex-P1: a terminal flip between reserve and put reclaims and rolls back', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'postput', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  // Expire the session at the post-persist ownership check: the reserve and
+  // the put already happened, so the handler must delete the part AND roll
+  // the reservation back.
+  const realPrepare = t.env.DB.prepare;
+  let fired = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql === 'SELECT state FROM catalog_uploads WHERE id = ?') {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realFirst = b.first;
+        b.first = async (...a) => {
+          if (!fired) {
+            fired = true;
+            await t.DB.prepare("UPDATE catalog_uploads SET state = 'expired', byte_ref = NULL, updated_at = ? WHERE id = ?").bind(new Date().toISOString(), v.json.id).run();
+          }
+          return realFirst(...a);
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(fired, true, 'the flip landed after the put');
+  assert.equal(c.status, 410, c.text);
+  assert.equal(c.json.code, 'UPLOAD_EXPIRED');
+  const parts = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(parts.length, 0, 'the part is reclaimed');
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  const pc = JSON.parse(row.quotas_json).parts;
+  assert.equal(pc.total, 0, 'the reservation rolls back');
+  assert.equal(Object.hasOwn(pc.bytes, 'model.gguf') ? pc.bytes['model.gguf'] : 0, 0);
+});

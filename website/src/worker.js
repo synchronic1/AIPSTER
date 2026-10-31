@@ -1590,58 +1590,107 @@ async function handleApi(request, env, url) {
         // counters instead. Same-index replacement subtracts the old bytes
         // first, so transport retries never false-trip; anything beyond
         // declared can never finalize (finalize requires exact fit).
-        // Counters are a heuristic bound under races (concurrent PUTs can
-        // under- or over-count); finalize enforces exact counts and exact
-        // fit from the assembly list, so over-admits cannot promote.
+        // Atomic reservation (Codex-P1): concurrent PUTs must not silently
+        // lose each other's accounting. The counters write is compare-and-
+        // swap on the previously read quotas_json: a conflict re-reads
+        // fresh counters and retries, so every recorded write serializes and
+        // exactly the fitting prefix of a burst admits. Only chunk PUTs
+        // write quotas_json (begin inserts it; every other path writes
+        // state/manifest), so a CAS miss means a rival chunk or a state
+        // flip, both re-mapped on the next iteration. Reservation precedes
+        // persistence: a refusal stores nothing and needs no rollback.
+        // Same-key racers can still overcount by one part (both pre-read a
+        // miss before either persists): bounded, fail-closed (refuses
+        // early), and finalize stays exact because it assembles from the
+        // store, never from counters.
         const key = `upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`;
         const existing = await store.get(key);
-        const quotas = JSON.parse(up.quotas_json);
-        const pc = quotas.parts || { total: 0, bytes: {} };
-        pc.bytes = pc.bytes || {};
-        const fileBytes = (pc.bytes[relpath] || 0) - (existing ? existing.length : 0) + bytes.byteLength;
-        if (fileBytes > declared.bytes) {
-          return json(413, { error: `Chunk exceeds the declared ${declared.bytes} bytes for ${relpath} (${fileBytes - bytes.byteLength} already stored).`, code: 'QUOTA_EXCEEDED' });
+        const existingLen = existing ? existing.length : 0;
+        let reserved = false;
+        for (let attempt = 0; attempt < 3 && !reserved; attempt += 1) {
+          const live = await first(db, 'SELECT state, quotas_json FROM catalog_uploads WHERE id = ?', uploadId);
+          if (!live || live.state !== 'uploading') {
+            if (!live || live.state === 'expired') {
+              return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
+            }
+            return json(409, { error: `Upload is ${live.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
+          }
+          const quotas = JSON.parse(live.quotas_json);
+          const pc = quotas.parts || { total: 0, bytes: {} };
+          // Prototype-safe counters (Codex-P1): relpaths are client-controlled
+          // and `__proto__`/`constructor` are legal names. On a plain object
+          // those read inherited members (budgets become NaN, which admits
+          // everything) and the `__proto__` write-back is silently dropped. A
+          // null-prototype object plus an own-property read keeps every name
+          // a plain counter. (JSON round-trips preserve own `__proto__` data
+          // properties, and Object.assign onto a null-prototype target cannot
+          // trigger the Object.prototype setter, which is not in its chain.)
+          pc.bytes = Object.assign(Object.create(null), pc.bytes || {});
+          const have = Object.hasOwn(pc.bytes, relpath) ? pc.bytes[relpath] : 0;
+          const fileBytes = have - existingLen + bytes.byteLength;
+          if (fileBytes > declared.bytes) {
+            return json(413, { error: `Chunk exceeds the declared ${declared.bytes} bytes for ${relpath} (${fileBytes - bytes.byteLength} already stored).`, code: 'QUOTA_EXCEEDED' });
+          }
+          const newTotal = (pc.total || 0) + (existing ? 0 : 1);
+          if (newTotal > MAX_PARTS_PER_UPLOAD) {
+            return json(413, { error: `Upload holds more than ${MAX_PARTS_PER_UPLOAD} parts; re-chunk with fewer, larger parts.`, code: 'TOO_MANY_PARTS' });
+          }
+          pc.total = newTotal;
+          pc.bytes[relpath] = fileBytes;
+          quotas.parts = pc;
+          const wrote = await run(db, 'UPDATE catalog_uploads SET quotas_json = ?, updated_at = ? WHERE id = ? AND state = ? AND quotas_json = ?', JSON.stringify(quotas), nowIso(), uploadId, 'uploading', live.quotas_json);
+          if (Number(wrote.meta.changes) === 1) reserved = true;
         }
-        const newTotal = pc.total + (existing ? 0 : 1);
-        if (newTotal > MAX_PARTS_PER_UPLOAD) {
-          return json(413, { error: `Upload holds more than ${MAX_PARTS_PER_UPLOAD} parts; re-chunk with fewer, larger parts.`, code: 'TOO_MANY_PARTS' });
+        if (!reserved) {
+          return json(409, { error: 'Chunk raced concurrent writes; retry the chunk.', code: 'UPLOAD_STATE', retryable: true });
         }
-        pc.total = newTotal;
-        pc.bytes[relpath] = fileBytes;
-        quotas.parts = pc;
+        // Roll back one reservation: called when persistence fails or the
+        // session leaves uploading under us. Best-effort CAS with no state
+        // conjunct (terminal rows accept the correction; it only shrinks
+        // held bytes toward truth). A leftover phantom only false-refuses
+        // until expiry - finalize stays exact either way.
+        const rollbackReservation = async () => {
+          for (let i = 0; i < 3; i += 1) {
+            const live = await first(db, 'SELECT quotas_json FROM catalog_uploads WHERE id = ?', uploadId);
+            if (!live) return;
+            const quotas = JSON.parse(live.quotas_json);
+            const pc = quotas.parts || { total: 0, bytes: {} };
+            pc.bytes = Object.assign(Object.create(null), pc.bytes || {});
+            const have = Object.hasOwn(pc.bytes, relpath) ? pc.bytes[relpath] : 0;
+            pc.total = Math.max(0, (pc.total || 0) - (existing ? 0 : 1));
+            pc.bytes[relpath] = Math.max(0, have - (bytes.byteLength - existingLen));
+            quotas.parts = pc;
+            const undone = await run(db, 'UPDATE catalog_uploads SET quotas_json = ? WHERE id = ? AND quotas_json = ?', JSON.stringify(quotas), uploadId, live.quotas_json);
+            if (Number(undone.meta.changes) === 1) return;
+          }
+        };
         // Idempotent rewrite: re-sending an index overwrites it, so
         // transport retries never corrupt the assembly (AC13).
-        await store.put(key, new Uint8Array(bytes));
-        // Fenced accounting write (Codex-sec-P2): a sweep may have expired
-        // this session while the body streamed. The state conjunct turns
-        // the counters write into the ownership verify: on a miss our part
-        // is reclaimed and the caller learns the terminal state instead of
-        // a 200 that orphans unbilled bytes.
-        const accounted = await run(db, 'UPDATE catalog_uploads SET quotas_json = ?, updated_at = ? WHERE id = ? AND state = ?', JSON.stringify(quotas), nowIso(), uploadId, 'uploading');
-        if (Number(accounted.meta.changes) !== 1) {
-          const cur = await first(db, 'SELECT state FROM catalog_uploads WHERE id = ?', uploadId);
-          if (cur && cur.state === 'uploading') {
-            // A finalize reset landed between our write and re-read: the
-            // session is usable again but this chunk lost its accounting.
-            // The part stays - no list is in flight anymore (the resetter
-            // is done), so every future terminal path lists fresh and
-            // includes it - and the client retries the chunk, which
-            // re-accounts as a same-index replace.
-            return json(409, { error: 'Chunk raced a concurrent finalize; retry the chunk.', code: 'UPLOAD_STATE', retryable: true });
-          }
-          // Every other miss reclaims the part. Skipping the delete on a
-          // live state would strand it: the finalizer's lists run BEFORE
-          // its verdict write, so a part landing after the list is missed
-          // by verdict cleanup and then marked swept/unflagged forever.
-          // Deleting can only remove a part a live finalizer listed, and
-          // assembly treats that as a retryable race (below), never a 500.
+        try {
+          await store.put(key, new Uint8Array(bytes));
+        } catch (error) {
+          await rollbackReservation();
+          throw error;
+        }
+        // Post-persist ownership check (Codex-sec-P2): a sweep or verdict
+        // may have moved the session while the body persisted. On anything
+        // but uploading, reclaim our part, roll back the reservation, and
+        // report the terminal state instead of a 200 that orphans bytes.
+        // Skipping the delete on a live state would strand the part: the
+        // finalizer's lists run BEFORE its verdict write, so a part landing
+        // after the list is missed by verdict cleanup and then marked
+        // swept/unflagged forever. Deleting can only remove a part a live
+        // finalizer listed, and assembly treats that as a retryable race,
+        // never a 500.
+        const cur = await first(db, 'SELECT state FROM catalog_uploads WHERE id = ?', uploadId);
+        if (!cur || cur.state !== 'uploading') {
           await store.del(key).catch(() => {});
+          await rollbackReservation();
           if (!cur || cur.state === 'expired') {
             return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
           }
           return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
-        }
-        return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
+        }        return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
       }
       // finalize: assemble (bounded), digest, validate, promote atomically.
       if (up.state === 'validated') {
@@ -1854,6 +1903,13 @@ async function handleApi(request, env, url) {
         const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
         for (const [relpath, flat] of assembled) await store.put(`asset/${assetId}/${relpath}`, flat);
         manifest.revision = revision;
+        // Pending-cleanup flag commits WITH the verdict (Codex-P2): the
+        // inline drain below covers one 2010-slice, and a delete fault or
+        // a dead request between commit and a later flag-write would strand
+        // quarantine copies on a validated row the sweep never revisits.
+        // Small sessions (<= 2010 parts) drain fully inline and carry no
+        // flag; a missing key reads as clean.
+        if (parts.length > 2010) manifest.cleaned = false;
         const baseIsExternal = manifest.adapter
           ? (manifest.adapter.baseAssetId.includes('/') || manifest.adapter.baseAssetId.startsWith('hub:'))
           : false;
@@ -1896,16 +1952,13 @@ async function handleApi(request, env, url) {
         // Incremental quarantine cleanup (Codex-sec-P2): the commit above
         // is durable, but deleting every part inline hangs big sessions
         // (each delete is a store round trip). Drain one sweep slice here;
-        // leftovers stay flagged in the manifest and the expiry sweep
-        // drains them on later intakes, exactly like rejected partial
+        // leftovers stay flagged in the manifest (persisted in the commit
+        // batch above, so a fault here cannot un-flag them) and the expiry
+        // sweep drains them on later intakes, exactly like rejected partial
         // drains. The validated asset already charges quota via its asset
-        // files; the quarantine copies converge to zero instead of
-        // lingering when a marathon cleanup dies mid-loop.
+        // files; the quarantine copies converge to zero instead of lingering
+        // when a marathon cleanup dies mid-loop.
         for (const p of parts.slice(0, 2010)) await store.del(p.key);
-        if (parts.length > 2010) {
-          manifest.cleaned = false;
-          await run(db, 'UPDATE catalog_uploads SET manifest_json = ? WHERE id = ?', JSON.stringify(manifest), uploadId);
-        }
         await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
         return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
       } catch (error) {
