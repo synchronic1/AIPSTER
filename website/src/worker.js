@@ -16,7 +16,7 @@ import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
-import { validateManifest, validateManifestStructure, validateFileBytes, isByteEligible, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_MANIFEST_BYTES, MAX_PARTS_PER_UPLOAD, MAX_FINALIZE_FILE_BYTES } from './lib/catalog/validate.mjs';
+import { validateManifestStructure, validateFileBytes, isByteEligible, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_MANIFEST_BYTES, MAX_PARTS_PER_UPLOAD, MAX_FINALIZE_FILE_BYTES } from './lib/catalog/validate.mjs';
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
 
@@ -2117,7 +2117,11 @@ async function handleApi(request, env, url) {
         const b = validateFileBytes(f, head);
         byteChecks.push(...b.checks);
         if (b.screened && f.relpath.toLowerCase().endsWith('.index.json')) {
-          shard = { relpath: f.relpath, head: await store.peek(`asset/${asset.id}/${f.relpath}`, MAX_MANIFEST_BYTES) };
+          // Fall back to the screened head: asset blobs are immutable once
+          // promoted, so a vanishing blob here is unreachable in practice -
+          // but a null head must never throw below.
+          const full = await store.peek(`asset/${asset.id}/${f.relpath}`, MAX_MANIFEST_BYTES);
+          shard = { relpath: f.relpath, head: full === null || full === undefined ? head : full };
         }
       }
       const verdict = validateManifestStructure({ files }, shard, byteChecks, manifest.kind === 'adapter' ? {
