@@ -42,6 +42,7 @@
       <button role="tab" data-tab="federation" aria-selected="false">Federation</button>
       <button role="tab" data-tab="keys" aria-selected="false">API Keys</button>
       <button role="tab" data-tab="usage" aria-selected="false">Usage</button>
+      <button role="tab" data-tab="advice" aria-selected="false">Advice</button>
       <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
     </nav>
     <section id="tab-overview" role="tabpanel"><h1>Overview</h1><div id="status-strip" class="card" role="status"><p class="muted">Checking resource status…</p></div><div id="ov-cards" class="grid"></div><div id="ov-note"></div></section>
@@ -194,6 +195,26 @@
       <h2>Your keys</h2><div id="key-list" class="grid"></div>
     </section>
     <section id="tab-usage" role="tabpanel" hidden><h1>Usage</h1><div id="usage-totals"></div><div id="usage-list" class="grid"></div></section>
+    <section id="tab-advice" role="tabpanel" hidden>
+      <h1>Fabric advice</h1>
+      <p class="muted">Advisory text about your own resources. Advice never runs inference, moves data, or changes anything: dispatch stays disabled and recommendations never name a model.</p>
+      <div id="adv-off" class="card" hidden>Advice is not enabled on this deployment.</div>
+      <div id="adv-on" hidden>
+      <p id="adv-mode" class="muted" role="status"></p>
+      <p id="adv-fields" class="muted"></p>
+      <form id="adv-form" class="card">
+        <h2>Ask for advice</h2>
+        <label>Task <textarea id="adv-task" rows="3" maxlength="1000" required placeholder="e.g. Which of my resources should serve a small text pilot?"></textarea></label>
+        <fieldset><legend>Resources (owned only)</legend><div id="adv-resources"></div></fieldset>
+        <label><input id="adv-optin" type="checkbox"> I confirm the outbound preview above: only my task plus redacted per-resource facts (alias, kind, freshness, capability tokens, usable bit) leave this browser. No names, hosts, keys, or credentials.</label>
+        <p id="adv-error" class="error" role="alert" hidden></p>
+        <button id="adv-submit" type="submit">Get advice</button>
+        <button id="adv-cancel" type="button" hidden>Cancel</button>
+        <button id="adv-retry" type="button" hidden>Retry with the same request key</button>
+      </form>
+      <div id="adv-result" aria-live="polite"></div>
+      </div>
+    </section>
     <section id="tab-settings" role="tabpanel" hidden>
       <h1>Settings</h1>
       <form id="settings-form" class="card">
