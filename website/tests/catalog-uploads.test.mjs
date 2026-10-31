@@ -939,3 +939,285 @@ test('Codex-sec-P2: a promotion landing between check and batch loses atomically
   const files = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)').bind('u_alice').first('n');
   assert.equal(files, 10000, 'only the rival row landed');
 });
+
+test('Codex-P2: the sweep never overwrites a terminal verdict (conditional flip)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const old = new Date(Date.now() - 2 * 86400000).toISOString();
+  const past = new Date(Date.now() - 1000).toISOString();
+  const spec = (name) => ({
+    name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  const v = await begin(t, t.alice, spec('victim'));
+  assert.equal(v.status, 201, v.text);
+  const vc = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  assert.equal(vc.status, 200, vc.text);
+  const trig = await begin(t, t.alice, spec('trigger'));
+  assert.equal(trig.status, 201, trig.text);
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, trig.json.id).run();
+  // Craft the victim LAST: any intake between crafting and the touch would
+  // sweep it early and the race would never execute.
+  await t.DB.prepare("UPDATE catalog_uploads SET state = 'promoting', byte_ref = ?, expires_at = ? WHERE id = ?").bind('clm_victim', old, v.json.id).run();
+  const vm = await t.DB.prepare('SELECT manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  const vmj = JSON.parse(vm.manifest_json);
+  vmj.claimLease = old;
+  await t.DB.prepare('UPDATE catalog_uploads SET manifest_json = ? WHERE id = ?').bind(JSON.stringify(vmj), v.json.id).run();
+  // A promotion commits while the sweep awaits store cleanup: hook the
+  // sweep flip (oldest-first hits the victim first) and land the commit.
+  const realPrepare = t.env.DB.prepare;
+  let fired = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.startsWith("UPDATE catalog_uploads SET state = 'expired'")) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realRun = b.run;
+        b.run = async () => {
+          if (!fired) {
+            fired = true;
+            await t.DB.prepare("UPDATE catalog_uploads SET state = 'validated', byte_ref = ?, updated_at = ? WHERE id = ?").bind('a_done', new Date().toISOString(), v.json.id).run();
+          }
+          return realRun();
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const touch = await chunk(t, t.alice, trig.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(touch.status, 410, touch.text);
+  assert.equal(fired, true, 'the commit landed mid-sweep');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'validated', 'a completed promotion survives the sweep');
+  assert.equal(row.byte_ref, 'a_done', 'the asset reference survives the sweep');
+});
+
+test('Codex-sec-P2: a chunk landing after a mid-flight sweep is reclaimed (410)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'race', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  // Expire the session at the chunk accounting write: this simulates a
+  // sweep whose list missed our in-flight part and whose flip lands while
+  // the body streams. Parts stay behind, exactly as in the real race.
+  const realPrepare = t.env.DB.prepare;
+  let fired = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.includes('SET quotas_json = ?')) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realRun = b.run;
+        b.run = async () => {
+          if (!fired) {
+            fired = true;
+            await t.DB.prepare("UPDATE catalog_uploads SET state = 'expired', byte_ref = NULL, updated_at = ? WHERE id = ?").bind(new Date().toISOString(), v.json.id).run();
+          }
+          return realRun();
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(fired, true, 'the sweep landed mid-chunk');
+  assert.equal(c.status, 410, c.text);
+  assert.equal(c.json.code, 'UPLOAD_EXPIRED');
+  const parts = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(parts.length, 0, 'the orphaned part is reclaimed, not left unbilled');
+});
+
+test('Codex-sec-P2: finalize refuses an over-cap part count exactly (413, no promote)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const N = 100001;
+  const v = await begin(t, t.alice, {
+    name: 'many', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'big.dat', bytes: N }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < N; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/big.dat`, new Uint8Array([i & 0xff]));
+  }
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 413, f.text);
+  assert.equal(f.json.code, 'TOO_MANY_PARTS');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'uploading', 'the claim is released, not held');
+  const mine = await readJson(await t.call('/api/catalog/my-assets', { headers: sess(t, t.alice) }));
+  assert.equal(mine.json.items.length, 0, 'nothing promoted');
+});
+
+test('Codex-sec-P2: quota stays held until rejected parts drain, then releases', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const QUOTA = 500 * 1024 * 1024 * 1024;
+  const HELD = 4021;
+  // A 4021-part refused upload: inline cleanup drains 2010 and 2011 stay,
+  // so the row is still undrained when the next intake's sweep runs.
+  const v = await begin(t, t.alice, {
+    name: 'refused', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'w.bin', bytes: HELD }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < HELD; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/w.bin`, new Uint8Array([i & 0xff]));
+  }
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 422, f.text);
+  const rej = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(rej.state, 'rejected');
+  assert.equal(rej.byte_ref, null, 'partial drain stays unmarked for the sweep backstop');
+  const afterReject = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(afterReject.length, 2011, 'inline cleanup drained 2010 of 4021');
+  // A manifest that fits only if the undrained bytes are excluded: total =
+  // QUOTA - 4020, so total + 4021 held = QUOTA + 1 over.
+  const total = QUOTA - 4020;
+  const per = Math.floor(total / 5);
+  const files = [0, 1, 2, 3].map((i) => ({ relpath: `f${i}.gguf`, bytes: per }));
+  files.push({ relpath: 'f4.gguf', bytes: total - per * 4 });
+  for (const fl of files) assert.ok(fl.bytes <= 100 * 1024 * 1024 * 1024, 'per-file cap respected');
+  const fill = await begin(t, t.alice, {
+    name: 'fill', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0', files,
+  });
+  assert.equal(fill.status, 400, fill.text);
+  assert.equal(fill.json.code, 'QUOTA_EXCEEDED');
+  const afterFill = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(afterFill.length, 1, 'the refused begin still drained 2010 parts first');
+  const stillHeld = await t.DB.prepare('SELECT byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(stillHeld.byte_ref, null, 'partial drain keeps quota held');
+  // The next intake sweeps the last leftover part; quota releases afterwards.
+  const small = await begin(t, t.alice, {
+    name: 'small', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 's.gguf', bytes: 1 }],
+  });
+  assert.equal(small.status, 201, small.text);
+  const swept = await t.DB.prepare('SELECT byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(swept.byte_ref, 'swept');
+  const left = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(left.length, 0, 'the leftover part drained');
+  const fill2 = await begin(t, t.alice, {
+    name: 'fill2', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0', files,
+  });
+  assert.equal(fill2.status, 201, fill2.text);
+});
+
+test('Codex-sec-P2: the sweep reclaims rejected-undrained parts before their deadline', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'craft', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'c.gguf', bytes: 3 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < 3; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/c.gguf`, new Uint8Array([i]));
+  }
+  const future = new Date(Date.now() + 23 * 3600 * 1000).toISOString();
+  await t.DB.prepare("UPDATE catalog_uploads SET state = 'rejected', byte_ref = NULL, expires_at = ? WHERE id = ?").bind(future, v.json.id).run();
+  const trig = await begin(t, t.alice, {
+    name: 'trig', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 't.gguf', bytes: 1 }],
+  });
+  assert.equal(trig.status, 201, trig.text);
+  const left = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(left.length, 0, 'undrained rejected parts go on any intake, not at expiry');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'rejected', 'the verdict stands');
+  assert.equal(row.byte_ref, 'swept');
+});
+
+test('Codex-sec-P2: a spent write budget refuses finalize before any store read', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const v = await begin(t, t.alice, {
+    name: 'budgeted', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  assert.equal(c.status, 200, c.text);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 429, f.text);
+  assert.equal(f.json.code, 'WRITE_RATE_LIMITED');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'uploading', 'the claim releases; the session retries after the window');
+});
+
+test('Codex-sec-P2: three digest mismatches terminally reject the session', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'wronghash', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32, sha256: '00'.repeat(32) }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  assert.equal(c.status, 200, c.text);
+  const f1 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f1.status, 400, f1.text);
+  assert.equal(f1.json.code, 'DIGEST_MISMATCH');
+  const f2 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f2.status, 400, f2.text);
+  const f3 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f3.status, 422, f3.text);
+  assert.equal(f3.json.code, 'ASSET_REJECTED');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'rejected');
+  assert.equal(row.byte_ref, 'swept', 'few parts drain inline');
+  const left = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(left.length, 0, 'quarantine parts are reclaimed with the verdict');
+  const f4 = await finalize(t, t.alice, v.json.id);
+  assert.equal(f4.status, 422, f4.text);
+  assert.equal(f4.json.duplicate, true, 're-finalize reports the standing verdict without rework');
+});
+
+test('Codex-sec-P2: big promotions clean incrementally and converge via the sweep', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'big', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'big.gguf', bytes: 2011 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < 2011; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/big.gguf`, new Uint8Array([0x47]));
+  }
+  const f = await finalize(t, t.alice, v.json.id);
+  assert.equal(f.status, 201, f.text);
+  const after = await t.DB.prepare('SELECT state, byte_ref, manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(after.state, 'validated');
+  assert.equal(after.byte_ref, f.json.assetId);
+  assert.equal(JSON.parse(after.manifest_json).cleaned, false, 'leftover parts stay flagged');
+  const left = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(left.length, 1, 'one sweep slice drains inline, the rest converges later');
+  const trig = await begin(t, t.alice, {
+    name: 'trig', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 't.gguf', bytes: 1 }],
+  });
+  assert.equal(trig.status, 201, trig.text);
+  const drained = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(drained.length, 0, 'the sweep drains flagged leftovers before expiry');
+  const done = await t.DB.prepare('SELECT state, byte_ref, manifest_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(done.state, 'validated', 'the verdict never changes');
+  assert.equal(done.byte_ref, f.json.assetId, 'the asset reference never changes');
+  assert.equal(JSON.parse(done.manifest_json).cleaned, true);
+});

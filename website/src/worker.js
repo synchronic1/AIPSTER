@@ -16,7 +16,7 @@ import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
-import { validateManifest, validateRelPath as catalogRelPath, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK } from './lib/catalog/validate.mjs';
+import { validateManifest, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_PARTS_PER_UPLOAD } from './lib/catalog/validate.mjs';
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
 
@@ -241,7 +241,7 @@ async function expireCatalogUploads(db, store, ownerId) {
   // would re-fill every LIMIT 20 batch and starve genuine expiries
   // (Codex-P2). A row leaves the predicate only when fully drained; a
   // partial drain (>2010 parts) stays for the next sweep.
-  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'expired') AND (state != 'rejected' OR byte_ref IS NULL) ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
+  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND ((expires_at <= ? AND state != 'validated') OR (state = 'rejected' AND byte_ref IS NULL) OR (state = 'validated' AND json_extract(manifest_json, '$.cleaned') IS FALSE)) AND state != 'expired' AND (state != 'rejected' OR byte_ref IS NULL) ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
   for (const row of stale) {
     let drained = true;
     if (store) {
@@ -252,13 +252,28 @@ async function expireCatalogUploads(db, store, ownerId) {
     if (!drained) continue;
     const now = new Date().toISOString();
     if (row.state === 'rejected') {
-      await run(db, "UPDATE catalog_uploads SET byte_ref = 'swept', updated_at = ? WHERE id = ?", now, row.id);
+      await run(db, "UPDATE catalog_uploads SET byte_ref = 'swept', updated_at = ? WHERE id = ? AND state = 'rejected'", now, row.id);
+    } else if (row.state === 'validated') {
+      // Flagged-leftover drain (Codex-sec-P2): big promotions leave
+      // parts behind (see promote cleanup); the sweep converges them.
+      // The verdict and asset reference never change here - only the
+      // flag clears, and only once the parts reach zero.
+      const full = await first(db, 'SELECT manifest_json FROM catalog_uploads WHERE id = ?', row.id);
+      const mj = JSON.parse(full.manifest_json);
+      mj.cleaned = true;
+      await run(db, "UPDATE catalog_uploads SET manifest_json = ?, updated_at = ? WHERE id = ? AND state = 'validated'", JSON.stringify(mj), now, row.id);
     } else {
       // Expiry invalidates the fence token (Codex-P2): a finalizer stalled
       // past its deadline must not commit after the sweep frees its quota.
       // Clearing here covers every token-gated statement; the commit batch
-      // additionally requires state = 'promoting' (below).
-      await run(db, "UPDATE catalog_uploads SET state = 'expired', byte_ref = NULL, updated_at = ? WHERE id = ?", now, row.id);
+      // additionally requires state = 'promoting' (below). The flip is
+      // conditional on a live state (Codex-sec-P2): the store cleanup above
+      // awaits, so a promotion may commit (validated + asset byte_ref)
+      // while this sweep is in flight; an unconditional flip would
+      // overwrite that terminal verdict and orphan the asset row. A missed
+      // flip leaves the committed row untouched, which is correct in both
+      // orders.
+      await run(db, "UPDATE catalog_uploads SET state = 'expired', byte_ref = NULL, updated_at = ? WHERE id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", now, row.id);
     }
   }
   return stale.length;
@@ -1491,7 +1506,7 @@ async function handleApi(request, env, url) {
     }
     await expireCatalogUploads(db, byteStore(env), me());
     const owned = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
-    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", me());
+    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL))", me());
     if ((owned ? owned.n : 0) + (inflight ? inflight.n : 0) + total > MAX_ASSET_BYTES) {
       return json(400, { error: 'Account storage quota exceeded.', code: 'QUOTA_EXCEEDED' });
     }
@@ -1523,9 +1538,9 @@ async function handleApi(request, env, url) {
     const admitted = await run(db, `INSERT INTO catalog_uploads (id, owner_id, state, quotas_json, manifest_json, byte_ref, expires_at, created_at, updated_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')) < ${MAX_ACTIVE_UPLOADS_PER_USER}
       AND (SELECT COALESCE(SUM(bytes), 0) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?))
-        + (SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting'))
+        + (SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL)))
         + ? <= ${MAX_ASSET_BYTES}`,
-      id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length }), JSON.stringify(manifest), null, expiresAt, now, now,
+      id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length, parts: { total: 0, bytes: {} } }), JSON.stringify(manifest), null, expiresAt, now, now,
       me(), me(), me(), total);
     if (Number(admitted.meta.changes) !== 1) {
       // Lost admission: classify with read-only probes so the error names
@@ -1569,24 +1584,48 @@ async function handleApi(request, env, url) {
           throw error;
         }
         if (!bytes.byteLength) return json(400, { error: 'Empty chunk refused.', code: 'BAD_CHUNK' });
-        // Quota defense-in-depth (Codex-P1): bound what one file can
-        // persist to its declared bytes BEFORE storing. Same-index
-        // replacement subtracts the old bytes first, so transport
-        // retries never false-trip; anything beyond declared can never
-        // finalize (finalize requires exact fit), so early refusal only
-        // rejects doomed writes instead of consuming storage.
-        const partPrefix = `upload/${uploadId}/part/`;
-        const prior = await store.list(partPrefix);
-        const mine = prior.filter((p) => uploadPartPath(p.key, partPrefix) === relpath);
-        const same = mine.find((p) => Number(p.key.split('/')[3]) === index);
-        const current = mine.reduce((n, p) => n + p.size, 0) - (same ? same.size : 0);
-        if (current + bytes.byteLength > declared.bytes) {
-          return json(413, { error: `Chunk exceeds the declared ${declared.bytes} bytes for ${relpath} (${current} already stored).`, code: 'QUOTA_EXCEEDED' });
+        // O(1) chunk accounting (Codex-sec-P2): a per-PUT full-prefix LIST
+        // costs O(n) server work per PUT, quadratic per session, so replace
+        // detection is one targeted GET and byte/count budgets ride on row
+        // counters instead. Same-index replacement subtracts the old bytes
+        // first, so transport retries never false-trip; anything beyond
+        // declared can never finalize (finalize requires exact fit).
+        // Counters are a heuristic bound under races (concurrent PUTs can
+        // under- or over-count); finalize enforces exact counts and exact
+        // fit from the assembly list, so over-admits cannot promote.
+        const key = `upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`;
+        const existing = await store.get(key);
+        const quotas = JSON.parse(up.quotas_json);
+        const pc = quotas.parts || { total: 0, bytes: {} };
+        pc.bytes = pc.bytes || {};
+        const fileBytes = (pc.bytes[relpath] || 0) - (existing ? existing.length : 0) + bytes.byteLength;
+        if (fileBytes > declared.bytes) {
+          return json(413, { error: `Chunk exceeds the declared ${declared.bytes} bytes for ${relpath} (${fileBytes - bytes.byteLength} already stored).`, code: 'QUOTA_EXCEEDED' });
         }
+        const newTotal = pc.total + (existing ? 0 : 1);
+        if (newTotal > MAX_PARTS_PER_UPLOAD) {
+          return json(413, { error: `Upload holds more than ${MAX_PARTS_PER_UPLOAD} parts; re-chunk with fewer, larger parts.`, code: 'TOO_MANY_PARTS' });
+        }
+        pc.total = newTotal;
+        pc.bytes[relpath] = fileBytes;
+        quotas.parts = pc;
         // Idempotent rewrite: re-sending an index overwrites it, so
         // transport retries never corrupt the assembly (AC13).
-        await store.put(`upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`, new Uint8Array(bytes));
-        await run(db, 'UPDATE catalog_uploads SET updated_at = ? WHERE id = ?', nowIso(), uploadId);
+        await store.put(key, new Uint8Array(bytes));
+        // Fenced accounting write (Codex-sec-P2): a sweep may have expired
+        // this session while the body streamed. The state conjunct turns
+        // the counters write into the ownership verify: on a miss our part
+        // is reclaimed and the caller learns the terminal state instead of
+        // a 200 that orphans unbilled bytes.
+        const accounted = await run(db, 'UPDATE catalog_uploads SET quotas_json = ?, updated_at = ? WHERE id = ? AND state = ?', JSON.stringify(quotas), nowIso(), uploadId, 'uploading');
+        if (Number(accounted.meta.changes) !== 1) {
+          await store.del(key).catch(() => {});
+          const cur = await first(db, 'SELECT state FROM catalog_uploads WHERE id = ?', uploadId);
+          if (!cur || cur.state === 'expired') {
+            return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
+          }
+          return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
+        }
         return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
       }
       // finalize: assemble (bounded), digest, validate, promote atomically.
@@ -1641,8 +1680,25 @@ async function handleApi(request, env, url) {
       // or D1 fault) resets in the catch, so every fault stays retryable
       // instead of stranding the upload in promoting until lease expiry.
       try {
+        // Attempt budget (Codex-sec-P2): every assembly + hash burns
+        // real work, so each claim-winning attempt pays the hourly write
+        // budget BEFORE any store reads. Claim losers return free above;
+        // only the winner pays. A throw here releases the claim in the
+        // catch and rethrows, so budget-exhausted sessions retry next
+        // window instead of stranding in promoting.
+        await checkWriteBudget(db, me());
         const partPrefix = `upload/${uploadId}/part/`;
-        const parts = await store.list(partPrefix);
+        const parts = await store.list(partPrefix, MAX_PARTS_PER_UPLOAD + 1);
+        if (parts.length > MAX_PARTS_PER_UPLOAD) {
+          // Exact session cap (Codex-sec-P2): the chunk counters are a
+          // heuristic bound under races, so the limited assembly list is
+          // the exact enforcement: cap + 1 keys means over cap, with no
+          // second read. The claim releases so a re-chunked session can
+          // proceed after the client trims its part count.
+          const resetParts = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
+          if (Number(resetParts.meta.changes) !== 1) return claimLost();
+          return json(413, { error: `Upload holds more than ${MAX_PARTS_PER_UPLOAD} parts; re-chunk with fewer, larger parts.`, code: 'TOO_MANY_PARTS' });
+        }
         const assembled = new Map();
         for (const f of manifest.files) {
           const mine = parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).sort((a, b) => (a.key < b.key ? -1 : 1));
@@ -1666,7 +1722,25 @@ async function handleApi(request, env, url) {
           const digest = await crypto.subtle.digest('SHA-256', flat);
           const sha = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
           if (f.sha256 && f.sha256 !== sha) {
-            const resetDigest = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
+            // Digest strikes (Codex-sec-P2): each mismatch burns a full
+            // assembly + hash, so three strikes on one session is a terminal
+            // reject, not an endless retry loop. The counter persists in the
+            // manifest across attempts; incompletes stay retryable (they are
+            // the core flow) and are bounded by the attempt budget instead.
+            const fails = (manifest.digestFails || 0) + 1;
+            manifest.digestFails = fails;
+            if (fails >= 3) {
+              const doomed = await store.list(`upload/${uploadId}/part/`);
+              for (const p of doomed.slice(0, 2010)) await store.del(p.key);
+              const struckMark = doomed.length <= 2010 ? 'swept' : null;
+              manifest.checks = [{ code: 'DIGEST_MISMATCH', ok: false, message: `Digest mismatch for ${f.relpath} on 3 attempts: declared bytes differ from received bytes.`, resolve: 'Re-chunk the file and start a new upload.' }];
+              manifest.validator = VALIDATOR_VERSION;
+              const struckOut = await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND byte_ref = ?', 'rejected', JSON.stringify(manifest), struckMark, nowIso(), uploadId, claimToken);
+              if (Number(struckOut.meta.changes) !== 1) return claimLost();
+              await audit(db, me(), 'catalog.upload.reject', uploadId, 'DIGEST_MISMATCH');
+              return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: manifest.checks });
+            }
+            const resetDigest = await run(db, "UPDATE catalog_uploads SET state = 'uploading', manifest_json = ?, updated_at = ? WHERE id = ? AND byte_ref = ?", JSON.stringify(manifest), nowIso(), uploadId, claimToken);
             if (Number(resetDigest.meta.changes) !== 1) return claimLost();
             return json(400, { error: `Digest mismatch for ${f.relpath}: declared bytes differ from received bytes.`, code: 'DIGEST_MISMATCH' });
           }
@@ -1687,12 +1761,11 @@ async function handleApi(request, env, url) {
         manifest.validator = verdict.version;
         if (!verdict.ok) {
           // Reclaim quarantine bytes BEFORE the verdict write (Codex-P1):
-          // quota accounting releases rejected sessions, so their parts
-          // must go too - otherwise every rejection orphans bytes outside
-          // quota. Cleanup-first also keeps a store fault retryable (the
-          // session stays promoting; no verdict is half-reported). A fully
-          // drained reject is marked byte_ref 'swept' so the expiry sweep
-          // skips it; a partial drain stays NULL for the sweep backstop.
+          // a fully drained reject is marked byte_ref 'swept' and leaves
+          // quota; a partial drain stays NULL so quota stays held until
+          // the sweep backstop drains it (Codex-sec-P2). Cleanup-first
+          // also keeps a store fault retryable (the session stays
+          // promoting; no verdict is half-reported).
           const doomed = await store.list(`upload/${uploadId}/part/`);
           for (const p of doomed.slice(0, 2010)) await store.del(p.key);
           const sweptMark = doomed.length <= 2010 ? 'swept' : null;
@@ -1708,7 +1781,7 @@ async function handleApi(request, env, url) {
         // atomicity needs a live-gate transport — over-admission is bounded
         // to one footprint and visible to every later check (N5).
         const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
-        const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", me());
+        const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL))", me());
         if ((ownedNow ? ownedNow.n : 0) + (inflightNow ? inflightNow.n : 0) > MAX_ASSET_BYTES) {
           const resetQuota = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
           if (Number(resetQuota.meta.changes) !== 1) return claimLost();
@@ -1792,7 +1865,19 @@ async function handleApi(request, env, url) {
           if (!cur || cur.state !== 'promoting' || cur.byte_ref !== claimToken) return claimLost();
           throw capError('files');
         }
-        for (const p of parts) await store.del(p.key);
+        // Incremental quarantine cleanup (Codex-sec-P2): the commit above
+        // is durable, but deleting every part inline hangs big sessions
+        // (each delete is a store round trip). Drain one sweep slice here;
+        // leftovers stay flagged in the manifest and the expiry sweep
+        // drains them on later intakes, exactly like rejected partial
+        // drains. The validated asset already charges quota via its asset
+        // files; the quarantine copies converge to zero instead of
+        // lingering when a marathon cleanup dies mid-loop.
+        for (const p of parts.slice(0, 2010)) await store.del(p.key);
+        if (parts.length > 2010) {
+          manifest.cleaned = false;
+          await run(db, 'UPDATE catalog_uploads SET manifest_json = ? WHERE id = ?', JSON.stringify(manifest), uploadId);
+        }
         await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
         return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
       } catch (error) {

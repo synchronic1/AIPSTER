@@ -34,10 +34,15 @@ function memoryStore() {
     async del(key) {
       files.delete(key);
     },
-    async list(prefix) {
+    async list(prefix, limit = Infinity) {
+      // Limit support bounds finalize assembly lists (Codex-sec-P2):
+      // callers pass cap + 1 and treat a full page as over-cap. The memory
+      // backend still scans its (test-scale) map; R2 stops paginating
+      // early, which is where the bound matters.
       const out = [];
       for (const [k, v] of files) if (k.startsWith(prefix)) out.push({ key: k, size: v.length });
-      return out.sort((a, b) => (a.key < b.key ? -1 : 1));
+      out.sort((a, b) => (a.key < b.key ? -1 : 1));
+      return out.slice(0, limit);
     },
   };
 }
@@ -61,15 +66,15 @@ function r2Store(bucket) {
     async del(key) {
       await bucket.delete(key);
     },
-    async list(prefix) {
+    async list(prefix, limit = Infinity) {
       const out = [];
       let cursor;
       do {
-        const page = await bucket.list({ prefix, cursor, limit: 1000 });
+        const page = await bucket.list({ prefix, cursor, limit: Math.min(1000, limit - out.length) });
         for (const o of page.objects) out.push({ key: o.key, size: o.size });
         cursor = page.truncated ? page.cursor : undefined;
-      } while (cursor);
-      return out.sort((a, b) => (a.key < b.key ? -1 : 1));
+      } while (cursor && out.length < limit);
+      return out.sort((a, b) => (a.key < b.key ? -1 : 1)).slice(0, limit);
     },
   };
 }

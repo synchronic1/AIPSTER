@@ -7,6 +7,10 @@
 // store (tests); the caller supplies bounded reads.
 export const VALIDATOR_VERSION = 'catalog-validate/1.0';
 export const MAX_MANIFEST_FILES = 2000;
+// Session part cap (Codex-sec-P2): the largest admissible session is 500
+// GiB in 8 MiB chunks (65,536 parts); 100,000 leaves headroom while
+// keeping every assembly list bounded. Chunk indexes are likewise 0..100000.
+export const MAX_PARTS_PER_UPLOAD = 100000;
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
 export const MAX_HEADER_PEEK = 64 * 1024;
 export const MAX_FILE_BYTES = 100 * 1024 * 1024 * 1024;
