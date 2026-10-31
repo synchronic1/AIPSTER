@@ -108,6 +108,23 @@ class PairingLifecycleTests(unittest.TestCase):
             self.assertIn("could not",err.getvalue());self.assertNotIn("unpaired locally",out.getvalue())
         finally:self.data.chmod(0o700)
 
+    @unittest.skipIf(os.name=="nt","POSIX directory ownership bits")
+    def test_posix_existing_directory_is_verified_not_silently_repaired(self):
+        if os.geteuid()==0:self.skipTest("root bypasses POSIX ownership checks")
+        target=self.data/"existing";self.data.mkdir(parents=True);target.mkdir(mode=0o755)
+        with self.subTest(mode="0o755"):
+            target.chmod(0o755)
+            with self.assertRaises(pairing.PairingError) as ctx:
+                pairing.private_dir(target)
+            self.assertEqual(ctx.exception.code,"PRIVATE_STORAGE")
+            self.assertEqual(target.stat().st_mode&0o777,0o755)
+        with self.subTest(mode="0o300"):
+            target.chmod(0o300)
+            try:
+                self.assertEqual(pairing.private_dir(target),target)
+                self.assertEqual(target.stat().st_mode&0o777,0o300)
+            finally:target.chmod(0o700)
+
     @unittest.skipUnless(os.name=="nt","Windows sharing semantics")
     def test_native_open_key_handle_reports_unpair_failure(self):
         meta=self.pair();key=self.data/meta["key_file"]

@@ -154,6 +154,22 @@ def private_dir(path):
         if not _restrict_path(path, directory=True, new=True):
             raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
         return path
+    if os.name != "nt":
+        # Existing POSIX directories are verified, never repaired. Silently
+        # chmod-ing a directory (e.g. 0300 -> 0700) before enumerating managed
+        # keys can mask a read failure and let destructive cleanup claim
+        # completeness over a listing it could not fully read, so fail closed
+        # on shared ownership instead and leave owner-only modes untouched.
+        try:
+            if path.is_symlink():
+                raise OSError("linked worker state")
+            if not path.is_dir():
+                raise OSError("unexpected worker state type")
+            if path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+                raise OSError("shared worker state")
+        except OSError as exc:
+            raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage") from exc
+        return path
     # Another process may have created the directory an instant ago and still
     # be replacing the token's default owner (e.g. Administrators on an
     # elevated token) with the user. Only that exact state is waited out,
