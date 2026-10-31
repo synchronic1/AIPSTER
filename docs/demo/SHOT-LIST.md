@@ -3,7 +3,12 @@
 No recorded video exists yet (verified 2026-10-31: no video links on the
 deployed site or in this repository). Record the journey below with an
 authorized test identity, upload it, and link the upload from the README demo
-section. That upload link is the one remaining owner action.
+section. Exact missing items, both owner actions: (1) a test identity the
+recorder is authorized to use — either a GitHub test account approved for the
+public-signup sign-in, or the seeded demo credential delivered via a private
+channel (never typed visibly, recorded, or committed); (2) a publishing
+destination plus explicit upload authorization. No destination, approval,
+account, or credential change is implied by this list.
 
 ## Setup (before recording)
 
