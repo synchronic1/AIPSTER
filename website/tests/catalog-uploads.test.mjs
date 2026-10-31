@@ -1596,9 +1596,11 @@ test('Codex-P1: growing overlaps overcount, never undercount', async () => {
   const t = await fx();
   __resetFixtureStore();
   const store = byteStore(t.env);
-  // Declared 64: the loser's retry re-reads the key, which may hit (exact
-  // replace accounting) or miss (new-key accounting) depending on the
-  // winner's put timing; both admit and both stay fail-closed.
+  // Declared 64: the loser's retry re-reads the key, which may hit the
+  // winner's put (exact replace accounting) or miss it and see the seed
+  // (stale-credit replace accounting); both admit and both stay
+  // fail-closed. New-key accounting cannot happen here: the seeded key
+  // always exists on this path (no deletes), so the pre-read never misses.
   const id = await seedOnePart(t, 'grow', 64);
   const restore = casBarrier(t);
   const [a, b] = await Promise.all([
