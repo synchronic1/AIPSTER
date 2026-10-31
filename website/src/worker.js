@@ -245,7 +245,7 @@ async function expireCatalogUploads(db, store, ownerId) {
   for (const row of stale) {
     let drained = true;
     if (store) {
-      const parts = await store.list(`upload/${row.id}/part/`);
+      const parts = await store.list(`upload/${row.id}/part/`, 2011);
       for (const p of parts.slice(0, 2010)) await store.del(p.key);
       drained = parts.length <= 2010;
     }
@@ -1575,7 +1575,7 @@ async function handleApi(request, env, url) {
         const declared = manifest.files.find((f) => f.relpath === relpath);
         if (!declared) return json(400, { error: 'Chunk path is not in the declared manifest.', code: 'BAD_PATH' });
         const index = Number(url.searchParams.get('index'));
-        if (!Number.isSafeInteger(index) || index < 0 || index > 100000) return json(400, { error: 'Chunk index must be 0..100000.', code: 'BAD_CHUNK' });
+        if (!Number.isSafeInteger(index) || index < 0 || index > MAX_PARTS_PER_UPLOAD) return json(400, { error: 'Chunk index must be 0..100000.', code: 'BAD_CHUNK' });
         let bytes;
         try {
           bytes = await readBodyBytes(request, CHUNK_MAX_BYTES);
@@ -1619,11 +1619,29 @@ async function handleApi(request, env, url) {
         // a 200 that orphans unbilled bytes.
         const accounted = await run(db, 'UPDATE catalog_uploads SET quotas_json = ?, updated_at = ? WHERE id = ? AND state = ?', JSON.stringify(quotas), nowIso(), uploadId, 'uploading');
         if (Number(accounted.meta.changes) !== 1) {
-          await store.del(key).catch(() => {});
           const cur = await first(db, 'SELECT state FROM catalog_uploads WHERE id = ?', uploadId);
-          if (!cur || cur.state === 'expired') {
-            return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
+          if (!cur || cur.state === 'expired' || cur.state === 'rejected' || cur.state === 'validated') {
+            // Terminal-or-gone: verdict cleanups may have listed before our
+            // part landed (a swept mark or missing cleaned flag would then
+            // strand it), and no live finalizer can be listing now, so the
+            // part is ours alone to reclaim.
+            await store.del(key).catch(() => {});
+            if (!cur || cur.state === 'expired') {
+              return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
+            }
+            return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
           }
+          if (cur.state === 'uploading') {
+            // A finalize reset landed between our write and re-read: the
+            // session is usable again but this chunk lost its accounting.
+            // The part stays (prefix cleanup owns it); the client retries
+            // the chunk, which re-accounts as a same-index replace.
+            return json(409, { error: 'Chunk raced a concurrent finalize; retry the chunk.', code: 'UPLOAD_STATE', retryable: true });
+          }
+          // Promoting/validating/quarantined: a live finalizer or the sweep
+          // owns the whole prefix (terminal paths always list fresh), so
+          // deleting here could remove a part a finalizer already listed
+          // and turn assembly into a 500. Leave the part, report the state.
           return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
         }
         return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
@@ -1730,7 +1748,7 @@ async function handleApi(request, env, url) {
             const fails = (manifest.digestFails || 0) + 1;
             manifest.digestFails = fails;
             if (fails >= 3) {
-              const doomed = await store.list(`upload/${uploadId}/part/`);
+              const doomed = await store.list(`upload/${uploadId}/part/`, 2011);
               for (const p of doomed.slice(0, 2010)) await store.del(p.key);
               const struckMark = doomed.length <= 2010 ? 'swept' : null;
               manifest.checks = [{ code: 'DIGEST_MISMATCH', ok: false, message: `Digest mismatch for ${f.relpath} on 3 attempts: declared bytes differ from received bytes.`, resolve: 'Re-chunk the file and start a new upload.' }];
@@ -1766,7 +1784,7 @@ async function handleApi(request, env, url) {
           // the sweep backstop drains it (Codex-sec-P2). Cleanup-first
           // also keeps a store fault retryable (the session stays
           // promoting; no verdict is half-reported).
-          const doomed = await store.list(`upload/${uploadId}/part/`);
+          const doomed = await store.list(`upload/${uploadId}/part/`, 2011);
           for (const p of doomed.slice(0, 2010)) await store.del(p.key);
           const sweptMark = doomed.length <= 2010 ? 'swept' : null;
           const verdictWrote = await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND byte_ref = ?', 'rejected', JSON.stringify(manifest), sweptMark, nowIso(), uploadId, claimToken);

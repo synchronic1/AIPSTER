@@ -1221,3 +1221,62 @@ test('Codex-sec-P2: big promotions clean incrementally and converge via the swee
   assert.equal(done.byte_ref, f.json.assetId, 'the asset reference never changes');
   assert.equal(JSON.parse(done.manifest_json).cleaned, true);
 });
+
+test('Codex-sec-P2 follow-up: a chunk racing a live finalize keeps its part (409, no delete)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const v = await begin(t, t.alice, {
+    name: 'racefin', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const c0 = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(32).fill(0x47));
+  assert.equal(c0.status, 200, c0.text);
+  // A finalize claims between our route-top read and our accounting write.
+  const realPrepare = t.env.DB.prepare;
+  let fired = false;
+  t.env.DB.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (typeof sql === 'string' && sql.includes('SET quotas_json = ?')) {
+      const realBind = stmt.bind;
+      stmt.bind = (...p) => {
+        const b = realBind(...p);
+        const realRun = b.run;
+        b.run = async () => {
+          if (!fired) {
+            fired = true;
+            await t.DB.prepare("UPDATE catalog_uploads SET state = 'promoting', byte_ref = ? WHERE id = ?").bind('clm_live', v.json.id).run();
+          }
+          return realRun();
+        };
+        return b;
+      };
+    }
+    return stmt;
+  };
+  const c1 = await chunk(t, t.alice, v.json.id, 'model.gguf', 1, new Uint8Array(8).fill(0x47));
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(fired, true, 'the claim landed mid-chunk');
+  assert.equal(c1.status, 409, c1.text);
+  assert.equal(c1.json.code, 'UPLOAD_STATE');
+  const parts = await store.list(`upload/${v.json.id}/part/`);
+  assert.equal(parts.length, 2, 'the live finalizer owns the prefix; nothing is un-listed');
+});
+
+test('Codex-sec-P2 follow-up: the chunk path enforces the heuristic session cap', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const v = await begin(t, t.alice, {
+    name: 'heuristic', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(v.status, 201, v.text);
+  const row = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  const quotas = JSON.parse(row.quotas_json);
+  quotas.parts.total = 100000;
+  await t.DB.prepare('UPDATE catalog_uploads SET quotas_json = ? WHERE id = ?').bind(JSON.stringify(quotas), v.json.id).run();
+  const c = await chunk(t, t.alice, v.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
+  assert.equal(c.status, 413, c.text);
+  assert.equal(c.json.code, 'TOO_MANY_PARTS');
+});
