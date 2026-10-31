@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+          fetch-depth: 0 # source-update pin tests read f3e115e..3fa309c history
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7 resolved 2026-10-28
         with:
           version: '0.12.12'
@@ -36,5 +37,5 @@ jobs:
         working-directory: local-worker
       - run: ./.venv/Scripts/python.exe test_installation.py
         working-directory: local-worker
-      - run: ./.venv/Scripts/python.exe -m unittest test_pairing test_pairing_security test_pairing_windows_storage test_pairing_lifecycle test_pairing_e2e -v
+      - run: ./.venv/Scripts/python.exe -m unittest test_pairing test_pairing_security test_pairing_windows_storage test_pairing_lifecycle test_pairing_e2e test_sender_lock test_source_update -v
         working-directory: local-worker

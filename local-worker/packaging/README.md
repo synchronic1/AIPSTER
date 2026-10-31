@@ -115,6 +115,8 @@ exposes local inference only: there is no capacity-contribution control,
 and boot autostart stays an explicit installer opt-in (off by default),
 so neither can engage implicitly.
 
+One sender per data dir: a second heartbeat loop exits SENDER_RUNNING (6) instead of doubling heartbeats, and the tray recognizes an external sender ("already running in another process") without spawning into a held lock. The lock is an OS-held handle, so a crash or Taskkill releases it and the next start proceeds; a stale lock file alone never blocks a start.
+
 Job-object caveat: under a sandboxed launcher the process already belongs to
 a job that forbids nesting, so assignment fails. That failure is logged with
 its Win32 reason (`confined=False confine_error=...`), and the strict

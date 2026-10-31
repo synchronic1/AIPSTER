@@ -21,7 +21,7 @@ const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 
 // Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
-const DOCS_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
+const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
 const EXPECTED_LINKS = [
   `${TREE}README.md`,
@@ -359,12 +359,13 @@ test('agent setup copies pinned, secret-free instructions and confirms once', as
     'these steps cover x64 only', 'no qualified instructions exist',
     'does NOT share this computer', 'does NOT enable inference',
     'does not contact AIPSTER until I pair it', 'holds no AIPSTER credential',
-    'Pair this computer', 'type the one-time code', 'Pairing registers the resource',
+    'type the one-time code', 'Pairing registers the resource',
     'pairing.py heartbeat-loop --config configs/mock.toml', 'pairing.py unpair',
     'a heartbeat proves reachability only, never inference readiness', 'A running worker is NOT proof of inference readiness',
     'Remove only local-worker/.venv', 'There is no automatic update']) {
     assert.ok(flat.includes(phrase), `missing: ${phrase}`);
   }
+  assert.ok(!flat.includes('tray menu') && !flat.includes('aipster-worker pair'), 'no packaged pairing copy while no installer is usable');
   assert.ok(!SECRET_SHAPED.test(instructions), 'no credential-shaped material in copied instructions');
   assert.ok(!/127\.0\.0\.1|localhost|C:\\Users/.test(instructions), 'no loopback literal or user path baked in');
   assert.deepEqual(ui.calls.slice(before), [], 'copying adds no API call');
@@ -559,10 +560,11 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
     'security-fixed revision', 'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified',
     'untested', 'separate prerequisites', 'Mint a one-time pairing code above',
     'not linked until paired', 'Advanced: manual resource registration',
-    'pairing.py heartbeat-loop', 'Packaged install?', 'aipster-worker pair', 'tray starts the sender',
+    'pairing.py heartbeat-loop',
     'Disconnect and uninstall', 'Troubleshooting', 'worker and its root LICENSE only']) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
+  assert.ok(!text.includes('tray menu') && !text.includes('aipster-worker pair'), 'no packaged pairing copy while no installer is usable');
   const commands = nodesOf(html.slice(html.indexOf('<pre'), html.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
   const lines = commands.split('\n').map((s) => s.trim()).filter(Boolean);
   assert.deepEqual(lines, [

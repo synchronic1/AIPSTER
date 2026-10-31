@@ -655,6 +655,87 @@ class SenderSupervisionTests(unittest.TestCase):
         self.assertEqual(child.EXIT_REPAIR_REQUIRED, 4)
 
 
+class TraySenderExternalTests(unittest.TestCase):
+    """Worker-connect R4: a sender owned by another process is recognized."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='aipster-sender-ext-')
+        self.addCleanup(self.temp.cleanup)
+        self.data = Path(self.temp.name) / 'worker-data'
+        self.data.mkdir(parents=True)
+        self.logs = []
+        self.backend = HeadlessBackend(self.logs.append)
+        self.ctl = controller.Controller(self.data, self.backend)
+        self.ctl.config = self.data / 'config.toml'
+        self.ctl.loaded = SimpleNamespace(node=SimpleNamespace(
+            host='127.0.0.1', port=free_loopback_port(), token_env='DENDRITE_API_TOKEN'))
+        self.ctl.child = FakeChild()
+        self.ctl.sender = FakeSender()
+        self.ctl.last_heartbeat = time.monotonic()
+
+    def pair_store(self):
+        (self.data / 'pairing.json').write_text('{"resource_id": "r_fake01"}', encoding='utf-8')
+
+    def hold_external(self):
+        guard = pairing._hold_sender_lock(self.data)
+        self.assertIsNotNone(guard)
+        self.addCleanup(guard.release)
+        return guard
+
+    def sender_line(self):
+        payload = json.loads((self.data / 'state.json').read_text(encoding='utf-8'))
+        return payload['pairing']['sender']
+
+    def test_start_defers_to_external_sender(self):
+        self.pair_store()
+        self.hold_external()
+        self.assertTrue(self.ctl.start_sender())
+        self.assertEqual(self.ctl.sender.starts, 0, 'no spawn into a held lock')
+        self.assertEqual(self.ctl.sender_notified, 6)
+        self.assertIn('another process', self.sender_line())
+
+    def test_poll_exit6_reports_external_without_notify(self):
+        self.ctl.sender._exit = 6
+        self.ctl.tick()
+        self.ctl.tick()
+        kinds = [e[0] for e in self.backend.events]
+        self.assertNotIn('sender_stopped', kinds)
+        self.assertNotIn('pair_again', kinds)
+        self.assertEqual(self.ctl.sender.starts, 0)
+        self.assertIn('another process', self.sender_line())
+
+    def test_stop_clears_external_report(self):
+        self.ctl.sender._exit = 6
+        self.ctl.tick()
+        self.assertIn('another process', self.sender_line())
+        self.ctl.stop_worker()
+        self.assertIsNone(self.ctl.sender_notified)
+        line = self.sender_line()
+        self.assertNotIn('another process', line)
+        self.assertIn('stopped', line)
+
+    def test_connect_defers_to_external_sender_when_serving(self):
+        self.pair_store()
+        self.hold_external()
+        self.ctl.state = state.RUNNING
+        self.ctl.sender._running = False
+        self.assertTrue(self.ctl.connect())
+        self.assertEqual(self.ctl.sender.starts, 0)
+        self.assertEqual(self.ctl.sender_notified, 6)
+        self.assertEqual(len(self.ctl.child.started), 0)
+
+    def test_start_spawns_when_probe_unavailable(self):
+        self.pair_store()
+        self.hold_external()
+        with patch.dict(sys.modules, {'pairing': None}):
+            self.assertTrue(self.ctl.start_sender())
+        self.assertEqual(self.ctl.sender.starts, 1, 'exit 6 still guards the spawn')
+
+    def test_sender_running_exit_matches_pairing(self):
+        self.assertEqual(child.EXIT_SENDER_RUNNING, pairing.EXIT_SENDER_RUNNING)
+        self.assertEqual(child.EXIT_SENDER_RUNNING, 6)
+
+
 class TrayConnectActionsTests(unittest.TestCase):
     """Worker-connect W2: Connect/Settings/copy-address tray actions."""
 
