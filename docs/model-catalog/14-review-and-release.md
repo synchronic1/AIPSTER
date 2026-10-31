@@ -27,9 +27,12 @@
 
 ## Evidence (all local, fixture-only)
 
-- `npm run check` PASS, `npm test` 985/985 PASS, `npm run build`
+- `npm run check` PASS, `npm test` 1001/1001 PASS, `npm run build`
   PASS, `npm run bundle` dry-run PASS (final re-run after last edit,
-  quiescent tree, preview stopped, port 8791 verified free).
+  quiescent tree, preview stopped, port 8791 verified free). One
+  transient full-run flake observed (node worker init failure in an
+  unrelated file's runner, green alone and on re-run); recorded, not
+  hidden. Check manifest `89915d56…`.
 - Renders 01–13: real headless-Edge captures against local fixture
   `wrangler dev` (owner session, seeded `render-box` telemetry).
 - Renders 14–20: interactive CDP-driven Edge journeys, same fixture
@@ -75,15 +78,76 @@
   races, exact event trails); no secrets, no trust broadening.
   Verified against the better-sqlite3 shim only — live-D1
   behavior untested, consistent with the fixture-only posture.
-- Follow-ons accepted (low/info, not blockers): N1 cancelling +
-  silent worker holds forever (needs quiet-poll threshold or
-  force-cancel); N2 poll consumes before CAS (loser drops its
-  receipt unaudited); N3 event INSERT no longer batched with the
-  state UPDATE (crash window); N4 admission checks plan estimate
-  but reserves max(plan, decision); N5 F15 re-check still
-  check-then-act (same class as F8 residual); N6 lingered
-  transport-cancel flag after a lost race (benign audit line);
-  N7 big-endian Mach-O magics uncovered.
+- Follow-ons from that round, all reconciled in the release pass
+  (below): N1–N7.
+
+## Release pass (N1–N7 + site release)
+
+Peter directed release: push, review, merge, and deploy this scoped
+feature to the existing Cloudflare site; fix-forward online for
+ordinary defects, roll back for security/tenant-isolation/data-loss
+risk. No paid inference, model downloads, credential changes, or
+live worker qualification under this release.
+
+- N1 fixed: a cancelling job past the 60s quiet window fails
+  `CANCEL_UNCONFIRMED` WITH its reservation held (new
+  `{ release: false }` transition option); the hold frees only on a
+  terminal worker report or lost node access (terminal-read
+  reconciliation). Unknown execution never frees potentially
+  occupied capacity. Pinned by 3 tests (threshold hold, late-ack
+  release, revocation release).
+- N2 fixed: fixture transport gains `peek`; status reads run
+  peek → CAS → consume-on-success, so a race loser destroys
+  nothing. Stale replays are consumed-but-unapplied; the old
+  conflict-audit is removed (nothing is lost to audit). Revocation
+  reordered to transition-then-cancel (same N6 root cause). Pinned
+  by 2 tests (peek unit, serialized-consumption race).
+- N3 fixed: transitions commit as one guarded batch — CAS UPDATE +
+  conditional event marker (deterministic `ev_<job>_<from>_<to>`
+  id; a same-target loser PK-conflicts and rolls back) +
+  marker-conditional release. Uses the repo's proven D1
+  batch-as-transaction contract. Pinned by 2 tests (marker ids,
+  loser-commits-nothing) plus 3 miniflare-D1 runtime proofs.
+- N4 fixed: admission checks `needBytes = max(plan, re-evaluated)`
+  and reserves the same figure — one variable, no check/reserve
+  skew. Pinned by a growth-in-the-window test (compat passes,
+  admission 409s with `neededBytes`).
+- N5 documented residual (reviewer's suggested treatment):
+  racing finalizes can both pass; over-admission bounded to one
+  footprint and visible to later checks — same class as F8.
+- N6 fixed: cancel sends the worker request only after a
+  successful CAS (first try and retry converge); a lost race sends
+  nothing. Pinned by a lost-race test (no flag, no phantom audit).
+- N7 fixed: big-endian Mach-O magics refused; cancelling
+  self-transition removed from the predicate. Pinned by 2 tests.
+- UI: heartbeat availability vs capability-report freshness
+  disambiguated — strip says "no worker heartbeats seen" (never
+  bare "telemetry"), compat card says "capability-report age …
+  snapshot only, not a connected node". Pinned by 2 tests.
+- Migrations verified against current main (not assumed): main is
+  at 0016, 0001–0016 byte-identical on this branch, 0017/0018 are
+  the correct next numbers. New `catalog-d1-runtime.test.mjs`
+  (4 tests) applies 0001–0018 on real local D1 (miniflare),
+  asserts catalog tables/columns, and proves the N3/admit SQL —
+  including under FK enforcement, which local D1 applies and the
+  node shim does not (seeds carry real parents).
+- Release target discovered: live site serves chain merge
+  `2ed8fdf` (run 40981033161), prod D1 journal exactly
+  0001–0015, `auth_deployed:false` is a hardcoded build
+  placeholder (same both sides). PR #47 (0016 + admin scaffold)
+  is merged but never deployed: this release carries it, so the
+  migration plan is 0016+0017+0018 post-merge per the chain
+  runbook (backup → journal check → apply → probe → deploy).
+  Admin router reviewed for the carry: deny-by-default, live
+  grant re-check, keys/demo fail closed, mutations 501, no
+  state changes — prod has no grant rows, so all admin routes
+  fail closed until operator-SQL grants exist.
+- Main is unprotected (no required reviews/checks enforced by
+  GitHub); the release follows the normal process anyway: draft
+  PR → CI green → independent reviews → merge with
+  `--match-head-commit`, no self-approval. No open PRs and no
+  competing catalog writer at release start; no DGM-lane
+  activity found (branches or PRs).
 
 ## Local reproduction
 
@@ -143,18 +207,23 @@ Merge prerequisites: independent review clearance of the exact SHAs;
 CI green; no reported chain collision (files overlap the chain lane —
 coordinate with the release owner before merge).
 
-Deploy prerequisites: D1 backup; apply 0017→0018 on staging first,
-then prod; no new secrets (uses `BETTER_AUTH_SECRET`; `CATALOG_STORE`
-binding deferred by design); health/readiness + smoke (login,
-compat unknown without telemetry, plan refusal live).
+Deploy prerequisites: D1 backup (private dir, never committed);
+confirm prod journal exactly 0001–0015; apply 0016 (carried #47,
+never deployed) + 0017→0018 in filename order; readiness probe
+(journal rows, `admin_grants` + catalog tables present); no new
+secrets (uses `BETTER_AUTH_SECRET`; `CATALOG_STORE` binding
+deferred by design); health/readiness + smoke (login, admin
+routes fail closed without grants, compat unknown without
+telemetry, plan refusal live, catalog fixture journeys).
 
 Rollback: restore the D1 backup; redeploy the previous release.
 Migrations are additive (new tables/columns only).
 
 ## Explicitly NOT done
 
-Push, PR, merge, deploy, R2 provisioning, credential enrollment,
-paid calls, prod migration, live inference. Fresh-context code +
-security reviews plus a read-only delta re-review (READY) have been
-performed and are recorded above; that is review evidence for the
-owner's merge decision, not a merge authorization.
+R2 provisioning, credential enrollment, paid calls, live
+inference, live worker qualification. Push, PR, coordinated merge,
+prod migration (0016+0017+0018), and deploy are authorized under
+the release pass above and proceed through the normal process
+(CI green, independent reviews recorded, `--match-head-commit`,
+no self-approval, runbook-order migration + deploy).

@@ -1,4 +1,4 @@
-/* Built with Meta Muse. Exact-client probe for the heartbeat strip copy:
+﻿/* Built with Meta Muse. Exact-client probe for the heartbeat strip copy:
  * loads the checked-in public/app/app.js in a stub DOM (same pattern as
  * ui-session.test.mjs) and asserts renderStatus presents heartbeat-seen
  * resources as reachability-only, usable=false with distinct not-ready
@@ -71,14 +71,15 @@ test('usable=false rows get distinct not-ready attention copy', async () => {
   assert.ok(!stripNegations(host.innerHTML).match(/ready|runnable/i), 'never rendered as runnable/ready');
 });
 
-test('never-seen rows keep the telemetry-unavailable copy', async () => {
+test('never-seen rows keep the heartbeat-unavailable copy', async () => {
   const { context, el } = await loadClient();
   const host = el('probe');
   context.renderStatus(host, payload([item({ liveness: 'offline', lastSeenAt: null, lastSeenAgeMs: null, usable: false })]));
   assert.ok(host.innerHTML.includes('last seen never'), host.innerHTML);
   assert.ok(!host.innerHTML.includes('heartbeat seen'), 'no heartbeat copy without a heartbeat');
   assert.ok(!host.innerHTML.includes('ATTENTION'), 'no attention copy without a heartbeat');
-  assert.ok(host.innerHTML.includes('live telemetry is unavailable'), 'global unavailable copy kept');
+  assert.ok(host.innerHTML.includes('no worker heartbeats seen'), 'global unavailable copy kept');
+  assert.ok(!host.innerHTML.includes('live telemetry is unavailable'), 'bare telemetry wording is gone');
 });
 
 test('demo labels are unchanged by heartbeat presence', async () => {

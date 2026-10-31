@@ -212,6 +212,27 @@ test('compat compatible path renders the estimate breakdown with method and unce
   assert.ok(!SECRET_SHAPED.test(ui.el('compat-out').innerHTML), 'no secret-shaped content in decisions');
 });
 
+test('compat labels snapshot freshness as a capability report, never bare telemetry', async () => {
+  const ui = await makeUi();
+  const node = await registerResource(ui, 'big-box');
+  const s = fixtureSnapshot();
+  const now = new Date().toISOString();
+  await ui.t.DB.prepare('INSERT INTO node_capabilities (node_id, schema_version, reported_at, os, arch, runtimes_json, mem_json, disk_json, workload_json) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(node.id, now, s.os, s.arch, JSON.stringify(s.runtimes), JSON.stringify(s.mem), JSON.stringify(s.disk), JSON.stringify(s.workload)).run();
+  await openDetail(ui, 'fixture-org/tiny-instruct-gguf');
+  ui.el('compat-node').value = node.id;
+  ui.el('compat-runtime').value = 'fixture-llama';
+  ui.el('compat-context').value = '2048';
+  ui.el('compat-concurrency').value = '1';
+  ui.el('compat-form').listeners.submit({ preventDefault() {} });
+  await ui.waitForDOM(() => ui.el('compat-out').innerHTML.includes('Decision:'), 'compat never rendered');
+  const out = ui.el('compat-out').innerHTML;
+  assert.ok(out.includes('capability-report age'), 'snapshot freshness is labeled a capability report');
+  assert.ok(!out.includes('telemetry age'), 'bare telemetry wording is gone');
+  const stripped = textOf(out).replace(/snapshot only, not a connected node/i, '');
+  assert.ok(!/connected|ready to run/i.test(stripped), 'a fresh snapshot implies no connected node');
+});
+
 test('empty and upstream-error search states are distinct and honest', async () => {
   const ui = await makeUi();
   await ui.clickTab('models');

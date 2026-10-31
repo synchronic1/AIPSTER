@@ -1,4 +1,4 @@
-/* Built with Meta Muse. */
+﻿﻿/* Built with Meta Muse. */
 // AIPSTER apex Worker: same-origin control-panel API + /app UI + /admin UI on
 // top of the existing static site. Routing: /api/auth/* -> Better Auth,
 // /api/* -> JSON API (errors always JSON, never the static 404 page),
@@ -379,31 +379,66 @@ function gatedRefusal(asset, adapterAsset) {
 // finishes first honestly wins as ready). Writes are compare-and-swap:
 // a concurrent writer wins and the loser re-reads instead of
 // resurrecting (F1). Events land only on success; terminal failures and
-// cancels release the reservation (AC15/AC17). Ready KEEPS its
-// reservation: loaded weights occupy memory until an unload API exists
-// (documented follow-on).
+// cancels release the reservation (AC15/AC17) unless the caller holds it
+// for unreconciled capacity (N1 passes { release: false }). Ready KEEPS
+// its reservation: loaded weights occupy memory until an unload API
+// exists (documented follow-on).
 // Late receipts on terminal jobs are audited, never applied (F9).
 const DEPLOY_ORDER = ['queued', 'admitted', 'staging', 'verifying', 'loading', 'ready'];
 const DEPLOY_TERMINAL = TERMINAL_STATES;
+// A cancelling job the worker never answers fails (reservation HELD) past
+// this quiet window; updated_at is the cancelling-entry clock because
+// quiet reads never touch it (N1).
+const CANCEL_QUIET_MS = 60_000;
 
-async function transitionDeployment(db, job, to, detail = '', code = null) {
+async function transitionDeployment(db, job, to, detail = '', code = null, opts = {}) {
   const from = job.state;
   if (DEPLOY_TERMINAL.includes(from)) return { ok: false, error: `Deployment is already ${from}.` };
   const forward = to === 'failed' || to === 'cancelled'
-    || (to === 'cancelling' && !DEPLOY_TERMINAL.includes(from))
+    || (to === 'cancelling' && from !== 'cancelling' && !DEPLOY_TERMINAL.includes(from))
     || (from === 'cancelling' && to === 'ready')
     || (DEPLOY_ORDER.includes(from) && DEPLOY_ORDER.includes(to) && DEPLOY_ORDER.indexOf(to) > DEPLOY_ORDER.indexOf(from));
   if (!forward) return { ok: false, error: `Illegal transition ${from} -> ${to}.` };
   const now = nowIso();
-  const applied = await run(db, 'UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state = ?',
-    to, to === 'failed' ? JSON.stringify({ code, detail: detail.slice(0, 500) }) : '{}', now, job.id, from);
-  if (Number(applied && applied.meta ? applied.meta.changes : 0) !== 1) {
-    return { ok: false, conflict: true, error: `Deployment moved under this write (saw ${from}).` };
+  // N3: the state write, its evidence event, and the terminal release
+  // commit as one guarded batch (D1 batch is all-or-nothing per
+  // qa-d1-contract.test.mjs, but zero-row statements still succeed, so
+  // every statement after the UPDATE is conditional):
+  // - the event marker lands only when the post-state is exactly this
+  //   write (id + state + updated_at), with a deterministic id per
+  //   job/from/to, so a same-target loser PK-conflicts and rolls back
+  //   instead of duplicating;
+  // - the release lands only when this write's marker landed.
+  // A lost race therefore commits nothing; callers re-read (F1). The
+  // marker id is unique per job because transitions are monotonic:
+  // forward-only along DEPLOY_ORDER, one cancelling entry (repeat
+  // cancels replay), terminal once.
+  const markerId = `ev_${job.id}_${from}_${to}`;
+  const errJson = to === 'failed' ? JSON.stringify({ code, detail: detail.slice(0, 500) }) : '{}';
+  const stmts = [
+    db.prepare('UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state = ?')
+      .bind(to, errJson, now, job.id, from),
+    db.prepare(`INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail)
+      SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM catalog_deployments WHERE id = ? AND state = ? AND updated_at = ?)`)
+      .bind(markerId, job.id, now, from, to, detail.slice(0, 500), job.id, to, now),
+  ];
+  if ((to === 'failed' || to === 'cancelled') && opts.release !== false) {
+    stmts.push(db.prepare(`UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'
+      AND EXISTS (SELECT 1 FROM catalog_deployment_events WHERE id = ?)`)
+      .bind(now, job.id, markerId));
   }
-  await run(db, 'INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)',
-    rid('ev_'), job.id, now, from, to, detail.slice(0, 500));
-  if (to === 'failed' || to === 'cancelled') {
-    await run(db, "UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'", now, job.id);
+  let out;
+  try {
+    out = await db.batch(stmts);
+  } catch (batchError) {
+    // A same-target loser PK-conflicts on the deterministic marker id;
+    // re-read to distinguish that from a genuine failure (F2 pattern).
+    const current = await first(db, 'SELECT state FROM catalog_deployments WHERE id = ?', job.id);
+    if (!current || current.state !== from) return { ok: false, conflict: true, error: `Deployment moved under this write (saw ${from}).` };
+    throw batchError;
+  }
+  if (Number(out && out[0] && out[0].meta ? out[0].meta.changes : 0) !== 1) {
+    return { ok: false, conflict: true, error: `Deployment moved under this write (saw ${from}).` };
   }
   return { ok: true };
 }
@@ -1448,7 +1483,10 @@ async function handleApi(request, env, url) {
       }
       // Quota is re-checked at finalize: a concurrent promotion may have
       // landed since begin (F15). owned + inflight (self included) is the
-      // post-promote footprint.
+      // post-promote footprint. Two racing finalizes can still both pass
+      // (check-then-act): like F8 (see the 0018 header), true admission
+      // atomicity needs a live-gate transport — over-admission is bounded
+      // to one footprint and visible to every later check (N5).
       const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
       const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')", me());
       if ((ownedNow ? ownedNow.n : 0) + (inflightNow ? inflightNow.n : 0) > MAX_ASSET_BYTES) {
@@ -1749,8 +1787,13 @@ async function handleApi(request, env, url) {
     const avail = Math.max(0, (gpu ? snap.snapshot.mem.gpu[0].vramAvailBytes : snap.snapshot.mem.ramAvailBytes)
       - (snap.snapshot.workload.reservations || []).reduce((n, r) => n + (Number.isSafeInteger(r.bytes) ? r.bytes : 0), 0)
       - (held ? held.n : 0));
-    if (plan.estimateTotalBytes > avail) {
-      return json(409, { error: 'Node memory is over-reserved by concurrent work; retry when capacity frees.', code: 'RESERVATION_EXHAUSTED', availableBytes: avail, neededBytes: plan.estimateTotalBytes });
+    // Admission checks exactly what the hold will take: the re-evaluated
+    // estimate can exceed the plan figure (re-resolution growth), so a
+    // single needBytes feeds both the check and the reservation (N4).
+    // TOCTOU on `avail` itself stays F8-class (documented residual).
+    const needBytes = Math.max(plan.estimateTotalBytes, decision.estimate.totalBytes);
+    if (needBytes > avail) {
+      return json(409, { error: 'Node memory is over-reserved by concurrent work; retry when capacity frees.', code: 'RESERVATION_EXHAUSTED', availableBytes: avail, neededBytes: needBytes });
     }
     const now = nowIso();
     const id = rid('dep_');
@@ -1762,7 +1805,7 @@ async function handleApi(request, env, url) {
         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, '{}', ?, ?)`)
           .bind(id, me(), JSON.stringify({ ...plan, opId }), plan.planFingerprint, idempotencyKey, plan.nodeId, plan.runtime, now, now),
         db.prepare('INSERT INTO catalog_reservations (id, deployment_id, owner_id, node_id, bytes, state, created_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(rid('res_'), id, me(), plan.nodeId, Math.max(plan.estimateTotalBytes, decision.estimate.totalBytes), 'held', now, null),
+          .bind(rid('res_'), id, me(), plan.nodeId, needBytes, 'held', now, null),
         db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?, ?, ?, ?, ?, ?)')
           .bind(rid('ev_'), id, now, '', 'queued', 'admitted; reservation held'),
       ]);
@@ -1823,11 +1866,11 @@ async function handleApi(request, env, url) {
           const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
           return json(200, { ...(await catalogDeploymentShape(db, row)), events, duplicate: true });
         }
-        // Cancel pends until the worker acknowledges: the request goes
-        // out best-effort and the job waits in `cancelling` with its
-        // reservation held. A lost race gets one retry on fresh state,
-        // then an honest 409 (F1/F9).
-        if (transport) await transport.cancel(plan.opId);
+        // Cancel pends until the worker acknowledges: the state moves to
+        // `cancelling` first and the request goes out best-effort only on
+        // success, so a lost race sends no phantom worker-cancel (N6). The
+        // job waits in `cancelling` with its reservation held. A lost race
+        // gets one retry on fresh state, then an honest 409 (F1/F9).
         let moved = await transitionDeployment(db, row, 'cancelling', 'cancel requested by owner; worker cancel best-effort; awaiting acknowledgment');
         if (!moved.ok) {
           const retry = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
@@ -1835,47 +1878,64 @@ async function handleApi(request, env, url) {
             const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
             return json(200, { ...(await catalogDeploymentShape(db, retry)), events, duplicate: true });
           }
-          if (transport) await transport.cancel(plan.opId);
           moved = await transitionDeployment(db, retry, 'cancelling', 'cancel requested by owner; worker cancel best-effort; awaiting acknowledgment');
           if (!moved.ok) return json(409, { error: 'Deployment moved under the cancel request; refresh and retry.', code: 'DEPLOYMENT_CONFLICT' });
         }
+        if (transport) await transport.cancel(plan.opId);
         await audit(db, me(), 'catalog.deploy.cancel', row.id, row.state);
         const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
         const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
         return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, duplicate: false });
       }
-      // Status read with fixture reconciliation: each read processes one
-      // pending worker receipt (fixture transport only). Revocation is
-      // re-checked on every advance: lost access fails the flight (AC20).
-      // Every transition below is compare-and-swap: on conflict the read
-      // re-reads and returns current state instead of writing stale (F1).
+      // Status read with fixture reconciliation: each read peeks one
+      // pending worker receipt (fixture transport only) and consumes it
+      // only after making progress on it, so a race loser destroys
+      // nothing (N2). Revocation is re-checked on every advance: lost
+      // access fails the flight (AC20). Every transition below is
+      // compare-and-swap: on conflict the read re-reads and returns
+      // current state instead of writing stale (F1).
       const finishRead = async (orig) => {
         const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
         const events = await all(db, 'SELECT * FROM catalog_deployment_events WHERE deployment_id = ? ORDER BY at ASC', row.id);
         return json(200, { ...(await catalogDeploymentShape(db, fresh)), events, reconciled: fresh.state !== orig.state });
       };
       if (TERMINAL_STATES.includes(row.state)) {
-        // Late receipts are audited, never applied (F9).
+        // Late receipts are audited, never applied (F9). An
+        // unconfirmed-cancel job additionally reconciles its held
+        // reservation here: a terminal worker report releases it, and so
+        // does losing node access — the only two authorities that can
+        // speak for unknown execution (N1).
         if (transport) {
           const late = await transport.poll(plan.opId);
           if (late.status !== 'unknown') await auditLateReceipt(db, row.id, late);
+          const err = row.state === 'failed' ? JSON.parse(row.error_json || '{}') : null;
+          if (err && err.code === 'CANCEL_UNCONFIRMED') {
+            const acked = late.status === 'cancelled' || late.status === 'failed';
+            const accessNow = acked ? true : await catalogNodeAccess(db, me(), row.node_id);
+            if (acked || !accessNow) {
+              await run(db, "UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'", nowIso(), row.id);
+              await noteEvent(db, row.id, acked
+                ? `cancel acknowledged late (${late.status}); reservation released`
+                : 'access revoked after unconfirmed cancel; reservation released');
+            }
+          }
         }
         return finishRead(row);
       }
       if (!transport) return finishRead(row);
       const access = await catalogNodeAccess(db, me(), row.node_id);
       if (!access) {
-        if (transport) await transport.cancel(plan.opId);
         const revoked = await transitionDeployment(db, row, 'failed', 'access to the node was revoked mid-flight; worker cancel requested best-effort; worker state UNCONFIRMED; reservation released speculatively', 'REVOKED');
         if (!revoked.ok) return finishRead(row);
+        if (transport) await transport.cancel(plan.opId);
         return finishRead(row);
       }
-      let receipt = await transport.poll(plan.opId);
+      let receipt = await transport.peek(plan.opId);
       if (receipt.status === 'unknown') {
         // Reconcile by op id: re-dispatch resumes without duplicating
         // work; a second unknown means the worker truly lost it.
         await transport.dispatch({ opId: plan.opId, jobId: row.id, nodeId: row.node_id, script: plan.fixtureScript || [] });
-        receipt = await transport.poll(plan.opId);
+        receipt = await transport.peek(plan.opId);
       }
       if (row.state === 'cancelling') {
         // Only the worker terminal reports (or a finished load) move a
@@ -1883,19 +1943,36 @@ async function handleApi(request, env, url) {
         if (receipt.status === 'cancelled') {
           const t = await transitionDeployment(db, row, 'cancelled', 'worker acknowledged cancel; reservation released');
           if (!t.ok) return finishRead(row);
+          await transport.poll(plan.opId);
           return finishRead(row);
         }
         if (receipt.status === 'failed') {
           const t = await transitionDeployment(db, row, 'failed', `${receipt.code || 'failed'}: ${receipt.detail || 'worker-reported failure while cancelling'}; server-side cleanup NOT verified; reservation released`, typeof receipt.code === 'string' ? receipt.code.slice(0, 64) : null);
           if (!t.ok) return finishRead(row);
+          await transport.poll(plan.opId);
           return finishRead(row);
         }
         if (receipt.status === 'ready') {
           const t = await transitionDeployment(db, row, 'ready', 'worker reported ready while cancelling: load finished before cancel landed; reservation held');
           if (!t.ok) return finishRead(row);
+          await transport.poll(plan.opId);
           return finishRead(row);
         }
         if (receipt.status === 'unknown') {
+          // A silent worker must not hold a cancelling job forever — but
+          // unknown execution must not free potentially occupied capacity
+          // either. Past the quiet threshold the job fails WITH its
+          // reservation held; the hold frees only on a terminal worker
+          // report or lost access (see terminal reconciliation above).
+          // Authoritative acks above still win first, at any age.
+          const quietMs = Date.now() - Date.parse(row.updated_at);
+          if (Number.isFinite(quietMs) && quietMs > CANCEL_QUIET_MS) {
+            const t = await transitionDeployment(db, row, 'failed',
+              `cancel unacknowledged and worker quiet past ${CANCEL_QUIET_MS / 1000}s; execution state UNKNOWN; reservation HELD pending reconciliation — frees only on a terminal worker report or lost access; reconcile on reconnect`,
+              'CANCEL_UNCONFIRMED', { release: false });
+            if (!t.ok) return finishRead(row);
+            return finishRead(row);
+          }
           await noteEvent(db, row.id, 'cancel unacknowledged; worker quiet; reservation held');
           return finishRead(row);
         }
@@ -1910,28 +1987,28 @@ async function handleApi(request, env, url) {
       if (receipt.status === 'failed' || receipt.status === 'cancelled') {
         const t = await transitionDeployment(db, row, receipt.status, `${receipt.code || receipt.status}: ${receipt.detail || 'worker-reported terminal state'}; server-side cleanup NOT verified; reservation released`, typeof receipt.code === 'string' ? receipt.code.slice(0, 64) : null);
         if (!t.ok) return finishRead(row);
+        await transport.poll(plan.opId);
         return finishRead(row);
       }
       if (['admitted', 'staging', 'verifying', 'loading', 'ready'].includes(receipt.status)) {
         // Duplicate/stale receipts (resume replays the script from the
-        // top) are no-ops when the job is already there or past it.
+        // top) are consumed-but-unapplied when the job is already there
+        // or past it; a conflicted read consumes nothing, so there is no
+        // lost receipt to audit (N2).
         const seen = WORKER_STATES.indexOf(row.state);
         const got = WORKER_STATES.indexOf(receipt.status);
         if (got > seen) {
           const t = await transitionDeployment(db, row, receipt.status, receipt.detail || `worker reports ${receipt.status}`);
-          if (!t.ok) {
-            // Lost a race (typically to cancel): audit the consumed
-            // receipt when the winner terminalized, then current wins.
-            const fresh = await first(db, 'SELECT * FROM catalog_deployments WHERE id = ?', row.id);
-            if (TERMINAL_STATES.includes(fresh.state) && receipt.status !== 'unknown') await auditLateReceipt(db, row.id, receipt);
-            return finishRead(row);
-          }
+          if (!t.ok) return finishRead(row);
+          await transport.poll(plan.opId);
           return finishRead(row);
         }
+        await transport.poll(plan.opId);
         return finishRead(row);
       }
       const bad = await transitionDeployment(db, row, 'failed', `unrecognized worker receipt: ${String(receipt.status).slice(0, 64)}`, 'BAD_RECEIPT');
       if (!bad.ok) return finishRead(row);
+      await transport.poll(plan.opId);
       return finishRead(row);
     }
   }

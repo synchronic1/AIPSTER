@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson, TEST_SECRET } from './d1-shim.mjs';
 import { fixtureSnapshot, fixtureSmallSnapshot } from '../src/lib/catalog/fixtures.mjs';
-import { __resetFixtureTransport, __fixtureDispatchCount, __fixtureUncancel } from '../src/lib/catalog/transport.mjs';
+import { __resetFixtureTransport, __fixtureDispatchCount, __fixtureUncancel, __fixtureAckCancel, __fixtureWasCancelled, workerTransport } from '../src/lib/catalog/transport.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const GGUF = 'fixture-org/tiny-instruct-gguf';
@@ -665,4 +665,220 @@ test('F12-age: reservation hold start is visible on the job', async () => {
   const s = await status(t, t.alice, ex.json.id);
   assert.ok(s.json.reservation.heldSince, 'hold start timestamp present');
   assert.ok(Number.isFinite(Date.parse(s.json.reservation.heldSince)));
+});
+
+test('N4: admission checks the re-evaluated estimate, not just the plan figure', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  const snap = fixtureSnapshot();
+  await report(t, node.id, snap);
+  // Job 1 holds capacity, so execute-time availability sits strictly below
+  // the compat-time effective figure both evaluations see.
+  const p1 = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex1 = await execute(t, t.alice, 'op-n4-hold1', p1.json.planToken);
+  assert.equal(ex1.status, 202, ex1.text);
+  const held = ex1.json.reservation.bytes;
+  const effective = snap.mem.gpu[0].vramAvailBytes;
+  const avail = effective - held;
+  assert.ok(avail > 0 && avail < effective, `hold narrows availability: ${avail} of ${effective}`);
+  // Private asset with small weights; the plan-time estimate fits.
+  const now = new Date().toISOString();
+  const sha = 'cd'.repeat(32);
+  const W1 = 200 * 1024 * 1024;
+  await t.DB.prepare('INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, freshness_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('n4asset', 'u_alice', 'private', 'local/n4', sha, 'model', 'text-generation', 'llama', 'gguf', 'Q4_K_M', '{}', 'private', '{}', 'validated', now, now).run();
+  await t.DB.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)')
+    .bind('n4asset', 'model.gguf', W1, sha).run();
+  const p2 = await plan(t, t.alice, { nodeId: node.id, assetRef: 'priv:n4asset', fixtureScript: SCRIPT });
+  assert.equal(p2.status, 201, p2.text);
+  const E1 = p2.json.plan.estimateTotalBytes;
+  assert.ok(E1 <= avail, `plan-time estimate ${E1} fits post-hold availability ${avail}`);
+  // Weights grow between plan and execute. Target the window where compat
+  // still passes (budget <= effective) but the hold no longer fits.
+  const GiB = 1024 * 1024 * 1024;
+  const kv = 2 * 32 * 4096 * 2 * 2048 * 1; // kvCacheBytes at context 2048, concurrency 1
+  const target = avail + Math.floor((effective - avail) / 2);
+  const W2 = Math.ceil(((target / 1.15) - kv - 2 * GiB) / 1.1);
+  const E2 = Math.ceil((W2 + Math.ceil(W2 * 0.1) + kv + 2 * GiB) * 1.15);
+  assert.ok(E2 > avail && E2 <= effective, `grown estimate ${E2} lands in (${avail}, ${effective}]`);
+  assert.ok(W2 < snap.disk.availBytes, 'staging still fits disk');
+  await t.DB.prepare('UPDATE catalog_asset_files SET bytes = ? WHERE asset_id = ?').bind(W2, 'n4asset').run();
+  const ex2 = await execute(t, t.alice, 'op-n4-grow2', p2.json.planToken);
+  assert.equal(ex2.status, 409, ex2.text);
+  assert.equal(ex2.json.code, 'RESERVATION_EXHAUSTED');
+  assert.equal(ex2.json.neededBytes, E2);
+});
+
+test('N3: transition events carry deterministic marker ids', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.alice, 'op-n3-marker1', p.json.planToken);
+  const s = await status(t, t.alice, ex.json.id);
+  assert.equal(s.json.state, 'staging');
+  const ev = s.json.events.find((e) => e.to_state === 'staging');
+  assert.equal(ev.id, `ev_${ex.json.id}_admitted_staging`);
+});
+
+test('N3: a loser racing toward failed commits no event and no release', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'bogus-receipt' }] });
+  const ex = await execute(t, t.alice, 'op-n3-loserelease1', p.json.planToken);
+  const id = ex.json.id;
+  const gate = gateDbOnce(t.env.DB, /UPDATE catalog_deployments SET state/);
+  t.env.DB = gate.db;
+  const pending = t.call(`/api/catalog/deployments/${id}`, { headers: t.as(t.alice) });
+  await gate.entered; // status is held inside its admitted→failed batch
+  const cancel = await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  assert.equal(cancel.json.state, 'cancelling', cancel.text);
+  gate.release();
+  const st = await readJson(await pending);
+  assert.equal(st.status, 200, st.text);
+  assert.equal(st.json.state, 'cancelling');
+  assert.ok(!st.json.events.some((e) => e.to_state === 'failed'), 'loser commits no failed event');
+  assert.equal(st.json.reservation.state, 'held', 'loser releases nothing');
+});
+
+test('N1: cancelling past the quiet threshold fails with its reservation held', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [] });
+  const ex = await execute(t, t.alice, 'op-n1-quiethold1', p.json.planToken);
+  const id = ex.json.id;
+  const cancel = await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  assert.equal(cancel.json.state, 'cancelling');
+  __fixtureUncancel(ex.json.plan.opId); // cancel request lost: worker silent
+  const early = await status(t, t.alice, id);
+  assert.equal(early.json.state, 'cancelling', 'a fresh quiet cancel still waits');
+  await t.DB.prepare('UPDATE catalog_deployments SET updated_at = ? WHERE id = ?').bind(new Date(Date.now() - 61000).toISOString(), id).run();
+  const late = await status(t, t.alice, id);
+  assert.equal(late.json.state, 'failed', late.text);
+  assert.equal(late.json.error.code, 'CANCEL_UNCONFIRMED');
+  assert.match(late.json.error.detail, /UNKNOWN/, 'execution state is honestly unknown');
+  assert.match(late.json.error.detail, /HELD/, 'capacity stays held, never speculatively freed');
+  assert.equal(late.json.reservation.state, 'held');
+});
+
+test('N1: a late cancel ack releases the held reservation (unconfirmed-cancel)', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [] });
+  const ex = await execute(t, t.alice, 'op-n1-lateack1', p.json.planToken);
+  const id = ex.json.id;
+  await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  __fixtureUncancel(ex.json.plan.opId);
+  await t.DB.prepare('UPDATE catalog_deployments SET updated_at = ? WHERE id = ?').bind(new Date(Date.now() - 61000).toISOString(), id).run();
+  const failed = await status(t, t.alice, id);
+  assert.equal(failed.json.state, 'failed', failed.text);
+  assert.equal(failed.json.error.code, 'CANCEL_UNCONFIRMED');
+  __fixtureAckCancel(ex.json.plan.opId); // the quiet worker finally answers
+  const reconciled = await status(t, t.alice, id);
+  assert.equal(reconciled.json.state, 'failed');
+  assert.equal(reconciled.json.reservation.state, 'released', 'authoritative ack frees the hold');
+  assert.ok(reconciled.json.events.some((e) => /acknowledged late/.test(e.detail)), 'release is audited');
+});
+
+test('N1: revoking access releases an unconfirmed-cancel hold', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const g = await grant(t, node.id, 'bob@example.com');
+  const p = await plan(t, t.bob, { nodeId: node.id, fixtureScript: [] });
+  const ex = await execute(t, t.bob, 'op-n1-revoke1', p.json.planToken);
+  const id = ex.json.id;
+  await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.bob) }));
+  __fixtureUncancel(ex.json.plan.opId);
+  await t.DB.prepare('UPDATE catalog_deployments SET updated_at = ? WHERE id = ?').bind(new Date(Date.now() - 61000).toISOString(), id).run();
+  const failed = await status(t, t.bob, id);
+  assert.equal(failed.json.state, 'failed', failed.text);
+  assert.equal(failed.json.error.code, 'CANCEL_UNCONFIRMED');
+  assert.equal(failed.json.reservation.state, 'held');
+  await readJson(await t.call(`/api/grants/${g.id}`, { method: 'DELETE', headers: sess(t, t.alice) }));
+  const reconciled = await status(t, t.bob, id);
+  assert.equal(reconciled.json.reservation.state, 'released', 'lost access frees the hold');
+  assert.ok(reconciled.json.events.some((e) => /access revoked after unconfirmed cancel/.test(e.detail)));
+});
+
+test('N2: fixture peek does not consume', async () => {
+  __resetFixtureTransport();
+  const tr = workerTransport({ CATALOG_FIXTURES: '1' });
+  await tr.dispatch({ opId: 'wop_peek1', jobId: 'dep_x', nodeId: 'r_y', script: [{ status: 'staging' }] });
+  assert.equal((await tr.peek('wop_peek1')).status, 'staging');
+  assert.equal((await tr.peek('wop_peek1')).status, 'staging');
+  assert.equal((await tr.poll('wop_peek1')).status, 'staging');
+  assert.equal((await tr.poll('wop_peek1')).status, 'unknown');
+});
+
+test('N2: concurrent readers serialize receipt consumption (loser consumes nothing)', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'staging' }, { status: 'verifying' }] });
+  const ex = await execute(t, t.alice, 'op-n2-race1', p.json.planToken);
+  const id = ex.json.id;
+  const gate = gateDbOnce(t.env.DB, /UPDATE catalog_deployments SET state/);
+  t.env.DB = gate.db;
+  const pending = t.call(`/api/catalog/deployments/${id}`, { headers: t.as(t.alice) });
+  await gate.entered; // A held inside its admitted→staging batch
+  const bst = await status(t, t.alice, id); // B wins the same receipt
+  assert.equal(bst.json.state, 'staging', bst.text);
+  gate.release();
+  const ast = await readJson(await pending);
+  assert.equal(ast.json.state, 'staging');
+  assert.ok(!ast.json.events.some((e) => e.to_state === 'failed'), 'loser fails nothing spuriously');
+  const third = await status(t, t.alice, id); // the second receipt survived the race
+  assert.equal(third.json.state, 'verifying', third.text);
+});
+
+test('N6: a cancel that loses its race sends no worker-cancel flag', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: [{ status: 'failed', code: 'LOAD_FAILED', detail: 'loader crashed' }] });
+  const ex = await execute(t, t.alice, 'op-n6-nolinger1', p.json.planToken);
+  const id = ex.json.id;
+  const opId = ex.json.plan.opId;
+  const gate = gateDbOnce(t.env.DB, /UPDATE catalog_deployments SET state/);
+  t.env.DB = gate.db;
+  const pending = t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) });
+  await gate.entered; // cancel held inside its admitted→cancelling batch
+  const st = await status(t, t.alice, id); // terminalizes first (failed on its own script)
+  assert.ok(['failed', 'cancelled'].includes(st.json.state), st.text);
+  gate.release();
+  const lost = await readJson(await pending);
+  assert.ok(['failed', 'cancelled'].includes(lost.json.state), lost.text);
+  assert.equal(lost.json.duplicate, true);
+  assert.equal(__fixtureWasCancelled(opId), false, 'lost cancel sends no worker-cancel flag');
+  const again = await status(t, t.alice, id);
+  assert.ok(!again.json.events.some((e) => e.detail.includes('late receipt') && e.detail.includes('cancelled')), 'no phantom late-cancel audit');
+});
+
+test('N7: repeat cancel while cancelling replays without a self-transition', async () => {
+  const t = await fx();
+  __resetFixtureTransport();
+  const node = await register(t, t.alice, 'big-box');
+  await report(t, node.id, fixtureSnapshot());
+  const p = await plan(t, t.alice, { nodeId: node.id, fixtureScript: SCRIPT });
+  const ex = await execute(t, t.alice, 'op-n7-cancel2', p.json.planToken);
+  const id = ex.json.id;
+  const first = await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  assert.equal(first.json.state, 'cancelling');
+  const n0 = first.json.events.length;
+  const second = await readJson(await t.call(`/api/catalog/deployments/${id}/cancel`, { method: 'POST', headers: sess(t, t.alice) }));
+  assert.equal(second.json.state, 'cancelling');
+  assert.equal(second.json.duplicate, true);
+  assert.equal(second.json.events.length, n0, 'no cancelling→cancelling event lands');
 });

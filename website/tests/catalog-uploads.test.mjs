@@ -206,6 +206,11 @@ test('S-F7: magic screen covers common archive/executable variants', async () =>
   assert.equal(screenMagic(tinySafetensors().slice(0, 64)), null, 'safetensors still passes');
 });
 
+test('N7: magic screen covers big-endian Mach-O variants', async () => {
+  assert.ok(screenMagic(new Uint8Array([0xfe, 0xed, 0xfa, 0xce, 0, 0, 0, 0])), 'BE Mach-O 32-bit refused');
+  assert.ok(screenMagic(new Uint8Array([0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0])), 'BE Mach-O 64-bit refused');
+});
+
 test('AC11: traversal, bad suffixes, hostile bytes, and bad manifests fail closed', async () => {
   const t = await fx();
   __resetFixtureStore();

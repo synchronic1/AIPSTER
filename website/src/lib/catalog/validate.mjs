@@ -66,6 +66,7 @@ export function screenMagic(peek) {
   if (b[0] === 0xcf && b[1] === 0xfa && b[2] === 0xed && b[3] === 0xfe) return 'Mach-O executable refused';
   if (b[0] === 0xce && b[1] === 0xfa && b[2] === 0xed && b[3] === 0xfe) return 'Mach-O executable refused';
   if (b[0] === 0xca && b[1] === 0xfe && b[2] === 0xba && b[3] === 0xbe) return 'Mach-O executable refused';
+  if (b[0] === 0xfe && b[1] === 0xed && b[2] === 0xfa && (b[3] === 0xce || b[3] === 0xcf)) return 'Mach-O executable refused';
   return null;
 }
 

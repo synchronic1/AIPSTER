@@ -10,8 +10,11 @@
 // Fake semantics (documented, fixture-only):
 // - dispatch(op) records the worker op id; re-dispatch with the same op id
 //   resumes without duplicating work (AC15/AC16).
-// - poll(op) consumes one scripted receipt step for the op. Status reads
-//   drive the fake forward; each step is an explicit test fixture.
+// - peek(op) returns the next receipt WITHOUT consuming it, and poll(op)
+//   consumes one scripted receipt step for the op. Status reads run
+//   peek → compare-and-swap → consume-on-success, so a race loser never
+//   destroys a receipt the winner still needs (N2). Real transports behind
+//   this seam must offer the same peek/poll pair.
 // - Scripts live in the deployment plan under `fixtureScript` and are
 //   rejected outside fixture environments.
 // - __resetFixtureTransport() simulates a worker restart: server-side rows
@@ -52,6 +55,13 @@ export function __fixtureUncancel(opId) {
   if (op) op.cancelled = false;
 }
 
+// Test-only: simulate a worker that finally answers a cancel after going
+// quiet, so tests can drive late-acknowledgment reconciliation (N1).
+export function __fixtureAckCancel(opId) {
+  const op = ops.get(opId);
+  if (op) op.cancelled = true;
+}
+
 function fakeTransport() {
   return {
     backend: 'fake-fixture',
@@ -64,14 +74,26 @@ function fakeTransport() {
       }
       return { accepted: true, opId };
     },
-    // Returns the next receipt for the op, or { status: 'unknown' } when
-    // the worker has no record (restart / reconnect gap → reconcile).
-    async poll(opId) {
+    // Returns the next receipt for the op WITHOUT consuming it, or
+    // { status: 'unknown' } when the worker has no record (restart /
+    // reconnect gap → reconcile).
+    async peek(opId) {
       const op = ops.get(opId);
       if (!op) return { status: 'unknown', detail: 'worker holds no record of this op' };
       if (op.cancelled) return { status: 'cancelled', detail: 'worker acknowledged cancel' };
       if (op.cursor >= op.steps.length) {
         // Script exhausted without terminal state: the worker went quiet.
+        return { status: 'unknown', detail: 'no further receipts; worker quiet' };
+      }
+      return op.steps[op.cursor];
+    },
+    // Consumes one scripted receipt step for the op. Call only after the
+    // control plane made progress on the peeked receipt (N2).
+    async poll(opId) {
+      const op = ops.get(opId);
+      if (!op) return { status: 'unknown', detail: 'worker holds no record of this op' };
+      if (op.cancelled) return { status: 'cancelled', detail: 'worker acknowledged cancel' };
+      if (op.cursor >= op.steps.length) {
         return { status: 'unknown', detail: 'no further receipts; worker quiet' };
       }
       const step = op.steps[op.cursor];

@@ -1,4 +1,4 @@
-/* Built with Meta Muse. */
+﻿/* Built with Meta Muse. */
 // Control-panel client. Session cookie is httpOnly; sign-in is GitHub OAuth
 // for public GitHub registration or the seeded demo username/password (same sessions).
 // Mutations carry a custom CSRF header (never a secret). API secrets are
@@ -94,7 +94,7 @@ function renderStatus(el, data) {
   const items = list.map((r) => {
     const seen = r.lastSeenAt !== null && r.lastSeenAt !== undefined;
     const age = r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs);
-    // Only heartbeat-seen rows replace the telemetry-unavailable copy with
+    // Only heartbeat-seen rows replace the heartbeat-unavailable copy with
     // reachability-only copy. usable=false gets a distinct not-ready
     // attention note and never renders as runnable/ready.
     // Present-tense reachability needs a fresh heartbeat (Muse W4
@@ -111,8 +111,8 @@ function renderStatus(el, data) {
   const note = data.demo
     ? 'DEMO DATA: simulated fixture, not a live node.'
     : anySeen
-      ? 'Heartbeat telemetry seen for some resources — reachability only, never inference acceptance. Resources never seen have no telemetry; nothing here means ready to run.'
-      : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
+      ? 'Worker heartbeats seen for some resources — reachability only, never inference acceptance. Resources never seen have no heartbeats; nothing here means ready to run.'
+      : 'Declared resources only — no worker heartbeats seen, so nothing here means connected or ready to run. Heartbeats prove reachability only; capability reports (Models tab) are separate snapshots for estimation.';
   // Counts always cover every owned resource; only the listed page is capped.
   const truncated = data.itemsTruncated === true
     ? `<p class="muted">showing ${list.length} of ${s.total} — older resources omitted from the list; counts cover all resources.</p>`
@@ -897,7 +897,7 @@ async function runCompat(asset) {
       <li><strong>total ${fmtBytes(dec.estimate.totalBytes)}</strong></li></ul>
       <p class="muted">method: ${esc(dec.estimate.method)} · ${esc(dec.estimate.uncertainty)}</p>` : '';
     out.innerHTML = `<div class="card"><h3 tabindex="-1" id="compat-head">Decision: ${compatPill(dec.state)}</h3>
-      <p class="muted">node ${esc(dec.nodeId)} · estimator ${esc(dec.estimator)} · telemetry age ${dec.telemetryAgeMs === null ? 'unknown' : Math.round(dec.telemetryAgeMs / 1000) + 's'} · expires ${esc(dec.expiresAt)}${dec.cached ? ' · cached' : ''}${dec.fixture ? ' · DEMO' : ''}</p>
+      <p class="muted">node ${esc(dec.nodeId)} · estimator ${esc(dec.estimator)} · capability-report age ${dec.telemetryAgeMs === null ? 'unknown' : Math.round(dec.telemetryAgeMs / 1000) + 's'} · expires ${esc(dec.expiresAt)}${dec.cached ? ' · cached' : ''}${dec.fixture ? ' · DEMO' : ''} · snapshot only, not a connected node</p>
       ${dec.blocking && dec.blocking.length ? `<h4>Blocking</h4><ul>${rows(dec.blocking)}</ul>` : ''}
       ${dec.unknown && dec.unknown.length ? `<h4>Unknown (missing evidence)</h4><ul>${rows(dec.unknown)}</ul>` : ''}
       ${dec.warnings && dec.warnings.length ? `<h4>Warnings</h4><ul>${rows(dec.warnings)}</ul>` : ''}
