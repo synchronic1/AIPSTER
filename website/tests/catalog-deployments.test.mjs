@@ -910,7 +910,11 @@ test('Codex-sec-P2: spent write budgets reject deployment admission before any w
   assert.equal(d.status, 429, d.text);
   assert.equal(d.json.code, 'WRITE_RATE_LIMITED');
   const rows = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_deployments WHERE owner_id = ?').bind('u_alice').first('n');
-  assert.equal(rows, 0, 'no deployment, reservation, or event rows escape the budget');
+  assert.equal(rows, 0, 'no deployment rows escape the budget');
+  const res = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_reservations WHERE owner_id = ?').bind('u_alice').first('n');
+  assert.equal(res, 0, 'no reservation rows escape the budget');
+  const audits = await t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE actor_id = ? AND action = 'catalog.deploy.execute'").bind('u_alice').first('n');
+  assert.equal(audits, 0, 'no per-deploy audit rows escape the budget');
 });
 
 test('Codex-P2: deleting a resource removes its capability snapshot and reservations', async () => {
