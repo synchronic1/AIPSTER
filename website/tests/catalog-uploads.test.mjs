@@ -736,3 +736,103 @@ test('Codex-P2: a stale claim holder cannot commit after a lease steal (fence to
   assert.equal(row.state, 'promoting', 'the intruder claim is untouched by the loser');
   assert.equal(row.byte_ref, 'clm_intruder');
 });
+
+test('Codex-P2: an expired claim holder cannot commit (promotion requires promoting)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const bytes = new Uint8Array(64).fill(0x47);
+  const b = await begin(t, t.alice, {
+    name: 'expired-holder', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: bytes.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
+  assert.equal(c.status, 200, c.text);
+  // A concurrent intake sweeps this session past its deadline while the
+  // finalizer awaits storage I/O; the sweep preserves byte_ref.
+  const realDb = t.env.DB;
+  let fired = false;
+  t.env.DB = {
+    ...realDb,
+    batch: async (stmts) => {
+      const head = stmts && stmts[0] && stmts[0].sql ? stmts[0].sql : '';
+      if (!fired && head.startsWith('INSERT INTO catalog_assets ')) {
+        fired = true;
+        await realDb.prepare("UPDATE catalog_uploads SET state = 'expired' WHERE id = ?").bind(b.json.id).run();
+      }
+      return realDb.batch(stmts);
+    },
+  };
+  const fin = await finalize(t, t.alice, b.json.id);
+  t.env.DB = realDb;
+  assert.equal(fired, true, 'the sweep struck at the promote batch');
+  assert.equal(fin.status, 409, fin.text);
+  assert.equal(fin.json.code, 'FINALIZE_IN_PROGRESS');
+  const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first('n');
+  assert.equal(assets, 0, 'the expired holder promotes nothing');
+  const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(row.state, 'expired', 'the loser leaves the expired verdict alone');
+});
+
+test('Codex-P2: the expiry sweep clears the fence token (claim invalidated)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const past = new Date(Date.now() - 1000).toISOString();
+  const spec = (name) => ({
+    name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 32 }],
+  });
+  const v = await begin(t, t.alice, spec('victim'));
+  assert.equal(v.status, 201, v.text);
+  await t.DB.prepare("UPDATE catalog_uploads SET state = 'promoting', byte_ref = ?, expires_at = ? WHERE id = ?").bind('clm_victim', past, v.json.id).run();
+  const trig = await begin(t, t.alice, spec('trigger'));
+  assert.equal(trig.status, 201, trig.text);
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(past, trig.json.id).run();
+  const touch = await chunk(t, t.alice, trig.json.id, 'model.gguf', 0, new Uint8Array(8).fill(0x47));
+  assert.equal(touch.status, 410, touch.text);
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.equal(row.state, 'expired');
+  assert.equal(row.byte_ref, null, 'expiry invalidates the fence token');
+});
+
+test('Codex-sec-P2: spent write budgets reject revalidation before any reads', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const fin = await roundTrip(t, t.alice, 'reval-budget', [{ relpath: 'm.gguf', bytes: ggufBytes() }]);
+  assert.equal(fin.status, 201, fin.text);
+  const before = await t.DB.prepare('SELECT manifest_json FROM catalog_assets WHERE id = ?').bind(fin.json.assetId).first('manifest_json');
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const re = await readJson(await t.call(`/api/catalog/assets/${fin.json.assetId}/validate`, { method: 'POST', headers: sess(t, t.alice), body: {} }));
+  assert.equal(re.status, 429, re.text);
+  assert.equal(re.json.code, 'WRITE_RATE_LIMITED');
+  const after = await t.DB.prepare('SELECT manifest_json FROM catalog_assets WHERE id = ?').bind(fin.json.assetId).first('manifest_json');
+  assert.equal(after, before, 'no re-read, no re-write under a spent budget');
+  const audits = await t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE actor_id = ? AND action = 'catalog.asset.revalidate'").bind('u_alice').first('n');
+  assert.equal(audits, 0);
+});
+
+test('Codex-sec-P2: unchanged revalidation is idempotent (no rewrite, no audit)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const fin = await roundTrip(t, t.alice, 'reval-idem', [{ relpath: 'm.gguf', bytes: ggufBytes() }]);
+  assert.equal(fin.status, 201, fin.text);
+  const validate = async () => readJson(await t.call(`/api/catalog/assets/${fin.json.assetId}/validate`, { method: 'POST', headers: sess(t, t.alice), body: {} }));
+  const audits = () => t.DB.prepare("SELECT COUNT(*) AS n FROM audit WHERE actor_id = ? AND action = 'catalog.asset.revalidate'").bind('u_alice').first('n');
+  const first = await validate();
+  assert.equal(first.status, 200, first.text);
+  assert.equal(first.json.duplicate, true, 'nothing changed since promote: no rewrite');
+  assert.equal(await audits(), 0, 'no audit for a no-op revalidation');
+  const elf = new Uint8Array(64);
+  elf.set([0x7f, 0x45, 0x4c, 0x46], 0);
+  await store.put(`asset/${fin.json.assetId}/m.gguf`, elf);
+  const second = await validate();
+  assert.equal(second.status, 200, second.text);
+  assert.equal(second.json.validation, 'rejected');
+  assert.equal(second.json.duplicate, undefined, 'changed verdict writes through');
+  assert.equal(await audits(), 1);
+  const third = await validate();
+  assert.equal(third.json.duplicate, true, 'stable rejected verdict replays idempotently');
+  assert.equal(await audits(), 1);
+});

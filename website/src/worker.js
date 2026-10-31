@@ -254,7 +254,11 @@ async function expireCatalogUploads(db, store, ownerId) {
     if (row.state === 'rejected') {
       await run(db, "UPDATE catalog_uploads SET byte_ref = 'swept', updated_at = ? WHERE id = ?", now, row.id);
     } else {
-      await run(db, "UPDATE catalog_uploads SET state = 'expired', updated_at = ? WHERE id = ?", now, row.id);
+      // Expiry invalidates the fence token (Codex-P2): a finalizer stalled
+      // past its deadline must not commit after the sweep frees its quota.
+      // Clearing here covers every token-gated statement; the commit batch
+      // additionally requires state = 'promoting' (below).
+      await run(db, "UPDATE catalog_uploads SET state = 'expired', byte_ref = NULL, updated_at = ? WHERE id = ?", now, row.id);
     }
   }
   return stale.length;
@@ -1748,13 +1752,13 @@ async function handleApi(request, env, url) {
         // bounded footprint per lease steal, with no rows pointing at it.)
         const committed = await db.batch([
           db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
-            SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ?) = ?`)
+            SELECT ?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?`)
             .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
               JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
               JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now, uploadId, claimToken),
-          ...manifest.files.map((f) => db.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) SELECT ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ?) = ?')
+          ...manifest.files.map((f) => db.prepare("INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) SELECT ?, ?, ?, ? WHERE (SELECT byte_ref FROM catalog_uploads WHERE id = ? AND state = 'promoting') = ?")
             .bind(assetId, f.relpath, f.bytes, f.sha256, uploadId, claimToken)),
-          db.prepare('UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND byte_ref = ?')
+          db.prepare("UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ? AND state = 'promoting' AND byte_ref = ?")
             .bind('validated', JSON.stringify(manifest), assetId, now, uploadId, claimToken),
         ]);
         if (Number(committed[committed.length - 1].meta.changes) !== 1) return claimLost();
@@ -1821,6 +1825,10 @@ async function handleApi(request, env, url) {
       const files = await all(db, 'SELECT relpath, bytes, sha256 FROM catalog_asset_files WHERE asset_id = ?', asset.id);
       const totalBytes = files.reduce((n, f) => n + f.bytes, 0);
       if (totalBytes > 128 * 1024 * 1024) return json(413, { error: 'Asset exceeds the 128 MiB scaffold validation cap.', code: 'ASSET_TOO_LARGE' });
+      // Row-growth defense (Codex-sec-P2): revalidation re-reads headers
+      // and writes an audit row, so it claims the hourly write budget like
+      // every other mutating route - before any reads or writes.
+      await checkWriteBudget(db, me());
       const manifest = JSON.parse(asset.manifest_json);
       // Intent (review F19): revalidation re-reads bounded header peeks, not
       // full bytes — a drift check against stored digests, not a re-ingest.
@@ -1833,11 +1841,19 @@ async function handleApi(request, env, url) {
           targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
         },
       } : {});
+      // Idempotent revalidation (Codex-sec-P2): an unchanged verdict is a
+      // replay, not an event - skip the rewrite and the audit row, mirroring
+      // the duplicate-finalize path. Only a changed verdict writes.
+      const nextState = verdict.ok ? 'validated' : 'rejected';
+      if (asset.validation === nextState && manifest.validator === verdict.version
+        && JSON.stringify(manifest.checks) === JSON.stringify(verdict.checks)) {
+        return json(200, { ok: verdict.ok, assetId: asset.id, validation: nextState, checks: verdict.checks, duplicate: true });
+      }
       manifest.checks = verdict.checks;
       manifest.validator = verdict.version;
-      await run(db, 'UPDATE catalog_assets SET validation = ?, manifest_json = ? WHERE id = ?', verdict.ok ? 'validated' : 'rejected', JSON.stringify(manifest), asset.id);
-      await audit(db, me(), 'catalog.asset.revalidate', asset.id, verdict.ok ? 'validated' : 'rejected');
-      return json(200, { ok: verdict.ok, assetId: asset.id, validation: verdict.ok ? 'validated' : 'rejected', checks: verdict.checks });
+      await run(db, 'UPDATE catalog_assets SET validation = ?, manifest_json = ? WHERE id = ?', nextState, JSON.stringify(manifest), asset.id);
+      await audit(db, me(), 'catalog.asset.revalidate', asset.id, nextState);
+      return json(200, { ok: verdict.ok, assetId: asset.id, validation: nextState, checks: verdict.checks });
     }
   }
 
