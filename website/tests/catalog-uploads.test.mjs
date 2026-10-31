@@ -636,3 +636,23 @@ test('Codex-P2: shard-index weight paths resolve against the index location', as
   const v = validateManifest({ files }, peek);
   assert.equal(v.ok, true, JSON.stringify(v.checks));
 });
+
+test('Codex-P2: overlapping finalizes promote exactly once (exclusive claim)', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const bytes = new Uint8Array(64).fill(0x47);
+  const b = await begin(t, t.alice, {
+    name: 'race-me', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: bytes.length }],
+  });
+  assert.equal(b.status, 201, b.text);
+  const c = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, bytes);
+  assert.equal(c.status, 200, c.text);
+  const [r1, r2] = await Promise.all([finalize(t, t.alice, b.json.id), finalize(t, t.alice, b.json.id)]);
+  const codes = [r1.status, r2.status].sort();
+  assert.deepEqual(codes, [201, 409], `one winner, one retryable loser: ${r1.status} vs ${r2.status}`);
+  const loser = r1.status === 409 ? r1 : r2;
+  assert.equal(loser.json.code, 'FINALIZE_IN_PROGRESS');
+  const assets = await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_assets WHERE owner_id = ?').bind('u_alice').first('n');
+  assert.equal(assets, 1, 'exactly one asset promoted');
+});

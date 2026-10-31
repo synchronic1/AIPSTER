@@ -215,6 +215,12 @@ async function privateAssetShape(db, row) {
   };
 }
 
+// Finalization claim lease (Codex-P2): a finalize over at most 128 MiB
+// cannot legitimately run this long, and Worker execution limits
+// terminate the holder first - so a promoting row older than this always
+// means a dead owner, and a retry may steal the claim.
+const FINALIZE_CLAIM_MS = 5 * 60 * 1000;
+
 // Exact part ownership (Codex-P2): part keys are
 // `upload/{id}/part/{index8}/{relpath}` with a zero-padded 8-digit
 // index. Suffix matching confuses `config.json` with
@@ -1481,7 +1487,7 @@ async function handleApi(request, env, url) {
     }
     await expireCatalogUploads(db, byteStore(env), me());
     const owned = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
-    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')", me());
+    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", me());
     if ((owned ? owned.n : 0) + (inflight ? inflight.n : 0) + total > MAX_ASSET_BYTES) {
       return json(400, { error: 'Account storage quota exceeded.', code: 'QUOTA_EXCEEDED' });
     }
@@ -1506,7 +1512,7 @@ async function handleApi(request, env, url) {
       files: files.map((f) => ({ relpath: f.relpath, bytes: f.bytes, sha256: f.sha256 ? String(f.sha256).toLowerCase() : null })),
     };
     const up = await run(db, `INSERT INTO catalog_uploads (id, owner_id, state, quotas_json, manifest_json, byte_ref, expires_at, created_at, updated_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')) < ${MAX_ACTIVE_UPLOADS_PER_USER}`,
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')) < ${MAX_ACTIVE_UPLOADS_PER_USER}`,
       id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length }), JSON.stringify(manifest), null, expiresAt, now, now, me());
     assertClaimed(up, 'upload');
     await audit(db, me(), 'catalog.upload.begin', id, `${manifest.kind} ${manifest.name} ${files.length} files ${total} bytes`);
@@ -1572,125 +1578,147 @@ async function handleApi(request, env, url) {
       if (up.state === 'rejected') {
         return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: manifest.checks || [], duplicate: true });
       }
-      if (up.state !== 'uploading' && up.state !== 'validating') {
+      // Exclusive finalization claim (Codex-P2): overlapping finalizes
+      // must not double-promote. The claim UPDATE below is the linearizer:
+      // exactly one requester moves uploading/validating (or a stale
+      // promoting lease) to promoting; losers get a retryable 409 and
+      // write nothing. A fresh promoting row short-circuits here; a stale
+      // one proceeds to steal the dead owner's claim atomically.
+      const cutoff = new Date(Date.now() - FINALIZE_CLAIM_MS).toISOString();
+      if (up.state === 'promoting' && up.updated_at > cutoff) {
+        return json(409, { error: 'Finalization already in progress; retry shortly.', code: 'FINALIZE_IN_PROGRESS', retryable: true });
+      }
+      if (up.state !== 'uploading' && up.state !== 'validating' && up.state !== 'promoting') {
         return json(409, { error: `Upload is ${up.state}; nothing to finalize.`, code: 'UPLOAD_STATE' });
       }
       const totalBytes = manifest.files.reduce((n, f) => n + f.bytes, 0);
       if (totalBytes > 128 * 1024 * 1024) {
         return json(413, { error: 'Asset exceeds the 128 MiB scaffold finalize cap; streaming promotion is follow-on work.', code: 'ASSET_TOO_LARGE', retryable: false, action: 'Split the asset or wait for streaming promotion.' });
       }
-      await run(db, "UPDATE catalog_uploads SET state = 'validating', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-      const partPrefix = `upload/${uploadId}/part/`;
-      const parts = await store.list(partPrefix);
-      const assembled = new Map();
-      for (const f of manifest.files) {
-        const mine = parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).sort((a, b) => (a.key < b.key ? -1 : 1));
-        const order = mine.map((p) => Number(p.key.split('/')[3]));
-        if (!order.length || !order.every((v, i) => v === i)) {
-          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-          return json(400, { error: `Incomplete bytes for ${f.relpath}: chunk indexes are not contiguous from 0 (got ${order.join(',')}); never guessed, never skipped.`, code: 'UPLOAD_INCOMPLETE' });
-        }
-        const got = mine.reduce((n, p) => n + p.size, 0);
-        if (got !== f.bytes) {
-          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-          return json(400, { error: `Incomplete bytes for ${f.relpath}: ${got} of ${f.bytes}. Missing chunks are never skipped.`, code: 'UPLOAD_INCOMPLETE' });
-        }
-        const bufs = [];
-        for (const p of mine) bufs.push(await store.get(p.key));
-        const flat = new Uint8Array(f.bytes);
-        let at = 0;
-        for (const b of bufs) { flat.set(b, at); at += b.length; }
-        const digest = await crypto.subtle.digest('SHA-256', flat);
-        const sha = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
-        if (f.sha256 && f.sha256 !== sha) {
-          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-          return json(400, { error: `Digest mismatch for ${f.relpath}: declared bytes differ from received bytes.`, code: 'DIGEST_MISMATCH' });
-        }
-        f.sha256 = sha;
-        assembled.set(f.relpath, flat);
+      const claimed = await run(db, "UPDATE catalog_uploads SET state = 'promoting', updated_at = ? WHERE id = ? AND (state IN ('uploading', 'validating') OR (state = 'promoting' AND updated_at <= ?))", nowIso(), uploadId, cutoff);
+      if (Number(claimed.meta.changes) !== 1) {
+        return json(409, { error: 'Finalization already in progress; retry shortly.', code: 'FINALIZE_IN_PROGRESS', retryable: true });
       }
-      const peek = (relpath) => {
-        const full = assembled.get(relpath);
-        return full === undefined ? null : full.slice(0, MAX_HEADER_PEEK);
-      };
-      const verdict = validateManifest({ files: manifest.files }, peek, manifest.kind === 'adapter' ? {
-        adapter: {
-          baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
-          targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
-        },
-      } : {});
-      manifest.checks = verdict.checks;
-      manifest.validator = verdict.version;
-      if (!verdict.ok) {
-        // Reclaim quarantine bytes BEFORE the verdict write (Codex-P1):
-        // quota accounting releases rejected sessions, so their parts
-        // must go too - otherwise every rejection orphans bytes outside
-        // quota. Cleanup-first also keeps a store fault retryable (the
-        // session stays validating; no verdict is half-reported). A fully
-        // drained reject is marked byte_ref 'swept' so the expiry sweep
-        // skips it; a partial drain stays NULL for the sweep backstop.
-        const doomed = await store.list(`upload/${uploadId}/part/`);
-        for (const p of doomed.slice(0, 2010)) await store.del(p.key);
-        const sweptMark = doomed.length <= 2010 ? 'swept' : null;
-        await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), sweptMark, nowIso(), uploadId);
-        await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
-        return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: verdict.checks });
-      }
-      // Quota is re-checked at finalize: a concurrent promotion may have
-      // landed since begin (F15). owned + inflight (self included) is the
-      // post-promote footprint. Two racing finalizes can still both pass
-      // (check-then-act): like F8 (see the 0019 header), true admission
-      // atomicity needs a live-gate transport — over-admission is bounded
-      // to one footprint and visible to every later check (N5).
-      const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
-      const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')", me());
-      if ((ownedNow ? ownedNow.n : 0) + (inflightNow ? inflightNow.n : 0) > MAX_ASSET_BYTES) {
-        await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-        return json(400, { error: 'Account storage quota exceeded by a concurrent promotion; retry after cleanup.', code: 'QUOTA_EXCEEDED' });
-      }
-      if (manifest.kind === 'adapter') {
-        // The declared base must resolve to an owned asset (F18).
-        // Hub-form bases pass through: offline verification is impossible
-        // and live resolution is a documented live-gate.
-        const baseId = manifest.adapter.baseAssetId;
-        if (!baseId.includes('/') && !baseId.startsWith('hub:')) {
-          const base = await first(db, 'SELECT id FROM catalog_assets WHERE id = ? AND owner_id = ?', baseId, me());
-          if (!base) {
+      // The claim holder runs assembly through commit. Explicit refusal
+      // paths below reset to uploading before returning; a throw (store
+      // or D1 fault) resets in the catch, so every fault stays retryable
+      // instead of stranding the upload in promoting until lease expiry.
+      try {
+        const partPrefix = `upload/${uploadId}/part/`;
+        const parts = await store.list(partPrefix);
+        const assembled = new Map();
+        for (const f of manifest.files) {
+          const mine = parts.filter((p) => uploadPartPath(p.key, partPrefix) === f.relpath).sort((a, b) => (a.key < b.key ? -1 : 1));
+          const order = mine.map((p) => Number(p.key.split('/')[3]));
+          if (!order.length || !order.every((v, i) => v === i)) {
             await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
-            return json(422, { error: `Adapter base asset not found: ${baseId}.`, code: 'BASE_NOT_FOUND' });
+            return json(400, { error: `Incomplete bytes for ${f.relpath}: chunk indexes are not contiguous from 0 (got ${order.join(',')}); never guessed, never skipped.`, code: 'UPLOAD_INCOMPLETE' });
+          }
+          const got = mine.reduce((n, p) => n + p.size, 0);
+          if (got !== f.bytes) {
+            await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+            return json(400, { error: `Incomplete bytes for ${f.relpath}: ${got} of ${f.bytes}. Missing chunks are never skipped.`, code: 'UPLOAD_INCOMPLETE' });
+          }
+          const bufs = [];
+          for (const p of mine) bufs.push(await store.get(p.key));
+          const flat = new Uint8Array(f.bytes);
+          let at = 0;
+          for (const b of bufs) { flat.set(b, at); at += b.length; }
+          const digest = await crypto.subtle.digest('SHA-256', flat);
+          const sha = Array.from(new Uint8Array(digest), (x) => x.toString(16).padStart(2, '0')).join('');
+          if (f.sha256 && f.sha256 !== sha) {
+            await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+            return json(400, { error: `Digest mismatch for ${f.relpath}: declared bytes differ from received bytes.`, code: 'DIGEST_MISMATCH' });
+          }
+          f.sha256 = sha;
+          assembled.set(f.relpath, flat);
+        }
+        const peek = (relpath) => {
+          const full = assembled.get(relpath);
+          return full === undefined ? null : full.slice(0, MAX_HEADER_PEEK);
+        };
+        const verdict = validateManifest({ files: manifest.files }, peek, manifest.kind === 'adapter' ? {
+          adapter: {
+            baseAssetId: manifest.adapter.baseAssetId, baseRevision: manifest.adapter.baseRevision,
+            targetModules: manifest.adapter.targetModules, tokenizer: manifest.adapter.tokenizer,
+          },
+        } : {});
+        manifest.checks = verdict.checks;
+        manifest.validator = verdict.version;
+        if (!verdict.ok) {
+          // Reclaim quarantine bytes BEFORE the verdict write (Codex-P1):
+          // quota accounting releases rejected sessions, so their parts
+          // must go too - otherwise every rejection orphans bytes outside
+          // quota. Cleanup-first also keeps a store fault retryable (the
+          // session stays promoting; no verdict is half-reported). A fully
+          // drained reject is marked byte_ref 'swept' so the expiry sweep
+          // skips it; a partial drain stays NULL for the sweep backstop.
+          const doomed = await store.list(`upload/${uploadId}/part/`);
+          for (const p of doomed.slice(0, 2010)) await store.del(p.key);
+          const sweptMark = doomed.length <= 2010 ? 'swept' : null;
+          await run(db, 'UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?', 'rejected', JSON.stringify(manifest), sweptMark, nowIso(), uploadId);
+          await audit(db, me(), 'catalog.upload.reject', uploadId, verdict.checks.filter((c) => !c.ok).map((c) => c.code).join(','));
+          return json(422, { error: 'Asset rejected by validation.', code: 'ASSET_REJECTED', checks: verdict.checks });
+        }
+        // Quota is re-checked at finalize: a concurrent promotion may have
+        // landed since begin (F15). owned + inflight (self included) is the
+        // post-promote footprint. Two racing finalizes can still both pass
+        // (check-then-act): like F8 (see the 0019 header), true admission
+        // atomicity needs a live-gate transport — over-admission is bounded
+        // to one footprint and visible to every later check (N5).
+        const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
+        const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')", me());
+        if ((ownedNow ? ownedNow.n : 0) + (inflightNow ? inflightNow.n : 0) > MAX_ASSET_BYTES) {
+          await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+          return json(400, { error: 'Account storage quota exceeded by a concurrent promotion; retry after cleanup.', code: 'QUOTA_EXCEEDED' });
+        }
+        if (manifest.kind === 'adapter') {
+          // The declared base must resolve to an owned asset (F18).
+          // Hub-form bases pass through: offline verification is impossible
+          // and live resolution is a documented live-gate.
+          const baseId = manifest.adapter.baseAssetId;
+          if (!baseId.includes('/') && !baseId.startsWith('hub:')) {
+            const base = await first(db, 'SELECT id FROM catalog_assets WHERE id = ? AND owner_id = ?', baseId, me());
+            if (!base) {
+              await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ?", nowIso(), uploadId);
+              return json(422, { error: `Adapter base asset not found: ${baseId}.`, code: 'BASE_NOT_FOUND' });
+            }
           }
         }
+        // Promote: every file lands under the asset prefix before any row
+        // points at it; the DB writes commit in one batch (AC12).
+        // Quarantine is cleaned only AFTER the batch commits, so a failed
+        // promote stays retryable (Codex-P2). External (`org/model`,
+        // `hub:`) adapter bases leave the local base FK null — the
+        // manifest keeps the reference — because Hub parents never exist
+        // as local rows and FK enforcement would fail the batch.
+        const now = nowIso();
+        const assetId = rid('a_');
+        const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
+        const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
+        for (const [relpath, flat] of assembled) await store.put(`asset/${assetId}/${relpath}`, flat);
+        manifest.revision = revision;
+        const baseIsExternal = manifest.adapter
+          ? (manifest.adapter.baseAssetId.includes('/') || manifest.adapter.baseAssetId.startsWith('hub:'))
+          : false;
+        await db.batch([
+          db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
+            VALUES (?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ?)`)
+            .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
+              JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
+              JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now),
+          ...manifest.files.map((f) => db.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)')
+            .bind(assetId, f.relpath, f.bytes, f.sha256)),
+          db.prepare('UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?')
+            .bind('validated', JSON.stringify(manifest), assetId, now, uploadId),
+        ]);
+        for (const p of parts) await store.del(p.key);
+        await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
+        return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
+      } catch (error) {
+        await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND state = 'promoting'", nowIso(), uploadId);
+        throw error;
       }
-      // Promote: every file lands under the asset prefix before any row
-      // points at it; the DB writes commit in one batch (AC12).
-      // Quarantine is cleaned only AFTER the batch commits, so a failed
-      // promote stays retryable (Codex-P2). External (`org/model`,
-      // `hub:`) adapter bases leave the local base FK null — the
-      // manifest keeps the reference — because Hub parents never exist
-      // as local rows and FK enforcement would fail the batch.
-      const now = nowIso();
-      const assetId = rid('a_');
-      const manifestSha = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(manifest.files)));
-      const revision = Array.from(new Uint8Array(manifestSha), (x) => x.toString(16).padStart(2, '0')).join('');
-      for (const [relpath, flat] of assembled) await store.put(`asset/${assetId}/${relpath}`, flat);
-      manifest.revision = revision;
-      const baseIsExternal = manifest.adapter
-        ? (manifest.adapter.baseAssetId.includes('/') || manifest.adapter.baseAssetId.startsWith('hub:'))
-        : false;
-      await db.batch([
-        db.prepare(`INSERT INTO catalog_assets (id, owner_id, source, repo, revision, kind, task, arch, format, quant, license_json, access, manifest_json, validation, base_asset_id, base_revision, freshness_at, created_at)
-          VALUES (?, ?, 'private', ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?, 'validated', ?, ?, ?, ?)`)
-          .bind(assetId, me(), manifest.name, revision, manifest.kind, manifest.task, manifest.arch, manifest.format, manifest.quant,
-            JSON.stringify({ tags: [manifest.license], evidence: 'owner-declared', note: 'Owner statement, not independently verified.' }),
-            JSON.stringify(manifest), manifest.adapter && !baseIsExternal ? manifest.adapter.baseAssetId : null, manifest.adapter ? manifest.adapter.baseRevision : '', now, now),
-        ...manifest.files.map((f) => db.prepare('INSERT INTO catalog_asset_files (asset_id, relpath, bytes, sha256) VALUES (?, ?, ?, ?)')
-          .bind(assetId, f.relpath, f.bytes, f.sha256)),
-        db.prepare('UPDATE catalog_uploads SET state = ?, manifest_json = ?, byte_ref = ?, updated_at = ? WHERE id = ?')
-          .bind('validated', JSON.stringify(manifest), assetId, now, uploadId),
-      ]);
-      for (const p of parts) await store.del(p.key);
-      await audit(db, me(), 'catalog.upload.validate', assetId, `${manifest.kind} ${manifest.name} ${manifest.files.length} files`);
-      return json(201, { ok: true, uploadId, state: 'validated', assetId, revision });
     }
   }
   {
@@ -1702,7 +1730,7 @@ async function handleApi(request, env, url) {
       const manifest = JSON.parse(up.manifest_json);
       let received = null;
       const store = byteStore(env);
-      if (store && ['uploading', 'quarantined', 'validating'].includes(up.state)) {
+      if (store && ['uploading', 'quarantined', 'validating', 'promoting'].includes(up.state)) {
         const partPrefix = `upload/${up.id}/part/`;
         const parts = await store.list(partPrefix);
         received = manifest.files.map((f) => ({
