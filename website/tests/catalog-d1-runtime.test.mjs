@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { MIGRATION_FILES } from './d1-shim.mjs';
+import { TRANSITION_SQL } from '../src/worker.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let mf = null;
@@ -61,14 +62,9 @@ test('catalog migrations 0001-0018 apply on real local D1 with the N3 columns', 
   assert.ok((await cols('catalog_deployment_events')).includes('detail'), 'catalog_deployment_events.detail');
 });
 
-// Exact mirror of transitionDeployment's N3 batch: UPDATE + conditional
-// marker + conditional release. Drifts from worker.js must fail here.
-const N3_UPDATE = 'UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state = ?';
-const N3_MARKER = `INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail)
-      SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM catalog_deployments WHERE id = ? AND state = ? AND updated_at = ?)`;
-const N3_RELEASE = `UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'
-      AND EXISTS (SELECT 1 FROM catalog_deployment_events WHERE id = ?)`;
-
+// The N3 batch below runs transitionDeployment's own exported SQL
+// (TRANSITION_SQL), so worker.js drift fails here instead of silently
+// unproving the batch.
 async function seedJob(jobId, state) {
   const now = new Date().toISOString();
   await db.batch([
@@ -83,9 +79,9 @@ test('N3 batch on real D1: winner commits marker+release, stale loser commits no
   await seedJob('dep_n3a', 'admitted');
   const wnow = new Date().toISOString();
   const wout = await db.batch([
-    db.prepare(N3_UPDATE).bind('failed', '{"code":"X"}', wnow, 'dep_n3a', 'admitted'),
-    db.prepare(N3_MARKER).bind('ev_dep_n3a_admitted_failed', 'dep_n3a', wnow, 'admitted', 'failed', 'd', 'dep_n3a', 'failed', wnow),
-    db.prepare(N3_RELEASE).bind(wnow, 'dep_n3a', 'ev_dep_n3a_admitted_failed'),
+    db.prepare(TRANSITION_SQL.update).bind('failed', '{"code":"X"}', wnow, 'dep_n3a', 'admitted'),
+    db.prepare(TRANSITION_SQL.marker).bind('ev_dep_n3a_admitted_failed', 'dep_n3a', wnow, 'admitted', 'failed', 'd', 'dep_n3a', 'failed', wnow),
+    db.prepare(TRANSITION_SQL.release).bind(wnow, 'dep_n3a', 'ev_dep_n3a_admitted_failed', 'dep_n3a', 'failed', wnow),
   ]);
   assert.equal(wout[0].meta.changes, 1, 'D1 reports the CAS rowcount');
   const marker = await db.prepare('SELECT to_state FROM catalog_deployment_events WHERE id = ?').bind('ev_dep_n3a_admitted_failed').first();
@@ -94,8 +90,8 @@ test('N3 batch on real D1: winner commits marker+release, stale loser commits no
   assert.equal(res.state, 'released', 'winner releases');
   const lnow = new Date().toISOString();
   const lout = await db.batch([
-    db.prepare(N3_UPDATE).bind('staging', '{}', lnow, 'dep_n3a', 'admitted'),
-    db.prepare(N3_MARKER).bind('ev_dep_n3a_admitted_staging', 'dep_n3a', lnow, 'admitted', 'staging', 'd', 'dep_n3a', 'staging', lnow),
+    db.prepare(TRANSITION_SQL.update).bind('staging', '{}', lnow, 'dep_n3a', 'admitted'),
+    db.prepare(TRANSITION_SQL.marker).bind('ev_dep_n3a_admitted_staging', 'dep_n3a', lnow, 'admitted', 'staging', 'd', 'dep_n3a', 'staging', lnow),
   ]);
   assert.equal(lout[0].meta.changes, 0, 'stale UPDATE matches nothing');
   const ghost = await db.prepare('SELECT id FROM catalog_deployment_events WHERE id = ?').bind('ev_dep_n3a_admitted_staging').first();
@@ -119,14 +115,17 @@ test('admit batch on real D1: deployment+reservation+event commit parent-first u
   assert.equal(n.n, 1, 'reservation committed alongside its deployment');
 });
 
-test('N3 batch on real D1: marker PK conflict rolls the whole batch back', async () => {
+test('N3 batch on real D1: constraint failure rolls the whole batch back (atomicity)', async () => {
+  // Seeds a marker collision no reachable race produces (a serialized
+  // loser zero-rows the marker guard first); the point proved is batch
+  // atomicity under constraint failure, the backstop behind the guards.
   await seedJob('dep_n3c', 'admitted');
   await db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?,?,?,?,?,?)')
     .bind('ev_dep_n3c_admitted_staging', 'dep_n3c', new Date().toISOString(), 'admitted', 'staging', 'pre-existing').run();
   const now = new Date().toISOString();
   await assert.rejects(db.batch([
-    db.prepare(N3_UPDATE).bind('staging', '{}', now, 'dep_n3c', 'admitted'),
-    db.prepare(N3_MARKER).bind('ev_dep_n3c_admitted_staging', 'dep_n3c', now, 'admitted', 'staging', 'd', 'dep_n3c', 'staging', now),
+    db.prepare(TRANSITION_SQL.update).bind('staging', '{}', now, 'dep_n3c', 'admitted'),
+    db.prepare(TRANSITION_SQL.marker).bind('ev_dep_n3c_admitted_staging', 'dep_n3c', now, 'admitted', 'staging', 'd', 'dep_n3c', 'staging', now),
   ]), 'duplicate marker fails the batch');
   const row = await db.prepare('SELECT state FROM catalog_deployments WHERE id = ?').bind('dep_n3c').first();
   assert.equal(row.state, 'admitted', 'state write rolled back');
@@ -134,4 +133,24 @@ test('N3 batch on real D1: marker PK conflict rolls the whole batch back', async
   assert.equal(res.state, 'held', 'no release without its marker');
   const n = await db.prepare('SELECT COUNT(*) n FROM catalog_deployment_events WHERE id = ?').bind('ev_dep_n3c_admitted_staging').first();
   assert.equal(n.n, 1, 'exactly the pre-existing marker row');
+});
+
+test('N3 release guard on real D1: a stale loser cannot free a held reservation', async () => {
+  // The N1 hold shape: terminal job, landed marker, still-held
+  // reservation. A stale loser racing toward the same target must not
+  // release it even though its marker id pre-exists — the release also
+  // requires this write's post-state.
+  await seedJob('dep_n3h', 'failed');
+  await db.prepare('UPDATE catalog_deployments SET updated_at = ? WHERE id = ?').bind('2026-01-01T00:00:00.000Z', 'dep_n3h').run();
+  await db.prepare('INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail) VALUES (?,?,?,?,?,?)')
+    .bind('ev_dep_n3h_cancelling_failed', 'dep_n3h', '2026-01-01T00:00:00.000Z', 'cancelling', 'failed', 'n1 hold').run();
+  const lnow = new Date().toISOString();
+  const lout = await db.batch([
+    db.prepare(TRANSITION_SQL.update).bind('failed', '{}', lnow, 'dep_n3h', 'cancelling'),
+    db.prepare(TRANSITION_SQL.marker).bind('ev_dep_n3h_cancelling_failed', 'dep_n3h', lnow, 'cancelling', 'failed', 'd', 'dep_n3h', 'failed', lnow),
+    db.prepare(TRANSITION_SQL.release).bind(lnow, 'dep_n3h', 'ev_dep_n3h_cancelling_failed', 'dep_n3h', 'failed', lnow),
+  ]);
+  assert.equal(lout[0].meta.changes, 0, 'stale UPDATE matches nothing');
+  const res = await db.prepare('SELECT state FROM catalog_reservations WHERE deployment_id = ?').bind('dep_n3h').first();
+  assert.equal(res.state, 'held', 'pre-existing marker does not authorize release');
 });

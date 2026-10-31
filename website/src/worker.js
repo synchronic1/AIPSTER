@@ -391,6 +391,18 @@ const DEPLOY_TERMINAL = TERMINAL_STATES;
 // quiet reads never touch it (N1).
 const CANCEL_QUIET_MS = 60_000;
 
+// N3 SQL shapes, exported for the D1 runtime contract test
+// (catalog-d1-runtime.test.mjs) so drift fails loudly instead of
+// silently unproving the batch.
+export const TRANSITION_SQL = {
+  update: 'UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state = ?',
+  marker: `INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail)
+      SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM catalog_deployments WHERE id = ? AND state = ? AND updated_at = ?)`,
+  release: `UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'
+      AND EXISTS (SELECT 1 FROM catalog_deployment_events WHERE id = ?)
+      AND EXISTS (SELECT 1 FROM catalog_deployments WHERE id = ? AND state = ? AND updated_at = ?)`,
+};
+
 async function transitionDeployment(db, job, to, detail = '', code = null, opts = {}) {
   const from = job.state;
   if (DEPLOY_TERMINAL.includes(from)) return { ok: false, error: `Deployment is already ${from}.` };
@@ -406,33 +418,37 @@ async function transitionDeployment(db, job, to, detail = '', code = null, opts 
   // every statement after the UPDATE is conditional):
   // - the event marker lands only when the post-state is exactly this
   //   write (id + state + updated_at), with a deterministic id per
-  //   job/from/to, so a same-target loser PK-conflicts and rolls back
-  //   instead of duplicating;
-  // - the release lands only when this write's marker landed.
-  // A lost race therefore commits nothing; callers re-read (F1). The
-  // marker id is unique per job because transitions are monotonic:
-  // forward-only along DEPLOY_ORDER, one cancelling entry (repeat
-  // cancels replay), terminal once.
+  //   job/from/to;
+  // - the release lands only when this write's marker landed AND the
+  //   post-state is still this write, so a stale loser can never free
+  //   another write's hold (not even an N1 hold behind a pre-existing
+  //   marker).
+  // A serialized loser zero-rows on the UPDATE and on both EXISTS
+  // guards, and returns conflict with nothing committed; callers
+  // re-read (F1). A PK conflict needs the same millisecond AND the
+  // same target as the winner — vanishingly rare — and rolls back
+  // the same way. The marker id is unique per job because
+  // transitions are monotonic: forward-only along DEPLOY_ORDER, one
+  // cancelling entry (repeat cancels replay), terminal once.
   const markerId = `ev_${job.id}_${from}_${to}`;
   const errJson = to === 'failed' ? JSON.stringify({ code, detail: detail.slice(0, 500) }) : '{}';
   const stmts = [
-    db.prepare('UPDATE catalog_deployments SET state = ?, error_json = ?, updated_at = ? WHERE id = ? AND state = ?')
+    db.prepare(TRANSITION_SQL.update)
       .bind(to, errJson, now, job.id, from),
-    db.prepare(`INSERT INTO catalog_deployment_events (id, deployment_id, at, from_state, to_state, detail)
-      SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM catalog_deployments WHERE id = ? AND state = ? AND updated_at = ?)`)
+    db.prepare(TRANSITION_SQL.marker)
       .bind(markerId, job.id, now, from, to, detail.slice(0, 500), job.id, to, now),
   ];
   if ((to === 'failed' || to === 'cancelled') && opts.release !== false) {
-    stmts.push(db.prepare(`UPDATE catalog_reservations SET state = 'released', released_at = ? WHERE deployment_id = ? AND state = 'held'
-      AND EXISTS (SELECT 1 FROM catalog_deployment_events WHERE id = ?)`)
-      .bind(now, job.id, markerId));
+    stmts.push(db.prepare(TRANSITION_SQL.release)
+      .bind(now, job.id, markerId, job.id, to, now));
   }
   let out;
   try {
     out = await db.batch(stmts);
   } catch (batchError) {
-    // A same-target loser PK-conflicts on the deterministic marker id;
-    // re-read to distinguish that from a genuine failure (F2 pattern).
+    // Same-millisecond same-target losers PK-conflict on the
+    // deterministic marker id; re-read to distinguish that from a
+    // genuine failure (F2 pattern).
     const current = await first(db, 'SELECT state FROM catalog_deployments WHERE id = ?', job.id);
     if (!current || current.state !== from) return { ok: false, conflict: true, error: `Deployment moved under this write (saw ${from}).` };
     throw batchError;
