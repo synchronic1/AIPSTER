@@ -103,6 +103,15 @@ export async function decideRoute({ db, env = {}, tenant, features = {}, tenantP
     if (cached) {
       const served = serveCached(cached.response.rankedIds || [], scored.ranked);
       if (served) {
+        // Same absolute-deadline gate as the advice path: a lapsed
+        // request keeps its cached ranking as evidence but holds nothing.
+        if (request.deadlineMs <= now()) {
+          return finish({
+            source: cached.stale ? 'degraded-stale' : 'cached',
+            ranking: served.ranking, completed: served.completed, route: null,
+            degraded: true, failure: { code: 'DEADLINE_EXCEEDED', status: 200 },
+          });
+        }
         const route = await cascadeFor(db, tenant, opId, served.ranking, scored.ranked, request, now());
         return finish({
           source: cached.stale ? 'degraded-stale' : 'cached',

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS routing_reservations (
   tokens INTEGER NOT NULL,
   state TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_routing_res_op ON routing_reservations(op_id);

@@ -256,6 +256,59 @@ test('routing decide: live clock in production, scripted clock proves rechecks',
   }
 });
 
+test('routing capacity: failed refunds leave the hold recoverable', async () => {
+  const t = await createTestEnv({});
+  await seed(t);
+  await reserveCapacity(t.DB, { opId: 'op_f', tenant: 'u_alice', grantId: 'g_rc', jobs: 1, tokens: 100, nowMs: NOW });
+  const failDb = {
+    ...t.DB,
+    prepare: (sql) => {
+      if (!sql.includes('UPDATE grants')) return t.DB.prepare(sql);
+      return {
+        bind: (...p) => {
+          const real = t.DB.prepare(sql).bind(...p);
+          return { ...real, run: async () => { throw new Error('injected refund failure'); } };
+        },
+      };
+    },
+  };
+  await assert.rejects(releaseCapacity(failDb, { opId: 'op_f', nowMs: NOW }), /injected/);
+  const row = await t.DB.prepare('SELECT state FROM routing_reservations WHERE op_id = ?').bind('op_f').first();
+  assert.match(row.state, /^releasing:/);
+  // A plain retry finds no held row; the sweeper reaps the aged token.
+  assert.equal(await releaseCapacity(t.DB, { opId: 'op_f', nowMs: NOW }), 0);
+  assert.equal(await sweepReservations(t.DB, NOW + 120000), 1);
+  const u = { ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rc').first()) };
+  assert.deepEqual(u, { used_jobs: 0, used_tokens: 0 });
+});
+
+test('routing ledger: concurrent stealers elect exactly one leader', async () => {
+  const t = await createTestEnv({});
+  await claimRequest(t.DB, { opId: 'op_s0', tenant: 'u_alice', requestId: 'req_s', nowMs: NOW });
+  const a = claimRequest(t.DB, { opId: 'op_s1', tenant: 'u_alice', requestId: 'req_s', nowMs: NOW + 61000 });
+  const b = claimRequest(t.DB, { opId: 'op_s2', tenant: 'u_alice', requestId: 'req_s', nowMs: NOW + 61000 });
+  const rs = await Promise.allSettled([a, b]);
+  assert.equal(rs.filter((r) => r.status === 'fulfilled').length, 1);
+  const denied = rs.filter((r) => r.status === 'rejected');
+  assert.equal(denied.length, 1);
+  assert.equal(denied[0].reason.code, 'ROUTE_OP_IN_FLIGHT');
+});
+
+test('routing decide: cached admission respects the absolute deadline', async () => {
+  const t = await createTestEnv(ENV);
+  await seed(t);
+  const ok = async () => new Response(JSON.stringify(rankResponse(['r1', 'r2'])), { status: 200 });
+  await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: { model: 'm', kinds: ['local'] }, fetchImpl: ok, nowMs: NOW });
+  // Positions: claim, request, eligibility, cache-get, cascade-recheck.
+  const script = [NOW, NOW, NOW, NOW, NOW + 999999];
+  let i = 0;
+  const out = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: { model: 'm', kinds: ['local'] }, fetchImpl: ok, clock: () => script[Math.min(i++, script.length - 1)] });
+  assert.equal(out.source, 'cached');
+  assert.equal(out.route, null);
+  assert.equal(out.degraded, true);
+  assert.equal(out.failure.code, 'DEADLINE_EXCEEDED');
+});
+
 test('routing decide: cascade skips raced quota, dispatch stays 501', async () => {
   const t = await createTestEnv(ENV);
   await seed(t);

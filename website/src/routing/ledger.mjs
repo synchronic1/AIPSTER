@@ -38,11 +38,14 @@ export async function claimRequest(db, { opId, tenant, requestId, nowMs = null }
   if (!row) throw httpError(429, 'Another route decision is running for this request. Retry with the same request id.', 'ROUTE_OP_IN_FLIGHT');
   if (row.state === 'admitted' || row.state === 'rejected') return { outcome: 'replay', op: row };
   // Proposed or expired: steal only when the claim lapsed, else back off.
+  // The takeover predicate carries the OBSERVED owner and expiry: two
+  // concurrent stealers race the same predicate and exactly one wins,
+  // because the winner's renewal invalidates the loser's predicate.
   const lapsed = row.state === 'expired' || Date.parse(row.expires_at) <= now;
   if (!lapsed) throw httpError(429, 'Another route decision is running for this request. Retry with the same request id.', 'ROUTE_OP_IN_FLIGHT');
   const steal = await run(db,
-    "UPDATE routing_ops SET id = ?, state = 'proposed', updated_at = ?, expires_at = ? WHERE tenant_id = ? AND request_id = ? AND state IN ('proposed','expired')",
-    opId, at, new Date(now + ROUTING_CLAIM_TTL_MS).toISOString(), tenant, requestId);
+    "UPDATE routing_ops SET id = ?, state = 'proposed', updated_at = ?, expires_at = ? WHERE tenant_id = ? AND request_id = ? AND state IN ('proposed','expired') AND id = ? AND expires_at = ?",
+    opId, at, new Date(now + ROUTING_CLAIM_TTL_MS).toISOString(), tenant, requestId, row.id, row.expires_at);
   if (Number(steal.meta.changes) === 1) return { outcome: 'leader', op: await getOpByRequest(db, tenant, requestId) };
   const again = await getOpByRequest(db, tenant, requestId);
   if (again && (again.state === 'admitted' || again.state === 'rejected')) return { outcome: 'replay', op: again };
