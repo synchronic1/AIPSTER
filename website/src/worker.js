@@ -1599,8 +1599,8 @@ async function handleApi(request, env, url) {
         // state/manifest), so a CAS miss means a rival chunk or a state
         // flip, both re-mapped on the next iteration. Reservation precedes
         // persistence: a refusal stores nothing and needs no rollback.
-        // Same-key racers can still overcount by one part (both pre-read a
-        // miss before either persists): bounded, fail-closed (refuses
+        // Same-key N-racers can overcount by up to N-1 parts (all pre-read
+        // one base before any persists): bounded, fail-closed (refuses
         // early), and finalize stays exact because it assembles from the
         // store, never from counters.
         const key = `upload/${uploadId}/part/${String(index).padStart(8, '0')}/${relpath}`;
@@ -1690,7 +1690,8 @@ async function handleApi(request, env, url) {
             return json(410, { error: 'Upload session expired during chunk write; start a new one.', code: 'UPLOAD_EXPIRED' });
           }
           return json(409, { error: `Upload is ${cur.state}; chunks are accepted only while uploading.`, code: 'UPLOAD_STATE' });
-        }        return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
+        }
+        return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
       }
       // finalize: assemble (bounded), digest, validate, promote atomically.
       if (up.state === 'validated') {
