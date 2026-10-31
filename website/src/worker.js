@@ -8,7 +8,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET, MAX_BODY_BYTES } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
 import { dgmPreviewEnabled } from './dgm/router.mjs';
@@ -219,7 +219,10 @@ async function privateAssetShape(db, row) {
 // move to expired, and their quarantine parts are deleted best-effort
 // (bounded per call). Runs at the top of upload intake, never on a timer.
 async function expireCatalogUploads(db, store, ownerId) {
-  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'expired') LIMIT 20", ownerId, new Date().toISOString());
+  // Oldest-first: rejected rows keep matching this predicate (their verdict
+  // never flips), so an unordered LIMIT 20 could starve genuine expiries
+  // once an owner accumulates swept rejections (review follow-up).
+  const stale = await all(db, "SELECT id, state FROM catalog_uploads WHERE owner_id = ? AND expires_at <= ? AND state NOT IN ('validated', 'expired') ORDER BY expires_at LIMIT 20", ownerId, new Date().toISOString());
   for (const row of stale) {
     // Rejected rows join the sweep as a crash backstop (Codex-P1): the
     // reject path deletes parts inline, but a fault between the verdict
@@ -1395,6 +1398,11 @@ async function handleApi(request, env, url) {
     if ((owned ? owned.n : 0) + (inflight ? inflight.n : 0) + total > MAX_ASSET_BYTES) {
       return json(400, { error: 'Account storage quota exceeded.', code: 'QUOTA_EXCEEDED' });
     }
+    // Row-growth defense (Codex-sec-P2): every begin inserts an upload row
+    // plus an audit row, and the byte quota cannot bound 1-byte manifests.
+    // Claim the hourly write budget (same 120/hour as resources/keys/
+    // grants) and cap live sessions, mirroring the grants INSERT guard.
+    await checkWriteBudget(db, me());
     const now = nowIso();
     const id = rid('up_');
     const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
@@ -1410,8 +1418,10 @@ async function handleApi(request, env, url) {
       adapter,
       files: files.map((f) => ({ relpath: f.relpath, bytes: f.bytes, sha256: f.sha256 ? String(f.sha256).toLowerCase() : null })),
     };
-    await run(db, 'INSERT INTO catalog_uploads (id, owner_id, state, quotas_json, manifest_json, byte_ref, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length }), JSON.stringify(manifest), null, expiresAt, now, now);
+    const up = await run(db, `INSERT INTO catalog_uploads (id, owner_id, state, quotas_json, manifest_json, byte_ref, expires_at, created_at, updated_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating')) < ${MAX_ACTIVE_UPLOADS_PER_USER}`,
+      id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length }), JSON.stringify(manifest), null, expiresAt, now, now, me());
+    assertClaimed(up, 'upload');
     await audit(db, me(), 'catalog.upload.begin', id, `${manifest.kind} ${manifest.name} ${files.length} files ${total} bytes`);
     return json(201, { id, state: 'uploading', quotas: { totalBytes: total, files: files.length }, expiresAt, chunkMaxBytes: CHUNK_MAX_BYTES, store: storeAvailable(env) ? 'bound' : 'unprovisioned' });
   }

@@ -16,6 +16,7 @@ export const WRITE_BUDGET_PER_HOUR = 120;
 export const MAX_RESOURCES_PER_USER = 100;
 export const MAX_KEYS_PER_USER = 20; // active (non-revoked)
 export const MAX_GRANTS_PER_USER = 100; // active (non-revoked), outgoing
+export const MAX_ACTIVE_UPLOADS_PER_USER = 20; // uploading/quarantined/validating sessions
 
 export function budgetWindow(now = new Date()) {
   return now.toISOString().slice(0, 13); // UTC hour bucket: '2026-10-28T16'
@@ -123,6 +124,7 @@ export async function checkWriteBudget(db, userId) {
 export function capError(kind) {
   if (kind === 'key') return httpError(409, `Active API key limit reached (${MAX_KEYS_PER_USER} per user). Revoke an old key first.`, 'KEY_LIMIT');
   if (kind === 'grant') return httpError(409, `Active grant limit reached (${MAX_GRANTS_PER_USER} per user).`, 'GRANT_LIMIT');
+  if (kind === 'upload') return httpError(409, `Active upload session limit reached (${MAX_ACTIVE_UPLOADS_PER_USER} per user). Finish or expire one first.`, 'UPLOAD_LIMIT');
   return httpError(409, `Resource limit reached (${MAX_RESOURCES_PER_USER} per user).`, 'RESOURCE_LIMIT');
 }
 

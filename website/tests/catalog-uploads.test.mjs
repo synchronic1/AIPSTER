@@ -9,6 +9,7 @@ import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex, MAX_ASSET_BYTES } from '../src/lib/catalog/validate.mjs';
 import { __resetFixtureStore, byteStore } from '../src/lib/catalog/store.mjs';
+import { budgetWindow } from '../src/lib/quotas.js';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const GGUF = 'fixture-org/tiny-instruct-gguf';
@@ -526,4 +527,35 @@ test('Codex-P1: the expiry sweep reclaims rejected orphans without flipping the 
   assert.equal((await store.list(`upload/${a.json.id}/part/`)).length, 0, 'sweep reclaims rejected orphans');
   const row = await t.DB.prepare('SELECT state FROM catalog_uploads WHERE id = ?').bind(a.json.id).first();
   assert.equal(row.state, 'rejected', 'the rejected verdict survives the sweep');
+});
+
+test('Codex-sec-P2: spent write budgets reject upload begins before any write', async () => {
+  const t = await fx();
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const b = await begin(t, t.alice, {
+    name: 'over-budget', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 429, b.text);
+  assert.equal(b.json.code, 'WRITE_RATE_LIMITED');
+  assert.equal(await t.DB.prepare('SELECT COUNT(*) AS n FROM catalog_uploads WHERE owner_id = ?').bind('u_alice').first('n'), 0);
+});
+
+test('Codex-sec-P2: active upload sessions are capped per owner', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  for (let i = 0; i < 20; i += 1) {
+    const b = await begin(t, t.alice, {
+      name: `sweep-flood-${i}`, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+      files: [{ relpath: 'model.gguf', bytes: 1 }],
+    });
+    assert.equal(b.status, 201, `session ${i}: ${b.text}`);
+  }
+  const over = await begin(t, t.alice, {
+    name: 'sweep-flood-20', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'model.gguf', bytes: 1 }],
+  });
+  assert.equal(over.status, 409, over.text);
+  assert.equal(over.json.code, 'UPLOAD_LIMIT');
 });
