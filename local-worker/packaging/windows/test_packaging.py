@@ -814,7 +814,7 @@ class FirstrunChildDirTests(unittest.TestCase):
         from private_storage_win32 import protect_path
         with tempfile.TemporaryDirectory(prefix='aipster-firstrun-') as tmp:
             data = Path(tmp) / 'worker-data'
-            data.mkdir()
+            first.private_directory(data)
             (data / 'logs').mkdir()
             real_out, real_err = sys.stdout, sys.stderr
             try:
