@@ -1549,7 +1549,7 @@ async function handleApi(request, env, url) {
     }
     await expireCatalogUploads(db, byteStore(env), me());
     const owned = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
-    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL))", me());
+    const inflight = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL) OR (state = 'expired' AND byte_ref = 'expired-draining'))", me());
     if ((owned ? owned.n : 0) + (inflight ? inflight.n : 0) + total > MAX_ASSET_BYTES) {
       return json(400, { error: 'Account storage quota exceeded.', code: 'QUOTA_EXCEEDED' });
     }
@@ -1578,10 +1578,14 @@ async function handleApi(request, env, url) {
     // session-count cap and the aggregate byte budget in ONE statement, so
     // exactly the fitting prefix of a burst admits and losers insert zero
     // rows. No changes() chaining: each predicate reads committed state.
+    // Expired rows still marked 'expired-draining' keep their declared bytes
+    // charged (Codex-sec-P2 r4434757538): the sweep drains 2010 parts per
+    // intake, so releasing at the flip let a tenant stack quota-sized
+    // cohorts in the shared bucket. The charge clears with the marker.
     const admitted = await run(db, `INSERT INTO catalog_uploads (id, owner_id, state, quotas_json, manifest_json, byte_ref, expires_at, created_at, updated_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM catalog_uploads WHERE owner_id = ? AND state IN ('uploading', 'quarantined', 'validating', 'promoting')) < ${MAX_ACTIVE_UPLOADS_PER_USER}
       AND (SELECT COALESCE(SUM(bytes), 0) FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?))
-        + (SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL)))
+        + (SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL) OR (state = 'expired' AND byte_ref = 'expired-draining')))
         + ? <= ${MAX_ASSET_BYTES}`,
       id, me(), 'uploading', JSON.stringify({ totalBytes: total, files: files.length, parts: { total: 0, bytes: {} } }), JSON.stringify(manifest), null, expiresAt, now, now,
       me(), me(), me(), total);
@@ -2025,7 +2029,7 @@ async function handleApi(request, env, url) {
         // atomicity needs a live-gate transport — over-admission is bounded
         // to one footprint and visible to every later check (N5).
         const ownedNow = await first(db, 'SELECT COALESCE(SUM(bytes), 0) n FROM catalog_asset_files WHERE asset_id IN (SELECT id FROM catalog_assets WHERE owner_id = ?)', me());
-        const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL))", me());
+        const inflightNow = await first(db, "SELECT COALESCE(SUM(CAST(json_extract(quotas_json, '$.totalBytes') AS INTEGER)), 0) n FROM catalog_uploads WHERE owner_id = ? AND (state IN ('uploading', 'quarantined', 'validating', 'promoting') OR (state = 'rejected' AND byte_ref IS NULL) OR (state = 'expired' AND byte_ref = 'expired-draining'))", me());
         if ((ownedNow ? ownedNow.n : 0) + (inflightNow ? inflightNow.n : 0) > MAX_ASSET_BYTES) {
           const resetQuota = await run(db, "UPDATE catalog_uploads SET state = 'uploading', updated_at = ? WHERE id = ? AND byte_ref = ?", nowIso(), uploadId, claimToken);
           if (Number(resetQuota.meta.changes) !== 1) return claimLost();

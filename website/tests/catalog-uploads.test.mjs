@@ -1124,6 +1124,45 @@ test('Codex-sec-P2: quota stays held until rejected parts drain, then releases',
   assert.equal(fill2.status, 201, fill2.text);
 });
 
+test('Codex-sec-P2 r4434757538: expired-draining uploads keep their declared bytes charged until fully drained', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const store = byteStore(t.env);
+  const QUOTA = 500 * 1024 * 1024 * 1024;
+  const HELD = 4021;
+  const v = await begin(t, t.alice, {
+    name: 'abandoned', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'w.bin', bytes: HELD }],
+  });
+  assert.equal(v.status, 201, v.text);
+  for (let i = 0; i < HELD; i++) {
+    await store.put(`upload/${v.json.id}/part/${String(i).padStart(8, '0')}/w.bin`, new Uint8Array([i & 0xff]));
+  }
+  await t.DB.prepare('UPDATE catalog_uploads SET expires_at = ? WHERE id = ?').bind(new Date(Date.now() - 1000).toISOString(), v.json.id).run();
+  // Fits only if the still-stored expired bytes are excluded.
+  const total = QUOTA - 4020;
+  const per = Math.floor(total / 5);
+  const files = [0, 1, 2, 3].map((i) => ({ relpath: `f${i}.gguf`, bytes: per }));
+  files.push({ relpath: 'f4.gguf', bytes: total - per * 4 });
+  const spec = (name, fl) => ({ name, kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0', files: fl });
+  const fill = await begin(t, t.alice, spec('fill', files));
+  assert.equal(fill.status, 400, fill.text);
+  assert.equal(fill.json.code, 'QUOTA_EXCEEDED');
+  const row = await t.DB.prepare('SELECT state, byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first();
+  assert.deepEqual({ ...row }, { state: 'expired', byte_ref: 'expired-draining' }, 'claimed expired, still draining');
+  assert.equal((await store.list(`upload/${v.json.id}/part/`)).length, 2011, 'first sweep drained 2010 of 4021');
+  // Further intakes drain the rest; the charge releases only once empty.
+  assert.equal((await begin(t, t.alice, spec('s1', [{ relpath: 's.gguf', bytes: 1 }]))).status, 201);
+  assert.equal((await t.DB.prepare('SELECT byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first()).byte_ref, 'expired-draining');
+  assert.equal((await begin(t, t.alice, spec('s2', [{ relpath: 's.gguf', bytes: 1 }]))).status, 201);
+  assert.equal((await t.DB.prepare('SELECT byte_ref FROM catalog_uploads WHERE id = ?').bind(v.json.id).first()).byte_ref, null, 'drain converged');
+  assert.equal((await store.list(`upload/${v.json.id}/part/`)).length, 0);
+  // Two live 1-byte sessions now hold 2 bytes; the fill shrinks to fit.
+  files[4] = { ...files[4], bytes: files[4].bytes - 2 };
+  const fill2 = await begin(t, t.alice, spec('fill2', files));
+  assert.equal(fill2.status, 201, fill2.text);
+});
+
 test('Codex-sec-P2: the sweep reclaims rejected-undrained parts before their deadline', async () => {
   const t = await fx();
   __resetFixtureStore();
