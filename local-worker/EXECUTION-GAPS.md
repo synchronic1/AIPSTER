@@ -8,21 +8,27 @@ is against public `dendrite/config.py`, `schemas.py`, `node.py`,
 ## What the job runner connects (2026-11-01)
 
 `inference_worker.py` now implements the worker half of the admitted-dispatch
-path: one leased job at a time from the worker job route, a strict bound-CPU
-envelope check, exactly one non-streaming Ganglion completion, and an
-EIF-shaped result bound to the lease. It reuses the stored heartbeat key and
-touches neither the running port-8090 worker nor its enrollment.
+path: one leased job at a time from the worker job route, a strict nested
+bound-CPU envelope check (`{protocol, task, binding}`, canonical worker wire
+shapes), exactly one non-streaming Ganglion completion, and an EIF-shaped
+result bound to the lease. It reuses the stored heartbeat key and touches
+neither the running port-8090 worker nor its enrollment.
 
 Real in this tree and unit-tested against fake loopback servers:
 
 - Lease polling with the heartbeat-scoped key, product User-Agent, 204 idle
   backoff, `Retry-After` handling and the repair-required exit on a revoked key.
-- Strict envelope validation: capability, CPU placement bound to this resource,
-  runtime `ganglion`, model, prompt, token ceiling, future deadline, no
-  simulation and no unknown fields.
+- Strict envelope validation of the nested coordinator envelope: exact
+  `aipster-bound-cpu-internal/1` protocol, capability, CPU placement bound to
+  this resource, runtime `ganglion`, model, prompt, token ceiling, future
+  deadline equal to the binding deadline, no simulation, exactly the five
+  binding fields and no unknown top-level or task fields.
 - Model gating against Ganglion `GET /v1/models` (briefly cached), one completion
   with `temperature: 0` and a deadline-bounded timeout, no redirects and no
   retries, and a stable `failed` reason for every failure path.
+- Result shapes held to L2's validator: success is exactly the EIF key set with
+  `runtime_instance`/`model_fingerprint` echoed from the binding; failure is
+  exactly `{reason, detail?, elapsed_ms?, usage?, cache?}`.
 - A private started-job ledger written before the completion call, so a crash
   between execution and posting never re-executes a job.
 - Single-runner locking and secret-free logging (no key, token, prompt or
@@ -48,9 +54,11 @@ model. Ganglion was read once with `GET /v1/models` to learn its response shape;
 no completion was posted, no model was loaded or unloaded, and no real inference
 was performed. Before any qualification round:
 
-- the L1 store and L2 routes must land and agree on the lease/result shapes,
-  including the `deadline_at` units (the runner expects integer Unix ms) and
-  whether the leased envelope still carries the internal `binding`;
+- the L1 store and L2 routes must land and agree on the lease/result shapes.
+  The runner now conforms to Addendum A's canonical shapes (nested envelope
+  with the `binding`, echo of `runtime_instance`/`model_fingerprint`, exact
+  success and failure key sets) and to L2's validator at `9f2fc29`, but no
+  deployed route has ever produced one of these frames;
 - a first live run should use a disposable test resource, a tiny `max_tokens`
   and a deadline long enough to observe one failed-and-one-succeeded result;
 - Ganglion placement, model digest and context/RAM fit must be recorded for the

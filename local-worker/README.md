@@ -188,23 +188,48 @@ Prerequisites:
 | `--once` | Poll once and exit; still takes the single-runner lock |
 
 Per job the runner: leases one job from `GET /api/worker/jobs/next` with the
-stored heartbeat key; validates the bound envelope strictly (`capability`
-`complete`, `placement.device` `cpu`, node id equal to this resource, runtime
-`ganglion`, model, prompt, `max_tokens` 1..4096, a deadline in the future,
-`temperature` 0, no simulation, no unknown fields); checks the model against
-Ganglion `GET /v1/models`; then makes one non-streaming `POST /v1/completions`
-(`temperature: 0`, timeout = the deadline minus now, no redirects, no retries)
-and posts `{lease_id, status, result}` to
+stored heartbeat key; validates the leased envelope strictly; checks the model
+against Ganglion `GET /v1/models`; then makes one non-streaming
+`POST /v1/completions` (`temperature: 0`, timeout = the deadline minus now, no
+redirects, no retries) and posts `{lease_id, status, result}` to
 `POST /api/worker/jobs/:job_id/result`. A `404` on completions means the route
 does not exist, so one single-message `/v1/chat/completions` fallback is tried;
 every other failure is final.
+
+The lease frame is `{job_id, lease_id, envelope, deadline_at}`: `job_id` and
+`lease_id` are opaque strings and `deadline_at` is integer Unix milliseconds.
+The envelope is nested, as the coordinator builds it
+(`website/src/inference/dispatch-coordinator.mjs`):
+
+```
+{ protocol: "aipster-bound-cpu-internal/1",
+  task: { capability: "complete", model_id, prompt, max_tokens, temperature: 0,
+          allow_simulated: false, idempotency_key,
+          placement: { device: "cpu", node_id, runtime_id: "ganglion" } },
+  binding: { op_id, generation, runtime_instance, model_fingerprint, deadline_at } }
+```
+
+`protocol` must match exactly; `task` is validated field by field
+(`capability` `complete`, `placement.device` `cpu`, node id equal to this
+resource, runtime `ganglion`, model, prompt, `max_tokens` 1..4096,
+`temperature` present and 0, `allow_simulated` present and false, no unknown
+fields); `binding` must carry exactly those five fields, with
+`binding.deadline_at` equal to the lease `deadline_at` and in the future. There
+is no flat-envelope form: an envelope without the protocol wrapper is refused.
 
 A failure is always reported as `failed` with a stable `reason`
 (`ENVELOPE_INVALID`, `MODEL_UNAVAILABLE`, `GANGLION_UNAVAILABLE`,
 `GANGLION_HTTP_ERROR`, `GANGLION_TIMEOUT`, `GANGLION_INVALID_RESPONSE`,
 `EMPTY_CONTENT`, `DEADLINE_EXCEEDED`) and no content, so it can never be
-mistaken for a successful result. Success carries `simulated: false` and the
-EIF result shape.
+mistaken for a successful result. The failed result is exactly
+`{reason, detail?, elapsed_ms?, usage?, cache?}` — no request, node, runtime,
+model, `simulated` or `content` field, because a failure claims nothing about
+the job's identity. A success is exactly
+`{request_id, node_id, runtime_id, model_id, runtime_instance,
+model_fingerprint, simulated: false, content, elapsed_ms, usage, cache}`;
+`runtime_instance` and `model_fingerprint` are echoed from the lease binding,
+never invented. Both shapes match L2's validator in
+`website/src/inference/worker-transport.mjs`.
 
 Before calling Ganglion the job id is written to a private started-job ledger
 (`jobs-started.json` in the worker data dir). A job whose result post was never

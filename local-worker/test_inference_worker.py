@@ -6,14 +6,21 @@ and synthetic: no live Ganglion, no AIPSTER network, no model load, no
 inference. Pairing credentials are synthetic fixtures stored in a
 throwaway private data dir.
 
-Shapes under test:
+Shapes under test (canonical worker wire shapes, Addendum A of
+DS-INFERENCE-LANES-20261101.md; the coordinator builds the envelope at
+website/src/inference/dispatch-coordinator.mjs ~L331 and L2 validates the
+result in website/src/inference/worker-transport.mjs):
   GET  /api/worker/jobs/next            -> 204 | {job_id, lease_id, envelope, deadline_at}
+  envelope                             -> {protocol, task, binding}
   POST /api/worker/jobs/:job_id/result  -> {lease_id, status, result}
   GET  /v1/models                       -> {object: 'list', data: [{id}]}
   POST /v1/completions                  -> OpenAI text_completion
   POST /v1/chat/completions             -> OpenAI chat.completion (fallback only)
 """
+import copy
 import json
+import math
+import re
 import sys
 import tempfile
 import threading
@@ -37,34 +44,78 @@ FAKE_CODE = "pair-01234567-89AB-CDEF-GHJKMNPQ"[:27]
 FAKE_SECRET = "synthetic-heartbeat-key-0123456789abcdef"
 FAKE_RESOURCE = "r_fake01"
 MODEL = "qwen3-27b"
+PROTOCOL = "aipster-bound-cpu-internal/1"
+RUNTIME_INSTANCE = "ganglion-instance-0001"
+MODEL_FINGERPRINT = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
 
 def now_ms():
     return int(time.time() * 1000)
 
 
-def envelope(model=MODEL, prompt="hello there", max_tokens=16,
-             node_id=FAKE_RESOURCE, runtime_id="ganglion", **over):
-    env = {
+def task(model=MODEL, prompt="hello there", max_tokens=16,
+         node_id=FAKE_RESOURCE, runtime_id="ganglion", **over):
+    """One bound-CPU task: exactly what encodeBoundCpuTask emits.
+
+    website/src/inference/eif-task-contract.mjs @ 9f2fc29: encodeCpuTask
+    returns {capability, model_id, prompt, max_tokens, temperature,
+    allow_simulated, idempotency_key}; encodeBoundCpuTask adds placement.
+    """
+    body = {
         "capability": "complete",
         "model_id": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0,
         "allow_simulated": False,
-        "idempotency_key": "op_0123456789abcdef",
+        "idempotency_key": "dispatch-op-000001",
         "placement": {"device": "cpu", "node_id": node_id, "runtime_id": runtime_id},
+    }
+    body.update(over)
+    return body
+
+
+def binding(deadline_ms=None, **over):
+    """The coordinator's internal binding (dispatch-coordinator.mjs ~L331)."""
+    body = {
+        "op_id": "dispatch-op-000001",
+        "generation": 1,
+        "runtime_instance": RUNTIME_INSTANCE,
+        "model_fingerprint": MODEL_FINGERPRINT,
+        "deadline_at": now_ms() + 60000 if deadline_ms is None else deadline_ms,
+    }
+    body.update(over)
+    return body
+
+
+def envelope(task_body=None, binding_body=None, deadline_ms=None, **over):
+    """The nested lease envelope: {protocol, task, binding}."""
+    env = {
+        "protocol": PROTOCOL,
+        "task": task() if task_body is None else task_body,
+        "binding": binding(deadline_ms) if binding_body is None else binding_body,
     }
     env.update(over)
     return env
 
 
 def lease(job_id="job_1", lease_id="lease_1", env=None, deadline_ms=None):
+    if env is None:
+        if deadline_ms is None:
+            deadline_ms = now_ms() + 60000
+        env = envelope(deadline_ms=deadline_ms)
+    elif deadline_ms is None:
+        # Keep the lease deadline and the binding deadline agreeing unless a
+        # test deliberately sets one of them apart.
+        inner = env.get("binding") if isinstance(env, dict) else None
+        deadline_ms = inner.get("deadline_at") if isinstance(inner, dict) else None
+        if not isinstance(deadline_ms, int) or isinstance(deadline_ms, bool):
+            deadline_ms = now_ms() + 60000
     return {
         "job_id": job_id,
         "lease_id": lease_id,
-        "envelope": envelope() if env is None else env,
-        "deadline_at": now_ms() + 60000 if deadline_ms is None else deadline_ms,
+        "envelope": env,
+        "deadline_at": deadline_ms,
     }
 
 
@@ -84,6 +135,88 @@ def chat_body(content="hello"):
                      "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
     }
+
+
+# -- Mirror of L2's worker result validator ------------------------------
+#
+# Copied rule for rule from website/src/inference/worker-transport.mjs on
+# branch ds/inference-routes-20261101 at commit 9f2fc29. Line numbers below
+# are that file's. The worker has no JS runtime, so the contract test
+# restates the rules here and holds the posted bodies to them.
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")   # L17
+MODEL_ID_MAX = 256                                          # L18
+CONTENT_MAX = 65536                                         # L19
+WORKER_RESULT_MAX_BYTES = 1024 * 1024                       # L20
+SUCCEEDED_ALLOWED = frozenset({                             # L48-49
+    "request_id", "node_id", "runtime_id", "model_id", "runtime_instance",
+    "model_fingerprint", "simulated", "content", "elapsed_ms", "usage", "cache",
+    "truncated",
+})
+FAILED_ALLOWED = frozenset({"reason", "detail", "elapsed_ms", "usage", "cache"})  # L63
+
+
+def _is_str(value, maximum=MODEL_ID_MAX):                   # L23
+    return isinstance(value, str) and 0 < len(value) <= maximum
+
+
+def _is_obj(value):                                         # L22
+    return isinstance(value, dict)
+
+
+def _valid_succeeded_result(result):                        # L46-59
+    if not _is_obj(result):
+        return False
+    if set(result) - SUCCEEDED_ALLOWED:                     # L50
+        return False
+    if not all(_is_str(result.get(key)) for key in (       # L51
+            "request_id", "node_id", "runtime_id", "model_id")):
+        return False
+    if not all(_is_str(result.get(key)) for key in (       # L52
+            "runtime_instance", "model_fingerprint")):
+        return False
+    if result.get("simulated") is not False:                # L53
+        return False
+    if "truncated" in result and result["truncated"] is not False:  # L54
+        return False
+    content = result.get("content")                         # L55
+    if (not isinstance(content, str) or not content.strip()
+            or len(content) > CONTENT_MAX):
+        return False
+    elapsed = result.get("elapsed_ms")                      # L56
+    if (isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed) or elapsed < 0):
+        return False
+    if not _is_obj(result.get("usage")) or not _is_obj(result.get("cache")):  # L57
+        return False
+    return True
+
+
+def _valid_failed_result(result):                           # L61-66
+    if not _is_obj(result):
+        return False
+    if set(result) - FAILED_ALLOWED:                        # L64
+        return False
+    return _is_str(result.get("reason"), 128)                # L65
+
+
+def validate_worker_result_report(body):                    # L74-97
+    """L2's rules. Returns None when accepted, else a rejection code."""
+    if not _is_obj(body):                                   # L75
+        return "INVALID_RESULT"
+    if len(body) != 3 or set(body) != {"lease_id", "status", "result"}:  # L77
+        return "REPORT_SHAPE"
+    if not isinstance(body["lease_id"], str) or not ID_RE.match(body["lease_id"]):  # L80
+        return "LEASE_ID"
+    if body["status"] not in ("succeeded", "failed"):       # L83-84
+        return "STATUS"
+    wire = json.dumps(body, separators=(",", ":")).encode("utf-8")  # L87
+    if len(wire) > WORKER_RESULT_MAX_BYTES:
+        return "BODY_TOO_LARGE"
+    if body["status"] == "succeeded" and not _valid_succeeded_result(body["result"]):  # L90
+        return "INVALID_RESULT"
+    if body["status"] == "failed" and not _valid_failed_result(body["result"]):  # L93
+        return "INVALID_RESULT"
+    return None
 
 
 class FakeApiState:
@@ -305,11 +438,15 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(posted["body"]["status"], "succeeded")
         result = posted["body"]["result"]
         self.assertEqual(set(result), {"request_id", "node_id", "runtime_id", "model_id",
-                                       "simulated", "content", "elapsed_ms", "usage", "cache"})
+                                       "runtime_instance", "model_fingerprint", "simulated",
+                                       "content", "elapsed_ms", "usage", "cache"})
         self.assertEqual(result["request_id"], "job_1")
         self.assertEqual(result["node_id"], FAKE_RESOURCE)
         self.assertEqual(result["runtime_id"], "ganglion")
         self.assertEqual(result["model_id"], MODEL)
+        # Echoed from the binding, never invented by the worker.
+        self.assertEqual(result["runtime_instance"], RUNTIME_INSTANCE)
+        self.assertEqual(result["model_fingerprint"], MODEL_FINGERPRINT)
         self.assertIs(result["simulated"], False)
         self.assertEqual(result["content"], "hello")
         self.assertIsInstance(result["elapsed_ms"], int)
@@ -404,82 +541,208 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.api.results), before + 1)
         body = self.api.results[-1]["body"]
         self.assertEqual(body["status"], "failed")
-        self.assertEqual(body["result"]["reason"], "ENVELOPE_INVALID")
-        self.assertEqual(body["result"].get("detail"), detail)
-        self.assertIs(body["result"]["simulated"], False)
-        self.assertNotIn("content", body["result"])
-        return body["result"]
+        result = body["result"]
+        self.assertEqual(set(result) - {"reason", "detail", "elapsed_ms", "usage", "cache"},
+                         set(), "a failed result carries no EIF identity fields")
+        self.assertEqual(result["reason"], "ENVELOPE_INVALID")
+        self.assertEqual(result.get("detail"), detail)
+        for forbidden in ("request_id", "node_id", "runtime_id", "model_id",
+                          "simulated", "content"):
+            self.assertNotIn(forbidden, result)
+        return result
+
+    def test_rejects_flat_envelope(self):
+        # The pre-Addendum-A flat envelope is gone: no dual format.
+        self.assert_envelope_rejected(lease(env=task()), "protocol")
+
+    def test_rejects_wrong_protocol(self):
+        self.assert_envelope_rejected(
+            lease(env=envelope(protocol="aipster-bound-cpu-internal/2")), "protocol")
+
+    def test_rejects_unknown_envelope_field(self):
+        self.assert_envelope_rejected(lease(env=envelope(authenticated=True)),
+                                      "unknown_field")
+
+    def test_rejects_unknown_task_field(self):
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(authenticated=True))), "task_field")
+
+    def test_rejects_non_object_task(self):
+        self.assert_envelope_rejected(lease(env=envelope(task_body="complete")), "task")
+
+    def test_rejects_missing_binding(self):
+        env = envelope()
+        del env["binding"]
+        self.assert_envelope_rejected(lease(env=env), "binding")
+
+    def test_rejects_non_object_binding(self):
+        self.assert_envelope_rejected(lease(env=envelope(binding_body="binding")), "binding")
+
+    def test_rejects_unknown_binding_field(self):
+        self.assert_envelope_rejected(
+            lease(env=envelope(binding_body=binding(extra="x"))), "binding_field")
+
+    def test_rejects_missing_binding_field(self):
+        inner = binding()
+        del inner["model_fingerprint"]
+        self.assert_envelope_rejected(lease(env=envelope(binding_body=inner)),
+                                      "binding_field")
+
+    def test_rejects_malformed_binding_value(self):
+        for inner in (binding(op_id=""), binding(generation=0),
+                      binding(runtime_instance=""), binding(model_fingerprint=None)):
+            with self.subTest(binding=inner):
+                self.assert_envelope_rejected(
+                    lease(env=envelope(binding_body=inner)), "binding_value")
 
     def test_rejects_foreign_resource(self):
-        env = envelope(node_id="r_someone_else")
-        self.assert_envelope_rejected(lease(env=env), "node_id")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(node_id="r_someone_else"))), "node_id")
 
     def test_rejects_wrong_runtime(self):
-        env = envelope(runtime_id="eif-llama")
-        self.assert_envelope_rejected(lease(env=env), "runtime_id")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(runtime_id="eif-llama"))), "runtime_id")
 
     def test_rejects_gpu_placement(self):
-        env = envelope(placement={"device": "gpu", "node_id": FAKE_RESOURCE,
-                                  "runtime_id": "ganglion"})
+        env = envelope(task_body=task(placement={"device": "gpu", "node_id": FAKE_RESOURCE,
+                                                  "runtime_id": "ganglion"}))
         self.assert_envelope_rejected(lease(env=env), "device")
 
     def test_rejects_extra_placement_field(self):
-        env = envelope(placement={"device": "cpu", "node_id": FAKE_RESOURCE,
-                                  "runtime_id": "ganglion", "gpu_index": 0})
+        env = envelope(task_body=task(placement={"device": "cpu", "node_id": FAKE_RESOURCE,
+                                                  "runtime_id": "ganglion",
+                                                  "gpu_index": 0}))
         self.assert_envelope_rejected(lease(env=env), "placement")
 
-    def test_rejects_unknown_envelope_field(self):
-        env = envelope(authenticated=True)
-        self.assert_envelope_rejected(lease(env=env), "unknown_field")
-
     def test_rejects_unknown_capability(self):
-        env = envelope(capability="summarize")
-        self.assert_envelope_rejected(lease(env=env), "capability")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(capability="summarize"))), "capability")
 
     def test_rejects_oversized_max_tokens(self):
-        env = envelope(max_tokens=4097)
-        self.assert_envelope_rejected(lease(env=env), "max_tokens")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(max_tokens=4097))), "max_tokens")
 
     def test_rejects_non_integer_max_tokens(self):
-        env = envelope(max_tokens="16")
-        self.assert_envelope_rejected(lease(env=env), "max_tokens")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(max_tokens="16"))), "max_tokens")
 
     def test_rejects_empty_prompt(self):
-        env = envelope(prompt="   ")
-        self.assert_envelope_rejected(lease(env=env), "prompt")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(prompt="   "))), "prompt")
 
     def test_rejects_nonzero_temperature(self):
-        env = envelope(temperature=0.7)
-        self.assert_envelope_rejected(lease(env=env), "temperature")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(temperature=0.7))), "temperature")
+
+    def test_rejects_missing_temperature(self):
+        body = task()
+        del body["temperature"]
+        self.assert_envelope_rejected(lease(env=envelope(task_body=body)), "temperature")
 
     def test_rejects_simulated_allowance(self):
-        env = envelope(allow_simulated=True)
-        self.assert_envelope_rejected(lease(env=env), "allow_simulated")
+        self.assert_envelope_rejected(
+            lease(env=envelope(task_body=task(allow_simulated=True))), "allow_simulated")
+
+    def test_rejects_missing_simulated_flag(self):
+        body = task()
+        del body["allow_simulated"]
+        self.assert_envelope_rejected(lease(env=envelope(task_body=body)), "allow_simulated")
 
     def test_rejects_missing_idempotency_key(self):
-        env = envelope()
-        del env["idempotency_key"]
-        self.assert_envelope_rejected(lease(env=env), "idempotency_key")
+        body = task()
+        del body["idempotency_key"]
+        self.assert_envelope_rejected(lease(env=envelope(task_body=body)), "idempotency_key")
 
     def test_rejects_past_deadline(self):
         self.assert_envelope_rejected(lease(deadline_ms=now_ms() - 1000), "deadline")
 
     def test_rejects_binding_deadline_mismatch(self):
-        env = envelope(binding={"op_id": "op_1", "generation": 1,
-                                "deadline_at": now_ms() + 90000})
+        env = envelope(binding_body=binding(now_ms() + 90000))
         self.assert_envelope_rejected(lease(env=env, deadline_ms=now_ms() + 60000),
                                       "deadline")
 
-    def test_accepts_documented_binding(self):
+    def test_rejects_non_integer_binding_deadline(self):
+        env = envelope(binding_body=binding(deadline_ms="2026-11-01T19:00:00.000Z"))
+        self.assert_envelope_rejected(lease(env=env, deadline_ms=now_ms() + 60000),
+                                      "deadline")
+
+    def test_accepts_coordinator_envelope_and_echoes_binding(self):
         deadline = now_ms() + 60000
-        env = envelope(binding={"op_id": "op_1", "generation": 1,
-                                "runtime_instance": "ganglion@local",
-                                "model_fingerprint": "sha256:abc",
-                                "deadline_at": deadline})
+        env = envelope(deadline_ms=deadline)
         self.api.leases = [lease(env=env, deadline_ms=deadline)]
         code, _, err = self.run_quiet(self.runner(), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err)
-        self.assertEqual(self.api.results[0]["body"]["status"], "succeeded")
+        body = self.api.results[0]["body"]
+        self.assertEqual(body["status"], "succeeded")
+        self.assertEqual(body["result"]["runtime_instance"], RUNTIME_INSTANCE)
+        self.assertEqual(body["result"]["model_fingerprint"], MODEL_FINGERPRINT)
+
+    # -- coordinator wire contract ---------------------------------------
+
+    def test_posted_reports_pass_l2_worker_result_validation(self):
+        """The real coordinator envelope, held to L2's exact result rules.
+
+        The lease frames below carry the envelope literal the coordinator
+        builds at website/src/inference/dispatch-coordinator.mjs ~L331 on
+        branch ds/inference-routes-20261101 @ 9f2fc29: TRANSPORT_PROTOCOL +
+        encodeBoundCpuTask({modelId, prompt, maxTokens, operationKey},
+        {device:'cpu', nodeId, runtimeId}) + the internal binding. Both a
+        succeeded and a failed report must pass
+        validateWorkerResultReport (website/src/inference/worker-transport.mjs
+        L74-97), whose rules are mirrored above.
+        """
+        deadline = now_ms() + 60000
+        coordinator_envelope = {
+            "protocol": "aipster-bound-cpu-internal/1",
+            "task": {
+                "capability": "complete",
+                "model_id": "qwen3-27b",
+                "prompt": "hello there",
+                "max_tokens": 16,
+                "temperature": 0,
+                "allow_simulated": False,
+                "idempotency_key": "dispatch-op-000001",
+                "placement": {"device": "cpu", "node_id": "r_fake01",
+                              "runtime_id": "ganglion"},
+            },
+            "binding": {
+                "op_id": "dispatch-op-000001",
+                "generation": 1,
+                "runtime_instance": "ganglion-instance-0001",
+                "model_fingerprint": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+                "deadline_at": deadline,
+            },
+        }
+        unlisted = copy.deepcopy(coordinator_envelope)
+        unlisted["task"]["model_id"] = "qwen-not-there"
+
+        self.api.leases = [
+            {"job_id": "dispatch-job-000001", "lease_id": "lease-000001",
+             "envelope": coordinator_envelope, "deadline_at": deadline},
+            {"job_id": "dispatch-job-000002", "lease_id": "lease-000002",
+             "envelope": unlisted, "deadline_at": deadline},
+        ]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=2)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual([entry["body"]["status"] for entry in self.api.results],
+                         ["succeeded", "failed"])
+
+        succeeded = self.api.results[0]["body"]
+        failed = self.api.results[1]["body"]
+        self.assertIsNone(validate_worker_result_report(succeeded),
+                          "L2 would reject the succeeded report")
+        self.assertIsNone(validate_worker_result_report(failed),
+                          "L2 would reject the failed report")
+        self.assertEqual(succeeded["lease_id"], "lease-000001")
+        self.assertEqual(set(succeeded["result"]), {
+            "request_id", "node_id", "runtime_id", "model_id", "runtime_instance",
+            "model_fingerprint", "simulated", "content", "elapsed_ms", "usage", "cache"})
+        self.assertEqual(succeeded["result"]["runtime_instance"],
+                         "ganglion-instance-0001")
+        self.assertEqual(succeeded["result"]["model_fingerprint"],
+                         "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+        self.assertEqual(set(failed["result"]) - FAILED_ALLOWED, set())
+        self.assertEqual(failed["result"]["reason"], "MODEL_UNAVAILABLE")
 
     def test_malformed_lease_frame_cannot_be_reported_and_stops(self):
         frame = lease()
@@ -503,16 +766,19 @@ class InferenceWorkerTests(unittest.TestCase):
     # -- Ganglion model gate and failures --------------------------------
 
     def test_unlisted_model_fails_without_calling_completions(self):
-        self.api.leases = [lease(env=envelope(model="qwen-not-there"))]
+        self.api.leases = [lease(env=envelope(task_body=task(model="qwen-not-there")))]
         code, _, err = self.run_quiet(self.runner(), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err)
         self.assertEqual(self.ganglion.hits["completions"], 0)
         self.assertEqual(self.ganglion.models_hits, 1)
         body = self.api.results[0]["body"]
         self.assertEqual(body["status"], "failed")
-        self.assertEqual(body["result"]["reason"], "MODEL_UNAVAILABLE")
-        self.assertIs(body["result"]["simulated"], False)
-        self.assertNotIn("content", body["result"])
+        result = body["result"]
+        self.assertEqual(set(result) - {"reason", "detail", "elapsed_ms", "usage", "cache"},
+                         set(), "a failed result carries no EIF identity fields")
+        self.assertEqual(result["reason"], "MODEL_UNAVAILABLE")
+        self.assertNotIn("model_id", result)
+        self.assertNotIn("content", result)
 
     def test_unreachable_model_list_fails_closed(self):
         self.ganglion.models_status = 500
@@ -663,10 +929,12 @@ class InferenceWorkerTests(unittest.TestCase):
         self.api.leases = [lease()]
         code, out, err = self.run_quiet(self.runner(), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err)
-        self.api.leases = [lease("job_2", "lease_2", env=envelope(model="qwen-not-there"))]
+        self.api.leases = [lease("job_2", "lease_2",
+                                 env=envelope(task_body=task(model="qwen-not-there")))]
         code, out2, err2 = self.run_quiet(self.runner(), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err2)
-        self.api.leases = [lease("job_3", "lease_3", env=envelope(node_id="r_foreign"))]
+        self.api.leases = [lease("job_3", "lease_3",
+                                 env=envelope(task_body=task(node_id="r_foreign")))]
         code, out3, err3 = self.run_quiet(self.runner(), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err3)
         self.assertEqual([r["body"]["status"] for r in self.api.results],

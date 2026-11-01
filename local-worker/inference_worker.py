@@ -28,10 +28,21 @@ Safety rules this module enforces:
     completion call. After a crash, an already-started job id is never
     executed again; its outcome stays uncertain instead of being guessed.
 
-Wire shapes (internal, fixed by the dispatch lane):
+Wire shapes (canonical worker wire shapes, dispatch lane Addendum A):
 
   GET  /api/worker/jobs/next            -> 204 | {job_id, lease_id, envelope, deadline_at}
+  envelope -> {protocol: 'aipster-bound-cpu-internal/1',
+               task: {capability, model_id, prompt, max_tokens, temperature,
+                      allow_simulated, idempotency_key, placement},
+               binding: {op_id, generation, runtime_instance,
+                         model_fingerprint, deadline_at}}
   POST /api/worker/jobs/:job_id/result -> {lease_id, status, result}
+
+  A succeeded result is exactly {request_id, node_id, runtime_id, model_id,
+  runtime_instance, model_fingerprint, simulated:false, content, elapsed_ms,
+  usage, cache}; runtime_instance and model_fingerprint are echoed from the
+  binding. A failed result is exactly {reason, detail?, elapsed_ms?, usage?,
+  cache?}. L2's website/src/inference/worker-transport.mjs validates both.
 """
 
 import argparse
@@ -72,9 +83,15 @@ STARTED_LEDGER_LIMIT = 5000
 
 PROMPT_MAX_CHARS = 65536
 MAX_TOKENS_CEILING = 4096
-ENVELOPE_KEYS = frozenset({
+ECHO_ID_MAX_CHARS = 256
+ENVELOPE_PROTOCOL = "aipster-bound-cpu-internal/1"
+ENVELOPE_KEYS = frozenset({"protocol", "task", "binding"})
+TASK_KEYS = frozenset({
     "capability", "model_id", "prompt", "max_tokens", "temperature",
-    "allow_simulated", "idempotency_key", "placement", "binding",
+    "allow_simulated", "idempotency_key", "placement",
+})
+BINDING_KEYS = frozenset({
+    "op_id", "generation", "runtime_instance", "model_fingerprint", "deadline_at",
 })
 PLACEMENT_KEYS = frozenset({"device", "node_id", "runtime_id"})
 
@@ -250,42 +267,64 @@ def validate_lease(frame):
     return job_id, lease_id, frame.get("envelope"), deadline
 
 
+def _is_echo_string(value):
+    """A binding value the worker can echo into an L2-valid result.
+
+    L2 accepts any non-empty string up to 256 characters for
+    runtime_instance and model_fingerprint, so that is exactly the range
+    this worker is willing to repeat back.
+    """
+    return (isinstance(value, str) and 0 < len(value) <= ECHO_ID_MAX_CHARS)
+
+
 def validate_envelope(envelope, resource_id, deadline_ms, now_ms):
     """Strict bound-envelope check. Raises EnvelopeRejected on anything odd.
 
-    The accepted field set is exactly what the bound CPU codec emits plus
-    the internal `binding` the dispatch coordinator attaches. Anything
-    else is refused: authority, placement and sampling fields are decided
-    server-side and must never travel back in from a job.
+    The lease envelope is nested: {protocol, task, binding}. `task` is the
+    bound-CPU codec output and is validated field by field; `binding` is the
+    coordinator's internal instance pin and must carry exactly its five
+    fields. Anything else is refused: authority, placement and sampling
+    fields are decided server-side and must never travel back in from a job.
     """
     if not isinstance(envelope, dict):
         raise EnvelopeRejected(ENVELOPE_INVALID, "envelope")
+    if envelope.get("protocol") != ENVELOPE_PROTOCOL:
+        raise EnvelopeRejected(ENVELOPE_INVALID, "protocol")
     if set(envelope) - ENVELOPE_KEYS:
         raise EnvelopeRejected(ENVELOPE_INVALID, "unknown_field")
-    if envelope.get("capability") != "complete":
+    task = envelope.get("task")
+    if not isinstance(task, dict):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "task")
+    if set(task) - TASK_KEYS:
+        raise EnvelopeRejected(ENVELOPE_INVALID, "task_field")
+    binding = envelope.get("binding")
+    if not isinstance(binding, dict):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "binding")
+    if set(binding) != BINDING_KEYS:
+        raise EnvelopeRejected(ENVELOPE_INVALID, "binding_field")
+    if task.get("capability") != "complete":
         raise EnvelopeRejected(ENVELOPE_INVALID, "capability")
-    model_id = envelope.get("model_id")
+    model_id = task.get("model_id")
     if not _is_identifier(model_id):
         raise EnvelopeRejected(ENVELOPE_INVALID, "model_id")
-    prompt = envelope.get("prompt")
+    prompt = task.get("prompt")
     if (not isinstance(prompt, str) or not prompt.strip()
             or len(prompt) > PROMPT_MAX_CHARS):
         raise EnvelopeRejected(ENVELOPE_INVALID, "prompt")
-    max_tokens = envelope.get("max_tokens")
+    max_tokens = task.get("max_tokens")
     if (isinstance(max_tokens, bool) or not isinstance(max_tokens, int)
             or not 1 <= max_tokens <= MAX_TOKENS_CEILING):
         raise EnvelopeRejected(ENVELOPE_INVALID, "max_tokens")
-    if "temperature" in envelope:
-        temperature = envelope["temperature"]
-        if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
-                or temperature != 0):
-            raise EnvelopeRejected(ENVELOPE_INVALID, "temperature")
-    if "allow_simulated" in envelope and envelope["allow_simulated"] is not False:
+    temperature = task.get("temperature")
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or temperature != 0):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "temperature")
+    if task.get("allow_simulated") is not False:
         raise EnvelopeRejected(ENVELOPE_INVALID, "allow_simulated")
-    idempotency_key = envelope.get("idempotency_key")
+    idempotency_key = task.get("idempotency_key")
     if not _is_identifier(idempotency_key, maximum=128):
         raise EnvelopeRejected(ENVELOPE_INVALID, "idempotency_key")
-    placement = envelope.get("placement")
+    placement = task.get("placement")
     if not isinstance(placement, dict) or set(placement) != PLACEMENT_KEYS:
         raise EnvelopeRejected(ENVELOPE_INVALID, "placement")
     if placement["device"] != "cpu":
@@ -294,12 +333,21 @@ def validate_envelope(envelope, resource_id, deadline_ms, now_ms):
         raise EnvelopeRejected(ENVELOPE_INVALID, "node_id")
     if placement["runtime_id"] != "ganglion":
         raise EnvelopeRejected(ENVELOPE_INVALID, "runtime_id")
-    binding = envelope.get("binding")
-    if binding is not None and not isinstance(binding, dict):
-        raise EnvelopeRejected(ENVELOPE_INVALID, "binding")
+    if not _is_identifier(binding["op_id"], maximum=128):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "binding_value")
+    generation = binding["generation"]
+    if (isinstance(generation, bool) or not isinstance(generation, int)
+            or generation < 1):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "binding_value")
+    if not _is_echo_string(binding["runtime_instance"]):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "binding_value")
+    if not _is_echo_string(binding["model_fingerprint"]):
+        raise EnvelopeRejected(ENVELOPE_INVALID, "binding_value")
+    # The lease deadline is the only deadline; a binding that disagrees with
+    # it means the two sides are looking at different jobs.
     if isinstance(deadline_ms, bool) or not isinstance(deadline_ms, int):
         raise EnvelopeRejected(ENVELOPE_INVALID, "deadline")
-    if isinstance(binding, dict) and binding.get("deadline_at") != deadline_ms:
+    if binding["deadline_at"] != deadline_ms:
         raise EnvelopeRejected(ENVELOPE_INVALID, "deadline")
     if deadline_ms <= now_ms:
         raise EnvelopeRejected(ENVELOPE_INVALID, "deadline")
@@ -308,6 +356,10 @@ def validate_envelope(envelope, resource_id, deadline_ms, now_ms):
         "prompt": prompt,
         "max_tokens": max_tokens,
         "deadline_ms": deadline_ms,
+        "node_id": placement["node_id"],
+        "runtime_id": placement["runtime_id"],
+        "runtime_instance": binding["runtime_instance"],
+        "model_fingerprint": binding["model_fingerprint"],
     }
 
 
@@ -611,10 +663,7 @@ class JobRunner:
         try:
             lease = validate_envelope(envelope, resource_id, deadline, self.now_ms())
         except EnvelopeRejected as exc:
-            model_id = envelope.get("model_id") if isinstance(envelope, dict) else None
-            return self._post_failure(meta, job_id, lease_id,
-                                      model_id if isinstance(model_id, str) else None,
-                                      exc.reason, exc.detail)
+            return self._post_failure(meta, job_id, lease_id, exc.reason, exc.detail)
         if self.ledger.contains(job_id):
             # Re-leasing a started job means the earlier result was never
             # confirmed. Re-running it could double-charge and double-run,
@@ -626,14 +675,14 @@ class JobRunner:
         try:
             listed = self.ganglion.models()
         except GanglionError as exc:
-            return self._post_failure(meta, job_id, lease_id, model_id,
+            return self._post_failure(meta, job_id, lease_id,
                                       GANGLION_UNAVAILABLE, exc.detail)
         if model_id not in listed:
-            return self._post_failure(meta, job_id, lease_id, model_id,
+            return self._post_failure(meta, job_id, lease_id,
                                       MODEL_UNAVAILABLE, None)
         remaining = (lease["deadline_ms"] - self.now_ms()) / 1000.0
         if remaining <= 0:
-            return self._post_failure(meta, job_id, lease_id, model_id,
+            return self._post_failure(meta, job_id, lease_id,
                                       DEADLINE_EXCEEDED, None)
         # Commit the attempt before calling Ganglion: a crash after this
         # point must leave the job marked as started, never silently rerun.
@@ -652,14 +701,18 @@ class JobRunner:
                                                self.clock() + remaining)
         except GanglionError as exc:
             elapsed = int(round((self.clock() - started) * 1000))
-            return self._post_failure(meta, job_id, lease_id, model_id,
+            return self._post_failure(meta, job_id, lease_id,
                                       exc.reason, exc.detail, elapsed)
         elapsed_ms = int(round((self.clock() - started) * 1000))
+        # Exactly L2's succeeded key set. runtime_instance and
+        # model_fingerprint are echoed from the binding, never invented.
         result = {
             "request_id": job_id,
-            "node_id": resource_id,
-            "runtime_id": "ganglion",
+            "node_id": lease["node_id"],
+            "runtime_id": lease["runtime_id"],
             "model_id": model_id,
+            "runtime_instance": lease["runtime_instance"],
+            "model_fingerprint": lease["model_fingerprint"],
             "simulated": False,
             "content": completed["content"],
             "elapsed_ms": elapsed_ms,
@@ -668,17 +721,12 @@ class JobRunner:
         }
         return self._post(meta, job_id, lease_id, "succeeded", result)
 
-    def _post_failure(self, meta, job_id, lease_id, model_id, reason, detail,
+    def _post_failure(self, meta, job_id, lease_id, reason, detail,
                       elapsed_ms=None):
-        result = {
-            "request_id": job_id,
-            "node_id": meta["resource_id"],
-            "runtime_id": "ganglion",
-            "simulated": False,
-            "reason": reason,
-        }
-        if model_id:
-            result["model_id"] = model_id
+        # Exactly L2's failed key set: {reason, detail?, elapsed_ms?,
+        # usage?, cache?}. No request/node/runtime/model identity, no
+        # simulated flag and no content: a failure claims nothing.
+        result = {"reason": reason}
         if detail:
             result["detail"] = detail
         if elapsed_ms is not None:
