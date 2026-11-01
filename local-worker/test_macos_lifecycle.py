@@ -26,6 +26,7 @@ Interfaces (reconciled 2026-11-01 on origin/main f6e45f5; vendor from 0763d87):
 """
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -454,6 +455,7 @@ class RestartPreservesIdentityTests(unittest.TestCase):
             self.assertEqual(pairing.cmd_status(self.args), pairing.EXIT_OK)
         self.assertIn("RESTART-BEAT", out.getvalue())
 
+    @unittest.skipIf(os.name == "nt", "POSIX shebang child plus ps-based PID check")
     def test_restart_does_not_start_duplicate_sender_in_same_controller(self):
         from packaging.aipster_tray.child import SenderChild
         fake_bin = Path(self.tmp.name) / "fake-bundle"
@@ -623,6 +625,7 @@ class CrossProcessSenderExclusionTests(unittest.TestCase):
         self.data = Path(self.tmp.name) / "synthetic-data"
         pairing.private_dir(self.data)
 
+    @unittest.skipIf(os.name == "nt", "start_new_session plus ps-based PID check")
     def test_second_sender_exits_without_beating(self):
         holder_script = Path(self.tmp.name) / "hold_sender_lock.py"
         holder_script.write_text(
@@ -668,6 +671,22 @@ class CrossProcessSenderExclusionTests(unittest.TestCase):
         guard = pairing._hold_sender_lock(self.data)
         self.assertIsNotNone(guard, "stale marker must not wedge the next start")
         guard.release()
+
+
+class PackagingNamespaceTests(unittest.TestCase):
+    """Repo packaging/ must survive alongside PyPI's same-named package."""
+
+    def test_repo_packaging_portion_is_importable(self):
+        import packaging
+        from packaging.aipster_tray import child  # noqa: F401
+        here = (ROOT / "packaging").resolve()
+        portions = {Path(entry).resolve() for entry in packaging.__path__}
+        self.assertIn(here, portions, "repo packaging/ lost from packaging.__path__")
+
+    @unittest.skipUnless(importlib.util.find_spec("packaging.version") is not None,
+                         "PyPI packaging not installed")
+    def test_site_packaging_portion_preserved(self):
+        import packaging.version  # noqa: F401
 
 
 if __name__ == "__main__":
