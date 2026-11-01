@@ -63,11 +63,45 @@ production pass after that release:
 
 ## Tests
 
-`website/tests/admin-scaffold.test.mjs` (12 tests): denial matrix,
+`website/tests/admin-scaffold.test.mjs` (13 tests): denial matrix,
 grant edges, role separation, CSRF-before-501 ordering,
 no-state-change, unknown-route non-leakage, panel headers. The mount
 also serves the flag-gated DGM fixture-preview slice (see below). Run `npm
 test` from `website/`.
+
+## Milestone 1: read-only Overview and Resources
+
+Two reads went live; everything else in this doc still holds. Both require
+a live platform grant with `admin.overview.read` / `admin.resources.read`
+(`operations_observer`); the denial matrix, role separation, and
+unknown-route behavior are unchanged, and mutations stay 501 with CSRF
+checked first.
+
+- `GET /api/admin/v1/overview` (`admin.overview.v1`, `available`):
+  platform inventory counts from the `resources` table. Liveness buckets
+  reuse `parseStatusRow` / `resourceLiveness` (`STALE_AFTER_MS`), so they
+  match `GET /api/status` exactly, minus the owner filter. Empty inventory
+  reports measured zeros; fabrics, usable capacity, and coverage stay
+  null with explicit reason codes (`fabric_model_pending`,
+  `not_instrumented`, `coverage_pending`) — never invented zeros.
+- `GET /api/admin/v1/resources` (`admin.resources.v1`, `available`):
+  paginated inventory (`limit` default 20, cap 50; stable `created_at
+  DESC, id ASC` order). Item columns mirror the status route: `id, name,
+  kind, liveness, lastSeenAt, lastSeenAgeMs, usable, configured,
+  authenticated` — owner, cpu/gpu, origin, limits, credits, and
+  verification stay out. `total` counts every row while malformed rows
+  skip the items, exactly like the status route.
+- `/admin` shell renders only server-reported states (`aria-live` status
+  and result regions, escaped output, native pager buttons). The pager
+  starts `hidden` and CSS keeps it hidden until a measured total arrives.
+- Tests: `website/tests/admin-overview.test.mjs` (6 tests: denial matrix,
+  empty inventory, liveness buckets, pagination, item-shape isolation,
+  malformed-row skip) and `website/tests/admin-ui.test.mjs` (13 tests:
+  rendering, escaping, empty/unknown states, pager flow, shell structure
+  and live regions, plus six regressions: superseded Overview/Resources
+  success and failure responses never paint or clear a painted page, a
+  sparse final window keeps bounds from offset plus limit, and a page past
+  a shrunken total reports an empty window). Run `npm test` from `website/`.
 
 ## DGM fixture preview (0.5.0)
 
