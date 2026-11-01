@@ -253,7 +253,7 @@ test('Codex-P1: chunk bytes past the declared file size are refused before stori
   assert.equal(over.status, 413, over.text);
   assert.equal(over.json.code, 'QUOTA_EXCEEDED');
   const dup = await chunk(t, t.alice, b.json.id, 'model.gguf', 0, ggufBytes(8));
-  assert.equal(dup.status, 200, dup.text, 'same-index replacement still allowed');
+  assert.equal(dup.status, 200, dup.text, 'byte-identical re-send still allowed');
   const st = await readJson(await t.call(`/api/catalog/uploads/${b.json.id}`, { headers: sess(t, t.alice) }));
   assert.equal(st.json.received[0].got, 8, 'over-quota bytes never persisted');
 });
@@ -2175,12 +2175,35 @@ test('Codex-sec-P2: exact chunk replays are idempotent (no PUT, no D1 write)', a
   assert.equal(q1.quotas_json, q0.quotas_json, 'counters byte-identical after replay');
   const stored1 = await store.get(key);
   assert.deepEqual(Array.from(stored1), Array.from(stored0), 'stored bytes unchanged');
-  // Same-size but different bytes still take the CAS path and replace.
+  // R1: differing re-sends are metered - each claims the hourly write
+  // budget, so same-size alternation cannot burn unbounded D1/R2 writes
+  // once the budget is spent. Fresh-budget replaces still admit (metered).
   const alt = new Uint8Array(64).fill(0x48);
-  const r2 = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, alt);
-  assert.equal(r2.status, 200, r2.text);
+  const admitted = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, alt);
+  assert.equal(admitted.status, 200, admitted.text);
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  t.env.DB.prepare = (sql) => {
+    if (typeof sql === 'string' && sql.includes('SET quotas_json = ?')) casWrites += 1;
+    return realPrepare(sql);
+  };
+  const qSpent = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  const storedSpent = await store.get(key);
+  for (let i = 0; i < 6; i += 1) {
+    const r = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, i % 2 ? new Uint8Array(Array.from(storedSpent)) : ggufBytes());
+    if (i % 2) {
+      assert.equal(r.status, 200, r.text, 'byte-identical retries stay free on a spent budget');
+    } else {
+      assert.equal(r.status, 429, r.text);
+      assert.equal(r.json.code, 'WRITE_RATE_LIMITED');
+    }
+  }
+  t.env.DB = { ...t.env.DB, prepare: realPrepare };
+  assert.equal(casWrites, 0, 'metered-out re-sends write no counters');
+  const q2 = await t.DB.prepare('SELECT quotas_json FROM catalog_uploads WHERE id = ?').bind(b.json.id).first();
+  assert.equal(q2.quotas_json, qSpent.quotas_json, 'counters unchanged by 429s');
   const stored2 = await store.get(key);
-  assert.deepEqual(Array.from(stored2), Array.from(alt), 'different bytes replace through CAS');
+  assert.deepEqual(Array.from(stored2), Array.from(storedSpent), 'the stored part is untouched');
 });
 test('Codex-sec-P2: attempt gate fails closed on prefix-list faults', async () => {
   const t = await fx();

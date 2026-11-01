@@ -1656,6 +1656,7 @@ async function handleApi(request, env, url) {
         let reserved = false;
         let usedNew = false;
         let usedCredit = 0;
+        let metered = false;
         for (let attempt = 0; attempt < 3 && !reserved; attempt += 1) {
           // Fresh replace pre-read per attempt: a conflict means a rival
           // moved, so re-derive the credit instead of reusing a stale one.
@@ -1687,11 +1688,25 @@ async function handleApi(request, env, url) {
           // identical bytes is a transport retry, not new data - the bytes
           // are already stored and counted, so answer 200 with no PUT and no
           // D1 write. Without this, one budgeted session replays into
-          // unbounded shared R2/D1 operations. Same-size-but-different
-          // bodies still take the CAS path (the sender pays bandwidth equal
-          // to the work), and state was verified uploading just above.
+          // unbounded shared R2/D1 operations. State was verified uploading
+          // just above.
           if (existing && existing.length === bytes.byteLength && bytesEqual(existing, bytes)) {
             return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
+          }
+          // Differing re-send metering (R1): the stored bytes are already
+          // counted, so a re-send with different bytes that took the CAS
+          // path burned D1/R2 writes with possibly zero progress -
+          // unboundedly once the budget is spent, since same-size
+          // alternation freezes the counters while every body reserves and
+          // persists. Each differing re-send therefore claims the hourly
+          // write budget once per PUT (CAS retries share the claim): a
+          // spent budget 429s before any D1/R2 write, while byte-identical
+          // retries return free above. Fresh indexes stay unclaimed
+          // (bounded by declaration plus the session/part caps). A claim
+          // burned on a later 413/state refusal is bounded fail-closed.
+          if (existing && !metered) {
+            await checkWriteBudget(db, me());
+            metered = true;
           }
           const quotas = JSON.parse(live.quotas_json);
           const pc = quotas.parts || { total: 0, bytes: {} };
