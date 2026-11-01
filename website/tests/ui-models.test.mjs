@@ -121,7 +121,10 @@ async function openDetail(ui, repo, wired = true) {
   if (wired) {
     // The client wires the compat submit after its node inventory
     // resolves; no DOM mutation marks that, so poll the listener map.
-    for (let i = 0; i < 200; i++) {
+    // Time-bounded (5 s) rather than 200 turns: CI run 41284295947 timed
+    // out under load at 200 turns and passed on rerun of the same head.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
       if (ui.el('compat-form').listeners.submit) return;
       await new Promise(setImmediate);
     }
