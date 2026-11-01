@@ -30,9 +30,9 @@
 </ul>
 </nav>
 <main>
-<section id="overview" aria-label="Overview"><h2>Overview</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/overview">Load</button></section>
+<section id="overview" aria-label="Overview"><h2>Overview</h2><p class="state" aria-live="polite">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/overview">Load</button><div id="overview-result" aria-live="polite"></div></section>
 <section id="fabrics" aria-label="Fabrics"><h2>Fabrics</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/fabrics">Load</button></section>
-<section id="resources" aria-label="Resources"><h2>Resources</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/resources">Load</button></section>
+<section id="resources" aria-label="Resources"><h2>Resources</h2><p class="state" aria-live="polite">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/resources">Load</button><div id="resources-result" aria-live="polite"></div><div id="resources-pages" class="pager" hidden><button type="button" id="resources-prev">Previous</button><span id="resources-page-label"></span><button type="button" id="resources-next">Next</button></div></section>
 <section id="metrics" aria-label="Metrics"><h2>Metrics</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/metrics">Load</button></section>
 <section id="access" aria-label="Access"><h2>Access</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/access/users">Load</button></section>
 <section id="operations" aria-label="Operations"><h2>Operations</h2><p class="state">Not loaded.</p><button type="button" data-endpoint="/api/admin/v1/operations/health">Load</button></section>

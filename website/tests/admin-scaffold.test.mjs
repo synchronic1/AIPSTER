@@ -147,7 +147,9 @@ test('admin: live grant unlocks scoped reads as unavailable envelopes, never zer
   assert.equal(status.status, 200);
   assert.equal(status.json.grant.role, 'operations_observer');
   assert.equal(status.json.elevation, 'not_implemented');
-  for (const p of ['/api/admin/v1/overview', '/api/admin/v1/fabrics', '/api/admin/v1/resources',
+  // Milestone 1: GET /api/admin/v1/overview and /api/admin/v1/resources are live;
+  // their empty/bucket/denial behavior is pinned in admin-overview.test.mjs.
+  for (const p of ['/api/admin/v1/fabrics',
     '/api/admin/v1/operations/health', '/api/admin/v1/operations/alerts', '/api/admin/v1/coverage']) {
     const out = await readJson(await t.call(p, { headers: t.as(t.alice) }));
     assert.equal(out.status, 200, p);
