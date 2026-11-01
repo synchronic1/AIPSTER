@@ -50,6 +50,21 @@
     <section id="tab-compute" role="tabpanel" hidden>
       <h1>My Compute</h1>
       <section id="connect-card" class="card connect" aria-label="Connect your computer" hidden></section>
+      <section id="inference-panel" class="card" aria-labelledby="inference-h" hidden>
+        <h2 id="inference-h">Run inference</h2>
+        <p class="muted">One non-streaming run on a resource you can use. The server issues a short-lived admission first; the worker executes it and the result is settled exactly once. Leaving this tab stops waiting.</p>
+        <form id="inference-form">
+          <label>Resource <select id="inf-resource"></select></label>
+          <label>Model id <input id="inf-model" maxlength="256" required placeholder="e.g. the model id your worker advertises"></label>
+          <label>Max tokens <input id="inf-max-tokens" type="number" min="1" max="4096" value="256" required></label>
+          <label>Prompt <textarea id="inf-prompt" rows="5" maxlength="65536" required placeholder="One prompt, at most 65,536 characters"></textarea></label>
+          <p id="inf-note" class="muted"></p>
+          <p id="inf-error" class="error" role="alert" hidden></p>
+          <p class="actions"><button id="inf-run" type="submit" class="btn">Run once</button><button id="inf-cancel" type="button" class="btn secondary" hidden>Cancel before start</button>&nbsp;<button id="inf-retry" type="button" class="btn secondary" hidden>Retry with the same request key</button></p>
+        </form>
+        <p id="inf-status" class="muted" role="status"></p>
+        <div id="inf-result" aria-live="polite"></div>
+      </section>
       <details class="card"><summary>Advanced: manual resource registration</summary>
       <p class="muted">Pairing above is the normal path: it discovers hardware automatically. Use this form only to declare a resource by hand.</p>
       <form id="resource-form">

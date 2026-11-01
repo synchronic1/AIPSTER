@@ -1269,6 +1269,10 @@ async function handleApi(request, env, url) {
       sharedWithMe: Number(shared ? shared.n : 0),
       demo: isDemo(),
       nowMs,
+      // Read-only feature exposure for the control panel: the app already
+      // polls this endpoint, so gating here adds no request. Flag off stays
+      // false and the UI renders exactly as it did before inference existed.
+      features: { inference: inferenceEnabled(env) },
     }));
   }
 
