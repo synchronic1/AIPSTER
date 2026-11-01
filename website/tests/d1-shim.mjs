@@ -66,7 +66,7 @@ export function createD1Shim(sqlite) {
   };
 }
 
-export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_write_budget.sql', '0006_fabric.sql', '0007_consent.sql', '0008_repair2.sql', '0009_state_layer.sql', '0010_revision_receipts.sql', '0011_fabric_admission.sql', '0012_fabric_restriction_admission.sql', '0013_heartbeat_binding.sql', '0014_fabric_restriction_receipts.sql', '0015_pairing.sql', '0016_admin.sql', '0017_dgm_preview.sql', '0018_advisor_ops.sql'];
+export const MIGRATION_FILES = ['0001_better_auth.sql', '0002_app.sql', '0003_demo_auth.sql', '0004_disable_flag.sql', '0005_write_budget.sql', '0006_fabric.sql', '0007_consent.sql', '0008_repair2.sql', '0009_state_layer.sql', '0010_revision_receipts.sql', '0011_fabric_admission.sql', '0012_fabric_restriction_admission.sql', '0013_heartbeat_binding.sql', '0014_fabric_restriction_receipts.sql', '0015_pairing.sql', '0016_admin.sql', '0017_dgm_preview.sql', '0018_advisor_ops.sql', '0021_routing_ops.sql'];
 
 export function applyMigrations(sqlite, names = MIGRATION_FILES) {
   for (const name of names) {

@@ -24,7 +24,8 @@ export const ADVISOR_EVIDENCE_MAX = 8;
 export const ADVISOR_BLOCKED_MAX = 8;
 export const ADVISOR_BLOCKED_LEN_MAX = 500;
 export const ADVISOR_CAPS_MAX = 10;
-export const ADVISOR_CAP_TOKEN = /^[a-z0-9][a-z0-9-]{0,40}$/;
+import { CAP_TOKEN as SHARED_CAP_TOKEN, filterCapTokens } from '../lib/caps.js';
+export const ADVISOR_CAP_TOKEN = SHARED_CAP_TOKEN;
 // Deterministic restrictions, computed server-side, always attached: advice
 // never implies what these deny.
 export const ADVISOR_RESTRICTIONS = ['dispatch-disabled', 'model-compatibility-unknown'];
@@ -70,15 +71,7 @@ function telemetryOf(liveness) {
 }
 
 function filterCaps(raw) {
-  let arr;
-  try { arr = JSON.parse(raw || '[]'); } catch { return []; }
-  if (!Array.isArray(arr)) return [];
-  const out = [];
-  for (const c of arr) {
-    if (typeof c === 'string' && ADVISOR_CAP_TOKEN.test(c)) out.push(c);
-    if (out.length >= ADVISOR_CAPS_MAX) break;
-  }
-  return out;
+  return filterCapTokens(raw, { max: ADVISOR_CAPS_MAX, pattern: ADVISOR_CAP_TOKEN });
 }
 
 /**
@@ -164,13 +157,6 @@ export function validateAdvice(value, { refs }) {
   return value;
 }
 
-/** Canonical SHA-256 hex of a JSON value (stable key order) for op digests. */
-export async function canonicalDigest(value) {
-  const stable = (v) => {
-    if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
-    if (v && typeof v === 'object') return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(',')}}`;
-    return JSON.stringify(v) ?? 'null';
-  };
-  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(stable(value)));
-  return Array.from(new Uint8Array(bytes), (x) => x.toString(16).padStart(2, '0')).join('');
-}
+// Canonical digest lives in lib/digest.js (shared with routing); the
+// re-export keeps existing adviser imports working unchanged.
+export { canonicalDigest } from '../lib/digest.js';
