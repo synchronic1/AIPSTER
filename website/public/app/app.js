@@ -12,6 +12,17 @@ let generation = 0;
 const staleError = () => Object.assign(new Error('Stale response.'), { stale: true });
 const isStale = (e) => !!(e && e.stale);
 
+// Server-declared feature flags, read from the GET /api/status payload the app
+// already polls. Inference controls render only after the server says the
+// feature is on; an unknown or failed read keeps them hidden (fail closed).
+const features = { inference: false, inferenceKnown: false };
+function applyFeatures(data) {
+  const f = data && data.features;
+  if (!f || typeof f.inference !== 'boolean') return;
+  features.inference = f.inference === true;
+  features.inferenceKnown = true;
+}
+
 const $ = (id) => document.getElementById(id);
 const banner = (msg) => { const b = $('banner'); b.textContent = msg; b.hidden = false; setTimeout(() => { b.hidden = true; }, 3500); };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -137,6 +148,7 @@ async function refreshStatusStrip(token, gen, failures) {
   try {
     const data = await api('/api/status');
     if (token !== statusPollToken || gen !== generation) return;
+    applyFeatures(data);
     renderStatus(strip, data);
     scheduleStatusPoll(token, gen, STATUS_POLL_BASE_MS, 0);
   } catch (e) {
@@ -927,8 +939,15 @@ async function loadCompute() {
   // Done can refresh within the same navigation generation. Only the latest
   // inventory request may update either the cards or the grant selector.
   const load = ++computeLoad;
+  // A repaint ends any run whose controls are being replaced; the key stays
+  // client-side only and is never re-used by a later run.
+  stopInferencePolling();
   renderConnectCard();
   const el = $('compute-list'); loading(el);
+  // The run panel is flag-gated by the server: it stays hidden until the
+  // status payload (or, if that read was missed, one direct re-read) says
+  // inference is enabled.
+  $('inference-panel').hidden = true;
   try {
     const inv = await api('/api/inventory?limit=50');
     if (load !== computeLoad) return;
@@ -938,12 +957,391 @@ async function loadCompute() {
     el.innerHTML = inv.items.length ? inv.items.map(resourceCard).join('') : '';
     if (!inv.items.length) state(el, '', 'No resources yet. Pair a worker above, or register one manually under Advanced.');
     $('grant-resource').innerHTML = inv.items.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+    await refreshInferencePanel(inv, load);
   } catch (e) {
     if (isStale(e) || load !== computeLoad) return;
     if (connect) { connect.phase = 'load-error'; connect.loadError = e.message; paintConnectCard(); }
     state(el, 'error', e.message);
   }
 }
+
+// ---- inference run panel (dark unless the server says it is enabled) ----
+// The exposure signal is features.inference on GET /api/status, which the app
+// already polls, so the flag-off page issues no new request and looks exactly
+// as it did before this feature existed. Admission -> job (client idempotency
+// key + deadline) -> reconcile polling.
+// Model output is untrusted: it renders through esc() only, never innerHTML
+// of raw content, and provenance must say simulated:false before this panel
+// calls anything a real result. The run key is minted once per run; a retry
+// after an unknown transport outcome re-submits the identical body so the
+// server can replay it instead of creating a duplicate job.
+const INFERENCE_MAX_TOKENS = 4096;
+const INFERENCE_MAX_PROMPT = 65536;
+const INFERENCE_DEADLINE_MS = 120000;
+const INFERENCE_POLL_BASE_MS = 750;
+const INFERENCE_POLL_MAX_MS = 5000;
+const INFERENCE_CODE_RE = /\(([A-Z][A-Z0-9_]*)\)\s*$/;
+// A failure with one of these codes is a defined server response, not an
+// unknown transport outcome; there is nothing to safely replay.
+const INFERENCE_DEFINITE = new Set([
+  'DISPATCH_LIMIT', 'MODEL_NOT_ADVERTISED', 'BAD_RUNTIME', 'BAD_MAX_TOKENS', 'BAD_MODEL', 'BAD_RESOURCE',
+  'GRANT_QUOTA_EXHAUSTED', 'NO_MATCHING_GRANT', 'INFERENCE_DISABLED', 'RESOURCE_STALE',
+  'ADMISSION_EXPIRED', 'ADMISSION_NOT_AVAILABLE', 'BINDING_MISMATCH', 'INVALID_REQUEST', 'INVALID_DEADLINE',
+  'IDEMPOTENCY_CONFLICT', 'FORGED_CLIENT_AUTHORITY', 'UNSUPPORTED_FIELD', 'UNSUPPORTED_PARAMETER',
+  'UNSUPPORTED_CAPABILITY', 'UNSUPPORTED_CONTRACT_VERSION', 'TARGET_CAPABILITY_UNSUPPORTED',
+  'AUTH_REQUIRED', 'CSRF_REQUIRED', 'KEY_EXPIRED', 'KEY_SCOPE', 'KEY_FORBIDDEN', 'DEMO_RESTRICTED', 'NOT_FOUND'
+]);
+const INFERENCE_COPY = {
+  DISPATCH_LIMIT: 'Dispatch limit reached for now. Wait for current runs to finish, then try again.',
+  MODEL_NOT_ADVERTISED: 'The worker does not advertise this model id. Pick a model that worker lists.',
+  BAD_RUNTIME: 'That runtime id is not allowed on this deployment (ganglion or llama-server).',
+  GRANT_QUOTA_EXHAUSTED: 'The grant budget is exhausted for this request.',
+  NO_MATCHING_GRANT: 'No single grant covers this exact resource, model and token count.',
+  INFERENCE_DISABLED: 'Inference is disabled on this deployment.',
+  DISPATCH_UNAVAILABLE: 'Inference dispatch is not available on this deployment.',
+  RESOURCE_STALE: 'That resource is not reachable right now (its heartbeat is stale).',
+  ADMISSION_EXPIRED: 'The admission expired before the run started. Run again.',
+  ADMISSION_NOT_AVAILABLE: 'The admission is not available to this account. Run again.',
+  BINDING_MISMATCH: 'The admission does not match this model and token count. Run again.',
+  BAD_MAX_TOKENS: 'max_tokens must be a whole number from 1 to 4096.',
+  BAD_MODEL: 'Enter a model id.',
+  BAD_RESOURCE: 'Choose a reachable resource.',
+  INVALID_REQUEST: 'The request was refused as invalid.',
+  INVALID_DEADLINE: 'The deadline was refused. Run again.',
+  IDEMPOTENCY_CONFLICT: 'That request key was already used for a different request. Run once to start a new one.',
+  AUTH_REQUIRED: 'Sign in again to run inference.',
+  CSRF_REQUIRED: 'The request was refused. Reload the panel and try again.',
+  KEY_SCOPE: 'This credential cannot run inference.',
+  DEMO_RESTRICTED: 'The demo account cannot run inference.',
+  NOT_FOUND: 'That resource or request was not found for this account.',
+  OUTCOME_UNCERTAIN: 'The outcome is uncertain. Nothing is retried automatically.',
+  RESULT_UNAVAILABLE: 'The result could not be read.',
+  AUTHORITY_UNAVAILABLE: 'The dispatch service is unavailable.',
+  DEADLINE_REACHED: 'No result arrived before the deadline. The outcome is unknown.'
+};
+let inferencePollToken = 0;
+let inferenceRun = null;
+
+const inferenceCode = (e) => {
+  const m = INFERENCE_CODE_RE.exec(String((e && e.message) || ''));
+  return m ? m[1] : null;
+};
+function inferenceErrorText(e) {
+  const code = inferenceCode(e);
+  const raw = String((e && e.message) || 'Request failed.');
+  const base = code && INFERENCE_COPY[code] ? INFERENCE_COPY[code] : raw.replace(/\s*\([A-Z][A-Z0-9_]*\)\s*$/, '');
+  return code ? `${base} (${code})` : base;
+}
+// 128 bits of randomness, 36 chars, matching the coordinator's key regex
+// ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$.
+function inferenceKey() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      return 'inf-' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch { /* fall through to a best-effort local key */ }
+  return 'inf-' + Date.now().toString(36) + '-' + Math.random().toString(16).slice(2, 12);
+}
+const inferenceCurrent = (run) => !!(run && run.token === inferencePollToken && run.gen === generation);
+function setInferenceStatus(msg) { $('inf-status').textContent = msg; }
+function setInferenceBusy(busy) {
+  $('inf-run').disabled = busy;
+  $('inf-run').textContent = busy ? 'Running…' : 'Run once';
+}
+function stopInferencePolling() {
+  inferencePollToken++;
+  if (inferenceRun && inferenceRun.phase !== 'settled') inferenceRun.phase = 'stopped';
+}
+
+async function refreshInferencePanel(inv, load) {
+  const panel = $('inference-panel');
+  const current = () => load === undefined || load === computeLoad;
+  if (!features.inferenceKnown) {
+    // A tab switch bumps the generation and drops the startup status read, so
+    // a fast or direct entry into My Compute can arrive with the flag still
+    // unknown. Re-read the same endpoint once; any failure stays hidden.
+    try {
+      applyFeatures(await api('/api/status'));
+    } catch (e) {
+      if (isStale(e) || !current()) return;
+      panel.hidden = true;
+      return;
+    }
+    if (!current()) return;
+    if (!features.inferenceKnown) { panel.hidden = true; return; }
+  }
+  if (!features.inference) { panel.hidden = true; return; }
+  panel.hidden = false;
+  paintInferencePanel(inv);
+}
+
+function paintInferencePanel(inv) {
+  const reachable = ((inv && inv.items) || []).filter((r) => r.state && r.state.online);
+  const sel = $('inf-resource');
+  const keep = sel.value;
+  sel.innerHTML = reachable.length
+    ? reachable.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('')
+    : '<option value="">no reachable resource</option>';
+  if (keep && reachable.some((r) => r.id === keep)) sel.value = keep;
+  const demo = !!(me && me.demo);
+  $('inf-run').disabled = demo || !reachable.length;
+  $('inf-note').textContent = demo
+    ? 'Inference is unavailable for the demo account.'
+    : reachable.length
+      ? 'Reachability only: a fresh heartbeat does not promise this worker will accept this model.'
+      : 'No reachable resource yet. Pair a worker and wait for a heartbeat.';
+}
+
+function inferenceFailText(text) {
+  const err = $('inf-error');
+  err.textContent = text;
+  err.hidden = false;
+}
+function finishInferenceError(e, retryable) {
+  setInferenceBusy(false);
+  $('inf-cancel').hidden = true;
+  $('inf-retry').hidden = !retryable;
+  setInferenceStatus('Stopped.');
+  inferenceFailText(inferenceErrorText(e));
+}
+function finishInferenceUncertain(extra) {
+  if (inferenceRun) inferenceRun.phase = 'uncertain';
+  setInferenceBusy(false);
+  $('inf-cancel').hidden = true;
+  $('inf-retry').hidden = true;
+  setInferenceStatus(extra && extra.code === 'DEADLINE_REACHED' ? 'Deadline reached.' : 'Outcome uncertain.');
+  const code = (extra && extra.code) || 'OUTCOME_UNCERTAIN';
+  inferenceFailText(inferenceErrorText(new Error(`${INFERENCE_COPY[code] || 'The outcome is unknown.'} (${code})`)));
+}
+function inferenceOutcomeHtml(outcome) {
+  const o = outcome || {};
+  const p = o.provenance || null;
+  const finish = String(o.finish || 'unknown');
+  const verified = !!(p && p.simulated === false && typeof p.runtime_id === 'string' && typeof p.model_id === 'string');
+  const body = o.released === true && typeof o.content === 'string'
+    ? `<pre class="cardtext">${esc(o.content)}</pre>`
+    : `<p class="muted">Content withheld (${esc(o.withheld_reason || (o.released === false ? 'release not authorized' : 'no content'))}). The admitted budget is still charged.</p>`;
+  const provenance = verified
+    ? `<p class="muted">runtime: ${esc(p.runtime_id)}${p.runtime_instance ? ' · instance: ' + esc(p.runtime_instance) : ''} · model: ${esc(p.model_id)} · simulated: false</p>`
+    : '<p class="error" role="alert">Provenance is incomplete or simulated; this is not a verified real result.</p>';
+  return `<div class="card"><h2>Result <span class="pill ${finish === 'succeeded' ? 'ok' : 'bad'}">${esc(finish)}</span></h2>${body}${provenance}</div>`;
+}
+function renderInferenceOutcome(outcome) {
+  if (inferenceRun) { inferenceRun.phase = 'settled'; inferenceRun.retry = null; }
+  setInferenceBusy(false);
+  $('inf-cancel').hidden = true;
+  $('inf-retry').hidden = true;
+  setInferenceStatus('Settled.');
+  $('inf-result').innerHTML = inferenceOutcomeHtml(outcome);
+}
+
+async function runInferenceOnce() {
+  if (inferenceRun && ['admitting', 'submitting', 'waiting'].includes(inferenceRun.phase)) return;
+  const err = $('inf-error'); err.textContent = ''; err.hidden = true;
+  $('inf-result').innerHTML = '';
+  $('inf-retry').hidden = true;
+  if (me && me.demo) return inferenceFailText('The demo account cannot run inference. (DEMO_RESTRICTED)');
+  const resourceId = $('inf-resource').value;
+  const modelId = $('inf-model').value.trim();
+  const maxTokens = Number($('inf-max-tokens').value);
+  const prompt = $('inf-prompt').value;
+  if (!resourceId) return inferenceFailText('Choose a reachable resource. (BAD_RESOURCE)');
+  if (!modelId || modelId.length > 256) return inferenceFailText('Enter a model id (up to 256 characters). (BAD_MODEL)');
+  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > INFERENCE_MAX_TOKENS) {
+    return inferenceFailText('max_tokens must be a whole number from 1 to 4096. (BAD_MAX_TOKENS)');
+  }
+  if (!prompt || prompt.length > INFERENCE_MAX_PROMPT) {
+    return inferenceFailText('Enter a prompt of 1 to 65,536 characters. (INVALID_REQUEST)');
+  }
+  const gen = generation;
+  const token = ++inferencePollToken;
+  const key = inferenceKey();
+  const deadlineMs = Date.now() + INFERENCE_DEADLINE_MS;
+  const run = { key, gen, token, body: null, deadline: deadlineMs, phase: 'admitting', attempts: 0, retry: null };
+  inferenceRun = run;
+  setInferenceBusy(true);
+  $('inf-cancel').hidden = false;
+  setInferenceStatus('Requesting an admission…');
+  let admission;
+  try {
+    admission = await api('/api/inference/admissions', {
+      method: 'POST',
+      body: JSON.stringify({ resource_id: resourceId, model_id: modelId, max_tokens: maxTokens }),
+    });
+  } catch (e) {
+    if (!inferenceCurrent(run)) return;
+    if (isStale(e)) return;
+    run.phase = 'failed';
+    return finishInferenceError(e, false);
+  }
+  if (!inferenceCurrent(run)) return;
+  const ref = admission && admission.admission_ref;
+  const expires = admission && admission.expires_at;
+  if (typeof ref !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(ref)
+    || !Number.isSafeInteger(expires)) {
+    run.phase = 'failed';
+    return finishInferenceError(new Error('The admission response was unusable. (DISPATCH_UNAVAILABLE)'), false);
+  }
+  const deadlineAt = Math.min(deadlineMs, expires);
+  if (!(deadlineAt > Date.now())) {
+    run.phase = 'failed';
+    return finishInferenceError(new Error('The admission is already expired. (ADMISSION_EXPIRED)'), false);
+  }
+  run.body = {
+    contract_version: 'v1.0.0', admission_ref: ref, idempotency_key: key,
+    model_id: modelId, prompt, max_tokens: maxTokens, deadline_at: deadlineAt,
+  };
+  run.deadline = deadlineAt;
+  run.phase = 'submitting';
+  setInferenceStatus('Submitting the run…');
+  await submitInferenceJob(run);
+}
+
+async function submitInferenceJob(run) {
+  if (!inferenceCurrent(run) || !run.body) return;
+  $('inf-retry').hidden = true;
+  $('inf-error').hidden = true;
+  setInferenceBusy(true);
+  $('inf-cancel').hidden = false;
+  run.phase = 'submitting';
+  setInferenceStatus(run.attempts ? 'Resubmitting the same request key…' : 'Submitting the run…');
+  let res;
+  try {
+    res = await api('/api/jobs', { method: 'POST', body: JSON.stringify(run.body) });
+  } catch (e) {
+    if (!inferenceCurrent(run) || isStale(e)) return;
+    const code = inferenceCode(e);
+    // A same-key resubmit while the first attempt is still being admitted
+    // answers 409 OPERATION_IN_PROGRESS: that is a live operation to follow,
+    // not a failure to replay.
+    if (code === 'OPERATION_IN_PROGRESS') return pollInference(run);
+    // A defined refusal is final; anything else (a network failure or an
+    // unknown server outcome) may already have created the job, so the only
+    // safe retry is the identical body, which replays under the same key.
+    const retryable = !(code && INFERENCE_DEFINITE.has(code));
+    run.phase = 'failed';
+    run.retry = retryable ? 'post' : null;
+    if (retryable) setInferenceStatus('The request outcome is unknown. Nothing was retried automatically.');
+    return finishInferenceError(e, retryable);
+  }
+  if (!inferenceCurrent(run)) return;
+  await handleInferenceJobState(run, res);
+}
+
+async function handleInferenceJobState(run, res) {
+  const status = res && res.status;
+  if (status === 'settled') return renderInferenceOutcome(res.outcome);
+  if (status === 'dispatched') {
+    setInferenceStatus('Queued for the worker…');
+    return pollInference(run);
+  }
+  if (status === 'pending') {
+    setInferenceStatus('Waiting for dispatch…');
+    return scheduleInferencePoll(run);
+  }
+  if (status === 'uncertain') return finishInferenceUncertain(res);
+  if (status === 'expired_before_start') {
+    if (inferenceRun) inferenceRun.phase = 'expired';
+    setInferenceBusy(false);
+    $('inf-cancel').hidden = true;
+    setInferenceStatus('Expired before start.');
+    return inferenceFailText('The deadline passed before the run started; its holds were released. (DEADLINE_EXCEEDED)');
+  }
+  if (status === 'released') {
+    if (inferenceRun) inferenceRun.phase = 'released';
+    setInferenceBusy(false);
+    $('inf-cancel').hidden = true;
+    setInferenceStatus('Not admitted.');
+    return inferenceFailText('The operation was not admitted and its holds were released. (NOT_ADMITTED)');
+  }
+  if (status === 'rejected') {
+    if (inferenceRun) inferenceRun.phase = 'failed';
+    return finishInferenceError(new Error(`${res.error || 'The request was refused.'} (${res.code || 'REJECTED'})`), false);
+  }
+  // An unrecognised shape is an unknown outcome, never a success.
+  return finishInferenceUncertain({ code: 'OUTCOME_UNCERTAIN' });
+}
+
+function inferenceBackoff(attempts) {
+  return Math.min(Math.round(INFERENCE_POLL_BASE_MS * 1.6 ** Math.max(0, attempts - 1)), INFERENCE_POLL_MAX_MS);
+}
+function scheduleInferencePoll(run) {
+  if (!inferenceCurrent(run) || run.phase === 'settled' || run.phase === 'stopped') return;
+  if (typeof setTimeout !== 'function') return;
+  run.attempts += 1;
+  setTimeout(() => { pollInference(run); }, inferenceBackoff(run.attempts));
+}
+
+async function pollInference(run) {
+  if (!inferenceCurrent(run) || run.phase === 'settled' || run.phase === 'stopped') return;
+  if (!(Date.now() < run.deadline)) return finishInferenceUncertain({ code: 'DEADLINE_REACHED' });
+  run.phase = 'waiting';
+  let res;
+  try {
+    res = await api('/api/jobs/' + encodeURIComponent(run.key));
+  } catch (e) {
+    if (!inferenceCurrent(run) || isStale(e)) return;
+    const code = inferenceCode(e);
+    if (code === 'OPERATION_IN_PROGRESS') return scheduleInferencePoll(run);
+    // A transient read/store failure keeps waiting until the deadline. A
+    // recorded uncertain result is terminal and is never retried blindly.
+    if (code === null || code === 'DISPATCH_UNAVAILABLE') return scheduleInferencePoll(run);
+    if (code === 'OUTCOME_UNCERTAIN' || code === 'RESULT_UNAVAILABLE' || code === 'AUTHORITY_UNAVAILABLE' || code === 'RESULT_REJECTED') {
+      return finishInferenceUncertain({ code });
+    }
+    run.phase = 'failed';
+    return finishInferenceError(e, false);
+  }
+  if (!inferenceCurrent(run)) return;
+  const status = res && res.status;
+  if (status === 'settled') return renderInferenceOutcome(res.outcome);
+  if (status === 'dispatched') { setInferenceStatus('Waiting for the worker…'); return scheduleInferencePoll(run); }
+  if (status === 'pending') { setInferenceStatus('Waiting for dispatch…'); return scheduleInferencePoll(run); }
+  if (status === 'uncertain') return finishInferenceUncertain(res);
+  if (status === 'expired_before_start') return handleInferenceJobState(run, res);
+  if (status === 'released') return handleInferenceJobState(run, res);
+  if (status === 'rejected') return handleInferenceJobState(run, res);
+  return finishInferenceUncertain({ code: 'OUTCOME_UNCERTAIN' });
+}
+
+async function retryInferenceRun() {
+  const run = inferenceRun;
+  if (!run || !run.body || !inferenceCurrent(run)) return;
+  run.attempts = 0;
+  await submitInferenceJob(run);
+}
+
+async function cancelInferenceRun() {
+  const run = inferenceRun;
+  if (!run || !run.key || !inferenceCurrent(run)) return;
+  if (run.phase === 'settled' || run.phase === 'stopped') return;
+  setInferenceStatus('Requesting cancellation…');
+  let res;
+  try {
+    res = await api('/api/jobs/' + encodeURIComponent(run.key) + '/cancel', { method: 'POST', body: '{}' });
+  } catch (e) {
+    if (!inferenceCurrent(run) || isStale(e)) return;
+    return finishInferenceError(e, false);
+  }
+  if (!inferenceCurrent(run)) return;
+  if (res && res.status === 'settled') return renderInferenceOutcome(res.outcome);
+  if (res && res.status === 'cancelled_before_start') {
+    inferencePollToken++; // fence any scheduled poll; the run is over
+    run.phase = 'cancelled';
+    setInferenceBusy(false);
+    $('inf-cancel').hidden = true;
+    setInferenceStatus('Cancelled before start. Nothing ran.');
+    return;
+  }
+  if (res && res.cancel === 'UNSUPPORTED_CAPABILITY') {
+    $('inf-cancel').hidden = true;
+    setInferenceStatus('The run already started; execution cannot be cancelled. Waiting for the result.');
+    return scheduleInferencePoll(run);
+  }
+  setInferenceStatus('Cancellation requested.');
+}
+
 
 async function loadShared() {
   const el = $('shared-list'); loading(el);
@@ -1614,6 +2012,20 @@ function resetState() {
   $('connect-card').innerHTML = ''; $('connect-card').hidden = true;
   $('grant-resource').innerHTML = '';
   if (advAbort) advAbort.abort(); advAbort = null; advLastKey = null;
+  // Inference run state is identity-scoped: stop polling, drop the key and
+  // any content, and hide the panel until the server re-announces the flag.
+  stopInferencePolling();
+  inferenceRun = null;
+  features.inference = false; features.inferenceKnown = false;
+  $('inference-panel').hidden = true;
+  $('inf-error').textContent = ''; $('inf-error').hidden = true;
+  $('inf-status').textContent = '';
+  $('inf-result').innerHTML = '';
+  $('inf-note').textContent = '';
+  $('inf-resource').innerHTML = '';
+  $('inf-cancel').hidden = true; $('inf-retry').hidden = true;
+  $('inf-run').disabled = false; $('inf-run').textContent = 'Run once';
+  for (const id of ['inf-model', 'inf-max-tokens', 'inf-prompt']) { const el = $(id); if (el) el.value = id === 'inf-max-tokens' ? '256' : ''; }
   $('adv-task').value = ''; $('adv-optin').checked = false;
   $('adv-mode').textContent = ''; $('adv-fields').textContent = '';
   $('adv-resources').innerHTML = ''; $('adv-result').innerHTML = '';
@@ -1655,6 +2067,9 @@ function resetState() {
 }
 
 document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('click', () => {
+  // Leaving the panel ends any scheduled reconcile; a late response is
+  // dropped by the generation fence inside api() as well.
+  stopInferencePolling();
   clearPairingCode();
   clearSetupCode();
   if (connect) paintConnectCard();
@@ -1766,6 +2181,9 @@ $('key-dismiss').addEventListener('click', () => { $('key-secret').textContent =
 $('adv-form').addEventListener('submit', async (e) => { e.preventDefault(); submitAdvice(); });
 $('adv-cancel').addEventListener('click', () => cancelAdvice());
 $('adv-retry').addEventListener('click', async () => { await submitAdvice(advLastKey); });
+$('inference-form').addEventListener('submit', async (e) => { e.preventDefault(); await runInferenceOnce(); });
+$('inf-cancel').addEventListener('click', () => { cancelInferenceRun(); });
+$('inf-retry').addEventListener('click', () => { retryInferenceRun(); });
 $('key-curl-copy').addEventListener('click', async () => {
   try {
     const text = $('key-curl').textContent || '';

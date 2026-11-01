@@ -25,6 +25,17 @@ lazily and its absence fails closed with `503 DISPATCH_UNAVAILABLE`.
 takes precedence over the legacy `GET /api/jobs/:id` read; with the flag off
 the legacy read is untouched.
 
+### Control-panel feature exposure
+
+The web app learns whether to render inference controls from
+`features: {inference: boolean}` on `GET /api/status` — the endpoint it already
+polls — so flag-off adds no request and the page is unchanged. The value is
+exactly `INFERENCE_ENABLED === '1'` for the deployment, is authenticated like the
+rest of the status payload, and carries no per-user or secret data. If the app
+has no accepted status read (for example a tab switch fenced the startup one),
+entering My Compute re-reads `/api/status` once; any failure leaves the controls
+hidden. The app never treats an unknown flag as enabled.
+
 ## Admission issuance
 
 The issuer checks, before calling `store.issueAdmission`:

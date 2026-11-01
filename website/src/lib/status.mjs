@@ -41,6 +41,7 @@
  * @property {number} total
  * @property {boolean} itemsTruncated
  * @property {number} sharedWithMe
+ * @property {{inference: boolean}} features
  * @property {StatusItem[]} items
  */
 
@@ -126,10 +127,14 @@ function parseAggregateSummary(summary, total) {
  * the Overview inventory total even when the list is truncated. Callers that
  * omit the aggregate get the legacy derivation from the listed page.
  *
- * @param {{rows: unknown[], summary?: {online:number,stale:number,offline:number,unknown:number}, total?: number, sharedWithMe: number, demo: boolean, nowMs: number}} input
+ * `features.inference` is the read-only exposure signal for the optional
+ * inference control panel. It defaults to false, so a caller that does not
+ * pass the deployment flag advertises nothing.
+ *
+ * @param {{rows: unknown[], summary?: {online:number,stale:number,offline:number,unknown:number}, total?: number, sharedWithMe: number, demo: boolean, nowMs: number, features?: {inference?: boolean}}} input
  * @returns {StatusPayload}
  */
-export function buildStatus({ rows, summary, total, sharedWithMe, demo, nowMs }) {
+export function buildStatus({ rows, summary, total, sharedWithMe, demo, nowMs, features }) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   /** @type {StatusItem[]} */
   const items = [];
@@ -170,6 +175,7 @@ export function buildStatus({ rows, summary, total, sharedWithMe, demo, nowMs })
     total: finalSummary.total,
     itemsTruncated,
     sharedWithMe: Number.isSafeInteger(sharedWithMe) && sharedWithMe >= 0 ? sharedWithMe : 0,
+    features: { inference: !!(features && features.inference === true) },
     items,
   };
 }
