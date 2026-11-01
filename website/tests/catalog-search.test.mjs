@@ -220,7 +220,7 @@ test('Codex-sec-P2: hub cache stores 404s, never errors', async () => {
     __resetHubMetaCache();
   }
 });
-
+
 test('R2: hub misses admit before fetching; cached hits never admit', async () => {
   __resetHubMetaCache();
   const realFetch = globalThis.fetch;
