@@ -60,9 +60,13 @@ test('production default supplies no authority/transport and refuses without sid
   noNetwork();
 });
 
-test('/api/jobs stays 501 and worker.js does not import the coordinator', async () => {
+test('/api/jobs stays 501 with the flag off; wiring exists only behind INFERENCE_ENABLED', async () => {
   const src = readFileSync(path.join(SRC, 'worker.js'), 'utf8');
-  assert.ok(!src.includes('dispatch-coordinator'), 'worker.js must not wire the coordinator');
+  // L2 wires the coordinator into routes, but only behind the flag: the
+  // disabled branch still answers with the exact 501 body and no store or
+  // authority is consulted (asserted end to end below).
+  assert.ok(src.includes('INFERENCE_ENABLED'), 'the flag guard must be present');
+  assert.ok(src.includes("code: 'INFERENCE_DISABLED'"), 'the disabled 501 body must be preserved');
   const { createTestEnv, readJson } = await import('./d1-shim.mjs');
   const t = await createTestEnv();
   const out = await readJson(await t.call('/api/jobs', { method: 'POST', headers: { ...t.as(t.alice), ...t.csrf }, body: { model: 'demo', prompt: 'hi' } }));
