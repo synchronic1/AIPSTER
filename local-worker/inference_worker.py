@@ -57,6 +57,7 @@ import argparse
 import errno
 import http.client
 import json
+import math
 import os
 import signal
 import sys
@@ -91,6 +92,10 @@ DEFAULT_RUNTIME_ID = "ganglion"
 
 JOBS_POLL_INTERVAL_SEC = 2.0
 JOBS_MAX_IDLE_SEC = 30.0
+# 2 ** n is exactly representable as a float only up to 2 ** 1023; a larger
+# int raises OverflowError when it is multiplied into a float. The idle
+# exponent is held below this so a long run of empty polls cannot overflow.
+MAX_IDLE_BACKOFF_EXPONENT = 1023
 MODELS_CACHE_TTL_SEC = 30.0
 GANGLION_MODELS_TIMEOUT_SEC = 5
 JOBS_LOCK_NAME = "jobs.lock"
@@ -605,6 +610,27 @@ def _hold_lock(data_dir, name):
     return _Lock(stream)
 
 
+def _max_idle_exponent(poll_interval, max_idle):
+    """Largest idle exponent an empty-poll backoff ever needs.
+
+    The wait is ``min(poll_interval * 2 ** idle, max_idle)``, so every idle
+    at or beyond ``log2(max_idle / poll_interval)`` already yields the cap.
+    Holding the counter there leaves the growth schedule and the cap
+    unchanged while keeping ``2 ** idle`` float-safe: an unbounded counter
+    made the power overflow (OverflowError) after ~1024 empty polls, before
+    ``min`` could apply the cap (finding 4437293876).
+    """
+    if not (max_idle > poll_interval):
+        return 0
+    ratio = max_idle / poll_interval
+    if not math.isfinite(ratio):
+        return MAX_IDLE_BACKOFF_EXPONENT
+    # +1 keeps a rounding margin, so the capped delay is exactly max_idle
+    # rather than a float hair below it.
+    exponent = int(math.ceil(math.log2(ratio))) + 1
+    return max(0, min(exponent, MAX_IDLE_BACKOFF_EXPONENT))
+
+
 class JobRunner:
     """Lease -> validate -> one upstream completion -> result, with backoff."""
 
@@ -619,6 +645,9 @@ class JobRunner:
         self.sleep = sleep or time.sleep
         self.poll_interval = max(0.001, float(poll_interval))
         self.max_idle = max(self.poll_interval, float(max_idle_sec))
+        # Idle polling stops counting here once the delay is already capped.
+        self.max_idle_exponent = _max_idle_exponent(self.poll_interval,
+                                                    self.max_idle)
         # Both are checked here so a bad runtime id or a non-loopback or
         # malformed upstream is refused before a stored credential is read.
         self.runtime_id = check_runtime_id(runtime_id)
@@ -732,6 +761,14 @@ class JobRunner:
               "left mid-flight", file=sys.stderr)
         return pairing.EXIT_OK
 
+    def _idle_delay(self, idle):
+        """Wait after `idle` consecutive empty polls, capped at max_idle."""
+        if idle >= self.max_idle_exponent:
+            # Already at (or past) the cap: return it without evaluating a
+            # power large enough to overflow a float.
+            return self.max_idle
+        return min(self.poll_interval * (2 ** idle), self.max_idle)
+
     def _loop(self, max_cycles):
         cycles = 0
         idle = 0
@@ -765,9 +802,8 @@ class JobRunner:
                 continue
             failures = 0
             if frame is None:
-                wait = retry_after if retry_after else min(
-                    self.poll_interval * (2 ** idle), self.max_idle)
-                idle += 1
+                wait = retry_after if retry_after else self._idle_delay(idle)
+                idle = min(idle + 1, self.max_idle_exponent)
                 self._wait(wait)
                 continue
             idle = 0
