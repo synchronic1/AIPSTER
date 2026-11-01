@@ -747,6 +747,7 @@ function validSetupMint(data) {
 function setupErrorText(e) {
   const msg = String((e && e.message) || '');
   if (e && e.mintMalformed) return 'The pairing service returned an unusable response. Nothing was copied.';
+  if (e && e.mintExpired) return 'The pairing service returned an already-expired code. Generate a new setup prompt.';
   if (/AUTH_REQUIRED/.test(msg)) return 'Sign-in required. Sign in again, then generate a new setup prompt.';
   if (/PAIRING_LIMIT/.test(msg)) return 'You already have the maximum active codes. Let one expire first.';
   if (/WRITE_RATE_LIMITED/.test(msg)) return 'Too many requests. Wait a little while, then generate a new setup prompt.';
@@ -784,6 +785,7 @@ async function genSetupPacket(replace) {
     if (!bound()) return;
     mint = validSetupMint(data);
     if (!mint) throw Object.assign(new Error('unusable mint response'), { mintMalformed: true });
+    if (Date.parse(mint.expiresAt) <= Date.now()) throw Object.assign(new Error('mint already expired'), { mintExpired: true });
   } catch (e) {
     if (!bound()) return;
     card.setup = { phase: 'error', code: '', expiresAt: '', packet: '', packetOs: '', error: setupErrorText(e), accountId, op };
@@ -846,6 +848,9 @@ async function retrySetupCopy() {
   }
   const op = (card.setupOp = (card.setupOp || 0) + 1);
   setup.op = op;
+  // The generate guard keys on setup.phase: mark the retry so an
+  // ordinary Generate press cannot mint over its pending clipboard write.
+  setup.phase = 'copying';
   card.phase = 'copying';
   paintConnectCard();
   const bound = () => gen === generation && setupBindingOk(card, op, card.os, me.id);
@@ -858,11 +863,13 @@ async function retrySetupCopy() {
     if (!bound()) return;
     await clipboard.writeText(setup.packet);
     if (!bound()) return;
+    setup.phase = 'ready';
     card.phase = 'setup-copied';
     card.fallback = '';
     card.fallbackRedacted = '';
   } catch {
     if (!bound()) return;
+    setup.phase = 'ready';
     card.phase = 'setup-failed';
     card.fallback = setup.packet;
     if (!card.fallbackRedacted) {

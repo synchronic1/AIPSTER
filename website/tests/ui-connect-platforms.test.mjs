@@ -382,3 +382,38 @@ test('leaving My Compute clears the staged fallback and its display', async () =
   ui.run('clearSetupCode()');
   assert.equal(ui.run('connect.phase'), 'load-error', 'unrelated card phases preserved');
 });
+
+test('expired mint on the generate path is rejected, never copied', async () => {
+  const captured = [];
+  const ui = fixture({ platform: 'Win32', clipboard: { writeText: async (text) => captured.push(text) } },
+    { mint: async () => mintResponse(fakeMintBody({ expiresAt: '2000-01-01T00:00:00.000Z' })) });
+  await ui.pick('windows');
+  await ui.press('gen-setup');
+  assert.equal(captured.length, 0, 'expired code never written');
+  assert.match(textOf(ui.card.innerHTML), /expired/i, 'expiry stated honestly');
+  assert.doesNotMatch(textOf(ui.card.innerHTML), /Setup prompt copied/, 'no success claim');
+  assert.ok(buttonWith(ui.card.innerHTML, 'setup-again'), 'explicit regeneration offered');
+});
+
+test('generate waits out an in-flight retry instead of racing its clipboard write', async () => {
+  let mints = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const mint = async () => { mints++; return mintResponse(fakeMintBody()); };
+  const ui = fixture({ platform: 'Win32', get clipboard() { throw new Error('denied'); } }, { mint });
+  await ui.pick('windows');
+  await ui.press('gen-setup');
+  assert.equal(mints, 1, 'one mint');
+  Object.defineProperty(ui.context.navigator, 'clipboard', { configurable: true, writable: true,
+    value: { writeText: async (text) => { ui.clipboard.push(text); await gate; } } });
+  const retry = ui.press('setup-copy');
+  await ui.flush();
+  assert.equal(ui.run('connect.setup.phase'), 'copying', 'retry marks the setup phase');
+  await ui.press('gen-setup');
+  assert.equal(mints, 1, 'no second mint while the retry write is pending');
+  release();
+  await retry;
+  await ui.flush();
+  assert.equal(ui.clipboard.length, 1, 'retry write landed once');
+  assert.match(textOf(ui.card.innerHTML), /Setup prompt copied/, 'retry success reported');
+});
