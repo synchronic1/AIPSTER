@@ -13,7 +13,9 @@
 // ADMIN_NOT_IMPLEMENTED: no administrative state changes anywhere in this
 // module. Elevation, audit writes, and out-of-band grant issuance are
 // Milestone 1 work; their absence is reported, not silently skipped.
-import { all } from '../lib/store.js';
+import { all, first, pageQuery } from '../lib/store.js';
+import { pagination } from '../lib/validate.js';
+import { parseStatusRow, resourceLiveness, STALE_AFTER_MS } from '../lib/status.mjs';
 import { handleDgmPreview } from '../dgm/router.mjs';
 
 // PRD Section 5 roles. Unknown role values authorize nothing.
@@ -210,8 +212,44 @@ export async function handleAdmin(ctx) {
   }
   // ---- reads: typed unavailable envelopes, no traffic detail views ----
   if (path === '/api/admin/v1/overview' && method === 'GET') {
-    return read(ctx, 'admin.overview.read', unavailable('admin.overview.v1', 'not_implemented',
-      { fabrics: null, resources: null, usable_capacity: null, coverage: null }));
+    const gate = await requireAdmin(ctx, 'admin.overview.read');
+    if (gate.status) return send(ctx, gate.status, gate.body);
+    // Milestone 1: real platform inventory from the resources table. The
+    // aggregate mirrors GET /api/status exactly (same liveness buckets over
+    // the same freshness rule), minus the owner filter: the platform grant
+    // authorizes platform-wide counts. Empty inventory reports measured
+    // zeros with state available; sections without an authoritative source
+    // stay null with explicit reason codes, never zeros.
+    const nowMs = Date.now();
+    const cutoffIso = new Date(nowMs - STALE_AFTER_MS).toISOString();
+    const agg = await first(ctx.db,
+      `SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN online = 1 THEN 0 ELSE 1 END), 0) AS offline,
+        COALESCE(SUM(CASE WHEN online = 1 AND (heartbeat_at IS NULL OR datetime(heartbeat_at) IS NULL) THEN 1 ELSE 0 END), 0) AS unknown,
+        COALESCE(SUM(CASE WHEN online = 1 AND datetime(heartbeat_at) IS NOT NULL AND heartbeat_at >= ? THEN 1 ELSE 0 END), 0) AS online,
+        COALESCE(SUM(CASE WHEN online = 1 AND datetime(heartbeat_at) IS NOT NULL AND heartbeat_at < ? THEN 1 ELSE 0 END), 0) AS stale
+        FROM resources`,
+      cutoffIso, cutoffIso);
+    return send(ctx, 200, {
+      schema_version: 'admin.overview.v1',
+      state: 'available',
+      observed_at: new Date(nowMs).toISOString(),
+      resources: {
+        total: Number(agg ? agg.total : 0),
+        online: Number(agg ? agg.online : 0),
+        stale: Number(agg ? agg.stale : 0),
+        offline: Number(agg ? agg.offline : 0),
+        unknown: Number(agg ? agg.unknown : 0),
+      },
+      fabrics: null,
+      fabrics_state: 'unavailable',
+      fabrics_reason_code: 'fabric_model_pending',
+      usable_capacity: null,
+      usable_capacity_state: 'not_instrumented',
+      coverage: null,
+      coverage_state: 'unavailable',
+      coverage_reason_code: 'coverage_pending',
+    });
   }
   if (path === '/api/admin/v1/fabrics' && method === 'GET') {
     // No canonical fabrics table exists (PRD VIS01): the scaffold invents
@@ -219,7 +257,52 @@ export async function handleAdmin(ctx) {
     return read(ctx, 'admin.fabrics.read', unavailableList('admin.fabrics.v1', 'fabric_model_pending'));
   }
   if (path === '/api/admin/v1/resources' && method === 'GET') {
-    return read(ctx, 'admin.resources.read', unavailableList('admin.resources.v1', 'not_implemented'));
+    const gate = await requireAdmin(ctx, 'admin.resources.read');
+    if (gate.status) return send(ctx, gate.status, gate.body);
+    // Milestone 1: real platform inventory, paginated. Column allowlist
+    // mirrors GET /api/status: owner_id, cpu, gpu, origin, limits, credits
+    // and verification stay out (identity- and address-shaped fields), so a
+    // platform grant sees operational state without tenant-identifying or
+    // credential-shaped material. Items reuse parseStatusRow and
+    // resourceLiveness, so per-row liveness matches the status strip; the
+    // aggregate total counts every row while malformed rows skip the items,
+    // exactly like the status route. Stable order (created_at, id) keeps
+    // pages consistent.
+    const nowMs = Date.now();
+    const q = pagination(ctx.url);
+    const page = await pageQuery(ctx.db, {
+      select: 'SELECT id, name, kind, online, usable, heartbeat_at, configured, authenticated',
+      from: 'FROM resources',
+      order: 'ORDER BY created_at DESC, id ASC',
+      ...q,
+    });
+    const items = [];
+    for (const raw of page.items) {
+      const trusted = parseStatusRow(raw);
+      if (!trusted) continue;
+      const liveness = resourceLiveness(trusted, nowMs);
+      const seen = (liveness === 'online' || liveness === 'stale') ? Date.parse(trusted.heartbeatAt) : NaN;
+      items.push({
+        id: trusted.id,
+        name: trusted.name,
+        kind: trusted.kind,
+        liveness,
+        lastSeenAt: Number.isFinite(seen) ? trusted.heartbeatAt : null,
+        lastSeenAgeMs: Number.isFinite(seen) ? Math.max(0, nowMs - seen) : null,
+        usable: trusted.usable,
+        configured: Number(raw.configured) === 1,
+        authenticated: Number(raw.authenticated) === 1,
+      });
+    }
+    return send(ctx, 200, {
+      schema_version: 'admin.resources.v1',
+      state: 'available',
+      observed_at: new Date(nowMs).toISOString(),
+      items,
+      total: page.total,
+      limit: page.limit,
+      offset: page.offset,
+    });
   }
   if (path === '/api/admin/v1/metrics' && method === 'GET') {
     const gate = await requireAdmin(ctx, 'admin.metrics.read');

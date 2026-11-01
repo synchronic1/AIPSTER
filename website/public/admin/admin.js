@@ -47,11 +47,114 @@ async function loadSection(section, endpoint) {
 document.querySelectorAll('button[data-endpoint]').forEach((button) => {
   button.addEventListener('click', () => {
     const section = button.closest('section');
-    if (section) loadSection(section, button.getAttribute('data-endpoint'));
+    if (!section) return;
+    if (section.id === 'overview') { loadOverview(); return; }
+    if (section.id === 'resources') { loadResources(0); return; }
+    loadSection(section, button.getAttribute('data-endpoint'));
   });
 });
+document.getElementById('resources-prev').addEventListener('click', () => loadResources(Math.max(0, resourcesOffset - RESOURCES_LIMIT)));
+document.getElementById('resources-next').addEventListener('click', () => loadResources(resourcesOffset + RESOURCES_LIMIT));
 
 loadStatus();
+
+// ---- Overview / Resources (Milestone 1: real authorized data) ----
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const unknown = (v) => (v === null || v === undefined ? 'unknown' : String(v));
+
+function requestFailure(body, status) {
+  if (body && body.code) return body.code + ' (HTTP ' + status + ')';
+  return 'HTTP ' + status;
+}
+
+async function loadOverview() {
+  const section = document.getElementById('overview');
+  const state = section.querySelector('.state');
+  const box = document.getElementById('overview-result');
+  state.textContent = 'Loading…';
+  box.textContent = '';
+  try {
+    const res = await fetch('/api/admin/v1/overview', { credentials: 'same-origin' });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || !body) {
+      state.textContent = 'Unavailable: ' + requestFailure(body, res.status) + '.';
+      return;
+    }
+    if (body.state !== 'available' || !body.resources) {
+      state.textContent = 'Unavailable: ' + (body.reason_code ? body.reason_code + ' ' : '') + '(' + unknown(body.state) + ').';
+      return;
+    }
+    state.textContent = 'Loaded ' + unknown(body.observed_at) + '.';
+    const r = body.resources;
+    box.innerHTML = '<table>'
+      + '<tr><th>resources total</th><td>' + unknown(r.total) + '</td></tr>'
+      + '<tr><th>online</th><td>' + unknown(r.online) + '</td></tr>'
+      + '<tr><th>stale</th><td>' + unknown(r.stale) + '</td></tr>'
+      + '<tr><th>offline</th><td>' + unknown(r.offline) + '</td></tr>'
+      + '<tr><th>unknown</th><td>' + unknown(r.unknown) + '</td></tr>'
+      + '<tr><th>fabrics</th><td>' + esc(body.fabrics_state || 'unknown')
+      + (body.fabrics_reason_code ? ' (' + esc(body.fabrics_reason_code) + ')' : '') + '</td></tr>'
+      + '<tr><th>usable capacity</th><td>' + esc(body.usable_capacity_state || 'unknown') + '</td></tr>'
+      + '<tr><th>coverage</th><td>' + esc(body.coverage_state || 'unknown')
+      + (body.coverage_reason_code ? ' (' + esc(body.coverage_reason_code) + ')' : '') + '</td></tr>'
+      + '</table>';
+  } catch {
+    state.textContent = 'Unavailable: request failed.';
+  }
+}
+
+let resourcesOffset = 0;
+const RESOURCES_LIMIT = 20;
+
+async function loadResources(offset) {
+  const section = document.getElementById('resources');
+  const state = section.querySelector('.state');
+  const box = document.getElementById('resources-result');
+  const pages = document.getElementById('resources-pages');
+  const label = document.getElementById('resources-page-label');
+  const prev = document.getElementById('resources-prev');
+  const next = document.getElementById('resources-next');
+  resourcesOffset = Math.max(0, offset || 0);
+  state.textContent = 'Loading…';
+  box.textContent = '';
+  pages.hidden = true;
+  try {
+    const res = await fetch('/api/admin/v1/resources?limit=' + RESOURCES_LIMIT + '&offset=' + resourcesOffset, { credentials: 'same-origin' });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || !body) {
+      state.textContent = 'Unavailable: ' + requestFailure(body, res.status) + '.';
+      return;
+    }
+    if (body.state !== 'available' || !Array.isArray(body.items)) {
+      state.textContent = 'Unavailable: ' + (body.reason_code ? body.reason_code + ' ' : '') + '(' + unknown(body.state) + ').';
+      return;
+    }
+    const total = Number.isSafeInteger(body.total) && body.total >= 0 ? body.total : null;
+    state.textContent = 'Loaded ' + unknown(body.observed_at) + '.';
+    if (!body.items.length) {
+      box.textContent = total === 0 ? 'No resources registered (empty).' : 'No rows on this page.';
+    } else {
+      const rows = body.items.map((it) =>
+        '<tr><td>' + esc(it.id) + '</td><td>' + esc(it.name) + '</td><td>' + esc(it.kind)
+        + '</td><td>' + esc(it.liveness) + '</td><td>' + esc(it.lastSeenAt || 'never seen')
+        + '</td><td>' + unknown(it.usable) + '</td><td>' + unknown(it.configured)
+        + '</td><td>' + unknown(it.authenticated) + '</td></tr>').join('');
+      box.innerHTML = '<table><tr><th>id</th><th>name</th><th>kind</th><th>liveness</th>'
+        + '<th>last seen</th><th>usable</th><th>configured</th><th>authenticated</th></tr>' + rows + '</table>';
+    }
+    if (total !== null && total > 0) {
+      const first = body.items.length ? resourcesOffset + 1 : resourcesOffset;
+      const last = resourcesOffset + body.items.length;
+      label.textContent = 'Rows ' + first + '–' + last + ' of ' + total + '.';
+      prev.disabled = resourcesOffset === 0;
+      next.disabled = last >= total;
+      pages.hidden = false;
+    }
+  } catch {
+    state.textContent = 'Unavailable: request failed.';
+  }
+}
 
 // ---- DGM fixture preview (flag-gated; the server authorizes every call) ----
 
