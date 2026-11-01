@@ -71,7 +71,12 @@ class Runtime(ABC):
             return False
         if self.config.mode == "managed" and self.config.kind != "mock":
             process = getattr(self, "process", None)
-            return bool(process is not None and process.returncode is None)
+            if process is None or process.returncode is not None:
+                return False
+            # ensure_loaded would restart on a changed file identity; refuse that
+            # under fabric admission instead of performing a hidden cold start.
+            identity = file_identity(model.path)
+            return bool(identity["cached_on_disk"] and identity["fingerprint"] == self.fingerprint)
         return True
 
     async def execute(
@@ -116,9 +121,15 @@ class Runtime(ABC):
                 # Cancellation/timeout may leave a native generation active. Managed adapters
                 # stop the owned process; attached adapters quarantine themselves instead.
                 await self.abort()
-                self.last_error = (
-                    "Request cancelled" if isinstance(exc, asyncio.CancelledError) else str(exc)
-                )
+                if isinstance(exc, asyncio.CancelledError):
+                    self.last_error = "Request cancelled"
+                elif require_resident:
+                    # Never retain prompt-bearing backend exception text for a
+                    # fabric job: the local snapshot and control-plane heartbeat
+                    # can re-expose last_error outside the fabric path.
+                    self.last_error = "Fabric request failed"
+                else:
+                    self.last_error = str(exc)
                 self.state = "error"
                 if isinstance(exc, TimeoutError):
                     raise RuntimeFailure("Inference deadline exceeded", 504) from exc

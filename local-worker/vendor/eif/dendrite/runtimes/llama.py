@@ -197,6 +197,10 @@ class LlamaRuntime(Runtime):
                 },
             }
         except httpx.TimeoutException as exc:
+            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                # The request never left this process; it cannot have started a
+                # native generation, so abort must not quarantine the attachment.
+                self._request_sent = False
             raise RuntimeFailure("Native inference timed out", 504) from exc
         except httpx.HTTPStatusError as exc:
             status = 422 if exc.response.status_code == 400 else 503
@@ -204,6 +208,9 @@ class LlamaRuntime(Runtime):
                 f"Native inference returned HTTP {exc.response.status_code}", status
             ) from exc
         except (httpx.HTTPError, ValueError, TypeError) as exc:
+            if isinstance(exc, httpx.ConnectError):
+                # Connection establishment failed; no request reached the server.
+                self._request_sent = False
             raise RuntimeFailure("Native inference failed or returned malformed JSON", 502) from exc
 
     async def stop(self):

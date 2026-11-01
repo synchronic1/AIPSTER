@@ -11,9 +11,13 @@ The pinned EIF snapshot has no root LICENSE and none of the 16 copied files has
 a copyright/SPDX/license notice. Its public visibility was not treated as a
 license. This copy is licensed under the owner's explicit grant, without editing
 or claiming to license the separate EIF repository. The 16-file allowlist and
-individual hashes are in provenance.json. Fourteen files keep their original bytes.
+individual hashes are in provenance.json. Ten files keep their original bytes.
 `dendrite/api.py` and `dendrite/config.py` were modified by AIPSTER local patch 0001
-(2026-10-28, security fix). As Apache-2.0 section 4(b) requires, each carries a
+(2026-10-28, security fix). `dendrite/fabric.py`, `dendrite/node.py`,
+`dendrite/runtimes/base.py` and `dendrite/runtimes/llama.py` were modified by
+AIPSTER local patch 0002 (2026-11-01, resident-only Ganglion fabric integration,
+result job-id binding, rejection handling and attach-quarantine scoping).
+As Apache-2.0 section 4(b) requires, each carries a
 prominent change notice, and provenance.json records both the upstream and patched
 hashes plus the patch itself.
 Dependencies, third-party logos, native engines and model weights are excluded

@@ -107,31 +107,42 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/vendor/eif" python -m pytest \
   -k "not installed_cli and not mock_daemon_health_and_execution"
 ```
 
-Result: **32 passed** on the patched tree (20 new fabric tests + 12 installation
+Result: **36 passed** on the patched tree (24 new fabric tests + 12 installation
 tests, including `verify_vendor.py --check-patches`). The two deselected cases
 resolve `dendrite`/the `dendrite` executable from the host environment rather than
 this vendor tree, so they are not evidence for this patch. `verify_vendor.py`
 reports 16 files against the pinned commit: 10 upstream-identical, 6 locally
 patched (patch 0001: `api.py`, `config.py`; patch 0002: `fabric.py`, `node.py`,
 `runtimes/base.py`, `runtimes/llama.py`). Reversing both patches reproduces the
-upstream hashes.
+upstream hashes, and forward-applying both to those upstream bytes reproduces the
+committed files byte-for-byte.
 
-Against the same test file with patch 0002 reversed in an isolated tree, **13 of
-20 fail** and 7 pass. The failures cover job-id binding, exact/resident admission,
-the under-lane residency guard, timeout and post-timeout behavior, permanent
-handshake/close rejection, and attach-quarantine scoping. They are the
+Against the same test file with patch 0002 reversed in an isolated tree, **17 of
+24 fail** and 7 pass. The failures cover job-id binding, exact/resident admission,
+the under-lane residency guard, fingerprint-aware managed residency, timeout and
+post-timeout behavior, permanent handshake/close rejection, probe handling,
+connect-failure quarantine and fabric-job `last_error` sanitization. They are the
 falsifiable before/after evidence for this patch.
 
 The new tests use a local fake fabric WebSocket and the mock runtime only. They
 cover: authenticated connect; one immediate heartbeat; resident-only capacity in
-the cloud snapshot; single result bound to the job ID; duplicate suppression
-during and after execution; unknown model, capability mismatch, missing model and
-unknown field denial before load; model-switch refusal; busy 429; timeout 504 with
-exactly one error and no local retry; disconnect cancellation with no result;
-malformed/oversized/unknown frames; a single heartbeat loop; no prompt or token in
-logs or error frames; permanent 401 handshake rejection without retry; 4001
-replacement and 4003 revocation stop states; and attach quarantine only after an
-unanswered sent request.
+the cloud snapshot (including a changed model file identity); single result bound
+to the job ID; duplicate suppression during and after execution and after a
+capacity rejection; unknown model, capability mismatch, missing model, unknown
+field and chat-frame denial before load; model-switch refusal; busy 429; timeout
+504 with exactly one error and no local retry; disconnect cancellation with no
+result; malformed/oversized/unknown frames; a single heartbeat loop; `probe_chat`
+answered by a heartbeat with no result; no prompt or token in logs, error frames,
+`last_error` or the local snapshot; permanent 401 handshake rejection without
+retry; 4001 replacement and 4003 revocation stop states; and attach quarantine
+only after an unanswered sent request, not after connect-phase failures.
+
+The worker's cloud snapshot was also checked against the Ganglion reference
+sanitizer and scheduler (AiTinkerersVenice HEAD `f5223d39`, unmodified) offline:
+`sanitizeNodeSnapshot` accepted both a resident and a cold snapshot, and
+`placementCandidates` returned the resident model while returning no placement
+for the cold/non-resident model. That check used the existing `fabric` checkout's
+`tsx` and a local JSON snapshot; no fabric connection or credential was used.
 
 Limits: the deployed fabric was not contacted, no credential was read, no node
 was enrolled, no live task or inference ran, and the AIPSTER dispatch path remains

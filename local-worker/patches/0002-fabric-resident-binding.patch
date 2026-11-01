@@ -1,5 +1,5 @@
 diff --git a/dendrite/fabric.py b/dendrite/fabric.py
-index 02a5708..bb05e9d 100644
+index 02a5708..689686e 100644
 --- a/dendrite/fabric.py
 +++ b/dendrite/fabric.py
 @@ -1,14 +1,23 @@
@@ -41,7 +41,7 @@ index 02a5708..bb05e9d 100644
  
  def connection_url(origin: str, node_id: str) -> str:
      url = urlsplit(origin)
-@@ -33,6 +48,15 @@ def connection_url(origin: str, node_id: str) -> str:
+@@ -33,6 +48,26 @@ def connection_url(origin: str, node_id: str) -> str:
  def cloud_snapshot(node: Node) -> dict:
      snapshot = node.snapshot()
      # The cloud needs capacities, not native binary paths, process IDs, or local errors.
@@ -54,10 +54,21 @@ index 02a5708..bb05e9d 100644
 +    # in-flight job, so degrade an unavailable host identity instead of looping.
 +    hardware["logical_cpus"] = hardware.get("logical_cpus") or 0
 +    hardware["hostname"] = hardware.get("hostname") or "unknown"
++    models = []
++    for model in snapshot["models"]:
++        configured = next(m for m in node.config.models if m.id == model["id"])
++        resident = node.runtimes[configured.runtime].is_resident(configured)
++        models.append(
++            {
++                **model,
++                "resident": resident,
++                "available": bool(model["available"] and resident),
++            }
++        )
      return {
          key: snapshot[key]
          for key in (
-@@ -43,21 +67,23 @@ def cloud_snapshot(node: Node) -> dict:
+@@ -43,21 +78,20 @@ def cloud_snapshot(node: Node) -> dict:
              "execution_scope",
              "active_requests",
              "performance",
@@ -78,14 +89,11 @@ index 02a5708..bb05e9d 100644
 +            | {"supports_model_switch": False, "supports_chat": False}
              for runtime in snapshot["runtimes"]
          ],
-+        "models": [
-+            {**model, "available": bool(model["available"] and model["resident"])}
-+            for model in snapshot["models"]
-+        ],
++        "models": models,
      }
  
  
-@@ -72,13 +98,16 @@ async def serve_connection(node: Node, ws):
+@@ -72,13 +106,16 @@ async def serve_connection(node: Node, ws):
          while True:
              await node.refresh_attached()
              await send({"type": "heartbeat", "snapshot": cloud_snapshot(node)})
@@ -103,7 +111,7 @@ index 02a5708..bb05e9d 100644
              await send({"type": "result", "job_id": job_id, "result": result.model_dump()})
          except ValidationError:
              await send(
-@@ -101,8 +130,9 @@ async def serve_connection(node: Node, ws):
+@@ -101,8 +138,9 @@ async def serve_connection(node: Node, ws):
              )
          except WebSocketException:
              pass
@@ -115,18 +123,60 @@ index 02a5708..bb05e9d 100644
              await send(
                  {
                      "type": "result",
-@@ -160,8 +190,10 @@ async def serve_connection(node: Node, ws):
+@@ -121,7 +159,15 @@ async def serve_connection(node: Node, ws):
+                 message = json.loads(raw)
+             except (ValueError, TypeError):
+                 continue
+-            if not isinstance(message, dict) or message.get("type") != "execute":
++            if not isinstance(message, dict):
++                continue
++            if message.get("type") == "probe_chat":
++                # This snapshot does not implement chat. Answer the admin probe
++                # with the normal heartbeat; the fabric expects no dedicated reply.
++                await send({"type": "heartbeat", "snapshot": cloud_snapshot(node)})
++                node.fabric["last_heartbeat_at"] = time.time()
++                continue
++            if message.get("type") != "execute":
+                 continue
+             job_id = message.get("job_id")
+             if not isinstance(job_id, str) or not 1 <= len(job_id) <= 128:
+@@ -132,6 +178,9 @@ async def serve_connection(node: Node, ws):
+                 await ws.close(1000, "Rotate completed job history")
+                 return
+             if len(active) >= len(node.runtimes):
++                # The rejection is this job's terminal outcome; record it so a
++                # re-delivery cannot execute and produce a second result.
++                completed.add(job_id)
+                 await send(
+                     {
+                         "type": "result",
+@@ -160,14 +209,24 @@ async def serve_connection(node: Node, ws):
  
  async def run_fabric_bridge(node: Node, token: str):
      url = connection_url(node.config.node.fabric_url, node.config.node.id)
 +    fabric = node.fabric
      delay = 1
      while True:
-+        fabric.update(state="connecting", connected_at=None, last_error=None, code=None)
++        fabric.update(
++            state="connecting",
++            connected_at=None,
++            last_heartbeat_at=None,
++            last_error=None,
++            code=None,
++        )
          try:
              async with connect(
                  url,
-@@ -175,9 +207,45 @@ async def run_fabric_bridge(node: Node, token: str):
+                 additional_headers={"Authorization": "Bearer " + token},
+                 proxy=None,
+-                max_size=262144,
++                # Align with the fabric's documented socket-message ceiling
++                # (LIMITS.socketMessageBytes = 1100 KiB), not a smaller guess.
++                max_size=1100 * 1024,
+                 max_queue=4,
+                 open_timeout=10,
+                 ping_interval=20,
+@@ -175,9 +234,48 @@ async def run_fabric_bridge(node: Node, token: str):
                  close_timeout=3,
              ) as ws:
                  delay = 1
@@ -141,6 +191,7 @@ index 02a5708..bb05e9d 100644
 +                fabric.update(
 +                    state="rejected",
 +                    connected_at=None,
++                    last_heartbeat_at=None,
 +                    last_error="Fabric rejected the node connection",
 +                    code=status,
 +                )
@@ -157,6 +208,7 @@ index 02a5708..bb05e9d 100644
 +                fabric.update(
 +                    state=state,
 +                    connected_at=None,
++                    last_heartbeat_at=None,
 +                    last_error="Fabric closed the node connection",
 +                    code=code,
 +                )
@@ -167,6 +219,7 @@ index 02a5708..bb05e9d 100644
 +        fabric.update(
 +            state="reconnecting",
 +            connected_at=None,
++            last_heartbeat_at=None,
 +            last_error="Fabric connection lost",
 +            code=None,
 +        )
@@ -262,7 +315,7 @@ index b22f623..dbba177 100644
              runtime_id=model.runtime,
              model_id=model.id,
 diff --git a/dendrite/runtimes/base.py b/dendrite/runtimes/base.py
-index 51d0653..62c58f7 100644
+index 51d0653..6d7d536 100644
 --- a/dendrite/runtimes/base.py
 +++ b/dendrite/runtimes/base.py
 @@ -1,3 +1,7 @@
@@ -273,7 +326,7 @@ index 51d0653..62c58f7 100644
  import asyncio
  import time
  import uuid
-@@ -59,9 +63,28 @@ class Runtime(ABC):
+@@ -59,9 +63,33 @@ class Runtime(ABC):
          finally:
              self.lock.release()
  
@@ -286,7 +339,12 @@ index 51d0653..62c58f7 100644
 +            return False
 +        if self.config.mode == "managed" and self.config.kind != "mock":
 +            process = getattr(self, "process", None)
-+            return bool(process is not None and process.returncode is None)
++            if process is None or process.returncode is not None:
++                return False
++            # ensure_loaded would restart on a changed file identity; refuse that
++            # under fabric admission instead of performing a hidden cold start.
++            identity = file_identity(model.path)
++            return bool(identity["cached_on_disk"] and identity["fingerprint"] == self.fingerprint)
 +        return True
 +
 +    async def execute(
@@ -303,8 +361,27 @@ index 51d0653..62c58f7 100644
              started = time.monotonic()
              try:
                  async with asyncio.timeout(self.node.request_timeout_seconds):
+@@ -93,9 +121,15 @@ class Runtime(ABC):
+                 # Cancellation/timeout may leave a native generation active. Managed adapters
+                 # stop the owned process; attached adapters quarantine themselves instead.
+                 await self.abort()
+-                self.last_error = (
+-                    "Request cancelled" if isinstance(exc, asyncio.CancelledError) else str(exc)
+-                )
++                if isinstance(exc, asyncio.CancelledError):
++                    self.last_error = "Request cancelled"
++                elif require_resident:
++                    # Never retain prompt-bearing backend exception text for a
++                    # fabric job: the local snapshot and control-plane heartbeat
++                    # can re-expose last_error outside the fabric path.
++                    self.last_error = "Fabric request failed"
++                else:
++                    self.last_error = str(exc)
+                 self.state = "error"
+                 if isinstance(exc, TimeoutError):
+                     raise RuntimeFailure("Inference deadline exceeded", 504) from exc
 diff --git a/dendrite/runtimes/llama.py b/dendrite/runtimes/llama.py
-index 7777827..52d6823 100644
+index 7777827..cbeb859 100644
 --- a/dendrite/runtimes/llama.py
 +++ b/dendrite/runtimes/llama.py
 @@ -1,5 +1,10 @@
@@ -356,7 +433,28 @@ index 7777827..52d6823 100644
              return {
                  "content": result["content"],
                  "cached_tokens": cached,
-@@ -208,8 +222,17 @@ class LlamaRuntime(Runtime):
+@@ -183,6 +197,10 @@ class LlamaRuntime(Runtime):
+                 },
+             }
+         except httpx.TimeoutException as exc:
++            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
++                # The request never left this process; it cannot have started a
++                # native generation, so abort must not quarantine the attachment.
++                self._request_sent = False
+             raise RuntimeFailure("Native inference timed out", 504) from exc
+         except httpx.HTTPStatusError as exc:
+             status = 422 if exc.response.status_code == 400 else 503
+@@ -190,6 +208,9 @@ class LlamaRuntime(Runtime):
+                 f"Native inference returned HTTP {exc.response.status_code}", status
+             ) from exc
+         except (httpx.HTTPError, ValueError, TypeError) as exc:
++            if isinstance(exc, httpx.ConnectError):
++                # Connection establishment failed; no request reached the server.
++                self._request_sent = False
+             raise RuntimeFailure("Native inference failed or returned malformed JSON", 502) from exc
+ 
+     async def stop(self):
+@@ -208,8 +229,17 @@ class LlamaRuntime(Runtime):
              self.reset()
  
      async def abort(self):

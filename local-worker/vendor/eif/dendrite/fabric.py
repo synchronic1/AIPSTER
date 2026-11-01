@@ -57,6 +57,17 @@ def cloud_snapshot(node: Node) -> dict:
     # in-flight job, so degrade an unavailable host identity instead of looping.
     hardware["logical_cpus"] = hardware.get("logical_cpus") or 0
     hardware["hostname"] = hardware.get("hostname") or "unknown"
+    models = []
+    for model in snapshot["models"]:
+        configured = next(m for m in node.config.models if m.id == model["id"])
+        resident = node.runtimes[configured.runtime].is_resident(configured)
+        models.append(
+            {
+                **model,
+                "resident": resident,
+                "available": bool(model["available"] and resident),
+            }
+        )
     return {
         key: snapshot[key]
         for key in (
@@ -80,10 +91,7 @@ def cloud_snapshot(node: Node) -> dict:
             | {"supports_model_switch": False, "supports_chat": False}
             for runtime in snapshot["runtimes"]
         ],
-        "models": [
-            {**model, "available": bool(model["available"] and model["resident"])}
-            for model in snapshot["models"]
-        ],
+        "models": models,
     }
 
 
@@ -151,7 +159,15 @@ async def serve_connection(node: Node, ws):
                 message = json.loads(raw)
             except (ValueError, TypeError):
                 continue
-            if not isinstance(message, dict) or message.get("type") != "execute":
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") == "probe_chat":
+                # This snapshot does not implement chat. Answer the admin probe
+                # with the normal heartbeat; the fabric expects no dedicated reply.
+                await send({"type": "heartbeat", "snapshot": cloud_snapshot(node)})
+                node.fabric["last_heartbeat_at"] = time.time()
+                continue
+            if message.get("type") != "execute":
                 continue
             job_id = message.get("job_id")
             if not isinstance(job_id, str) or not 1 <= len(job_id) <= 128:
@@ -162,6 +178,9 @@ async def serve_connection(node: Node, ws):
                 await ws.close(1000, "Rotate completed job history")
                 return
             if len(active) >= len(node.runtimes):
+                # The rejection is this job's terminal outcome; record it so a
+                # re-delivery cannot execute and produce a second result.
+                completed.add(job_id)
                 await send(
                     {
                         "type": "result",
@@ -193,13 +212,21 @@ async def run_fabric_bridge(node: Node, token: str):
     fabric = node.fabric
     delay = 1
     while True:
-        fabric.update(state="connecting", connected_at=None, last_error=None, code=None)
+        fabric.update(
+            state="connecting",
+            connected_at=None,
+            last_heartbeat_at=None,
+            last_error=None,
+            code=None,
+        )
         try:
             async with connect(
                 url,
                 additional_headers={"Authorization": "Bearer " + token},
                 proxy=None,
-                max_size=262144,
+                # Align with the fabric's documented socket-message ceiling
+                # (LIMITS.socketMessageBytes = 1100 KiB), not a smaller guess.
+                max_size=1100 * 1024,
                 max_queue=4,
                 open_timeout=10,
                 ping_interval=20,
@@ -218,6 +245,7 @@ async def run_fabric_bridge(node: Node, token: str):
                 fabric.update(
                     state="rejected",
                     connected_at=None,
+                    last_heartbeat_at=None,
                     last_error="Fabric rejected the node connection",
                     code=status,
                 )
@@ -234,6 +262,7 @@ async def run_fabric_bridge(node: Node, token: str):
                 fabric.update(
                     state=state,
                     connected_at=None,
+                    last_heartbeat_at=None,
                     last_error="Fabric closed the node connection",
                     code=code,
                 )
@@ -244,6 +273,7 @@ async def run_fabric_bridge(node: Node, token: str):
         fabric.update(
             state="reconnecting",
             connected_at=None,
+            last_heartbeat_at=None,
             last_error="Fabric connection lost",
             code=None,
         )

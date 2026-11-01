@@ -8,7 +8,8 @@ suppression.
 
 Run with the worker's vendored package first on sys.path, e.g.:
 
-    PYTHONPATH="$PWD/vendor/eif" python -m pytest test_fabric_bridge.py -q
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/vendor/eif" \
+      python -m pytest test_fabric_bridge.py -q
 """
 
 import asyncio
@@ -19,9 +20,11 @@ import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import dendrite
 import httpx
 from dendrite.config import Config, ModelConfig, NodeConfig, RuntimeConfig
 from dendrite.fabric import cloud_snapshot, connection_url, run_fabric_bridge, serve_connection
+from dendrite.hardware import file_identity
 from dendrite.node import Node
 from dendrite.runtimes.base import RuntimeFailure
 from dendrite.runtimes.llama import LlamaRuntime
@@ -29,6 +32,13 @@ from dendrite.schemas import ExecuteRequest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
+
+_VENDOR = (Path(__file__).resolve().parent / "vendor/eif/dendrite").resolve()
+if not Path(dendrite.__file__).resolve().is_relative_to(_VENDOR):
+    raise RuntimeError(
+        "fabric tests must import local-worker/vendor/eif/dendrite; "
+        "run with PYTHONPATH=$PWD/vendor/eif"
+    )
 
 
 class FakeFabric:
@@ -321,6 +331,17 @@ class FabricBridgeTests(unittest.IsolatedAsyncioTestCase):
                     extra = execute_frame(allow_simulated=True)
                     await fabric.send(extra)
                     self.assertEqual((await fabric.next_frame("result"))["status_code"], 422)
+                    chat = {
+                        "type": "execute",
+                        "job_id": str(uuid.uuid4()),
+                        "request": {
+                            "capability": "complete",
+                            "model_id": "m1",
+                            "messages": [{"role": "user", "content": "x"}],
+                        },
+                    }
+                    await fabric.send(chat)
+                    self.assertEqual((await fabric.next_frame("result"))["status_code"], 422)
                     await self.disconnect(ws, task)
             finally:
                 await node.close()
@@ -434,6 +455,58 @@ class FabricBridgeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await node.close()
 
+    async def test_probe_chat_is_answered_by_a_heartbeat_not_a_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            node = make_node(tmp, heartbeat=10)
+            await preload(node, "m1")
+            try:
+                async with FakeFabric() as fabric:
+                    ws, task = await self.connected(fabric, node)
+                    await fabric.next_frame("heartbeat")
+                    await fabric.send({"type": "probe_chat"})
+                    await fabric.next_frame("heartbeat")
+                    await asyncio.sleep(0.2)
+                    self.assertEqual(len(fabric.frames_of("heartbeat")), 2)
+                    self.assertEqual(fabric.frames_of("result"), [])
+                    self.assertIsNotNone(node.fabric["last_heartbeat_at"])
+                    await self.disconnect(ws, task)
+            finally:
+                await node.close()
+
+    async def test_capacity_rejection_is_terminal_for_that_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            node = make_node(tmp)
+            node.config.runtimes[0].mock_delay_seconds = 0.3
+            await preload(node, "m1")
+            try:
+                async with FakeFabric() as fabric:
+                    ws, task = await self.connected(fabric, node)
+                    first = execute_frame()
+                    second = execute_frame()
+                    await fabric.send(first)
+                    for _ in range(200):
+                        if node.runtimes["mock"].lock.locked():
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertTrue(node.runtimes["mock"].lock.locked())
+                    await fabric.send(second)
+                    rejected = await fabric.next_frame("result")
+                    self.assertEqual(rejected["job_id"], second["job_id"])
+                    self.assertEqual(rejected["status_code"], 429)
+                    await fabric.next_frame("result")  # first job completes
+                    await fabric.send(second)
+                    await asyncio.sleep(0.4)
+                    frames = [
+                        frame
+                        for frame in fabric.frames_of("result")
+                        if frame["job_id"] == second["job_id"]
+                    ]
+                    self.assertEqual(len(frames), 1)
+                    self.assertEqual(frames[0]["status_code"], 429)
+                    await self.disconnect(ws, task)
+            finally:
+                await node.close()
+
     async def test_execution_failure_log_has_no_prompt_or_token(self):
         prompt = "PROMPT-SENTINEL-abc123"
         token = "TOKEN-SENTINEL-xyz789"
@@ -463,6 +536,9 @@ class FabricBridgeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(prompt, logged)
                     self.assertNotIn(token, logged)
                     self.assertNotIn(prompt, json.dumps(fabric.frames))
+                    snapshot = node.snapshot()
+                    self.assertEqual(snapshot["runtimes"][0]["last_error"], "Fabric request failed")
+                    self.assertNotIn(prompt, json.dumps(snapshot))
                     await self.disconnect(ws, task)
             finally:
                 await node.close()
@@ -594,6 +670,93 @@ class FabricBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(runtime.quarantined)
         finally:
             await runtime.client.aclose()
+
+
+    async def test_connect_phase_failures_do_not_quarantine_an_attachment(self):
+        def attached():
+            return LlamaRuntime(
+                RuntimeConfig(
+                    id="attach", kind="ik_llama", mode="attach",
+                    base_url="http://127.0.0.1:1",
+                ),
+                NodeConfig(),
+            )
+
+        request = ExecuteRequest(capability="complete", model_id="m1", prompt="x")
+        for error in (
+            httpx.ConnectError("refused"),
+            httpx.ConnectTimeout("connect timeout"),
+            httpx.PoolTimeout("pool timeout"),
+        ):
+            runtime = attached()
+            try:
+                runtime.client.post = AsyncMock(side_effect=error)
+                with self.assertRaises(RuntimeFailure):
+                    await runtime.generate(request)
+                self.assertFalse(runtime._request_sent)
+                await runtime.abort()
+                self.assertFalse(runtime.quarantined)
+            finally:
+                await runtime.client.aclose()
+
+        runtime = attached()
+        try:
+            runtime.client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timeout"))
+            with self.assertRaises(RuntimeFailure):
+                await runtime.generate(request)
+            self.assertTrue(runtime._request_sent)
+            await runtime.abort()
+            self.assertTrue(runtime.quarantined)
+        finally:
+            await runtime.client.aclose()
+
+    async def test_managed_residency_requires_matching_fingerprint(self):
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.pid = 12345
+
+            def terminate(self):
+                self.returncode = -15
+
+            async def wait(self, timeout=None):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.gguf"
+            path.write_bytes(b"GGUF" + b"\0" * 64)
+            model = ModelConfig(
+                id="m1", runtime="managed", capabilities=["complete"], path=path
+            )
+            node = Node(
+                Config(
+                    node=NodeConfig(id="test-node", state_dir=Path(tmp)),
+                    runtimes=[
+                        RuntimeConfig(
+                            id="managed", kind="ik_llama", mode="managed", executable="sh"
+                        )
+                    ],
+                    models=[model],
+                )
+            )
+            runtime = node.runtimes["managed"]
+            runtime.loaded_model = model
+            runtime.state = "ready"
+            runtime.process = FakeProcess()
+            try:
+                runtime.fingerprint = "stale-fingerprint"
+                self.assertFalse(runtime.is_resident(model))
+                snapshot = cloud_snapshot(node)
+                self.assertFalse(snapshot["models"][0]["resident"])
+                self.assertFalse(snapshot["models"][0]["available"])
+
+                runtime.fingerprint = file_identity(path)["fingerprint"]
+                self.assertTrue(runtime.is_resident(model))
+                snapshot = cloud_snapshot(node)
+                self.assertTrue(snapshot["models"][0]["resident"])
+                self.assertTrue(snapshot["models"][0]["available"])
+            finally:
+                await node.close()
 
 
 if __name__ == "__main__":

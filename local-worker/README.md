@@ -158,14 +158,17 @@ transport and grants no AIPSTER authority.
 Prerequisites, all operator-supplied:
 
 - a node-role Fabric Access Token bound to this worker's exact `node.id`;
-- a model already loaded on a loopback runtime that this worker owns;
+- a model already loaded on a loopback runtime (owned by this worker, or shared
+  with explicit operator consent);
 - explicit consent to run inference on that model.
 
 Never put the token in TOML, a URL, a prompt, source or a log. Supply it through
 `GANGLION_FABRIC_TOKEN` (or the configured `fabric_token_env`) in the environment
-that starts `serve`. A revoked/expired token, a wrong node binding or a replaced
-connection stops the bridge and records a secret-free state; it does not retry
-forever and does not fight another connection for the same node ID.
+that starts `serve`. A handshake rejected with HTTP 400/401/403/404/426, or a
+policy close with code 1007/1008/1009/4001/4003, stops the bridge and records a
+secret-free state; other connection losses retry with capped backoff. A replaced
+connection (4001) stops instead of fighting for the same node ID. After a
+permanent stop, fix the cause and restart the daemon.
 
 ```toml
 [node]
@@ -188,26 +191,31 @@ capabilities = ["complete", "summarize"]
 ```
 
 `GET /v1/node` reports `fabric.state` (`disabled`, `connecting`, `connected`,
-`reconnecting`, `rejected`, `superseded`) plus a status code and a generic error;
-it never includes the token or prompt text.
+`reconnecting`, `rejected`, `superseded`) plus a status code and a generic error.
+The `fabric` block never includes the token or prompt text; a failed fabric job's
+runtime `last_error` is a fixed message rather than backend detail.
 
 Execution policy on this path:
 
-- **Resident-only and exact.** The worker advertises only already-loaded models
-  and no model switching. A fabric request for a different model is rejected
-  before any load or switch; load it through the local authenticated API first.
-  There is no fallback model or runtime.
+- **Resident-only and exact.** The worker advertises only resident models as
+  available and no model switching. A fabric request for a different model, or
+  for a resident model whose file identity has changed, is rejected before any
+  load or switch; load it through the local authenticated API first. There is no
+  fallback model or runtime.
 - **One job, one result.** The result's `request_id` is the fabric `job_id`;
-  duplicate frames for the same job are not re-executed.
+  duplicate frames for the same job, including after a capacity rejection, are
+  not re-executed.
 - **No streaming or cancel frame.** A disconnect is the only remote cancellation
-  and cancels local work. A request already sent to an attached server is treated
-  as uncertain and quarantined until operator recovery; a cancellation before
-  dispatch does not quarantine it.
+  and cancels local work. A cancellation before the native POST is attempted, or
+  a POST that failed to connect, does not quarantine the attachment; a request
+  that may have reached the server (including a cancellation while in flight) is
+  treated as uncertain and quarantined until operator recovery.
 - **Deadline is local.** The fabric enforces its own admission deadline and
   discards late results; the execute frame carries no deadline. This worker
   enforces `node.request_timeout_seconds` only.
 - **Raw prompt only.** Chat `messages` are not advertised and are rejected as an
-  invalid request.
+  invalid request. A `probe_chat` frame is answered with a normal heartbeat;
+  this snapshot has no chat profiles to refresh.
 
 Do not attach this worker to a managed runtime owned by another Dendrite: that
 owner may stop or switch it. A genuine end-to-end run needs the token, a resident
