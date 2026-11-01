@@ -39,6 +39,40 @@ test('migrations create the auth and app tables', () => {
   for (const c of ['cache_key', 'tenant_id', 'response_json', 'created_at', 'expires_at']) assert.ok(cols('routing_advice_cache').includes(c), `routing_advice_cache.${c}`);
   assert.ok(names.includes('routing_refunds'), 'missing table routing_refunds (0021 provisional)');
   for (const c of ['reservation_id', 'grant_id', 'jobs', 'tokens', 'created_at']) assert.ok(cols('routing_refunds').includes(c), `routing_refunds.${c}`);
+  assert.ok(names.includes('dispatch_admissions'), 'missing table dispatch_admissions (0024)');
+  for (const c of ['admission_ref', 'principal_id', 'tenant_id', 'grant_id', 'grant_revision', 'resource_id',
+    'incarnation', 'peer_node', 'peer_workspace', 'route', 'node_id', 'runtime_id', 'runtime_instance',
+    'model_id', 'model_fingerprint', 'max_tokens', 'pools_json', 'expires_at', 'created_at']) {
+    assert.ok(cols('dispatch_admissions').includes(c), `dispatch_admissions.${c}`);
+  }
+  assert.ok(names.includes('dispatch_operations'), 'missing table dispatch_operations (0024)');
+  for (const c of ['op_id', 'op_key', 'principal_id', 'tenant_id', 'request_digest', 'binding_json',
+    'generation', 'phase', 'job_id', 'uncertain_phase', 'uncertain_detail', 'cancel_intent',
+    'settled_outcome', 'settled_digest', 'settled_job_id', 'created_at', 'updated_at']) {
+    assert.ok(cols('dispatch_operations').includes(c), `dispatch_operations.${c}`);
+  }
+  assert.ok(names.includes('dispatch_holds'), 'missing table dispatch_holds (0024)');
+  for (const c of ['hold_id', 'op_id', 'generation', 'pool_id', 'pool_kind', 'amount', 'jobs', 'state',
+    'created_at', 'updated_at']) assert.ok(cols('dispatch_holds').includes(c), `dispatch_holds.${c}`);
+  assert.ok(names.includes('dispatch_pool_usage'), 'missing table dispatch_pool_usage (0024)');
+  for (const c of ['pool_id', 'kind', 'principal_id', 'day', 'ceiling_tokens', 'used_tokens',
+    'created_at', 'updated_at']) assert.ok(cols('dispatch_pool_usage').includes(c), `dispatch_pool_usage.${c}`);
+  assert.ok(names.includes('dispatch_start_redemptions'), 'missing table dispatch_start_redemptions (0024)');
+  for (const c of ['op_id', 'generation', 'redeemed_at', 'worker_node_id', 'worker_runtime_instance']) {
+    assert.ok(cols('dispatch_start_redemptions').includes(c), `dispatch_start_redemptions.${c}`);
+  }
+  assert.ok(names.includes('dispatch_fences'), 'missing table dispatch_fences (0024)');
+  for (const c of ['op_id', 'generation', 'fenced_at', 'reason']) assert.ok(cols('dispatch_fences').includes(c), `dispatch_fences.${c}`);
+  assert.ok(names.includes('dispatch_jobs'), 'missing table dispatch_jobs (0024)');
+  for (const c of ['job_id', 'op_id', 'generation', 'resource_id', 'node_id', 'runtime_id', 'model_id',
+    'runtime_instance', 'model_fingerprint', 'status', 'envelope_json', 'deadline_at', 'lease_id',
+    'leased_at', 'result_json', 'created_at', 'updated_at']) assert.ok(cols('dispatch_jobs').includes(c), `dispatch_jobs.${c}`);
+  assert.ok(names.includes('dispatch_settlements'), 'missing table dispatch_settlements (0024)');
+  for (const c of ['op_id', 'generation', 'job_id', 'outcome', 'result_digest', 'settled_at']) {
+    assert.ok(cols('dispatch_settlements').includes(c), `dispatch_settlements.${c}`);
+  }
+  const unique = sqlite.prepare('SELECT * FROM pragma_index_list(?)').all('dispatch_holds');
+  assert.ok(unique.some((i) => i.unique === 1), 'dispatch_holds is unique per (op_id, pool_id)');
 });
 
 test('migrations are idempotent where SQLite allows', () => {

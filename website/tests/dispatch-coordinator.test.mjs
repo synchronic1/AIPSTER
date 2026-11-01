@@ -10,6 +10,12 @@ import path from 'node:path';
 import {
   baseState, createClock, createFakeAuthority, createFakeTransport, createResolver, nowBase, succeededJob,
 } from './fixtures/dispatch-authority-fake.mjs';
+import {
+  T0 as STORE_T0, RES_1 as STORE_RES, alice as storeAlice, bob as storeBob, createStoreHarness,
+  coordinatorOverStore, submitBody as storeBody, workerResult, admittedOperation,
+  nextOpKey as storeOpKey,
+} from './fixtures/dispatch-store-fixture.mjs';
+import { ADMISSION_TTL_MS } from '../src/inference/dispatch-store.mjs';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
 
@@ -510,6 +516,155 @@ test('malformed store responses never read as success', async () => {
   const out = await s2.coord.submit('ctx-alice', body());
   assert.equal(out.status, 'uncertain');
   assert.equal(s2.transport.sent.length, 0);
+});
+
+// ---- parameterized run 2: the SAME coordinator object against the real D1
+// store (migration 0024 + src/inference/dispatch-store.mjs). The fake suite
+// above remains the exhaustive contract test; this section proves the store
+// implements the same boundary for the flows the fake only models, and runs
+// under the same zero-network guard.
+
+test('real store: positive lifecycle via the coordinator, settle once, no redispatch', async () => {
+  const h = createStoreHarness();
+  const { coordinator } = coordinatorOverStore(h);
+  const admission = await h.store.issueAdmission({
+    principal: storeAlice, resource_id: STORE_RES, model_id: 'model-x', max_tokens: 64,
+  });
+  const b = storeBody(admission);
+  const sent = await coordinator.submit('ctx-alice', b);
+  assert.equal(sent.status, 'dispatched');
+  assert.equal(sent.automatic_retry, false);
+
+  const replay = await coordinator.submit('ctx-alice', b);
+  assert.equal(replay.status, 'dispatched');
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_jobs').get().n, 1);
+
+  const frame = await h.store.leaseNextJob({ resource_id: STORE_RES });
+  assert.equal(frame.job_id, sent.job_id);
+  assert.equal(frame.envelope.binding.op_id, sent.op_id);
+  assert.equal(frame.envelope.binding.deadline_at, b.deadline_at);
+  assert.deepEqual(await h.store.completeJob({
+    job_id: frame.job_id, lease_id: frame.lease_id, resource_id: STORE_RES, status: 'succeeded',
+    result: workerResult(frame),
+  }), { accepted: true });
+
+  const settled = await coordinator.reconcile('ctx-alice', b.idempotency_key);
+  assert.equal(settled.status, 'settled');
+  assert.equal(settled.outcome.finish, 'succeeded');
+  assert.equal(settled.outcome.released, true);
+  assert.equal(settled.outcome.content, 'hello from the worker');
+  assert.equal((await coordinator.reconcile('ctx-alice', b.idempotency_key)).status, 'settled');
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_settlements').get().n, 1);
+  assert.equal(h.sqlite.prepare("SELECT used_tokens FROM dispatch_pool_usage").get().used_tokens, 64);
+  noNetwork();
+});
+
+test('real store: expiry, foreign principal and changed body are refusals, not dispatches', async () => {
+  const h = createStoreHarness();
+  const { coordinator } = coordinatorOverStore(h);
+  const admission = await h.store.issueAdmission({
+    principal: storeAlice, resource_id: STORE_RES, model_id: 'model-x', max_tokens: 64,
+  });
+  const b = storeBody(admission);
+  assert.equal((await coordinator.submit('ctx-alice', b)).status, 'dispatched');
+
+  assert.equal((await coordinator.submit('ctx-alice', { ...b, prompt: 'changed' })).code, 'IDEMPOTENCY_CONFLICT');
+  assert.equal((await coordinator.submit('ctx-bob', b)).code, 'ADMISSION_NOT_AVAILABLE');
+  h.clock.advance(ADMISSION_TTL_MS);
+  const expired = await coordinator.submit('ctx-alice', {
+    ...storeBody(admission), deadline_at: h.clock.now() + 60000,
+  });
+  assert.equal(expired.code, 'ADMISSION_EXPIRED');
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_jobs').get().n, 1);
+  noNetwork();
+});
+
+test('real store: revoke before redemption refuses the start and releases the hold', async () => {
+  const h = createStoreHarness();
+  const admission = await h.store.issueAdmission({
+    principal: storeBob, resource_id: STORE_RES, model_id: 'model-x', max_tokens: 128, grant: 'grant-1',
+  });
+  const b = storeBody(admission);
+  const authority = Object.assign({}, h.store, {
+    redeemStart: async (args) => {
+      h.sqlite.prepare('UPDATE grants SET revoked_at = ? WHERE id = ?').run(new Date(h.clock.now()).toISOString(), 'grant-1');
+      return h.store.redeemStart(args);
+    },
+  });
+  const mod = await load();
+  const coord = mod.createDispatchCoordinator({
+    resolvePrincipal: async () => ({ ...storeBob }),
+    authority,
+    transport: {
+      capabilities: { protocol: 'aipster-bound-cpu-internal/1', instance_pin: true, deadline: true },
+      dispatch: () => { throw new Error('must not dispatch after a refused start'); },
+      poll: () => null,
+    },
+    now: h.clock.now,
+  });
+  const out = await coord.submit('ctx-bob', b);
+  assert.equal(out.status, 'rejected');
+  assert.equal(out.code, 'START_REFUSED');
+  assert.equal(out.reason, 'revoked');
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM grants WHERE id = ?').get('grant-1').used_tokens, 0);
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_start_redemptions').get().n, 0);
+  noNetwork();
+});
+
+test('real store: deadline before redemption fences and releases without dispatch', async () => {
+  const h = createStoreHarness();
+  const admission = await h.store.issueAdmission({
+    principal: storeAlice, resource_id: STORE_RES, model_id: 'model-x', max_tokens: 64,
+  });
+  const b = storeBody(admission, { deadline_at: STORE_T0 + 1000 });
+  const authority = Object.assign({}, h.store, {
+    admit: async (args) => {
+      const out = await h.store.admit(args);
+      h.clock.advance(2000);
+      return out;
+    },
+  });
+  const mod = await load();
+  const coord = mod.createDispatchCoordinator({
+    resolvePrincipal: async () => ({ ...storeAlice }),
+    authority,
+    transport: {
+      capabilities: { protocol: 'aipster-bound-cpu-internal/1', instance_pin: true, deadline: true },
+      dispatch: () => { throw new Error('must not dispatch after the deadline'); },
+      poll: () => null,
+    },
+    now: h.clock.now,
+  });
+  const out = await coord.submit('ctx-alice', b);
+  assert.equal(out.status, 'expired_before_start');
+  assert.equal(out.code, 'DEADLINE_EXCEEDED');
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_jobs').get().n, 0);
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage').get().used_tokens, 0);
+  noNetwork();
+});
+
+test('real store: cancel before redemption fences and releases; after dispatch it is unsupported', async () => {
+  const h = createStoreHarness();
+  const { coordinator } = coordinatorOverStore(h);
+  const key = storeOpKey('cancel');
+  const pending = await admittedOperation(h, {
+    principal: storeAlice, max_tokens: 64, op_key: JSON.stringify([storeAlice.principal_id, key]),
+  });
+  assert.equal(pending.admitted.outcome, 'admitted');
+  const cancelled = await coordinator.cancel('ctx-alice', key);
+  assert.equal(cancelled.status, 'cancelled_before_start');
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage').get().used_tokens, 0);
+  assert.equal((await h.store.getOperation({ op_key: JSON.stringify([storeAlice.principal_id, key]) })).phase, 'released');
+
+  const admission = await h.store.issueAdmission({
+    principal: storeAlice, resource_id: STORE_RES, model_id: 'model-x', max_tokens: 32,
+  });
+  const b = storeBody(admission);
+  assert.equal((await coordinator.submit('ctx-alice', b)).status, 'dispatched');
+  const after = await coordinator.cancel('ctx-alice', b.idempotency_key);
+  assert.equal(after.cancel, 'UNSUPPORTED_CAPABILITY');
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage').get().used_tokens, 32);
+  noNetwork();
 });
 
 test('no real network was attempted by any test in this file', () => noNetwork());
