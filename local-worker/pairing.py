@@ -634,6 +634,32 @@ def _fd_unlock(fd):
         pass
 
 
+@contextlib.contextmanager
+def sender_lock(data_dir):
+    """Cross-process sender exclusion (macOS/POSIX lane, 2026-11-01).
+
+    Held for a heartbeat-loop so a restarted controller cannot start a
+    second sender while an orphaned first sender still beats. OS-held
+    like pair_lock (flock/msvcrt, never existence-based): a dead
+    holder's lock is released by the OS. Fails fast with SENDER_RUNNING.
+    """
+    private_dir(data_dir)
+    lock = Path(data_dir) / "sender.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            _fd_lock_exclusive(fd)
+        except OSError as exc:
+            raise PairingError(None, "SENDER_RUNNING",
+                               f"another heartbeat sender is using {data_dir}") from exc
+        try:
+            yield
+        finally:
+            _fd_unlock(fd)
+    finally:
+        os.close(fd)
+
+
 def cmd_pair(args):
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -722,94 +748,104 @@ def cmd_heartbeat(args, loop):
             sys.stdout.reconfigure(line_buffering=True)
         except (OSError, ValueError):
             pass
-    while True:
-        if not first_beat:
-            # Reload every beat: unpair stops the sender instead of beating on
-            # a cached credential, and a re-pair switches it to the new key.
-            # Under the mutex (Muse W3 round 11): the reload must not
-            # race a concurrent pair's writes. A contested lock just
-            # delays one beat; it never stops the sender.
+    with contextlib.ExitStack() as stack:
+        if loop:
             try:
-                with pair_lock(data_dir):
-                    meta = load_pairing(data_dir)
+                stack.enter_context(sender_lock(data_dir))
             except PairingError as exc:
-                if exc.code == "PAIR_IN_PROGRESS":
-                    print("heartbeat: pair in progress; rechecking after the interval",
+                if exc.code == "SENDER_RUNNING":
+                    print(f"heartbeat: [{exc.code}] {exc}; not starting a second sender",
                           file=sys.stderr)
-                    time.sleep(interval)
-                    continue
-                if exc.code != "NOT_PAIRED":
-                    print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
                     return EXIT_USAGE
-                write_status(data_dir, {"at": time.time(), "ok": False, "status": "unpaired",
-                                        "code": exc.code}, meta)
-                print("heartbeat: worker was unpaired; sender stopping", file=sys.stderr)
-                return EXIT_REPAIR_REQUIRED
-        first_beat = False
-        # Recomputed per beat (Codex P2): installed/removed models and
-        # engines change readiness, and a stale true would misreport ready.
-        usable = decide_usable(args.config)
-        try:
-            result = send_heartbeat(meta["api_base"], meta["resource_id"],
-                                    meta["heartbeat_key"], usable)
-        except RePairRequired as exc:
-            # A re-pair can land between the reload and the beat: the old key
-            # is revoked but a newer credential is already installed. The
-            # sender loop retries with it instead of reporting the fresh
-            # pairing as dead; a one-shot beat reports and exits.
-            # Under the mutex (Muse W3 round 12): compare against a
-            # store snapshot no concurrent pair is mid-write on.
+                raise
+        while True:
+            if not first_beat:
+                # Reload every beat: unpair stops the sender instead of beating on
+                # a cached credential, and a re-pair switches it to the new key.
+                # Under the mutex (Muse W3 round 11): the reload must not
+                # race a concurrent pair's writes. A contested lock just
+                # delays one beat; it never stops the sender.
+                try:
+                    with pair_lock(data_dir):
+                        meta = load_pairing(data_dir)
+                except PairingError as exc:
+                    if exc.code == "PAIR_IN_PROGRESS":
+                        print("heartbeat: pair in progress; rechecking after the interval",
+                              file=sys.stderr)
+                        time.sleep(interval)
+                        continue
+                    if exc.code != "NOT_PAIRED":
+                        print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
+                        return EXIT_USAGE
+                    write_status(data_dir, {"at": time.time(), "ok": False, "status": "unpaired",
+                                            "code": exc.code}, meta)
+                    print("heartbeat: worker was unpaired; sender stopping", file=sys.stderr)
+                    return EXIT_REPAIR_REQUIRED
+            first_beat = False
+            # Recomputed per beat (Codex P2): installed/removed models and
+            # engines change readiness, and a stale true would misreport ready.
+            usable = decide_usable(args.config)
             try:
-                with pair_lock(data_dir):
-                    latest = load_pairing(data_dir)
-            except PairingError:
-                latest = None
-            if loop and latest is not None and latest["heartbeat_key"] != meta["heartbeat_key"]:
-                meta = latest
-                first_beat = True
-                continue
-            write_status(data_dir, {"at": time.time(), "ok": False,
-                                    "status": "repair-required", "code": exc.code}, meta)
-            print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
-                  file=sys.stderr)
-            return EXIT_REPAIR_REQUIRED
-        except PairingError as exc:
-            state = "rate-limited" if exc.status == 429 else "network-error" if exc.status is None else "failed"
-            write_status(data_dir, {"at": time.time(), "ok": False, "status": state,
-                                    "code": exc.code, "retryAfterSec": exc.retry_after}, meta)
-            if exc.status == 429:
-                wait = exc.retry_after or interval
-                print(f"heartbeat: rate limited; retrying in {wait}s", file=sys.stderr)
-                if not loop:
-                    return EXIT_NETWORK
-                time.sleep(wait)
-                continue
-            if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
-                # Transport faults AND transient server failures share the
-                # bounded backoff (Codex P2): a 5xx must not terminate the
-                # sender while the service recovers.
-                failures += 1
-                if failures > MAX_ATTEMPTS_NETWORK:
-                    print(f"heartbeat: giving up after {MAX_ATTEMPTS_NETWORK} tries: [{exc.code}] {exc}",
-                          file=sys.stderr)
-                    return EXIT_NETWORK
-                wait = min(2 ** failures, 60)
-                print(f"heartbeat: [{exc.code}] {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
+                result = send_heartbeat(meta["api_base"], meta["resource_id"],
+                                        meta["heartbeat_key"], usable)
+            except RePairRequired as exc:
+                # A re-pair can land between the reload and the beat: the old key
+                # is revoked but a newer credential is already installed. The
+                # sender loop retries with it instead of reporting the fresh
+                # pairing as dead; a one-shot beat reports and exits.
+                # Under the mutex (Muse W3 round 12): compare against a
+                # store snapshot no concurrent pair is mid-write on.
+                try:
+                    with pair_lock(data_dir):
+                        latest = load_pairing(data_dir)
+                except PairingError:
+                    latest = None
+                if loop and latest is not None and latest["heartbeat_key"] != meta["heartbeat_key"]:
+                    meta = latest
+                    first_beat = True
+                    continue
+                write_status(data_dir, {"at": time.time(), "ok": False,
+                                        "status": "repair-required", "code": exc.code}, meta)
+                print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
                       file=sys.stderr)
-                if not loop:
-                    return EXIT_NETWORK
-                time.sleep(wait)
-                continue
-            print(f"heartbeat failed [{exc.code}]: {exc}", file=sys.stderr)
-            return EXIT_PAIRING_REJECTED
-        failures = 0
-        write_status(data_dir, {"at": time.time(), "ok": True, "usable": usable,
-                                "heartbeatAt": result.get("heartbeatAt"),
-                                "note": "reachability only; not inference-ready"}, meta)
-        print(f"heartbeat ok: usable={usable} at={result.get('heartbeatAt')}")
-        if not loop:
-            return EXIT_OK
-        time.sleep(interval)
+                return EXIT_REPAIR_REQUIRED
+            except PairingError as exc:
+                state = "rate-limited" if exc.status == 429 else "network-error" if exc.status is None else "failed"
+                write_status(data_dir, {"at": time.time(), "ok": False, "status": state,
+                                        "code": exc.code, "retryAfterSec": exc.retry_after}, meta)
+                if exc.status == 429:
+                    wait = exc.retry_after or interval
+                    print(f"heartbeat: rate limited; retrying in {wait}s", file=sys.stderr)
+                    if not loop:
+                        return EXIT_NETWORK
+                    time.sleep(wait)
+                    continue
+                if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
+                    # Transport faults AND transient server failures share the
+                    # bounded backoff (Codex P2): a 5xx must not terminate the
+                    # sender while the service recovers.
+                    failures += 1
+                    if failures > MAX_ATTEMPTS_NETWORK:
+                        print(f"heartbeat: giving up after {MAX_ATTEMPTS_NETWORK} tries: [{exc.code}] {exc}",
+                              file=sys.stderr)
+                        return EXIT_NETWORK
+                    wait = min(2 ** failures, 60)
+                    print(f"heartbeat: [{exc.code}] {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
+                          file=sys.stderr)
+                    if not loop:
+                        return EXIT_NETWORK
+                    time.sleep(wait)
+                    continue
+                print(f"heartbeat failed [{exc.code}]: {exc}", file=sys.stderr)
+                return EXIT_PAIRING_REJECTED
+            failures = 0
+            write_status(data_dir, {"at": time.time(), "ok": True, "usable": usable,
+                                    "heartbeatAt": result.get("heartbeatAt"),
+                                    "note": "reachability only; not inference-ready"}, meta)
+            print(f"heartbeat ok: usable={usable} at={result.get('heartbeatAt')}")
+            if not loop:
+                return EXIT_OK
+            time.sleep(interval)
 
 
 def cmd_status(args):

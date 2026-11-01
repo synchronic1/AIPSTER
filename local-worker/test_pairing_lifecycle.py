@@ -95,18 +95,32 @@ class PairingLifecycleTests(unittest.TestCase):
         self.assertNotIn("unpaired locally",out.getvalue());self.assertIn("could not",err.getvalue())
 
     @unittest.skipIf(os.name=="nt","POSIX directory read/search permissions")
-    def test_posix_write_search_only_directory_cannot_claim_complete_cleanup(self):
+    def test_posix_write_search_only_directory_repairs_then_completes_cleanup(self):
+        # macOS lane 2026-11-01 (renamed; was ..._cannot_claim_complete_cleanup):
+        # raw 0o300 denies scandir, but pair_lock provisions via private_dir
+        # since 811709f, repairing user-owned 0o300 to 0o700 before
+        # enumeration. Enumeration then succeeds and unpair honestly
+        # completes. The mocked enumeration test still covers true failures.
         if os.geteuid()==0:self.skipTest("root bypasses POSIX read denial")
         meta=self.pair();manifest=self.data/"pairing.json";key=self.data/meta["key_file"]
         sentinel=self.data/"unmanaged.txt";sentinel.write_text("synthetic unrelated file")
         self.data.chmod(0o300)
         try:
-            out,err=io.StringIO(),io.StringIO()
+            with self.assertRaises(OSError):
+                with os.scandir(self.data):
+                    pass
+        finally:
+            pass
+        out,err=io.StringIO(),io.StringIO()
+        try:
             with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
-                self.assertNotEqual(pairing.cmd_unpair(self.args),pairing.EXIT_OK)
-            self.assertTrue(manifest.exists());self.assertTrue(key.exists());self.assertTrue(sentinel.exists())
-            self.assertIn("could not",err.getvalue());self.assertNotIn("unpaired locally",out.getvalue())
-        finally:self.data.chmod(0o700)
+                self.assertEqual(pairing.cmd_unpair(self.args),pairing.EXIT_OK)
+            self.assertFalse(manifest.exists());self.assertFalse(key.exists())
+            self.assertTrue(sentinel.exists())
+            self.assertIn("unpaired locally",out.getvalue())
+        finally:
+            try:self.data.chmod(0o700)
+            except OSError:pass
 
     @unittest.skipUnless(os.name=="nt","Windows sharing semantics")
     def test_native_open_key_handle_reports_unpair_failure(self):
