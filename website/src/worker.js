@@ -16,7 +16,7 @@ import { advisorEnabled, advisorDescriptor, handleAdvisorPost } from './advisor/
 import { ADVISOR_BODY_MAX } from './advisor/validate.mjs';
 import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
-import { grantPartiesSameSide } from './lib/access.js';
+import { grantPartiesSameSide, grantUsage } from './lib/access.js';
 
 const VERSION = '0.5.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -521,7 +521,8 @@ async function handleApi(request, env, url) {
     const items = [];
     for (const g of page.items) {
       const r = await first(db, 'SELECT name FROM resources WHERE id = ?', g.resource_id);
-      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'recorded', policyNote: 'Inference-only grant recorded by the owner; quotas are checked when dispatch is enabled. Dispatch is currently disabled.' });
+      const net = await grantUsage(db, g.id);
+      items.push({ ...mapGrantLite(g), usedJobs: net.used_jobs, usedTokens: net.used_tokens, resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'recorded', policyNote: 'Inference-only grant recorded by the owner; quotas are checked when dispatch is enabled. Dispatch is currently disabled.' });
     }
     return json(200, { ...page, items });
   }
@@ -529,7 +530,12 @@ async function handleApi(request, env, url) {
     const d = needSession(); if (d) return deny(d);
     const q = pagination(url);
     const page = await pageQuery(db, { select: 'SELECT g.*', from: 'FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.owner_id = ? AND o.demo = r.demo', params: [me()], order: 'ORDER BY g.created_at DESC', ...q });
-    return json(200, { ...page, items: page.items.map(mapGrantLite) });
+    const items = [];
+    for (const g of page.items) {
+      const net = await grantUsage(db, g.id);
+      items.push({ ...mapGrantLite(g), usedJobs: net.used_jobs, usedTokens: net.used_tokens });
+    }
+    return json(200, { ...page, items });
   }
   if (path === '/api/grants' && method === 'POST') {
     const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);

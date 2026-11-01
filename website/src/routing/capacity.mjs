@@ -14,7 +14,9 @@
 import { httpError } from '../lib/validate.js';
 import { first, run } from '../lib/store.js';
 import { rid } from '../lib/store.js';
-import { grantPartiesSameSide } from '../lib/access.js';
+import { grantPartiesSameSide, grantUsage } from '../lib/access.js';
+
+export { grantUsage };
 
 export const ROUTING_RESERVE_TTL_MS = 300000;
 
@@ -59,15 +61,6 @@ export async function reserveCapacity(db, { opId, tenant, grantId, jobs, tokens,
     'INSERT INTO routing_reservations (id, op_id, tenant_id, grant_id, jobs, tokens, state, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     id, opId, tenant, grantId, jobs, tokens, 'held', at, at, new Date(now + ttlMs).toISOString());
   return { id, opId, tenant, grantId, jobs, tokens, state: 'held' };
-}
-
-/** Effective (net) usage of one grant: gross charges minus refund receipts. */
-export async function grantUsage(db, grantId) {
-  const row = await first(db,
-    `SELECT used_jobs - (SELECT COALESCE(SUM(jobs), 0) FROM routing_refunds WHERE grant_id = ?) AS used_jobs,
-            used_tokens - (SELECT COALESCE(SUM(tokens), 0) FROM routing_refunds WHERE grant_id = ?) AS used_tokens
-     FROM grants WHERE id = ?`, grantId, grantId, grantId);
-  return { used_jobs: Math.max(0, row.used_jobs), used_tokens: Math.max(0, row.used_tokens) };
 }
 
 /**

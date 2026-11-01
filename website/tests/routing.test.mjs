@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { createTestEnv } from './d1-shim.mjs';
 import { canUseResource } from '../src/lib/access.js';
 import { listEligible } from '../src/routing/eligibility.mjs';
+import { reserveCapacity, releaseCapacity } from '../src/routing/capacity.mjs';
 import {
   ROUTING_POLICY_VERSION, scoreCandidates, toEnvelopeCandidate,
   routingDigests, ROUTING_CANDIDATE_MAX, newRoutingRequest,
@@ -97,6 +98,22 @@ test('routing eligibility: kind filter and token-fit are hard constraints', asyn
   assert.equal(nofit.rejected.find((r) => r.resourceId === 'r_bob1').reason, 'CAPACITY_INSUFFICIENT');
   // Owned rows have no quota counters: capacity unknown, never excluded.
   assert.ok(nofit.eligible.some((c) => c.resourceId === 'r_alice1'));
+});
+
+test('routing eligibility: released quota restores eligibility and descriptor capacity', async () => {
+  const t = await createTestEnv({});
+  await seed(t);
+  const now = Date.now();
+  // Fill g_live (max 10 jobs / 50000 tokens, already 2 / 1000 used) through
+  // the real reserve path, then release: eligibility must follow NET usage.
+  await reserveCapacity(t.DB, { opId: 'op_e1', tenant: 'u_alice', grantId: 'g_live', jobs: 8, tokens: 49000, nowMs: now });
+  const spent = await listEligible(t.DB, 'u_alice', { nowMs: now });
+  assert.equal(spent.rejected.find((r) => r.resourceId === 'r_bob1').reason, 'QUOTA_EXHAUSTED');
+  await releaseCapacity(t.DB, { opId: 'op_e1' });
+  const out = await listEligible(t.DB, 'u_alice', { nowMs: now });
+  const hit = out.eligible.find((c) => c.resourceId === 'r_bob1');
+  assert.ok(hit, 'released grant must be eligible again');
+  assert.deepEqual(hit.capacity, { jobsRemaining: 8, tokensRemaining: 49000 });
 });
 
 test('routing eligibility: model compatibility stays unverified without a registry', async () => {
