@@ -68,7 +68,10 @@ function requestFailure(body, status) {
   return 'HTTP ' + status;
 }
 
+let overviewSeq = 0;
+
 async function loadOverview() {
+  const mySeq = ++overviewSeq;
   const section = document.getElementById('overview');
   const state = section.querySelector('.state');
   const box = document.getElementById('overview-result');
@@ -76,7 +79,9 @@ async function loadOverview() {
   box.textContent = '';
   try {
     const res = await fetch('/api/admin/v1/overview', { credentials: 'same-origin' });
+    if (mySeq !== overviewSeq) return;
     const body = await res.json().catch(() => null);
+    if (mySeq !== overviewSeq) return;
     if (!res.ok || !body) {
       state.textContent = 'Unavailable: ' + requestFailure(body, res.status) + '.';
       return;
@@ -100,11 +105,13 @@ async function loadOverview() {
       + (body.coverage_reason_code ? ' (' + esc(body.coverage_reason_code) + ')' : '') + '</td></tr>'
       + '</table>';
   } catch {
+    if (mySeq !== overviewSeq) return;
     state.textContent = 'Unavailable: request failed.';
   }
 }
 
 let resourcesOffset = 0;
+let resourcesSeq = 0;
 const RESOURCES_LIMIT = 20;
 
 async function loadResources(offset) {
@@ -115,13 +122,17 @@ async function loadResources(offset) {
   const label = document.getElementById('resources-page-label');
   const prev = document.getElementById('resources-prev');
   const next = document.getElementById('resources-next');
-  resourcesOffset = Math.max(0, offset || 0);
+  const myOffset = Math.max(0, offset || 0);
+  resourcesOffset = myOffset;
+  const mySeq = ++resourcesSeq;
   state.textContent = 'Loading…';
   box.textContent = '';
   pages.hidden = true;
   try {
-    const res = await fetch('/api/admin/v1/resources?limit=' + RESOURCES_LIMIT + '&offset=' + resourcesOffset, { credentials: 'same-origin' });
+    const res = await fetch('/api/admin/v1/resources?limit=' + RESOURCES_LIMIT + '&offset=' + myOffset, { credentials: 'same-origin' });
+    if (mySeq !== resourcesSeq) return;
     const body = await res.json().catch(() => null);
+    if (mySeq !== resourcesSeq) return;
     if (!res.ok || !body) {
       state.textContent = 'Unavailable: ' + requestFailure(body, res.status) + '.';
       return;
@@ -137,21 +148,33 @@ async function loadResources(offset) {
     } else {
       const rows = body.items.map((it) =>
         '<tr><td>' + esc(it.id) + '</td><td>' + esc(it.name) + '</td><td>' + esc(it.kind)
-        + '</td><td>' + esc(it.liveness) + '</td><td>' + esc(it.lastSeenAt || 'never seen')
+        + '</td><td>' + esc(it.liveness) + '</td><td>' + esc(it.lastSeenAt || 'unknown')
         + '</td><td>' + unknown(it.usable) + '</td><td>' + unknown(it.configured)
         + '</td><td>' + unknown(it.authenticated) + '</td></tr>').join('');
       box.innerHTML = '<table><tr><th>id</th><th>name</th><th>kind</th><th>liveness</th>'
         + '<th>last seen</th><th>usable</th><th>configured</th><th>authenticated</th></tr>' + rows + '</table>';
     }
+    // Window bounds and Next come from offset plus limit (echoed when sane,
+    // else requested): items.length shrinks when malformed rows skip, so it
+    // must never size the window. The displayed count rides along separately.
+    const effOffset = Number.isSafeInteger(body.offset) && body.offset >= 0 ? body.offset : myOffset;
+    const effLimit = Number.isSafeInteger(body.limit) && body.limit > 0 ? body.limit : RESOURCES_LIMIT;
     if (total !== null && total > 0) {
-      const first = body.items.length ? resourcesOffset + 1 : resourcesOffset;
-      const last = resourcesOffset + body.items.length;
-      label.textContent = 'Rows ' + first + '–' + last + ' of ' + total + '.';
-      prev.disabled = resourcesOffset === 0;
-      next.disabled = last >= total;
+      const winStart = effOffset + 1;
+      const winEnd = Math.min(effOffset + effLimit, total);
+      if (winStart > winEnd) {
+        label.textContent = 'Rows 0 of ' + total + ' (' + body.items.length + ' shown).';
+      } else if (body.items.length < winEnd - winStart + 1) {
+        label.textContent = 'Rows ' + winStart + '–' + winEnd + ' of ' + total + ' (' + body.items.length + ' shown).';
+      } else {
+        label.textContent = 'Rows ' + winStart + '–' + winEnd + ' of ' + total + '.';
+      }
+      prev.disabled = effOffset === 0;
+      next.disabled = (effOffset + effLimit) >= total;
       pages.hidden = false;
     }
   } catch {
+    if (mySeq !== resourcesSeq) return;
     state.textContent = 'Unavailable: request failed.';
   }
 }

@@ -55,7 +55,7 @@ function harness(routes) {
     const url = new URL(String(path), 'https://admin.local');
     const route = routes[url.pathname];
     if (!route) return Response.json({ error: 'No route', code: 'UNKNOWN' }, { status: 404 });
-    const out = route(url);
+    const out = await route(url);
     if (out instanceof Error) throw out;
     return Response.json(out.body, { status: out.status });
   };
@@ -139,11 +139,12 @@ test('admin ui: resources escape untrusted content and label the page', async ()
   assert.ok(!html.includes('<img src=x'), 'row markup is escaped');
   assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'), 'escaped name still readable');
   assert.ok(html.includes('r_&quot;1'), 'id quotes escaped');
-  assert.ok(html.includes('never seen'), 'missing last-seen reads as never seen, not epoch');
-  assert.equal(h.el('resources-page-label').textContent, 'Rows 1–2 of 5.');
+  assert.ok(!html.includes('never seen'), 'null last-seen never claims a history the API cannot see');
+  assert.ok(html.includes('<td>unknown</td><td>unknown</td><td>unknown</td>'), 'null last-seen renders unknown (offline, garbled and never-seen share null)');
+  assert.equal(h.el('resources-page-label').textContent, 'Rows 1–5 of 5 (2 shown).');
   assert.equal(h.el('resources-pages').hidden, false);
   assert.equal(h.el('resources-prev').disabled, true, 'first page disables Previous');
-  assert.equal(h.el('resources-next').disabled, false);
+  assert.equal(h.el('resources-next').disabled, true, 'offset plus limit already covers the total, Next closes');
   assert.ok(h.calls.find((c) => c.includes('/api/admin/v1/resources?limit=20&offset=0')), 'first load requests the first window');
 });
 
@@ -220,4 +221,155 @@ test('admin ui: shell keeps milestone controls keyboard-operable and announced',
   };
   walkSections(frag, null);
   assert.deepEqual(states, [{ section: 'overview', live: 'polite' }, { section: 'resources', live: 'polite' }], 'status lines announced');
+});
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function resourceRow(id) {
+  return {
+    id, name: 'n-' + id, kind: 'local', liveness: 'online',
+    lastSeenAt: '2026-10-31T17:59:00.000Z', lastSeenAgeMs: 1,
+    usable: true, configured: true, authenticated: true,
+  };
+}
+
+function resourcesPage(items, total, limit, offset) {
+  return {
+    status: 200,
+    body: {
+      schema_version: 'admin.resources.v1', state: 'available', observed_at: 't' + offset,
+      items, total, limit, offset,
+    },
+  };
+}
+
+test('admin ui: superseded resources responses never paint', async () => {
+  const first = deferred();
+  const second = deferred();
+  const h = harness({
+    '/api/admin/v1/resources': (url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      const gate = offset === 0 ? first.promise : second.promise;
+      return gate.then(() => resourcesPage([resourceRow('r_o' + offset)], 45, 20, offset));
+    },
+  });
+  h.buttons[1].click();
+  h.el('resources-next').click();
+  assert.deepEqual(
+    h.calls.filter((c) => c.startsWith('/api/admin/v1/resources')).map((c) => new URL(c, 'https://admin.local').searchParams.get('offset')),
+    ['0', '20'],
+    'both windows requested before either resolves',
+  );
+  second.resolve();
+  await settled(() => h.sections.resources.state.textContent === 'Loaded t20.', 'newer window paints');
+  assert.ok(h.el('resources-result').innerHTML.includes('r_o20'), 'newer rows painted');
+  first.resolve();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(h.el('resources-result').innerHTML.includes('r_o20'), 'older response did not overwrite rows');
+  assert.ok(!h.el('resources-result').innerHTML.includes('r_o0'), 'older rows never painted');
+  assert.equal(h.el('resources-page-label').textContent, 'Rows 21–40 of 45 (1 shown).');
+  assert.equal(h.el('resources-prev').disabled, false);
+  assert.equal(h.el('resources-next').disabled, false);
+});
+
+test('admin ui: superseded resources failures never clear a painted page', async () => {
+  const first = deferred();
+  const second = deferred();
+  const h = harness({
+    '/api/admin/v1/resources': (url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      const gate = offset === 0 ? first.promise : second.promise;
+      return gate.then(() => {
+        if (offset === 0) throw new Error('stale boom');
+        return resourcesPage([resourceRow('r_o20')], 45, 20, 20);
+      });
+    },
+  });
+  h.buttons[1].click();
+  h.el('resources-next').click();
+  second.resolve();
+  await settled(() => h.sections.resources.state.textContent === 'Loaded t20.', 'newer window paints');
+  first.resolve();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(h.sections.resources.state.textContent, 'Loaded t20.', 'stale failure did not clear state');
+  assert.ok(h.el('resources-result').innerHTML.includes('r_o20'), 'painted rows survive a stale failure');
+});
+
+test('admin ui: superseded overview failures never clear painted counts', async () => {
+  const first = deferred();
+  const second = deferred();
+  let n = 0;
+  const h = harness({
+    '/api/admin/v1/overview': () => {
+      n += 1;
+      const gate = n === 1 ? first.promise : second.promise;
+      const seq = n;
+      return gate.then(() => {
+        if (seq === 1) throw new Error('stale overview boom');
+        return AVAILABLE_OVERVIEW;
+      });
+    },
+  });
+  h.buttons[0].click();
+  h.buttons[0].click();
+  second.resolve();
+  await settled(() => h.sections.overview.state.textContent !== 'Loading…', 'newer overview paints');
+  assert.match(h.sections.overview.state.textContent, /Loaded 2026-10-31T18:00:00\.000Z/);
+  first.resolve();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.match(
+    h.sections.overview.state.textContent,
+    /Loaded 2026-10-31T18:00:00\.000Z/,
+    'stale failure did not clear overview',
+  );
+});
+
+test('admin ui: sparse final window keeps bounds from offset plus limit', async () => {
+  const h = harness({
+    '/api/admin/v1/resources': (url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      const items = offset === 40
+        ? [resourceRow('r_a'), resourceRow('r_b')]
+        : Array.from({ length: 20 }, (_, i) => resourceRow('r_' + offset + '_' + i));
+      return resourcesPage(items, 45, 20, offset);
+    },
+  });
+  h.buttons[1].click();
+  await settled(() => h.el('resources-page-label').textContent !== '', 'first window');
+  assert.equal(h.el('resources-page-label').textContent, 'Rows 1–20 of 45.');
+  h.el('resources-next').click();
+  await settled(() => h.el('resources-page-label').textContent === 'Rows 21–40 of 45.', 'second window');
+  h.el('resources-next').click();
+  await settled(() => h.el('resources-page-label').textContent !== 'Rows 21–40 of 45.', 'final window');
+  assert.equal(h.el('resources-page-label').textContent, 'Rows 41–45 of 45 (2 shown).');
+  assert.equal(h.el('resources-prev').disabled, false);
+  assert.equal(h.el('resources-next').disabled, true, 'Next closes when offset plus limit reaches the total');
+});
+
+test('admin ui: page past a shrunken total reports an empty window', async () => {
+  const h = harness({
+    '/api/admin/v1/resources': (url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      if (offset === 0) {
+        return resourcesPage(
+          Array.from({ length: 20 }, (_, i) => resourceRow('r_0_' + i)), 45, 20, 0,
+        );
+      }
+      return resourcesPage([], 5, 20, 20);
+    },
+  });
+  h.buttons[1].click();
+  await settled(() => h.el('resources-page-label').textContent !== '', 'first window');
+  assert.equal(h.el('resources-page-label').textContent, 'Rows 1–20 of 45.');
+  h.el('resources-next').click();
+  await settled(() => h.el('resources-page-label').textContent !== 'Rows 1–20 of 45.', 'shrunken window');
+  assert.equal(h.el('resources-result').textContent, 'No rows on this page.');
+  assert.equal(h.el('resources-page-label').textContent, 'Rows 0 of 5 (0 shown).');
+  assert.equal(h.el('resources-prev').disabled, false);
+  assert.equal(h.el('resources-next').disabled, true);
 });
