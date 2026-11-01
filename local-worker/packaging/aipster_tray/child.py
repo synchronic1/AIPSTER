@@ -10,6 +10,7 @@ it runs while serving whether or not the daemon bound its port.
 """
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -107,6 +108,53 @@ def looks_like_bind_error(text):
     return any(marker in lowered for marker in BIND_MARKERS)
 
 
+def _stop_own_process(proc, timeout):
+    """Terminate an owned child and its verified POSIX descendants.
+
+    POSIX children start with start_new_session=True, so the child is a
+    process-group leader containing only processes it spawned. Terminating
+    the group closes owned grandchildren a direct-child-only kill would
+    orphan. Windows keeps terminate/kill (job objects confine there).
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (OSError, ProcessLookupError):
+        proc.wait(timeout=10)
+        return
+    if pgid != proc.pid:
+        # Not the group leader (child changed its own pgid): fall back to
+        # single-process signals rather than a group we merely joined.
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        proc.wait(timeout=10)
+
+
 class WorkerChild:
     """Owns at most one dendrite child process plus its log/sniff threads."""
 
@@ -185,13 +233,7 @@ class WorkerChild:
         if proc is None:
             self._close_job()
             return
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+        _stop_own_process(proc, timeout)
         self._close_job()
 
     def _close_job(self):
@@ -359,13 +401,7 @@ class SenderChild:
         if proc is None:
             self._close_job()
             return
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+        _stop_own_process(proc, timeout)
         self.last_exit = proc.poll()
         self._close_job()
 

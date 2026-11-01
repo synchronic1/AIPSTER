@@ -9,6 +9,8 @@ Exit codes: 0 ok (run exits only on Quit; second launch exits 0 after reuse),
 2 usage/config/no-instance errors.
 """
 import os
+import shlex
+import subprocess
 import sys
 import time
 import urllib.request
@@ -319,7 +321,11 @@ class Controller:
             self.log("pair unavailable: console launcher missing from bundle")
             return False
         exe, args = target
-        self.log(f"pair console: {exe} {' '.join(args)}")
+        if os.name == "nt":
+            display = subprocess.list2cmdline([exe, *args])
+        else:
+            display = shlex.join([exe, *args])
+        self.log(f"pair console: {display}")
         self.backend.run_pair_console(exe, args)
         return True
 
