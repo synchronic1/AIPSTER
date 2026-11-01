@@ -1,3 +1,7 @@
+# Modified by AIPSTER local patch 0002 (2026-11-01): fabric dispatch resolves an
+# exact resident model and can never cold-start or switch one; execution results
+# bind to the dispatch job id; a secret-free fabric transport state is exposed in
+# the local node snapshot. Upstream base and hashes: local-worker/provenance.json.
 import asyncio
 import shutil
 import time
@@ -27,6 +31,16 @@ class Node:
             "enabled": bool(config.node.control_plane_url),
             "last_success_at": None,
             "last_error": None,
+        }
+        # Secret-free fabric transport state for GET /v1/node. The cloud snapshot
+        # does not include this block; it is local operator visibility only.
+        self.fabric = {
+            "enabled": bool(config.node.fabric_url),
+            "state": "disconnected" if config.node.fabric_url else "disabled",
+            "connected_at": None,
+            "last_heartbeat_at": None,
+            "last_error": None,
+            "code": None,
         }
 
     async def start(self):
@@ -85,6 +99,7 @@ class Node:
             "models": models,
             "discovered_gguf": self.discovered_models,
             "heartbeat": dict(self.heartbeat),
+            "fabric": dict(self.fabric),
         }
 
     def select(self, request: ExecuteRequest) -> ModelConfig:
@@ -113,13 +128,47 @@ class Node:
             ),
         )
 
-    async def execute(self, request: ExecuteRequest) -> ExecuteResponse:
+    def resolve_resident(self, request: ExecuteRequest) -> ModelConfig:
+        """Exact, already-resident model binding for fabric dispatch.
+
+        The fabric scheduler is told this worker serves resident models only, so a
+        mismatch here is a refusal, never a cue to cold-start, switch models or
+        fall back to a different candidate.
+        """
+        if request.model_id is None:
+            raise RuntimeFailure("Fabric execution requires an explicit configured model", 422)
+        model = next((m for m in self.config.models if m.id == request.model_id), None)
+        if model is None:
+            raise RuntimeFailure("Requested model is not configured on this worker", 404)
+        if request.capability not in model.capabilities:
+            raise RuntimeFailure("Model does not advertise the requested capability", 404)
+        runtime = self.runtimes[model.runtime]
+        if not runtime.is_resident(model):
+            raise RuntimeFailure(
+                "Requested model is not resident; this worker will not cold-start or "
+                "switch models for fabric dispatch",
+                409,
+            )
+        if runtime.lock.locked():
+            raise RuntimeFailure("Requested runtime is busy", 429)
+        return model
+
+    async def execute(
+        self,
+        request: ExecuteRequest,
+        execution_id: str | None = None,
+        resident_only: bool = False,
+    ) -> ExecuteResponse:
         await self.refresh_attached()
-        model = self.select(request)
-        result = await self.runtimes[model.runtime].execute(model, request)
+        model = (
+            self.resolve_resident(request) if resident_only else self.select(request)
+        )
+        result = await self.runtimes[model.runtime].execute(
+            model, request, require_resident=resident_only
+        )
         self.performance.observe(result, model.id, model.runtime)
         return ExecuteResponse(
-            request_id=str(uuid.uuid4()),
+            request_id=execution_id or str(uuid.uuid4()),
             node_id=self.config.node.id,
             runtime_id=model.runtime,
             model_id=model.id,

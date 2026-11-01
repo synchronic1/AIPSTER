@@ -1,9 +1,12 @@
 # Installation is not execution qualification
 
 The vendored worker is the public snapshot, not newer private EIF source. No
-private histories or patches were accessed or copied for this PR. The comparison
-is against public `dendrite/config.py`, `schemas.py`, `node.py`,
-`runtimes/llama.py` and AIPSTER's [published contract](../docs/eif-atomic-admission-contract.md).
+private histories were accessed or copied. Local patch 0002 is an original
+change implementing the documented Ganglion v0.2.0 node socket; it was checked
+offline against the Ganglion reference snapshot sanitizer and scheduler, and
+the deployed fabric was not connected or exercised. The remaining comparison is
+against public `dendrite/config.py`, `schemas.py`, `node.py`, `runtimes/llama.py`
+and AIPSTER's [published contract](../docs/eif-atomic-admission-contract.md).
 
 ## What the job runner connects (2026-11-01)
 
@@ -39,13 +42,13 @@ Still unavailable, unqualified or owned elsewhere:
 
 | Boundary | State |
 |---|---|
-| Server job routes and store | The worker consumes `GET /api/worker/jobs/next` and `POST /api/worker/jobs/:job_id/result`; the L1 dispatch store and L2 routes are not in this tree, and both 404 unless `INFERENCE_ENABLED` is set. The route/lease/result **wire shapes used here are the dispatch lane's**, not a deployed contract. |
+| Server job routes and store | The worker consumes `GET /api/worker/jobs/next` and `POST /api/worker/jobs/:job_id/result`, served by the dispatch store and routes in `website/src/inference/` (migration 0024). Both return 404 unless `INFERENCE_ENABLED` is set, and neither is deployed. |
 | Task admission | ExecuteRequest still has no stable operation key or owner/workspace authority in the public worker. Durable atomic budget reservation and admission remain AIPSTER-side and are not exercised here. |
 | Placement | The runner enforces the `aipster-bound-cpu-internal/1` envelope's placement fields, but that binding is only as good as the issuing store; capability matching is still not authorization. |
 | CPU confinement | Zero GPU layers is configurable, but the public worker still has no `cpu_only` opt-in, `--device none`, `--no-kv-offload`, or exclusion of ambient `LLAMA_ARG_*` values. Ganglion's own device placement was not audited or changed here. |
 | Retry / settlement | The worker posts once and holds a local started-job ledger, but there is no connected server-side settlement or lease store in this tree, and no cross-process proof that a leased job cannot be handed out twice. |
-| Transport / tenant isolation | The optional legacy fabric bridge is included only to satisfy package imports. Local bearer checks do not establish AIPSTER tenant/grant authority. |
-| Result and revocation | The worker reports EIF-shaped results and stops on a revoked/expired key, but admitted-revision validation, grant revocation settlement and the content-release recheck belong to the coordinator lane. |
+| Transport / tenant isolation | Patch 0002 reviews the opt-in outbound Ganglion fabric bridge: authenticated node socket, exact resident-model binding, resident-only capacity advertisement, job-id result binding and rejection handling. It remains disabled in the supplied examples and is still **not the AIPSTER transport**. AIPSTER's worker-pull job routes (above) are the AIPSTER transport, and a fabric socket does not establish AIPSTER tenant/grant authority. The fabric execute frame carries no tenant, grant, runtime ID or deadline; the worker trusts the authenticated socket and cannot re-verify AIPSTER authorization locally. |
+| Result and revocation | The worker reports EIF-shaped results and stops on a revoked/expired key, but admitted-revision validation, grant revocation settlement and the content-release recheck belong to the coordinator lane. Ganglion fabric results (patch 0002) are one non-streamed frame bound to the dispatch job ID, with no durable ledger across reconnects. |
 | Runtime evidence | Public code has some attach quarantine/model identity checks already. Native CPU ISA, RAM/context fit and exact model digest qualification remain future work. |
 
 ## Live qualification still pending
@@ -69,3 +72,25 @@ Unknown fields are rejected by the strict public schemas. Do not remove placemen
 fields to make newer tasks pass, downgrade to unbound retries or enable jobs on the
 strength of these installation tests. Authentication, tenancy, budgets, placement
 and F1/F1P holds are unchanged. `/api/jobs` still returns `INFERENCE_DISABLED`.
+
+## Ganglion contract limits recorded for local patch 0002
+
+The reviewed node contract is the Ganglion fabric v0.2.0 node socket described by
+its public manifest and node contract (reviewed 2026-11-01; the deployed fabric
+was not connected or exercised by this change): `GET /v1/nodes/connect?node_id=…`
+with a node-role token bound to that ID, one immediate and then periodic
+heartbeat, `execute` down the same socket, and exactly one terminal `result`
+frame. It has **no streaming, no cancel frame and no deadline field**. The
+contract assigns a 180 s deadline at admission and discards a result that arrives
+at or after it; the worker can only enforce its own `request_timeout_seconds`.
+Disconnect is the only remote cancellation signal, so an in-flight attached
+request is quarantined as an uncertain outcome. These are contract gaps for the
+fabric owner, not fields this worker may invent.
+
+Resident-only is deliberate: the worker advertises non-resident models as
+unavailable and advertises no model switching. A fabric request for any other
+model, or for a resident model whose file identity changed, is rejected with 409
+before a load or switch; make it resident through the local API first. Chat
+(`messages`) is not advertised and a forced frame is rejected as an invalid
+request; `probe_chat` is answered with a normal heartbeat. A durable
+cross-reconnect execution ledger and AIPSTER admission/settlement remain absent.

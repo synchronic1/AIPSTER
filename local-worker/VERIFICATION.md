@@ -90,3 +90,42 @@ clients and do not use these inbound routes. A network bind already required a
 token; it now also requires `advertise_url` or `allowed_hosts`. Loopback quickstart
 clients must send the bearer token. No native engine, model, inference or AIPSTER
 connection was exercised.
+
+## Local patch 0002: Ganglion fabric resident-only binding (2026-11-01)
+
+Patch `patches/0002-fabric-resident-binding.patch` (SHA-256
+`d9d2d616f292471f70cca59eee6189bd78f80a1d288d2c17fded52a0b69ec0f8`) implements the
+opt-in outbound Ganglion node socket in the vendored fabric bridge. It binds each
+fabric result to the dispatch `job_id`, executes only an already-resident exact
+model (never a cold start or switch), advertises resident-only capacity, treats a
+rejected handshake or policy close as permanent instead of retrying, and keeps
+prompts and transport secrets out of failure logs.
+
+The patch applies to EIF `536508832b12d993dc272e03d4f09aca53801f68`, the pin current
+main already carries with no other local change to these files. `verify_vendor.py
+--check-patches` reports 16 files: 10 upstream-identical and 6 locally patched
+(0001: `api.py`, `config.py`; 0002: `fabric.py`, `node.py`, `runtimes/base.py`,
+`runtimes/llama.py`). Reversing both patches reproduces the recorded upstream
+SHA-256 values, and forward-applying 0002 to main's pre-patch vendor bytes
+reproduces the committed files byte-for-byte.
+
+`test_fabric_bridge.py` exercises the reviewed wire contract against a local
+fake-fabric WebSocket and the mock runtime only. It covers: authenticated connect; one
+immediate heartbeat; resident-only capacity in the cloud snapshot, including a
+changed model file identity; a single result bound to the job ID; duplicate
+suppression during and after execution and after a capacity rejection; unknown
+model, capability mismatch, missing model, unknown field and chat-frame denial
+before load; model-switch refusal; busy 429; timeout 504 with exactly one error and
+no local retry; disconnect cancellation with no result; malformed/oversized/unknown
+frames; a single heartbeat loop; `probe_chat` answered by a heartbeat with no
+result; no prompt or token in logs, error frames, `last_error` or the local
+snapshot; permanent 401 handshake rejection without retry; 4001 replacement and
+4003 revocation stop states; and attach quarantine only after an unanswered sent
+request, not after connect-phase failures. All 24 tests pass.
+
+Limits: the deployed fabric was not contacted, no credential was read, no node was
+enrolled, no model was loaded, and no live task or inference ran; the AIPSTER
+dispatch path remains absent. The Ganglion contract has no streaming, cancel frame
+or transmitted deadline, so the worker enforces only its local request timeout;
+this is recorded in [EXECUTION-GAPS.md](EXECUTION-GAPS.md). The fabric evidence is
+synthetic, not a proof about the deployed fabric.
