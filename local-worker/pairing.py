@@ -12,7 +12,10 @@ Flow:
   2. Credentials land in the user-private data dir (0600 + Windows user ACL)
      and are never printed, logged, or placed in URLs.
   3. `pairing.py heartbeat-loop` posts bounded reachability heartbeats.
-     A heartbeat proves reachability, never inference readiness.
+     A heartbeat proves reachability, never inference readiness. With the
+     opt-in `--advertise-models`, a beat may also carry the upstream's
+     bounded model id list so the server can refuse an unknown model at
+     admission time instead of queueing a job that fails MODEL_UNAVAILABLE.
 
 This module never serves inbound traffic and never touches the daemon's
 loopback port: pairing is an outbound client (HTTPS, or loopback HTTP for
@@ -65,6 +68,13 @@ HEARTBEAT_MIN_INTERVAL_SEC = 30  # above the 25s server window + skew
 MAX_ATTEMPTS_NETWORK = 5
 STATUS_STALE_SEC = 5 * 60
 PRIVATE_DIR_SETTLE_SEC = 2  # concurrent creator still normalizing its new directory
+# Opt-in heartbeat model inventory (W1). Strictly bounded on both sides, so a
+# misbehaving upstream cannot inflate the heartbeat body: at most 32 model ids
+# of at most 128 printable characters, plus the runtime id. The list is
+# evidence for admission only; a heartbeat always proves reachability, and an
+# unreachable upstream just means the beat goes out without models.
+ADVERTISED_MODELS_MAX = 32
+ADVERTISED_MODEL_ID_MAX_CHARS = 128
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -491,11 +501,20 @@ def claim(api_base, code, node_id, hardware):
     raise PairingError(status, err, msg)
 
 
-def send_heartbeat(api_base, resource_id, secret, usable):
-    """Post one reachability beat. Returns the parsed response body."""
+def send_heartbeat(api_base, resource_id, secret, usable, models=None):
+    """Post one reachability beat. Returns the parsed response body.
+
+    `models` is the opt-in advertised inventory: None omits the field
+    entirely (the pre-inventory body is byte-for-byte unchanged), otherwise a
+    validated {"runtime_id", "model_ids"} mapping from
+    `bound_advertised_models`. It never carries a credential.
+    """
     base = check_api_base(api_base)
+    payload = {"usable": bool(usable)}
+    if models is not None:
+        payload["models"] = models
     status, body, retry_after = post_json(
-        f"{base}/api/resources/{resource_id}/heartbeat", {"usable": bool(usable)}, secret)
+        f"{base}/api/resources/{resource_id}/heartbeat", payload, secret)
     err = body.get("code") or "HEARTBEAT_FAILED"
     msg = body.get("error") or f"heartbeat failed (HTTP {status})"
     if status == 200:
@@ -509,6 +528,75 @@ def send_heartbeat(api_base, resource_id, secret, usable):
     if status == 429:
         raise PairingError(status, err, msg, retry_after)
     raise PairingError(status, err, msg)
+
+
+def advertisable_model_id(value):
+    """True for one id the heartbeat may carry: 1..128 printable characters.
+
+    Matches the server's intake bound (website/src/worker.js). Whitespace at
+    the edges is refused rather than trimmed, so the worker never advertises
+    an id the server would store in a different form.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= ADVERTISED_MODEL_ID_MAX_CHARS:
+        return False
+    if value != value.strip():
+        return False
+    return not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def bound_advertised_models(runtime_id, ids):
+    """Bound an upstream model list for the heartbeat. None when empty.
+
+    Keeps at most ADVERTISED_MODELS_MAX usable ids in upstream order,
+    dropping non-strings, over-long ids, control characters and duplicates.
+    """
+    selected, seen = [], set()
+    for value in ids or []:
+        if not advertisable_model_id(value) or value in seen:
+            continue
+        seen.add(value)
+        selected.append(value)
+        if len(selected) >= ADVERTISED_MODELS_MAX:
+            break
+    if not selected:
+        return None
+    return {"runtime_id": runtime_id, "model_ids": selected}
+
+
+def build_model_advertiser(args):
+    """Build the opt-in per-beat model probe. None when advertising is off.
+
+    The configuration (runtime id, upstream base) is validated here, before
+    any heartbeat: a bad value is a usage error, not something to discover on
+    every beat. The returned callable never raises and never blocks the beat:
+    any upstream fault (down, HTTP error, no listed models, malformed body)
+    yields None, so the heartbeat is sent without a models field. It also
+    returns only model ids, never the upstream token or any credential.
+    """
+    if not getattr(args, "advertise_models", False):
+        return None
+    # Lazy: the frozen pairing-only bundle must stay importable without the
+    # inference runner (same rule as the serve-jobs dispatch below).
+    import inference_worker
+    runtime_id = inference_worker.check_runtime_id(
+        getattr(args, "runtime_id", None) or inference_worker.DEFAULT_RUNTIME_ID)
+    raw_base = (getattr(args, "upstream_url", None)
+                or getattr(args, "ganglion_base", None)
+                or inference_worker.default_ganglion_base())
+    allow_non_loopback = bool(getattr(args, "allow_non_loopback_ganglion", False))
+    client = inference_worker.GanglionClient(
+        inference_worker.check_ganglion_base(raw_base, allow_non_loopback),
+        token=os.environ.get(inference_worker.GANGLION_TOKEN_ENV) or None,
+        allow_non_loopback=allow_non_loopback)
+
+    def advertise():
+        try:
+            listed = client.models()
+        except Exception:
+            return None
+        return bound_advertised_models(runtime_id, listed)
+
+    return advertise
 
 
 def pairing_files(data_dir):
@@ -840,6 +928,10 @@ def cmd_heartbeat(args, loop):
         # held for the read only, never across the loop.
         with pair_lock(data_dir):
             meta = load_pairing(data_dir)
+        # Validate the opt-in advertising configuration before the first beat:
+        # a bad runtime id or upstream base is a usage error here, never a
+        # half-working sender. Off by default, so nothing else changes.
+        advertise = build_model_advertiser(args)
     except PairingError as exc:
         print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK
@@ -894,9 +986,17 @@ def cmd_heartbeat(args, loop):
             # Recomputed per beat (Codex P2): installed/removed models and
             # engines change readiness, and a stale true would misreport ready.
             usable = decide_usable(args.config)
+            # Opt-in inventory: probed per beat and bounded here. A down or
+            # misbehaving upstream only omits the field; the beat still goes.
+            advertised = advertise() if advertise is not None else None
             try:
-                result = send_heartbeat(meta["api_base"], meta["resource_id"],
-                                        meta["heartbeat_key"], usable)
+                if advertised is None:
+                    result = send_heartbeat(meta["api_base"], meta["resource_id"],
+                                            meta["heartbeat_key"], usable)
+                else:
+                    result = send_heartbeat(meta["api_base"], meta["resource_id"],
+                                            meta["heartbeat_key"], usable,
+                                            models=advertised)
             except RePairRequired as exc:
                 # A re-pair can land between the reload and the beat: the old key
                 # is revoked but a newer credential is already installed. The
@@ -1035,6 +1135,27 @@ def cmd_unpair(args):
     return EXIT_OK
 
 
+def _add_heartbeat_model_args(parser):
+    """Opt-in heartbeat model inventory (W1). Off unless --advertise-models.
+
+    Kept on the heartbeat subcommands only: pairing, status and unpair never
+    probe an upstream, and the default body stays exactly {"usable": bool}.
+    """
+    parser.add_argument("--advertise-models", action="store_true",
+                        help="also advertise the upstream's GET /v1/models list "
+                             "so admission can refuse unknown models up front "
+                             "(opt-in; a down upstream just omits the list)")
+    parser.add_argument("--upstream-url", "--ganglion-base", dest="upstream_url",
+                        default=None,
+                        help="local upstream base URL used only with "
+                             "--advertise-models (default http://127.0.0.1:8471)")
+    parser.add_argument("--runtime-id", default="ganglion",
+                        help="runtime identity advertised with the model list: "
+                             "ganglion or llama-server (default ganglion)")
+    parser.add_argument("--allow-non-loopback-ganglion", action="store_true",
+                        help="permit a non-loopback upstream base for the model probe")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="AIPSTER worker pairing + heartbeat sender")
     parser.add_argument("--api-base", default=DEFAULT_API_BASE,
@@ -1049,9 +1170,11 @@ def build_parser():
     beat = sub.add_parser("heartbeat-once", help="post a single heartbeat")
     beat.add_argument("--config", default=None, help="worker config for the usable-bit policy")
     beat.add_argument("--interval", type=int, default=HEARTBEAT_INTERVAL_SEC)
+    _add_heartbeat_model_args(beat)
     loop = sub.add_parser("heartbeat-loop", help="post heartbeats until stopped (one sender per data dir; a second loop exits SENDER_RUNNING)")
     loop.add_argument("--config", default=None, help="worker config for the usable-bit policy")
     loop.add_argument("--interval", type=int, default=HEARTBEAT_INTERVAL_SEC)
+    _add_heartbeat_model_args(loop)
     sub.add_parser("status", help="show pairing state (never secrets)")
     sub.add_parser("unpair", help="forget local pairing (server key untouched)")
     # Inference job runner (lane L3). Kept in its own module so every other

@@ -111,6 +111,17 @@ const DISPATCH_ROUTE_RE = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{7,127})$/;
 const DISPATCH_CANCEL_RE = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{7,127})\/cancel$/;
 const WORKER_RESULT_RE = /^\/api\/worker\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/result$/;
 const MODEL_ID_MAX = 256;
+// Model inventory (W1). A worker MAY advertise the upstream model ids it can
+// serve in its heartbeat body's optional `models` field, so admission can
+// refuse an unknown model up front instead of holding budget for a job the
+// worker would fail with MODEL_UNAVAILABLE. The field is strictly bounded:
+// one runtime id from the Addendum B allowlist plus 1..32 model ids of 1..128
+// printable (non-control) characters each. A body carrying `models` gets the
+// larger cap; a plain {"usable"} beat keeps its exact 1 KiB cap.
+const MODEL_ADVERT_MAX = 32;
+const MODEL_ADVERT_ID_MAX = 128;
+const MODEL_ADVERT_ID_RE = /^[^\u0000-\u001F\u007F]+$/u;
+const HEARTBEAT_MODELS_BODY_MAX = 8 * 1024;
 // Addendum B: a Mac worker may serve a job from plain llama-server (Metal).
 // The runtime identity is server-validated here and pinned into the admission;
 // the coordinator carries it to task.placement.runtime_id and the instance id.
@@ -161,6 +172,40 @@ function dispatchGrantFor({ grant, resource, principal_id, model_id, max_tokens,
   const reasons = [];
   if (!matchGrant(request, policy, reasons)) return { refused: 'NO_MATCHING_GRANT', reasons };
   return { grant: policy };
+}
+
+// Strictly parse the heartbeat body's optional model inventory. Returns null
+// for anything malformed (the caller answers 400 and stores nothing) so an
+// unvalidated list can never become admission authority. Duplicates are
+// collapsed; order is preserved. This never throws and never echoes input.
+function parseAdvertisedModels(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes('runtime_id') || !keys.includes('model_ids')) return null;
+  if (typeof value.runtime_id !== 'string' || !INFERENCE_RUNTIME_IDS.has(value.runtime_id)) return null;
+  const ids = value.model_ids;
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > MODEL_ADVERT_MAX) return null;
+  const unique = [];
+  for (const id of ids) {
+    if (typeof id !== 'string' || id.length < 1 || id.length > MODEL_ADVERT_ID_MAX) return null;
+    if (id !== id.trim() || !MODEL_ADVERT_ID_RE.test(id)) return null;
+    if (!unique.includes(id)) unique.push(id);
+  }
+  return { runtime_id: value.runtime_id, model_ids: unique };
+}
+
+// Read one stored inventory row into {runtime_id, model_ids, observed_at} or
+// null. A row that does not parse is treated as absent (fail-open to today's
+// behaviour), never as "advertises nothing".
+function readStoredModels(row) {
+  if (!row || typeof row.model_ids_json !== 'string') return null;
+  let ids;
+  try { ids = JSON.parse(row.model_ids_json); } catch { return null; }
+  const parsed = parseAdvertisedModels({ runtime_id: row.runtime_id, model_ids: ids });
+  if (!parsed) return null;
+  const seen = Date.parse(row.observed_at);
+  if (!Number.isFinite(seen)) return null;
+  return { ...parsed, observed_at: seen };
 }
 
 function canonicalOrigin(env) {
@@ -868,10 +913,13 @@ async function handleApi(request, env, url) {
         db.prepare(`UPDATE dispatch_jobs SET status = 'expired', updated_at = ?
           WHERE resource_id = ? AND status IN ('queued', 'leased') AND ${owned}`).bind(now, r.id, r.id, me()),
         db.prepare(`DELETE FROM dispatch_admissions WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        // The advertised model inventory references the resource by FK (0025),
+        // so it must go before the row too.
+        db.prepare(`DELETE FROM resource_models WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
         db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
       ]);
-      if (Number(deleted[9].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      if (Number(deleted[10].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       return json(200, { ok: true });
     }
   }
@@ -903,17 +951,34 @@ async function handleApi(request, env, url) {
       }
       if (actor.key.scope !== 'heartbeat') return json(403, { error: 'This API key is not heartbeat-scoped.', code: 'KEY_SCOPE' });
       if (actor.key.resource_id !== resourceId) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
-      // Strict body: exactly {"usable": boolean} within 1 KiB. Unknown
-      // fields, client timestamps, and any other shape are rejected; the
-      // server is the only writer of heartbeat_at/online/usable.
+      // Strict body: {"usable": boolean} plus an OPTIONAL strictly bounded
+      // "models" inventory ({runtime_id, model_ids}). Unknown fields, client
+      // timestamps, and any other shape are rejected; the server is the only
+      // writer of heartbeat_at/online/usable. A body WITHOUT models keeps the
+      // exact 1 KiB cap; a body carrying models gets the larger bound that
+      // 32 ids of 128 characters need. Malformed lists are refused before any
+      // write, so they never become admission authority.
       let usable;
+      let advert = null;
       try {
-        const raw = new TextDecoder().decode(await readBodyBytes(request, HEARTBEAT_BODY_MAX));
+        const bytes = await readBodyBytes(request, HEARTBEAT_MODELS_BODY_MAX);
+        const raw = new TextDecoder().decode(bytes);
         let data = null;
         try { data = JSON.parse(raw || 'null'); } catch { data = null; }
         const keys = data && typeof data === 'object' && !Array.isArray(data) ? Object.keys(data) : null;
-        if (!keys || keys.length !== 1 || keys[0] !== 'usable' || typeof data.usable !== 'boolean') {
-          return json(400, { error: 'Body must be exactly {"usable": boolean}.', code: 'BAD_HEARTBEAT' });
+        const hasModels = !!keys && keys.includes('models');
+        if (!hasModels && bytes.byteLength > HEARTBEAT_BODY_MAX) {
+          return json(413, { error: 'Body too large.', code: 'BODY_TOO_LARGE' });
+        }
+        if (!keys || !keys.includes('usable') || typeof data.usable !== 'boolean'
+          || keys.some((k) => k !== 'usable' && k !== 'models')) {
+          return json(400, { error: 'Body must be {"usable": boolean} with an optional "models" list.', code: 'BAD_HEARTBEAT' });
+        }
+        if (hasModels) {
+          advert = parseAdvertisedModels(data.models);
+          if (!advert) {
+            return json(400, { error: 'models must be {"runtime_id", "model_ids"} with 1..32 ids of 1..128 printable characters.', code: 'BAD_HEARTBEAT' });
+          }
         }
         usable = data.usable ? 1 : 0;
       } catch (error) {
@@ -961,7 +1026,11 @@ async function handleApi(request, env, url) {
       // the atomic UPDATE must admit there too; a strict `<` rejected it and
       // the classifier, finding no remaining delay, fell through to 404.
       const windowStart = new Date(Date.now() - HEARTBEAT_MIN_INTERVAL_MS).toISOString();
-      const [claimed, ownerCharge, globalCharge] = await db.batch([
+      // The models upsert sits DIRECTLY after the resource UPDATE so its
+      // `changes() = 1` gate chains off that statement: a rejected heartbeat
+      // stores no list. It runs before the counter upserts, whose own gates
+      // then chain off it only when it ran (they are read by position below).
+      const batch = [
         db.prepare(
           `UPDATE resources SET heartbeat_at = ?, online = 1, usable = ?
            WHERE id = ?
@@ -972,8 +1041,26 @@ async function handleApi(request, env, url) {
              AND ${HEARTBEAT_CAPS_SQL}`)
           .bind(now, usable, resourceId, actor.key.owner_id, windowStart, actor.key.id, resourceId, now,
             actor.key.owner_id, hbWindow, budgets.owner, hbWindow, budgets.global),
-        ...heartbeatCounterStatements(db, actor.key.owner_id, hbWindow),
-      ]);
+      ];
+      if (advert) {
+        // observed_at is the server receipt time of THIS advertising beat. A
+        // later beat without models leaves both the list and observed_at
+        // alone, so the advert keeps ageing (5-minute window at admission).
+        batch.push(db.prepare(
+          `INSERT INTO resource_models (resource_id, runtime_id, model_ids_json, observed_at, updated_at)
+           SELECT ?, ?, ?, ?, ? WHERE changes() = 1
+           ON CONFLICT (resource_id) DO UPDATE SET
+             runtime_id = excluded.runtime_id,
+             model_ids_json = excluded.model_ids_json,
+             observed_at = excluded.observed_at,
+             updated_at = excluded.updated_at`)
+          .bind(resourceId, advert.runtime_id, JSON.stringify(advert.model_ids), now, now));
+      }
+      batch.push(...heartbeatCounterStatements(db, actor.key.owner_id, hbWindow));
+      const results = await db.batch(batch);
+      const claimed = results[0];
+      const globalCharge = results[results.length - 1];
+      const ownerCharge = results[results.length - 2];
       if (Number(claimed.meta.changes) === 1) {
         // The batch has committed the heartbeat. If a counter upsert did not
         // register its change (local D1 always chains changes(); production
@@ -2925,6 +3012,22 @@ async function handleApi(request, env, url) {
     if (liveness !== 'online') {
       return json(409, { error: 'The resource heartbeat is stale; no admission was issued.', code: 'RESOURCE_STALE' });
     }
+    // Model inventory (W1): a fresh advertised list is authoritative, so an
+    // unknown model is refused here instead of queueing a job that would fail
+    // MODEL_UNAVAILABLE after a budget hold. "Fresh" is the same window the
+    // dashboard uses for reachable; a list advertised before that (a worker
+    // that stopped advertising) is not authority. With no fresh list the
+    // pre-inventory behaviour is kept, but the response says so.
+    const storedModels = readStoredModels(
+      await first(db, 'SELECT runtime_id, model_ids_json, observed_at FROM resource_models WHERE resource_id = ?', resource.id),
+    );
+    const modelAdvertised = !!storedModels && Date.now() - storedModels.observed_at <= STALE_AFTER_MS;
+    if (modelAdvertised && !storedModels.model_ids.includes(body.model_id)) {
+      return json(409, {
+        error: 'The resource does not advertise this model; no admission was issued.',
+        code: 'MODEL_NOT_ADVERTISED',
+      });
+    }
     let grant = null;
     if (access.grantId) {
       const pinned = dispatchGrantFor({
@@ -2963,6 +3066,10 @@ async function handleApi(request, env, url) {
     return json(201, {
       admission_ref: admission.admission_ref, expires_at: admission.expires_at,
       model_id: admission.model_id, max_tokens: admission.max_tokens,
+      // false = the resource has no fresh advertised list, so this admission
+      // rests on today's behaviour (the worker still refuses an unknown
+      // model at execution time). true = the fresh list contained model_id.
+      model_advertised: modelAdvertised,
     });
   }
 

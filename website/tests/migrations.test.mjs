@@ -73,6 +73,13 @@ test('migrations create the auth and app tables', () => {
   }
   const unique = sqlite.prepare('SELECT * FROM pragma_index_list(?)').all('dispatch_holds');
   assert.ok(unique.some((i) => i.unique === 1), 'dispatch_holds is unique per (op_id, pool_id)');
+  assert.ok(names.includes('resource_models'), 'missing table resource_models (0025)');
+  for (const c of ['resource_id', 'runtime_id', 'model_ids_json', 'observed_at', 'updated_at']) {
+    assert.ok(cols('resource_models').includes(c), `resource_models.${c}`);
+  }
+  const resourceModelsPk = sqlite.prepare('SELECT * FROM pragma_table_info(?)').all('resource_models')
+    .filter((c) => c.pk > 0).map((c) => c.name);
+  assert.deepEqual(resourceModelsPk, ['resource_id'], 'one advertised list per resource');
 });
 
 test('migrations are idempotent where SQLite allows', () => {

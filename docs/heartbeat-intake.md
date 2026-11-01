@@ -31,16 +31,35 @@ Content-Type: application/json
 {"usable": true}
 ```
 
+An opted-in worker may additionally advertise the models its upstream serves:
+
+```
+{"usable": true, "models": {"runtime_id": "ganglion", "model_ids": ["qwen3.8-27b-atx-iq4_xs"]}}
+```
+
 - **Auth is API-key only.** Session cookies are rejected with `403
   KEY_REQUIRED` before any CSRF check, so this endpoint has no CSRF surface.
   Read/inference keys are rejected with `403 KEY_SCOPE`; heartbeat keys are
   rejected by every other route (`KEY_SCOPE` on read routes, `KEY_FORBIDDEN`
   on management routes).
-- **Strict body: exactly `{"usable": boolean}`.** Unknown fields, missing or
-  non-boolean `usable`, arrays, and empty bodies are `400 BAD_HEARTBEAT`.
-  Bodies over **1 KiB** are `413 BODY_TOO_LARGE`. Client timestamps are never
-  accepted: the server sets `heartbeat_at=now` and `online=1` plus the body's
-  `usable` bit, and no other columns change.
+- **Strict body: exactly `{"usable": boolean}`**, or that plus `models`.
+  Unknown fields, missing or non-boolean `usable`, arrays, and empty bodies
+  are `400 BAD_HEARTBEAT`. Bodies over **1 KiB** are `413 BODY_TOO_LARGE`
+  (bodies carrying `models` get **8 KiB**, sized for the 32 x 128-character
+  list bound). Client timestamps are never accepted: the server sets
+  `heartbeat_at=now` and `online=1` plus the body's `usable` bit, and of the
+  resource columns no others change.
+- **Optional model inventory.** `models` is optional and defaults to absent
+  (older workers are unaffected). When present it must be exactly
+  `{runtime_id, model_ids}`: `runtime_id` is `ganglion` or `llama-server`, and
+  `model_ids` is 1..32 unique ids of 1..128 printable, non-padded characters.
+  Anything else is `400 BAD_HEARTBEAT` and writes nothing — not even
+  `heartbeat_at`. A valid list is stored for the resource in `resource_models`
+  (migration 0025) with the accepted beat as `observed_at`; a later beat
+  **without** `models` leaves the list in place, so it ages with the
+  heartbeat and admission stops trusting it after the reachability window.
+  This is reachability telemetry, not a promise of inference: admission uses
+  it as described in `docs/inference-dispatch-routes.md`.
 - **Binding:** the key's `resource_id` must equal `:id`, the resource must be
   owned by the key owner, and the row must exist. Violations are `404
   NOT_FOUND` (binding mismatches intentionally do not distinguish
@@ -54,7 +73,9 @@ Content-Type: application/json
   binding-match + key-live, and the 25s window checks all live inside **one
   single conditional `UPDATE ... WHERE`** — no read-then-write. Lost claims
   are mapped to 404/401/429 by read-only probes afterwards; losers change
-  zero rows.
+  zero rows. The optional inventory upsert rides in the same D1 batch and is
+  itself conditional (`WHERE changes() = 1`) on that UPDATE, ahead of the
+  quota counters, so a lost claim stores no models either.
 - **No budget draw:** heartbeats never touch the hourly `write_budget`
   (migration 0005); intake works at a spent budget.
 - **Audit:** key creation is logged (`key.create`, detail records the
