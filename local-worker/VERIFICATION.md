@@ -90,3 +90,99 @@ clients and do not use these inbound routes. A network bind already required a
 token; it now also requires `advertise_url` or `allowed_hosts`. Loopback quickstart
 clients must send the bearer token. No native engine, model, inference or AIPSTER
 connection was exercised.
+
+## Local patch 0002: Ganglion fabric resident-only binding (2026-11-01)
+
+Base: AIPSTER `d1de902eb90067459615714941ea048f719d9edd`. Branch
+`claude/worker-ganglion-integration-20261101`. macOS arm64, CPython 3.12.13 with
+pydantic 2.13.5, httpx 0.28.1, websockets 17.1, fastapi 0.141.1 and pytest from
+an existing virtual environment. No package was installed and no model was
+loaded or run. Tests import the vendored package via `PYTHONPATH` and run with
+`PYTHONDONTWRITEBYTECODE=1` so the vendor allowlist stays byte-exact.
+
+```text
+cd local-worker
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/vendor/eif" python -m pytest \
+  test_installation.py test_fabric_bridge.py -q \
+  -k "not installed_cli and not mock_daemon_health_and_execution"
+```
+
+Result: **36 passed** on the patched tree (24 new fabric tests + 12 installation
+tests, including `verify_vendor.py --check-patches`). The two deselected cases
+resolve `dendrite`/the `dendrite` executable from the host environment rather than
+this vendor tree, so they are not evidence for this patch. `verify_vendor.py`
+reports 16 files against the pinned commit: 10 upstream-identical, 6 locally
+patched (patch 0001: `api.py`, `config.py`; patch 0002: `fabric.py`, `node.py`,
+`runtimes/base.py`, `runtimes/llama.py`). Reversing both patches reproduces the
+upstream hashes, and forward-applying both to those upstream bytes reproduces the
+committed files byte-for-byte.
+
+Against the same test file with patch 0002 reversed in an isolated tree, **17 of
+24 fail** and 7 pass. The failures cover job-id binding, exact/resident admission,
+the under-lane residency guard, fingerprint-aware managed residency, timeout and
+post-timeout behavior, permanent handshake/close rejection, probe handling,
+connect-failure quarantine and fabric-job `last_error` sanitization. They are the
+falsifiable before/after evidence for this patch.
+
+The new tests use a local fake fabric WebSocket and the mock runtime only. They
+cover: authenticated connect; one immediate heartbeat; resident-only capacity in
+the cloud snapshot (including a changed model file identity); single result bound
+to the job ID; duplicate suppression during and after execution and after a
+capacity rejection; unknown model, capability mismatch, missing model, unknown
+field and chat-frame denial before load; model-switch refusal; busy 429; timeout
+504 with exactly one error and no local retry; disconnect cancellation with no
+result; malformed/oversized/unknown frames; a single heartbeat loop; `probe_chat`
+answered by a heartbeat with no result; no prompt or token in logs, error frames,
+`last_error` or the local snapshot; permanent 401 handshake rejection without
+retry; 4001 replacement and 4003 revocation stop states; and attach quarantine
+only after an unanswered sent request, not after connect-phase failures.
+
+The worker's cloud snapshot was also checked against the Ganglion reference
+sanitizer and scheduler (AiTinkerersVenice HEAD `f5223d39`, unmodified) offline:
+`sanitizeNodeSnapshot` accepted both a resident and a cold snapshot, and
+`placementCandidates` returned the resident model while returning no placement
+for the cold/non-resident model. That check used the existing `fabric` checkout's
+`tsx` and a local JSON snapshot; no fabric connection or credential was used.
+
+Limits: the deployed fabric was not contacted, no credential was read, no node
+was enrolled, no live task or inference ran, and the AIPSTER dispatch path remains
+absent. The Ganglion contract has no streaming, cancel frame or transmitted
+deadline, so the worker enforces only its local request timeout; this is recorded
+in [EXECUTION-GAPS.md](EXECUTION-GAPS.md).
+
+### Carried forward onto `origin/main`
+
+The patch-0002 work above was authored on `d1de902eb90067459615714941ea048f719d9edd`.
+PR #62 could not merge as-is, so it was reconciled onto
+`origin/main f6e45f556a48dd5f75a8e8b90992e8d9cfa0393e` as
+`9c2c479caa87e8a555482278095f72d7c1a37bcb` (local only). In that reconcile the
+eight patch-0002 artifacts — `patches/0002-fabric-resident-binding.patch`,
+`provenance.json`, `test_fabric_bridge.py`, `vendor/eif/NOTICE` and the four
+patched `vendor/eif/dendrite` modules — are byte-identical to the reviewed tree,
+while `pairing.py` and its lifecycle tests stay on the newer `origin/main` R4
+sender-lock work. An independent coordinator re-ran `test_fabric_bridge.py`
+against a local fake fabric and mock runtime at that commit: **24 passed in
+4.20 s**, no live daemon, model, provider or credential.
+
+A successor candidate on top of `9c2c479` restores the patch-0002 documentation
+this section belongs to (`README.md`, `EXECUTION-GAPS.md`, `LICENSING.md` and this
+file had been carried over from `main` without it, leaving the shipped
+`LICENSING.md` change notice claiming a pre-patch file count) and adds
+`test_docs_consistency.py`, which fails on `9c2c479` and passes here. Offline
+results at that candidate, all run serially under the shared heavy-test lock with
+bytecode writes disabled and synthetic fixtures only:
+
+```text
+test_installation.py + test_fabric_bridge.py   36 passed, 2 deselected
+test_docs_consistency.py                        5 passed
+test_macos_lifecycle.py                        12 passed
+test_sender_lock.py                             4 passed
+test_pairing_lifecycle.py                      10 passed, 1 skipped (Windows-only)
+test_pairing.py                                38 passed
+verify_vendor.py --check-patches               16 files: 10 upstream-identical,
+                                               6 locally patched
+```
+
+No package was installed; the interpreter was an existing CPython 3.12.13
+virtual environment. The deployed fabric, a node enrollment, a Fabric Access
+Token, a live model and the AIPSTER dispatch path were not touched.
