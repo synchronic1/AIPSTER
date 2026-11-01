@@ -255,6 +255,24 @@ test('AC09: changed inputs invalidate; cache carries the full fingerprint', asyn
   assert.equal(rerun.json.cached, true);
 });
 
+test('Codex-P2 r4434749308: a second configuration does not prune the first fresh decision', async () => {
+  const t = await fx();
+  const node = await register(t, t.alice, 'compare-box');
+  await report(t, node.id, fixtureSnapshot());
+  const a = { repo: GGUF, nodeId: node.id, runtime: 'fixture-llama', context: 2048, concurrency: 1 };
+  const b = { ...a, context: 4096 };
+  assert.equal((await evaluate(t, t.alice, a)).json.cached, false);
+  // Ensure B's expiry is strictly later than A's, the condition the old
+  // `expires_at < decision.expiresAt` predicate pruned on.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal((await evaluate(t, t.alice, b)).json.cached, false);
+  const rows = await t.DB.prepare('SELECT COUNT(*) n FROM catalog_compat_cache WHERE principal = ?').bind('u_alice').first();
+  assert.equal(rows.n, 2, 'both fresh decisions stay cached');
+  const again = await evaluate(t, t.alice, a);
+  assert.equal(again.status, 200, again.text);
+  assert.equal(again.json.cached, true, 'the first configuration is served from cache, not re-metered');
+});
+
 test('compat auth and input boundaries', async () => {
   const t = await fx();
   const anon = await readJson(await t.call('/api/catalog/compat', { method: 'POST', body: {} }));

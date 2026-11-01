@@ -1485,7 +1485,11 @@ async function handleApi(request, env, url) {
         cacheKey, me(), fp, decisionJson, decision.expiresAt);
       // Hygiene: prune expired rows and cap per-principal growth (200,
       // provisional) so the display cache cannot grow unbounded (S-F12).
-      await run(db, 'DELETE FROM catalog_compat_cache WHERE principal = ? AND expires_at < ?', me(), decision.expiresAt);
+      // Expiry compares against NOW (Codex-P2 r4434749308): comparing to
+      // this decision's own future expiry pruned every earlier fresh entry,
+      // so comparing configurations re-metered each one. The 200 cap below
+      // bounds growth on its own.
+      await run(db, 'DELETE FROM catalog_compat_cache WHERE principal = ? AND expires_at <= ?', me(), new Date(nowMs).toISOString());
       await run(db, `DELETE FROM catalog_compat_cache WHERE principal = ? AND cache_key NOT IN (
         SELECT cache_key FROM catalog_compat_cache WHERE principal = ? ORDER BY expires_at DESC LIMIT 200)`, me(), me());
       return json(200, { ...decision, cached: false, fixture });
