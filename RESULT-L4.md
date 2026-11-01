@@ -250,3 +250,206 @@ this report.
 Reports **read** (not re-run): PR #62 body/diff, `worker/CANDIDATE.md`,
 `worker/RESULT.json`, `authority/REVIEW-WORKER-101ff94.md`, `e2e/REPORT.md`,
 `FINAL-HANDOFF.md`.
+
+---
+
+# PHASE B — L3 integration on macOS
+
+Marker: **DS-INFERENCE-L4-MACOS-20261101 / PHASE B**
+Status: **green, committed locally, not pushed.**
+
+## B.1 Integration
+
+| Item | Value |
+|---|---|
+| L3 branch | `origin/ds/worker-ganglion-20261101` @ **`30008c0ef95b2aa332b49f6dcc9af4421e12caf5`** (SHA verified after `git fetch`; matches the coordinator's) |
+| Merge | `git merge --no-ff` → merge commit **`0fd428a53d7c33b44c651410b4980efb07c87460`** (clean, no conflicts) |
+| Fix commit | **`aa0e8bdd89606e370a875013c6177f034c55e1e7`** — macOS lane changes, 4 files, +310/−21 |
+| Branch | `ds/worker-ganglion-macos-20261101`, local only |
+
+`30008c0` is `origin/main` + 5 commits (coordinator + failing-first tests + job
+runner + nested-wire conformance). It brings `local-worker/inference_worker.py`
+(792 lines), `test_inference_worker.py` (58 tests), the `serve-jobs` CLI and
+`pairing.py` env/token wiring, plus the internal website dispatch coordinator
+(`website/src/inference/dispatch-coordinator.mjs`, its tests/fixtures and
+`docs/dispatch-coordinator.md`), which I carried **unchanged and did not touch**.
+
+**Wire shapes unchanged.** The envelope (`{protocol, task, binding}`), the
+succeeded key set and the failed key set are untouched; `git diff` over
+`inference_worker.py` contains no result- or envelope-key line. No disagreement
+with L3's shapes is recorded.
+
+## B.2 Counts (tests I ran, native macOS, pinned 3.12 venv, shared lock held)
+
+| Run | Result |
+|---|---|
+| L3 suite as merged, before any change | `test_inference_worker` — **58 passed**, 32.305 s |
+| New macOS/POSIX cases, before the fix | **6 failed** of 7 (exact failures listed below) |
+| New macOS/POSIX cases, after the fix | **7 passed**, 4.819 s |
+| `test_inference_worker` final | **67 passed**, 37.311 s |
+| **Full local-worker suite** (`test_pairing test_pairing_security test_pairing_windows_storage test_pairing_lifecycle test_pairing_e2e test_sender_lock test_source_update test_inference_worker`) | **152 tests, OK (skipped=13), 85.259 s** |
+| `test_installation.py` | 14 passed, 2.023 s |
+| `verify_vendor.py --check-patches` | exit 0 — 16 files: 14 upstream-identical, 2 locally patched |
+| `packaging/macos/test_launchd_template.py` | 5 passed; `plutil -lint -s` exit 0 |
+| Signal tests repeated 3× | 3 passed each time (2.67–2.69 s), no flake |
+
+The 13 skips are the same platform skips as the Phase A baseline (11 native
+Windows storage, 1 Windows sharing semantics, 1 E2E class needing Node).
+
+## B.3 Checklist findings (each fix has a failing-first test)
+
+**1. POSIX private storage for the started-job ledger — one real defect, fixed.**
+The ledger itself was already sound: `pairing.write_private` uses `mkstemp` +
+`restrict_file` (0600) + `os.replace`, and `pairing.private_dir` verifies an
+existing dir is owner-only and 0700. But the **job lock was created 0644** on
+POSIX: `_hold_lock` used `open(path, "a+b")`, while the Windows branch already
+passed `0o600`. Fixed with `os.open(..., 0o600)` plus `fchmod` for a
+pre-existing file. Test: `test_posix_lock_file_is_created_private` (failed with
+0644, passes with 0600). The data dir is still 0700 either way, so this was
+hygiene, not exposure.
+
+**2. fcntl locking vs exit 6 — two real defects, fixed.**
+A `jobs.lock` that is a **symlink was followed** and flock-ed through
+(`open()` follows links); and any lock failure — wrong file type, unreadable —
+was reported as `[JOBS_RUNNING] another serve-jobs already holds this data dir`
+with exit **6**, sending an operator after a process that does not exist.
+Now: POSIX opens with `O_NOFOLLOW` and the file is `fchmod`-ed 0600; only
+`EACCES/EAGAIN/EWOULDBLOCK` (real contention, and `EACCES` for the Windows
+`msvcrt` path) returns `None` → `JOBS_RUNNING`/exit 6; every other failure is
+`PRIVATE_STORAGE`/exit 2. Tests:
+`test_posix_linked_lock_path_is_refused` (was exit 0 and flock-ed the outside
+file), `test_posix_unusable_lock_fails_closed_without_claiming_a_runner` (was
+exit 6 with the wrong message). The documented second-runner exit 6 is
+unchanged, and `test_second_runner_exits_jobs_running` still passes.
+
+**3. SIGTERM/SIGINT during poll and during a Ganglion call — the biggest gap, fixed.**
+There was **no signal handling**. Measured before the fix: SIGTERM during an
+idle poll → killed by signal (**-15**, no message, no unwinding); SIGTERM during
+a completion → **-15** with the completion abandoned; SIGINT during a poll →
+`KeyboardInterrupt` through `pairing.main` → **130**. Nothing was *re-executed*
+(the ledger is written before the call), but none of it was an honest exit, and
+a signal death is exactly what a crash-only `KeepAlive` would restart.
+Now `JobRunner.run` installs POSIX handlers: the first signal sets a stop flag
+and wakes the idle wait; the loop leaves **between** jobs; a completion already
+handed to Ganglion is allowed to finish and post before exiting; a second signal
+restores the default action so a wedged upstream can still be killed. Exit 0.
+Tests (subprocess, fake servers): `test_sigterm_during_idle_poll_exits_cleanly`,
+`test_sigint_during_idle_poll_exits_cleanly`,
+`test_sigterm_during_completion_posts_the_result_once` (asserts exactly one
+completion, one `succeeded` result posted, job present in the ledger, no
+`Traceback`, exit 0). Behaviour change to flag: **SIGINT now exits 0, not 130**,
+for `serve-jobs` only (`pair`/heartbeat keep 130).
+
+**4. Monotonic deadlines across sleep/wake — analysed; caveat documented, no code change.**
+Lease validity is wall-clock based (`deadline_at` vs `int(time.time()*1000)`) at
+validation, again after the model listing, and `started` elapsed is measured on
+`time.monotonic`. That ordering is correct and is now pinned by
+`test_deadline_expiring_during_model_listing_fails_without_completion` (a stalled
+monotonic clock cannot make an expired lease executable; nothing is recorded as
+started). The residual, unfixable-in-stdlib caveat: the socket timeout is derived
+as `monotonic_now + wall_remaining`, and **Darwin's `CLOCK_MONOTONIC` excludes
+system sleep**, so a Mac that sleeps mid-completion can let that one call
+outlive `deadline_at`. macOS has no `CLOCK_BOOTTIME`. The consequence is bounded
+and honest: the job is already in the ledger (never re-run), the result is posted
+with the real `elapsed_ms`, and the coordinator's lease decides. I did **not**
+convert a completed job into a `failed` report to "enforce" the deadline, because
+that would invite a remote retry and a double execution — the worse outcome.
+
+**5. `/private/var` vs `/var` temp paths — verified, test added.**
+macOS reaches `/private/var` through the `/var` symlink and
+`tempfile.gettempdir()` returns such a prefix-only path. `private_dir` and
+`_restrict_path` examine the **final** component, so a prefix symlink is
+correctly accepted. `test_private_store_reached_through_the_var_symlink_prefix`
+builds a data dir under `/var/tmp`, asserts the path really is symlinked, and
+checks 0700 dir / 0600 lock / 0600 ledger.
+
+**6. IPv6 `::1` vs `127.0.0.1` — already correct, now pinned.**
+`LOOPBACK_HOSTS` holds all three forms and `urlparse` normalises `[::1]` to
+`::1`. `test_loopback_ganglion_bases_cover_ipv6_and_localhost` pins
+`127.0.0.1`, `localhost`, `[::1]` and `https://[::1]` as accepted, and
+`[::2]`, `[2001:db8::1]`, `0.0.0.0`, `127.0.0.2` as refused (fail-closed). No
+code change was needed.
+
+**7. HTTPS certificate store — no code change; environment fact recorded.**
+`pairing.post_json` / `get_json` use `build_opener(NoRedirects())` with no custom
+`SSLContext`, so the interpreter's default trust store applies, and
+`check_api_base` already requires `https` for any non-loopback base. On this
+machine the pinned venv (Homebrew CPython 3.12.13) resolves
+`ssl.get_default_verify_paths().cafile = /opt/homebrew/etc/openssl@3/cert.pem`
+(192 CA certificates) — HTTPS to `aipster.net` would verify here. Caveat for
+other installs: that path is Homebrew-specific; an interpreter without a CA
+bundle would fail closed at TLS, not silently skip verification.
+
+**8. Optional launchd template — added.**
+`local-worker/packaging/macos/dev.aipster.worker.serve-jobs.plist`: user agent
+that runs `pairing.py --data-dir … serve-jobs`, `KeepAlive = {SuccessfulExit:
+false}` (restart on crash/non-zero only, so a 0 exit from a stop signal stays
+stopped), `ThrottleInterval 30`, explicit log paths, **no** environment block
+and no token, no `--allow-non-loopback-ganglion`, visible `__PLACEHOLDER__`s and
+nothing that installs it. Validated by `plutil -lint -s` (exit 0) and by
+`packaging/macos/test_launchd_template.py` (5 tests).
+
+## B.4 What a live Mac run would need
+
+Nothing on this machine can execute a job end to end. A live qualification needs
+**either** (a) a **Ganglion** OpenAI-compatible server on the Mac listening on
+`http://127.0.0.1:8471` (or `AIPSTER_GANGLION_URL`) with a resident model listed
+at `/v1/models`, **or** (b) a **separately approved Dendrite adapter** — the
+running node here is Dendrite on `127.0.0.1:8090`, which is token-gated and has
+no `/v1/models` route, and its engine on 8081 is not an AIPSTER runtime. I built
+no adapter and made **no Dendrite calls in Phase B** (the only probes were the
+two authorised GETs in Phase A). Until one of those exists, qualification rests
+on the fake upstreams. The server side is dark in any case: `POST /api/jobs`
+stays `INFERENCE_DISABLED`, and no live AIPSTER call was made.
+
+## B.5 PR #62 — deliberately not merged; what the job runner could use
+
+No group-kill, tray or lifecycle code was brought into this branch. Of PR #62's
+fixes, only these bear on `serve-jobs`:
+
+| PR #62 fix | Bearing on the inference worker |
+|---|---|
+| POSIX process-group stop (`child.py` `killpg`) | **Not applicable** — `serve-jobs` spawns no children; there is nothing to orphan. |
+| `test_macos_lifecycle.py` (12 regressions) | **Useful as a model, not as code.** Its deadline-bounded shutdown / no-orphan / no-replay cases are the closest prior art; the equivalents for the job loop are the signal and ledger tests added here. |
+| `sender_lock` context manager, exit 2 | **Not adopted.** It conflicts with main's R4 lock (exit 6); the job lock keeps exit 6 and the README's documented contract. |
+| `_fd_lock_exclusive` / flock pattern | Already equivalent in `_hold_lock`; nothing to port. |
+| Tray display quoting (`shlex.join`) | **Not applicable** — the runner has no display or console launch path. |
+| Owner-only private-storage expectations | Already enforced by `pairing.private_dir`/`write_private`; the gap was the lock file, fixed here. |
+
+If PR #62's group-kill work is ever wanted for a *tray-spawned* worker that
+supervises a model server, that is a different component and should land
+separately.
+
+## B.6 Flags for the coordinator (no wire-shape change requested)
+
+1. `serve-jobs` now exits **0** on SIGTERM/SIGINT (was -15/130). Anything that
+   treats 130 as the Ctrl+C signal should be told.
+2. A stop never abandons an in-flight completion; the job finishes and posts.
+   Bounded by the lease deadline, which can be slightly exceeded after a Mac
+   sleep (B.3 item 4).
+3. The Windows lock path still has no `O_NOFOLLOW` equivalent, so a junction or
+   reparse-point `jobs.lock` can be followed there. Out of this lane's scope;
+   noted rather than guessed at.
+4. `StartedLedger._load` still reads an existing `jobs-started.json` through a
+   symlink (writes are refused). Inside a 0700 owner-only dir this is
+   defence-in-depth only; not changed.
+5. `test_launchd_template.py` must be run as a script
+   (`python packaging/macos/test_launchd_template.py`), not imported as
+   `packaging.macos.*`, for the same namespace-`packaging` reason recorded in
+   Phase A.
+
+## B.7 Phase B evidence
+
+| Path | What |
+|---|---|
+| `/private/tmp/l4-20261101/logs/l3-inference.log` | 58 passed at merge, before changes |
+| `/private/tmp/l4-20261101/logs/l4-inference-full.log` | 65 passed (58 + 7 new) |
+| `/private/tmp/l4-20261101/logs/l4-full-unittest.log` | 150 tests OK at the first green full run |
+| `/private/tmp/l4-20261101/logs/l4-final-unittest.log` | **152 tests OK (13 skips), 85.259 s** at `aa0e8bd` |
+| `git show aa0e8bd` | the four-file fix and its failing-first tests |
+| `local-worker/packaging/macos/` | launchd template + its 5 tests |
+
+Rules honoured in Phase B: no push, no PR comment/approval, no merge to main, no
+deploy, no `aipster.net` call, no credential or private-storage read, no live
+inference POST, no model load, no Dendrite call, no change to running services or
+the main checkout. Local commits only.
