@@ -20,7 +20,12 @@ result in website/src/inference/worker-transport.mjs):
 import copy
 import json
 import math
+import os
 import re
+import shutil
+import signal
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -963,6 +968,19 @@ class InferenceWorkerTests(unittest.TestCase):
             JobRunner(self.data, ganglion_base="http://10.1.2.3:8471")
         self.assertEqual(self.api.next_hits, 0)
 
+    def test_loopback_ganglion_bases_cover_ipv6_and_localhost(self):
+        # A Ganglion bound to ::1 is as local as one bound to 127.0.0.1. The
+        # check is by parsed host, so the bracketed IPv6 form must work, and
+        # anything that only looks like loopback stays refused.
+        for raw in ("http://127.0.0.1:8471", "http://localhost:8471",
+                    "http://[::1]:8471", "https://[::1]:8471"):
+            self.assertEqual(check_ganglion_base(raw), raw.rstrip("/"))
+        for raw in ("http://[::2]:8471", "http://[2001:db8::1]:8471",
+                    "http://0.0.0.0:8471", "http://127.0.0.2:8471"):
+            with self.assertRaises(pairing.PairingError) as cm:
+                check_ganglion_base(raw)
+            self.assertEqual(cm.exception.code, "BAD_GANGLION_BASE")
+
     # -- CLI wiring ------------------------------------------------------
 
     def test_cli_serve_jobs_once(self):
@@ -985,6 +1003,147 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(code, pairing.EXIT_USAGE)
         self.assertIn("BAD_GANGLION_BASE", err.getvalue())
         self.assertEqual(self.api.next_hits, 0)
+
+    # -- POSIX lifecycle (macOS lane L4) ---------------------------------
+    #
+    # The runner is a long-lived daemon on macOS: launchd or a terminal
+    # sends SIGTERM/SIGINT, and the job lock lives in a user-private store.
+    # These hold the POSIX side to the same rules the Windows path states.
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes")
+    def test_posix_lock_file_is_created_private(self):
+        self.run_quiet(self.runner(), max_cycles=1)
+        lock_path = self.data / inference_worker.JOBS_LOCK_NAME
+        self.assertTrue(lock_path.exists(), "the job lock is created under the data dir")
+        self.assertFalse(lock_path.is_symlink())
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600,
+                         "the lock file is user-only, like every other store file")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes")
+    def test_posix_unusable_lock_fails_closed_without_claiming_a_runner(self):
+        # A broken lock path is not evidence that another runner is alive.
+        (self.data / inference_worker.JOBS_LOCK_NAME).mkdir()
+        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_USAGE, err)
+        self.assertIn("PRIVATE_STORAGE", err)
+        self.assertNotIn("JOBS_RUNNING", err)
+        self.assertEqual(self.api.next_hits, 0, "nothing polls without a usable lock")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink semantics")
+    def test_posix_linked_lock_path_is_refused(self):
+        outside = Path(self.tmp.name) / "outside.lock"
+        outside.write_text("", encoding="utf-8")
+        os.symlink(str(outside), str(self.data / inference_worker.JOBS_LOCK_NAME))
+        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_USAGE, err)
+        self.assertIn("PRIVATE_STORAGE", err)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "",
+                         "a linked lock path must not be written through")
+        self.assertEqual(self.api.next_hits, 0)
+
+    def _spawn_worker(self):
+        argv = [sys.executable, str(ROOT / "pairing.py"),
+                "--data-dir", str(self.data),
+                "serve-jobs", "--ganglion-base", self.gbase,
+                "--interval", "0.05"]
+        proc = subprocess.Popen(argv, cwd=str(ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
+
+    def _wait_until(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail("condition not reached in %.1fs" % timeout)
+
+    def _finish(self, proc, timeout=15):
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self.fail("serve-jobs did not stop within %ss: %r" % (timeout, err))
+        return out, err
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal semantics")
+    def test_sigterm_during_idle_poll_exits_cleanly(self):
+        proc = self._spawn_worker()
+        self._wait_until(lambda: self.api.next_hits >= 1)
+        proc.send_signal(signal.SIGTERM)
+        _, err = self._finish(proc)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("stop requested", err)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal semantics")
+    def test_sigint_during_idle_poll_exits_cleanly(self):
+        proc = self._spawn_worker()
+        self._wait_until(lambda: self.api.next_hits >= 1)
+        proc.send_signal(signal.SIGINT)
+        _, err = self._finish(proc)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("stop requested", err)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal semantics")
+    def test_sigterm_during_completion_posts_the_result_once(self):
+        self.api.leases = [lease()]
+        self.ganglion.completion_delay = 0.8
+        proc = self._spawn_worker()
+        self._wait_until(lambda: self.ganglion.hits["completions"] >= 1)
+        proc.send_signal(signal.SIGTERM)
+        _, err = self._finish(proc)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self.ganglion.hits["completions"], 1,
+                         "a stop never abandons or repeats the in-flight job")
+        self.assertEqual(len(self.api.results), 1, "the completed report is posted")
+        self.assertEqual(self.api.results[0]["body"]["status"], "succeeded")
+        self.assertTrue(StartedLedger(self.data).contains("job_1"))
+        self.assertNotIn(FAKE_SECRET, err)
+
+    @unittest.skipUnless(Path("/var/tmp").is_dir(), "macOS /var -> /private/var layout")
+    def test_private_store_reached_through_the_var_symlink_prefix(self):
+        # macOS reaches /private/var through the /var symlink, and
+        # tempfile.gettempdir() hands back such a prefix-only path. The
+        # private-store checks look at the final component only, so a data
+        # dir under it must still be provisioned 0700 with 0600 files.
+        raw = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="aipster-l4-"))
+        self.addCleanup(shutil.rmtree, str(raw), True)
+        self.assertNotEqual(raw.resolve(), raw, "/var is a symlink prefix")
+        data = raw / "data"
+        runner = JobRunner(data, ganglion_base=self.gbase, poll_interval=0.01)
+        code, _, err = self.run_quiet(runner, max_cycles=0)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o700)
+        lock_path = data / inference_worker.JOBS_LOCK_NAME
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+        StartedLedger(data).record("job_var")
+        ledger_path = data / inference_worker.STARTED_LEDGER_NAME
+        self.assertEqual(stat.S_IMODE(ledger_path.stat().st_mode), 0o600)
+        self.assertEqual(sorted(json.loads(ledger_path.read_text())["job_ids"]),
+                         ["job_var"])
+
+    def test_deadline_expiring_during_model_listing_fails_without_completion(self):
+        # Wall-clock expiry, not the monotonic clock, decides a lease: a
+        # stalled monotonic clock (macOS excludes system sleep from
+        # CLOCK_MONOTONIC) must never make an expired lease executable.
+        deadline = now_ms() + 1000
+        stamps = iter([deadline - 500, deadline + 5000])
+        self.api.leases = [lease(deadline_ms=deadline,
+                                 env=envelope(deadline_ms=deadline))]
+        runner = self.runner(now_ms=lambda: next(stamps, deadline + 5000))
+        code, _, err = self.run_quiet(runner, max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.hits["completions"], 0)
+        self.assertEqual(self.api.results[0]["body"]["status"], "failed")
+        self.assertEqual(self.api.results[0]["body"]["result"]["reason"],
+                         inference_worker.DEADLINE_EXCEEDED)
+        self.assertFalse(StartedLedger(self.data).contains("job_1"),
+                         "an expired lease is never recorded as started")
 
 
 if __name__ == "__main__":
