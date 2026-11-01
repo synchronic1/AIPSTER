@@ -264,7 +264,8 @@ test('same key + same operation reconciles without a second dispatch; changed bo
 });
 
 test('idempotency is principal-scoped: another principal with the same key is a different operation', async () => {
-  const { coord } = await setup();
+  const state = baseState(); state.grants['grant-1'].consumers.push('user-bob'); // Bob covered by the grant
+  const { coord } = await setup({ state });
   const a = await coord.submit('ctx-alice', body());
   const b = await coord.submit('ctx-bob', body({ admission_ref: 'adm-bob-1' }));
   assert.equal(b.status, 'dispatched');

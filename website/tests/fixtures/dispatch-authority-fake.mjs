@@ -152,6 +152,8 @@ export function createFakeAuthority(state = baseState(), { faults = {}, hooks = 
       const op = live(args.op_id);
       if (!op || op.generation !== args.generation) return { outcome: 'rejected', reason: 'fenced' };
       if (op.phase === 'admitted') return { outcome: 'admitted' };
+      // A start fence (cancel/deadline tombstone) also forbids a later admission.
+      if (state.fenced[`${args.op_id}:${args.generation}`]) return { outcome: 'rejected', reason: 'fenced' };
       const g = state.grants[args.authority.grant_id];
       if (!g || g.status !== 'enforced' || g.revoked !== false || g.revision !== args.authority.grant_revision
         || g.incarnation !== args.authority.incarnation) return { outcome: 'rejected', reason: 'authority_changed' };
