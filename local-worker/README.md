@@ -199,6 +199,15 @@ does not exist, so one single-message `/v1/chat/completions` fallback is tried;
 every other failure is final. Behaviour is identical against either upstream;
 only the runtime identity you configure changes.
 
+Before leasing, the runner probes the upstream with the same cheap
+`GET /v1/models` it caches anyway. An upstream that is down, or that answers
+`429`/`503`, is not given work: the runner backs off on its idle schedule and
+keeps heartbeating, so a busy GPU server never turns into a stream of failed
+jobs. If the upstream turns busy *after* the lease — a completion answering
+`429`/`503` — the job is posted `failed` with reason `UPSTREAM_BUSY` and is not
+retried; it is already in the started-job ledger, so a restart cannot silently
+run it a second time.
+
 The lease frame is `{job_id, lease_id, envelope, deadline_at}`: `job_id` and
 `lease_id` are opaque strings and `deadline_at` is integer Unix milliseconds.
 The envelope is nested, as the coordinator builds it
@@ -224,8 +233,8 @@ without the protocol wrapper is refused.
 A failure is always reported as `failed` with a stable `reason`
 (`ENVELOPE_INVALID`, `MODEL_UNAVAILABLE`, `GANGLION_UNAVAILABLE`,
 `GANGLION_HTTP_ERROR`, `GANGLION_TIMEOUT`, `GANGLION_INVALID_RESPONSE`,
-`EMPTY_CONTENT`, `DEADLINE_EXCEEDED`) and no content, so it can never be
-mistaken for a successful result. The failed result is exactly
+`UPSTREAM_BUSY`, `EMPTY_CONTENT`, `DEADLINE_EXCEEDED`) and no content, so it can
+never be mistaken for a successful result. The failed result is exactly
 `{reason, detail?, elapsed_ms?, usage?, cache?}` — no request, node, runtime,
 model, `simulated` or `content` field, because a failure claims nothing about
 the job's identity. A success is exactly
@@ -291,6 +300,119 @@ as part of this quickstart. No AIPSTER token/endpoint belongs in these examples.
 
 For Unix shells, the corresponding entry points are `.venv/bin/python` and
 `.venv/bin/dendrite`. Those platforms require their own clean-install retest.
+
+## Running the worker as one service
+
+`pairing.py serve` is the supported way to run a worker: the heartbeat sender
+and, with `--jobs`, the job runner in one process, one log and one exit code.
+Both halves are the existing loops unchanged — the same sender lock, the same
+`jobs.lock`, the same reload/re-pair handoff, ledger and backoff rules — so
+running it is not a different worker, only a single one.
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py serve                    # heartbeats only
+.\.venv\Scripts\python.exe pairing.py serve --jobs             # heartbeats + leased jobs
+.\.venv\Scripts\python.exe pairing.py serve --jobs `
+    --upstream-url http://127.0.0.1:8471 --runtime-id ganglion
+```
+
+`pairing.py serve` accepts every `serve-jobs` flag (`--upstream-url`/`--ganglion-base`,
+`--runtime-id`, `--allow-non-loopback-ganglion`, `--interval`, `--poll-interval`,
+`--models-cache-ttl`) and pairs them with the sender's `--interval` and
+`--config`. Jobs stay opt-in: without `--jobs` the service only heartbeats, and
+the job routes are never called.
+
+One process, one worker state:
+
+- A second `pairing.py serve`, `heartbeat-loop` or `serve-jobs` for the same
+  data dir is refused with exit 6 (`SENDER_RUNNING` / `JOBS_RUNNING`); neither
+  lock is relaxed or replaced.
+- A revoked key from either loop stops the service with exit 4, so repair is
+  never half-done. Other loop failures report their own code (2, 3, 5).
+- `SIGTERM`/`SIGINT` (launchd, Ctrl+C) finish and post the job in flight, stop
+  the sender, and exit 0; a second signal restores the default action. On
+  Windows the same stop is available through the tray/launcher that owns the
+  console, or by ending the process — a job in flight is never re-run, because
+  the started-job ledger records it before the upstream is called.
+
+### Windows Task Scheduler (template only)
+
+Paste the paths for your checkout; nothing here is installed automatically.
+`pairing.py serve` takes the single-runner locks itself, so `MultipleInstances`
+should stay `IgnoreNew` rather than letting Task Scheduler start a second worker.
+
+```xml
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>AIPSTER local worker (heartbeats + leased jobs)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\path\to\local-worker\.venv\Scripts\python.exe</Command>
+      <Arguments>pairing.py serve --jobs --upstream-url http://127.0.0.1:8471</Arguments>
+      <WorkingDirectory>C:\path\to\local-worker</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+```
+
+Register it with `schtasks /Create /TN AIPSTER-Worker /XML worker-task.xml`
+(or `Register-ScheduledTask`). Set `AIPSTER_GANGLION_TOKEN` in the user
+environment if the upstream needs one, never in the task arguments.
+
+### macOS launchd (template only)
+
+A `LaunchAgent` keeps the worker in the login session, which is where a
+loopback upstream lives. Save it as
+`~/Library/LaunchAgents/local.aipster.worker.plist` and load it yourself:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.aipster.worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/local-worker/.venv/bin/python</string>
+    <string>pairing.py</string>
+    <string>serve</string>
+    <string>--jobs</string>
+    <string>--runtime-id</string>
+    <string>llama-server</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/you/local-worker</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>/Users/you/Library/Logs/aipster-worker.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/Library/Logs/aipster-worker.log</string>
+</dict>
+</plist>
+```
+
+`KeepAlive`/`SuccessfulExit=false` restarts the worker after a crash but not
+after a clean stop or a repair-required exit, so a revoked key is not retried
+in a loop. `launchctl bootout` sends `SIGTERM`, which is the stop described
+above: the in-flight job finishes and is posted, then the process exits 0.
 
 ## Optional real engine preparation (not needed for the mock check)
 

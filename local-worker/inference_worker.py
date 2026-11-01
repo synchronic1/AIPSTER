@@ -26,6 +26,9 @@ Safety rules this module enforces:
   * Exactly one non-streaming completion per job, temperature 0, timeout
     = the job deadline minus now, no redirects, no retries. A model the
     upstream does not list is refused before any completion call.
+  * No job is leased while the local upstream is down or answering 429/503:
+    the loop backs off and probes again. A completion the upstream declines
+    with 429/503 after the lease is reported as UPSTREAM_BUSY, once.
   * A failure is always reported as `failed` with a stable reason. There
     is no path that reports simulated output as success.
   * The job id is written to a private started-job ledger before the
@@ -126,6 +129,10 @@ GANGLION_TIMEOUT = "GANGLION_TIMEOUT"
 GANGLION_INVALID_RESPONSE = "GANGLION_INVALID_RESPONSE"
 EMPTY_CONTENT = "EMPTY_CONTENT"
 DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
+# The upstream was too busy to take the completion (429/503). The job stays in
+# the started-job ledger, so it is reported once and never retried here.
+UPSTREAM_BUSY = "UPSTREAM_BUSY"
+UPSTREAM_BUSY_STATUSES = (429, 503)
 
 
 class EnvelopeRejected(Exception):
@@ -144,10 +151,14 @@ class LeaseFrameError(Exception):
 class GanglionError(Exception):
     """A completion attempt that produced no usable content. Stable reason."""
 
-    def __init__(self, reason, detail=None):
+    def __init__(self, reason, detail=None, status=None):
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
         self.detail = detail
+        # The upstream's HTTP status when there was one, so a caller can tell a
+        # busy upstream (429/503) from an absent or broken one without parsing
+        # the human-readable detail.
+        self.status = status
 
 
 def default_ganglion_base():
@@ -424,7 +435,8 @@ class GanglionClient:
         except PairingError as exc:
             raise GanglionError(GANGLION_UNAVAILABLE, f"models {exc.code}") from exc
         if status != 200:
-            raise GanglionError(GANGLION_UNAVAILABLE, f"models HTTP {status}")
+            raise GanglionError(GANGLION_UNAVAILABLE, f"models HTTP {status}",
+                                status=status)
         data = body.get("data")
         ids = [entry["id"] for entry in data
                if isinstance(entry, dict) and isinstance(entry.get("id"), str)] \
@@ -433,6 +445,24 @@ class GanglionClient:
             raise GanglionError(GANGLION_UNAVAILABLE, "no listed models")
         self._models, self._models_at = ids, now
         return ids
+
+    def probe(self):
+        """Cheap pre-lease readiness: (usable, state) from the model list.
+
+        `state` is None when a completion could be attempted now, "busy" when
+        the upstream answered as too busy to take more work (429/503), and
+        "down" for any other failure. It reads the same `GET /v1/models` the
+        model gate needs, so a healthy upstream costs one cached request per
+        models_cache_ttl rather than a request per poll.
+
+        This is deliberately not a job outcome: it only decides whether it is
+        worth leasing. Never raises, so an outage cannot end the loop.
+        """
+        try:
+            self.models()
+        except GanglionError as exc:
+            return False, "busy" if exc.status in UPSTREAM_BUSY_STATUSES else "down"
+        return True, None
 
     def _post(self, path, payload, deadline_monotonic):
         remaining = deadline_monotonic - self.clock()
@@ -458,7 +488,8 @@ class GanglionClient:
 
         A 404 on /v1/completions means the route does not exist (nothing was
         executed), so the documented single-message chat fallback is used
-        once. Any other failure is final.
+        once. A 429/503 is the upstream declining the work (UPSTREAM_BUSY);
+        any other failure is final.
         """
         body = {"model": model_id, "prompt": prompt, "max_tokens": max_tokens,
                 "temperature": 0, "stream": False}
@@ -468,8 +499,10 @@ class GanglionClient:
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": max_tokens, "temperature": 0, "stream": False}
             status, response = self._post("/v1/chat/completions", chat, deadline_monotonic)
+        if status in UPSTREAM_BUSY_STATUSES:
+            raise GanglionError(UPSTREAM_BUSY, f"HTTP {status}", status=status)
         if status != 200:
-            raise GanglionError(GANGLION_HTTP_ERROR, f"HTTP {status}")
+            raise GanglionError(GANGLION_HTTP_ERROR, f"HTTP {status}", status=status)
         choices = response.get("choices")
         text = None
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -663,10 +696,26 @@ class JobRunner:
         self._stop = threading.Event()
         self._stop_signum = None
 
+    def request_stop(self, signum=None):
+        """Ask the loop to stop between jobs, naming the signal when known.
+
+        A stop never interrupts an in-flight completion: the loop leaves after
+        the job it is holding has been posted, so stopping cannot strand a job
+        the upstream may already have run. The one-process service
+        (worker_service.py) calls this so one signal stops both halves of the
+        worker; the signal handler below calls it too.
+        """
+        if signum is not None and self._stop_signum is None:
+            self._stop_signum = signum
+        self._stop.set()
+
     def run(self, max_cycles=None):
         """Serve jobs until stopped. max_cycles bounds the polls (--once: 1)."""
-        self._stop = threading.Event()
-        self._stop_signum = None
+        if not self._stop.is_set():
+            # A stop requested before the loop started (a signal that arrived
+            # while a supervisor was launching it) must not be forgotten.
+            self._stop = threading.Event()
+            self._stop_signum = None
         try:
             # Provision before writing anything: the lock and ledger must not
             # be the first files to create an inherited, non-private store.
@@ -723,8 +772,7 @@ class JobRunner:
                 except (AttributeError, OSError, RuntimeError):
                     raise KeyboardInterrupt
                 return
-            self._stop_signum = signum
-            self._stop.set()
+            self.request_stop(signum)
 
         for name in ("SIGTERM", "SIGINT"):
             sig = getattr(signal, name, None)
@@ -777,6 +825,18 @@ class JobRunner:
             if self._stop.is_set():
                 return self._stop_exit()
             cycles += 1
+            # Probe before leasing. A down or busy upstream would only turn a
+            # fresh lease into a failure the worker never caused, so no job is
+            # leased until the upstream can take one; the wait grows like an
+            # empty queue's so an outage does not hot-loop.
+            usable, state = self.ganglion.probe()
+            if not usable:
+                print(f"jobs: upstream {state}; not leasing until it recovers",
+                      file=sys.stderr)
+                wait = self._idle_delay(idle)
+                idle = min(idle + 1, self.max_idle_exponent)
+                self._wait(wait)
+                continue
             try:
                 with pairing.pair_lock(self.data_dir):
                     meta = pairing.load_pairing(self.data_dir)
