@@ -245,7 +245,7 @@ class FakeApiState:
         self.result_plan = []     # (status, body) overriding the accepted result
         self.live_keys = {FAKE_SECRET}
         self.claims = []
-        self.beats = []           # {"body", "key"} heartbeat intake records
+        self.beats = []           # {"body", "usable", "key"}: the sender's heartbeat route
         self.next_hits = 0
         self.auth_seen = []
         self.user_agents = []
@@ -308,6 +308,16 @@ def make_api_server(state):
                                         "keyPrefix": "aip_live_k_fake01_synthe",
                                         "heartbeatUrl": "/api/resources/%s/heartbeat" % FAKE_RESOURCE,
                                         "created": True})
+            if path.startswith("/api/resources/") and path.endswith("/heartbeat"):
+                # The sender's route (pairing.send_heartbeat), so the one-process
+                # service tests can watch heartbeats and leases side by side.
+                key = self._auth()
+                state.beats.append({"body": body, "usable": body.get("usable"), "key": key})
+                if key not in state.live_keys:
+                    return self._send(401, {"code": "KEY_REVOKED", "error": "revoked"})
+                return self._send(200, {"ok": True,
+                                        "heartbeatAt": "2026-11-01T00:00:00.000Z",
+                                        "online": True, "usable": body.get("usable")})
             if path.startswith("/api/worker/jobs/") and path.endswith("/result"):
                 job_id = path[len("/api/worker/jobs/"):-len("/result")]
                 key = self._auth()
@@ -321,7 +331,7 @@ def make_api_server(state):
                 return self._send(status, payload)
             if path.endswith("/heartbeat"):
                 key = self._auth()
-                state.beats.append({"body": body, "key": key})
+                state.beats.append({"body": body, "usable": body.get("usable"), "key": key})
                 if key not in state.live_keys:
                     return self._send(401, {"code": "KEY_REVOKED", "error": "revoked"})
                 return self._send(200, {"ok": True, "heartbeatAt": "2026-11-01T00:00:00.000Z",
@@ -337,6 +347,7 @@ class FakeGanglionState:
     def __init__(self):
         self.models = [MODEL]
         self.models_status = 200
+        self.models_plan = []     # statuses served before the steady models_status
         self.models_hits = 0
         self.models_headers = []
         self.completion_status = 200
@@ -370,8 +381,9 @@ def make_ganglion_server(state):
             if urlparse(self.path).path == "/v1/models":
                 state.models_hits += 1
                 state.models_headers.append(dict(self.headers))
-                if state.models_status != 200:
-                    return self._send(state.models_status, {"error": "boom"})
+                status = state.models_plan.pop(0) if state.models_plan else state.models_status
+                if status != 200:
+                    return self._send(status, {"error": "boom"})
                 return self._send(200, {"object": "list",
                                         "data": [{"id": m, "object": "model",
                                                   "owned_by": "ganglion"} for m in state.models]})
@@ -885,12 +897,19 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertNotIn("model_id", result)
         self.assertNotIn("content", result)
 
-    def test_unreachable_model_list_fails_closed(self):
-        self.ganglion.models_status = 500
-        self.api.leases = [lease()]
-        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+    def test_upstream_failing_between_probe_and_model_gate_fails_the_lease(self):
+        # The cheap pre-lease probe saw a healthy upstream; the model gate one
+        # call later does not. The leased job still fails closed, without a
+        # completion, exactly as before the probe existed.
+        def lease_then_break(*args, **kwargs):
+            self.ganglion.models_plan = [500]
+            return lease(), None
+
+        with mock.patch.object(inference_worker, "fetch_next", lease_then_break):
+            code, _, err = self.run_quiet(self.runner(models_cache_ttl=0), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err)
         self.assertEqual(self.ganglion.hits["completions"], 0)
+        self.assertEqual(self.api.results[0]["body"]["status"], "failed")
         self.assertEqual(self.api.results[0]["body"]["result"]["reason"],
                          "GANGLION_UNAVAILABLE")
 
@@ -905,6 +924,83 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(body["status"], "failed")
         self.assertEqual(body["result"]["reason"], "GANGLION_HTTP_ERROR")
         self.assertNotIn("content", body["result"])
+
+    # -- upstream busy: never lease work the upstream cannot take ---------
+    #
+    # Leasing a job while the upstream is down or rate limited spends a lease
+    # and reports a failure the worker never caused. The job loop probes
+    # GET /v1/models first (already cached for the model gate) and simply does
+    # not lease. A completion that is refused with 429/503 after the lease is
+    # reported as UPSTREAM_BUSY: the job is already in the started-job ledger,
+    # so it is neither retried here nor re-run later.
+
+    def test_upstream_down_leases_nothing(self):
+        self.ganglion.models_status = 503
+        self.api.leases = [lease()]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=3)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.api.next_hits, 0,
+                         "a job is not leased while the upstream is down")
+        self.assertEqual(self.api.results, [])
+        self.assertGreaterEqual(self.ganglion.models_hits, 1)
+        self.assertIn("upstream", err)
+
+    def test_upstream_rate_limited_probe_leases_nothing(self):
+        self.ganglion.models_status = 429
+        self.api.leases = [lease()]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=2)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.api.next_hits, 0)
+        self.assertEqual(self.api.results, [])
+
+    def test_upstream_down_backs_off_without_giving_up(self):
+        # A local upstream outage is not an AIPSTER API failure: the loop
+        # neither exits (5) nor hot-loops while it waits for the upstream.
+        self.ganglion.models_status = 503
+        sleeps = []
+        code, _, err = self.run_quiet(self.runner(sleep=sleeps.append), max_cycles=8)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(len(sleeps), 8)
+        self.assertGreaterEqual(sleeps[1], sleeps[0], "the probe wait grows")
+        self.assertEqual(self.api.next_hits, 0)
+        self.assertEqual(self.ganglion.models_hits, 8)
+
+    def test_upstream_recovering_leases_again(self):
+        self.ganglion.models_plan = [503, 200]
+        self.api.leases = [lease()]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=2)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.api.next_hits, 1)
+        self.assertEqual(self.api.results[0]["body"]["status"], "succeeded")
+
+    def test_completion_429_fails_with_upstream_busy_and_no_retry(self):
+        self.ganglion.completion_status = 429
+        self.ganglion.completion_body = {"error": "busy"}
+        self.api.leases = [lease()]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.hits["completions"], 1, "still no retries")
+        self.assertEqual(self.ganglion.hits["chat"], 0)
+        body = self.api.results[0]["body"]
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(set(body["result"]) - FAILED_ALLOWED, set(),
+                         "a failed result carries no EIF identity fields")
+        self.assertEqual(body["result"]["reason"], "UPSTREAM_BUSY")
+        self.assertTrue(StartedLedger(self.data).contains("job_1"),
+                        "the refused job is in the ledger, so it is never re-run")
+
+    def test_chat_fallback_503_fails_with_upstream_busy(self):
+        self.ganglion.completion_status = 404
+        self.ganglion.completion_body = {"error": "no route"}
+        self.ganglion.chat_status = 503
+        self.ganglion.chat_body = {"error": "busy"}
+        self.api.leases = [lease()]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.hits["completions"], 1)
+        self.assertEqual(self.ganglion.hits["chat"], 1)
+        self.assertEqual(self.api.results[0]["body"]["result"]["reason"],
+                         "UPSTREAM_BUSY")
 
     def test_ganglion_timeout_fails_without_retry(self):
         self.ganglion.completion_delay = 2.0

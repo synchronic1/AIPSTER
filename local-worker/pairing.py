@@ -1197,6 +1197,31 @@ def build_parser():
                       help="seconds to cache the upstream model list")
     jobs.add_argument("--once", action="store_true",
                       help="poll for one job and exit")
+    # One supported service: the sender and, with --jobs, the job runner in a
+    # single process. Same minimal wiring as serve-jobs; the module is
+    # imported only when this command is used.
+    serve = sub.add_parser("serve",
+                           help="run the heartbeat sender and, with --jobs, the "
+                                "inference job runner as one service")
+    serve.add_argument("--config", default=None,
+                       help="worker config for the usable-bit policy")
+    serve.add_argument("--interval", type=int, default=HEARTBEAT_INTERVAL_SEC,
+                       help="heartbeat interval in seconds")
+    serve.add_argument("--jobs", action="store_true",
+                       help="also lease and run inference jobs (dark by default)")
+    serve.add_argument("--poll-interval", type=float, default=2.0,
+                       help="base idle job poll interval in seconds")
+    serve.add_argument("--ganglion-base", "--upstream-url", dest="ganglion_base",
+                       default=None,
+                       help="local upstream base URL, Ganglion or llama-server "
+                            "(default http://127.0.0.1:8471); --upstream-url is an alias")
+    serve.add_argument("--allow-non-loopback-ganglion", action="store_true",
+                       help="permit a non-loopback upstream base (not qualified)")
+    serve.add_argument("--runtime-id", default="ganglion",
+                       help="runtime identity this worker claims: ganglion or "
+                            "llama-server (default ganglion)")
+    serve.add_argument("--models-cache-ttl", type=float, default=30.0,
+                       help="seconds to cache the upstream model list")
     return parser
 
 
@@ -1223,6 +1248,11 @@ def main(argv=None):
             # here keeps a pair/heartbeat-only frozen bundle self-contained.
             import inference_worker
             return inference_worker.cmd_serve_jobs(args)
+        if args.command == "serve":
+            # Lazy, like serve-jobs: the service composes both loops and is
+            # only imported when it is used.
+            import worker_service
+            return worker_service.cmd_serve(args)
     except KeyboardInterrupt:
         # Ctrl+C stops the sender cleanly: no traceback, no partial claim
         # (pair's manifest commit is atomic under the pair mutex).
