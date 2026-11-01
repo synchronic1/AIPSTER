@@ -216,16 +216,6 @@ function uploadPartPath(key, prefix) {
   return key.slice(prefix.length + 9);
 }
 
-// Byte equality for idempotent chunk retries. Length is checked by
-// callers first; this compares content only.
-function bytesEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
-
 // Reclaim-fence predicate (Codex-sec-P2): true when an asset id is
 // committed (or its row is unreadable) and its prefix must NOT be
 // reclaimed. Exported for unit tests; the finalizer calls it before every
@@ -1661,12 +1651,18 @@ async function handleApi(request, env, url) {
         let usedNew = false;
         let usedCredit = 0;
         let metered = false;
+        // Part digest (Codex-sec-P2 r4434755041): persisted with the bytes
+        // so replace detection is a metadata-only HEAD. A full GET buffered
+        // the stored part (up to 8 MiB) on every re-send, before both the
+        // exact-retry return and metering, so a spent budget still allowed
+        // unbounded authenticated R2 reads and Worker memory/CPU.
+        const partSha = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), (x) => x.toString(16).padStart(2, '0')).join('');
         for (let attempt = 0; attempt < 3 && !reserved; attempt += 1) {
           // Fresh replace pre-read per attempt: a conflict means a rival
           // moved, so re-derive the credit instead of reusing a stale one.
           // The winning attempt's values freeze below for rollback.
-          const existing = await store.get(key);
-          const existingLen = existing ? existing.length : 0;
+          const existing = await store.head(key);
+          const existingLen = existing ? existing.size : 0;
           const live = await first(db, 'SELECT state, quotas_json FROM catalog_uploads WHERE id = ?', uploadId);
           if (!live || live.state !== 'uploading') {
             if (!live || live.state === 'expired') {
@@ -1694,7 +1690,10 @@ async function handleApi(request, env, url) {
           // D1 write. Without this, one budgeted session replays into
           // unbounded shared R2/D1 operations. State was verified uploading
           // just above.
-          if (existing && existing.length === bytes.byteLength && bytesEqual(existing, bytes)) {
+          // Identity is the server-written digest: a part without one (none
+          // exist in production; the store was never bound) is treated as
+          // differing and metered below, never fetched.
+          if (existing && existing.sha256 && existing.size === bytes.byteLength && existing.sha256 === partSha) {
             return json(200, { ok: true, uploadId, path: relpath, index, received: bytes.byteLength });
           }
           // Differing re-send metering (R1): the stored bytes are already
@@ -1764,7 +1763,7 @@ async function handleApi(request, env, url) {
         // Idempotent rewrite: re-sending an index overwrites it, so
         // transport retries never corrupt the assembly (AC13).
         try {
-          await store.put(key, new Uint8Array(bytes));
+          await store.put(key, new Uint8Array(bytes), { sha256: partSha });
         } catch (error) {
           await rollbackReservation();
           throw error;

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { validateManifest, validateRelPath, screenMagic, screenSafetensors, checkShardIndex, MAX_ASSET_BYTES } from '../src/lib/catalog/validate.mjs';
-import { __resetFixtureStore, byteStore, assetKey, assetScope, __failAssetListsForTest } from '../src/lib/catalog/store.mjs';
+import { __resetFixtureStore, byteStore, assetKey, assetScope, __failAssetListsForTest, __partBodyReadsForTest } from '../src/lib/catalog/store.mjs';
 import { __setRid16ForTest } from '../src/lib/store.js';
 import { assetPrefixProtected } from '../src/worker.js';
 import { budgetWindow } from '../src/lib/quotas.js';
@@ -2204,6 +2204,61 @@ test('Codex-sec-P2: exact chunk replays are idempotent (no PUT, no D1 write)', a
   assert.equal(q2.quotas_json, qSpent.quotas_json, 'counters unchanged by 429s');
   const stored2 = await store.get(key);
   assert.deepEqual(Array.from(stored2), Array.from(storedSpent), 'the stored part is untouched');
+});
+test('Codex-sec-P2 r4434755041: re-sends never read stored part bytes, and spent budgets stop differing re-sends first', async () => {
+  const t = await fx();
+  __resetFixtureStore();
+  const b = await begin(t, t.alice, {
+    name: 'replay-reads', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'm.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  assert.equal((await chunk(t, t.alice, b.json.id, 'm.gguf', 0, ggufBytes())).status, 200);
+  __partBodyReadsForTest(true);
+  // Fresh budget: an exact retry is free and reads no stored bytes.
+  const exact = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, ggufBytes());
+  assert.equal(exact.status, 200, exact.text);
+  assert.equal(__partBodyReadsForTest(), 0, 'exact retry decided without downloading the stored part');
+  // Spent budget: exact retries stay free, differing re-sends 429, and
+  // neither downloads the stored part (no unbounded R2 reads/buffering).
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  for (let i = 0; i < 6; i += 1) {
+    const r = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, i % 2 ? ggufBytes() : new Uint8Array(64).fill(0x48));
+    assert.equal(r.status, i % 2 ? 200 : 429, r.text);
+  }
+  assert.equal(__partBodyReadsForTest(), 0, 'no re-send downloaded the stored part');
+});
+test('Codex-sec-P2 r4434755041: R2 path uses HEAD + server-written digest metadata, never GET, on re-sends', async () => {
+  const t = await fx();
+  const files = new Map();
+  const meta = new Map();
+  let gets = 0;
+  const bucket = {
+    async put(key, bytes, opts) {
+      files.set(key, bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes));
+      meta.set(key, (opts && opts.customMetadata) || {});
+    },
+    async head(key) { return files.has(key) ? { size: files.get(key).length, customMetadata: meta.get(key) } : null; },
+    async get(key) { gets += 1; const v = files.get(key); return v === undefined ? null : { arrayBuffer: async () => v.slice().buffer }; },
+    async delete(key) { files.delete(key); meta.delete(key); },
+    async list({ prefix }) { return { objects: [...files.keys()].filter((k) => k.startsWith(prefix)).sort().map((k) => ({ key: k, size: files.get(k).length })), truncated: false }; },
+  };
+  t.env.CATALOG_STORE = bucket;
+  const b = await begin(t, t.alice, {
+    name: 'r2-replay', kind: 'model', task: 'text-generation', format: 'gguf', license: 'apache-2.0',
+    files: [{ relpath: 'm.gguf', bytes: 64 }],
+  });
+  assert.equal(b.status, 201, b.text);
+  assert.equal((await chunk(t, t.alice, b.json.id, 'm.gguf', 0, ggufBytes())).status, 200);
+  const key = `upload/${b.json.id}/part/00000000/m.gguf`;
+  assert.match(meta.get(key).sha256 || '', /^[0-9a-f]{64}$/, 'part persisted with its digest');
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  assert.equal((await chunk(t, t.alice, b.json.id, 'm.gguf', 0, ggufBytes())).status, 200, 'exact retry free on a spent budget');
+  const diff = await chunk(t, t.alice, b.json.id, 'm.gguf', 0, new Uint8Array(64).fill(0x48));
+  assert.equal(diff.status, 429, diff.text);
+  assert.equal(gets, 0, 'no re-send issued an R2 GET');
 });
 test('Codex-sec-P2: attempt gate fails closed on prefix-list faults', async () => {
   const t = await fx();

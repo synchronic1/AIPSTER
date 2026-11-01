@@ -9,9 +9,11 @@ import { isFixtureEnv } from './hub.mjs';
 export const CHUNK_MAX_BYTES = 8 * 1024 * 1024;
 
 const memoryBuckets = new Map();
+const memoryDigests = new Map();
 
 export function __resetFixtureStore() {
   memoryBuckets.clear();
+  memoryDigests.clear();
 }
 
 // Fault injection for fail-closed list handling (tests only): the next n
@@ -21,16 +23,33 @@ export function __resetFixtureStore() {
 let failAssetLists = 0;
 export function __failAssetListsForTest(n) { failAssetLists = n; }
 
+// Read accounting (tests only): counts full-body gets of upload part keys
+// on the fixture backend. Call with `true` to reset; returns the count.
+let partBodyReads = 0;
+export function __partBodyReadsForTest(reset = false) {
+  if (reset) partBodyReads = 0;
+  return partBodyReads;
+}
+
 function memoryStore() {
   const bucketId = 'fixture';
   if (!memoryBuckets.has(bucketId)) memoryBuckets.set(bucketId, new Map());
   const files = memoryBuckets.get(bucketId);
+  const digests = memoryDigests;
   return {
     backend: 'memory-fixture',
-    async put(key, bytes) {
+    // `meta.sha256` mirrors R2 customMetadata: written by this server with
+    // the bytes, read back by head() without fetching the body.
+    async put(key, bytes, meta = {}) {
       files.set(key, bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes));
+      if (meta && meta.sha256) digests.set(key, meta.sha256); else digests.delete(key);
+    },
+    async head(key) {
+      const v = files.get(key);
+      return v === undefined ? null : { size: v.length, sha256: digests.get(key) || null };
     },
     async get(key) {
+      if (key.includes('/part/')) partBodyReads += 1;
       const v = files.get(key);
       return v === undefined ? null : v.slice();
     },
@@ -40,6 +59,7 @@ function memoryStore() {
     },
     async del(key) {
       files.delete(key);
+      digests.delete(key);
     },
     async list(prefix, limit = Infinity) {
       // Limit support bounds finalize assembly lists (Codex-sec-P2):
@@ -61,8 +81,15 @@ function memoryStore() {
 function r2Store(bucket) {
   return {
     backend: 'r2',
-    async put(key, bytes) {
-      await bucket.put(key, bytes);
+    async put(key, bytes, meta = {}) {
+      if (meta && meta.sha256) await bucket.put(key, bytes, { customMetadata: { sha256: meta.sha256 } });
+      else await bucket.put(key, bytes);
+    },
+    // Metadata only (no body transfer): size plus the server-written digest.
+    async head(key) {
+      const obj = await bucket.head(key);
+      if (!obj) return null;
+      return { size: obj.size, sha256: (obj.customMetadata && obj.customMetadata.sha256) || null };
     },
     async get(key) {
       const obj = await bucket.get(key);
