@@ -5,6 +5,10 @@ transitions and notifications are logged; open_* return their targets without
 opening anything. IPC (mutex + window messages) still works: the hidden
 controller window is windowless, not absent.
 """
+import os
+import shlex
+import subprocess
+
 from .backend_base import Backend
 
 
@@ -47,6 +51,12 @@ class HeadlessBackend(Backend):
         return True
 
     def run_pair_console(self, exe, args):
-        self.events.append(("pair_console", str(exe), " ".join(args)))
-        self.log(f"backend=headless pair_console suppressed exe={exe} args={' '.join(args)}")
+        if os.name == "nt":
+            display = subprocess.list2cmdline([str(exe), *args])
+            arg_display = subprocess.list2cmdline(list(args))
+        else:
+            display = shlex.join([str(exe), *args])
+            arg_display = shlex.join(list(args))
+        self.events.append(("pair_console", str(exe), arg_display))
+        self.log(f"backend=headless pair_console suppressed cmd={display}")
         return (str(exe), list(args))

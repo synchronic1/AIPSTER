@@ -1,5 +1,10 @@
 """Native /completion adapter shared by IK_Llama and llama.cpp single-model servers."""
 
+# Modified by AIPSTER local patch 0002 (2026-11-01): quarantine an attached
+# server only when a request actually reached it and was not a known rejection,
+# so a fabric cancellation before dispatch cannot take a resident model offline.
+# Upstream base and hashes: local-worker/provenance.json.
+
 import asyncio
 import shutil
 import socket
@@ -23,6 +28,8 @@ class LlamaRuntime(Runtime):
         )
         self.quarantined = False
         self.last_observed_at: float | None = None
+        self._request_sent = False
+        self._known_rejection = False
 
     def native_alias(self, model: ModelConfig) -> str:
         return model.id + "@" + self.instance
@@ -143,7 +150,9 @@ class LlamaRuntime(Runtime):
             raise RuntimeFailure("max_tokens must be smaller than runtime context_size", 422)
 
     async def generate(self, request: ExecuteRequest) -> dict:
+        self._known_rejection = False
         try:
+            self._request_sent = True
             response = await self.client.post(
                 "/completion",
                 json={
@@ -155,6 +164,10 @@ class LlamaRuntime(Runtime):
                     "stream": False,
                 },
             )
+            if response.status_code in (400, 404, 405, 422, 429, 501):
+                # The server answered definitively; aborting this request cannot
+                # leave an unknown generation running on the attached model.
+                self._known_rejection = True
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, dict) or not isinstance(result.get("content"), str):
@@ -167,6 +180,7 @@ class LlamaRuntime(Runtime):
             cached = timings.get("cache_n")
             if type(cached) is not int or cached < 0:
                 cached = None
+            self._request_sent = False
             return {
                 "content": result["content"],
                 "cached_tokens": cached,
@@ -183,6 +197,10 @@ class LlamaRuntime(Runtime):
                 },
             }
         except httpx.TimeoutException as exc:
+            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                # The request never left this process; it cannot have started a
+                # native generation, so abort must not quarantine the attachment.
+                self._request_sent = False
             raise RuntimeFailure("Native inference timed out", 504) from exc
         except httpx.HTTPStatusError as exc:
             status = 422 if exc.response.status_code == 400 else 503
@@ -190,6 +208,9 @@ class LlamaRuntime(Runtime):
                 f"Native inference returned HTTP {exc.response.status_code}", status
             ) from exc
         except (httpx.HTTPError, ValueError, TypeError) as exc:
+            if isinstance(exc, httpx.ConnectError):
+                # Connection establishment failed; no request reached the server.
+                self._request_sent = False
             raise RuntimeFailure("Native inference failed or returned malformed JSON", 502) from exc
 
     async def stop(self):
@@ -208,8 +229,17 @@ class LlamaRuntime(Runtime):
             self.reset()
 
     async def abort(self):
-        if self.config.mode == "attach":
+        if (
+            self.config.mode == "attach"
+            and self._request_sent
+            and not self._known_rejection
+        ):
+            # Only an in-flight/answered request makes the attached slot's state
+            # unknown. A cancellation before dispatch (or a definite rejection)
+            # must not take the resident model offline.
             self.quarantined = True
+        self._request_sent = False
+        self._known_rejection = False
         await self.stop()
 
     async def close(self):
