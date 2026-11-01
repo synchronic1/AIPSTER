@@ -3,9 +3,10 @@
 One job at a time: `serve-jobs` leases a redeemed job for THIS resource
 through the AIPSTER worker job route using the stored heartbeat-scoped
 key, validates the bound CPU envelope strictly, runs it once on the local
-Ganglion OpenAI-compatible server, and posts an EIF-shaped result. It is
-an outbound client only: it opens no port and never touches the daemon's
-loopback API on 8090, its enrollment, or its credentials.
+upstream (Ganglion or llama-server, over the OpenAI `/v1` surface), and
+posts an EIF-shaped result. It is an outbound client only: it opens no port
+and never touches the daemon's loopback API on 8090, its enrollment, or its
+credentials.
 
 Standard library only, like pairing.py, so the installed launcher can
 freeze this tree without a new dependency. The heartbeat key is read
@@ -16,12 +17,15 @@ Safety rules this module enforces:
 
   * Nothing runs unless the operator starts `serve-jobs` explicitly; the
     server keeps `POST /api/jobs` disabled until INFERENCE_ENABLED is set.
-  * Ganglion must be loopback unless --allow-non-loopback-ganglion is
+  * The upstream must be loopback unless --allow-non-loopback-ganglion is
     given; its optional bearer token comes from the environment, never
     from pairing state.
+  * The claimed runtime id is one of `ganglion` | `llama-server` (Addendum
+    B) and a job addressed to any other runtime is refused with
+    ENVELOPE_INVALID, so a result never claims a runtime that did not run it.
   * Exactly one non-streaming completion per job, temperature 0, timeout
-    = the job deadline minus now, no redirects, no retries. A model that
-    Ganglion does not list is refused before any completion call.
+    = the job deadline minus now, no redirects, no retries. A model the
+    upstream does not list is refused before any completion call.
   * A failure is always reported as `failed` with a stable reason. There
     is no path that reports simulated output as success.
   * The job id is written to a private started-job ledger before the
@@ -72,6 +76,11 @@ DEFAULT_GANGLION_BASE = "http://127.0.0.1:8471"
 GANGLION_BASE_ENV = "AIPSTER_GANGLION_URL"
 GANGLION_TOKEN_ENV = "AIPSTER_GANGLION_TOKEN"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+# Runtime identity this worker may claim (Addendum B). A plain llama-server
+# on a Mac serves the same /v1 surface; a result must never say "ganglion"
+# when llama-server ran it.
+RUNTIME_ALLOWLIST = ("ganglion", "llama-server")
+DEFAULT_RUNTIME_ID = "ganglion"
 
 JOBS_POLL_INTERVAL_SEC = 2.0
 JOBS_MAX_IDLE_SEC = 30.0
@@ -133,25 +142,38 @@ def default_ganglion_base():
     return os.environ.get(GANGLION_BASE_ENV) or DEFAULT_GANGLION_BASE
 
 
+def check_runtime_id(raw):
+    """The runtime identity this worker is allowed to claim.
+
+    Addendum B's allowlist. Anything else is a configuration error, not a
+    per-job failure: refusing at startup keeps a mislabelled worker from
+    leasing jobs it would then have to fail.
+    """
+    if raw not in RUNTIME_ALLOWLIST:
+        raise PairingError(None, "BAD_RUNTIME",
+                           f"runtime id must be one of {', '.join(RUNTIME_ALLOWLIST)}")
+    return raw
+
+
 def check_ganglion_base(raw, allow_non_loopback=False):
-    """Validate the Ganglion base. Loopback HTTP(S) unless explicitly allowed."""
+    """Validate the upstream base. Loopback HTTP(S) unless explicitly allowed."""
     try:
         parsed = urlparse(raw)
     except ValueError as exc:
-        raise PairingError(None, "BAD_GANGLION_BASE", f"invalid Ganglion base: {exc}")
+        raise PairingError(None, "BAD_GANGLION_BASE", f"invalid upstream base: {exc}")
     if "@" in (parsed.netloc or ""):
         raise PairingError(None, "BAD_GANGLION_BASE",
-                           "credentials in the Ganglion URL are refused")
+                           "credentials in the upstream URL are refused")
     if parsed.query or parsed.fragment:
         raise PairingError(None, "BAD_GANGLION_BASE",
-                           "Ganglion base must not carry a query or fragment")
+                           "upstream base must not carry a query or fragment")
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in ("http", "https") or not host:
         raise PairingError(None, "BAD_GANGLION_BASE",
-                           "Ganglion base must be an http(s) URL")
+                           "upstream base must be an http(s) URL")
     if host not in LOOPBACK_HOSTS and not allow_non_loopback:
         raise PairingError(None, "BAD_GANGLION_BASE",
-                           "Ganglion base must be loopback; pass "
+                           "upstream base must be loopback; pass "
                            "--allow-non-loopback-ganglion to override")
     return raw.rstrip("/")
 
@@ -277,14 +299,18 @@ def _is_echo_string(value):
     return (isinstance(value, str) and 0 < len(value) <= ECHO_ID_MAX_CHARS)
 
 
-def validate_envelope(envelope, resource_id, deadline_ms, now_ms):
+def validate_envelope(envelope, resource_id, deadline_ms, now_ms,
+                      runtime_id=DEFAULT_RUNTIME_ID):
     """Strict bound-envelope check. Raises EnvelopeRejected on anything odd.
 
     The lease envelope is nested: {protocol, task, binding}. `task` is the
     bound-CPU codec output and is validated field by field; `binding` is the
     coordinator's internal instance pin and must carry exactly its five
-    fields. Anything else is refused: authority, placement and sampling
-    fields are decided server-side and must never travel back in from a job.
+    fields. The task's placement runtime must be the runtime this worker is
+    configured to claim (Addendum B), so a llama-server worker never runs a
+    job addressed to Ganglion, nor the other way round. Anything else is
+    refused: authority, placement and sampling fields are decided
+    server-side and must never travel back in from a job.
     """
     if not isinstance(envelope, dict):
         raise EnvelopeRejected(ENVELOPE_INVALID, "envelope")
@@ -331,7 +357,7 @@ def validate_envelope(envelope, resource_id, deadline_ms, now_ms):
         raise EnvelopeRejected(ENVELOPE_INVALID, "device")
     if placement["node_id"] != resource_id:
         raise EnvelopeRejected(ENVELOPE_INVALID, "node_id")
-    if placement["runtime_id"] != "ganglion":
+    if placement["runtime_id"] != runtime_id:
         raise EnvelopeRejected(ENVELOPE_INVALID, "runtime_id")
     if not _is_identifier(binding["op_id"], maximum=128):
         raise EnvelopeRejected(ENVELOPE_INVALID, "binding_value")
@@ -364,7 +390,7 @@ def validate_envelope(envelope, resource_id, deadline_ms, now_ms):
 
 
 class GanglionClient:
-    """One-way client for the local Ganglion OpenAI compatibility surface."""
+    """One-way client for the local upstream (Ganglion or llama-server) /v1 API."""
 
     def __init__(self, base, token=None, allow_non_loopback=False,
                  models_cache_ttl=MODELS_CACHE_TTL_SEC, clock=None):
@@ -376,7 +402,7 @@ class GanglionClient:
         self._models_at = 0.0
 
     def models(self):
-        """Model ids Ganglion says it can serve. Briefly cached."""
+        """Model ids the upstream says it can serve. Briefly cached."""
         now = self.clock()
         if self._models is not None and now - self._models_at < self.models_cache_ttl:
             return self._models
@@ -448,7 +474,7 @@ class GanglionClient:
 
 
 class StartedLedger:
-    """Private record of job ids handed to Ganglion, written before the call.
+    """Private record of job ids handed to the upstream, written before the call.
 
     A job whose execution started but whose result POST was never confirmed
     must not be executed a second time: the outcome is uncertain, and
@@ -537,20 +563,22 @@ def _hold_lock(data_dir, name):
 
 
 class JobRunner:
-    """Lease -> validate -> one Ganglion call -> result, with backoff."""
+    """Lease -> validate -> one upstream completion -> result, with backoff."""
 
     def __init__(self, data_dir, ganglion_base=None, ganglion_token=None,
                  allow_non_loopback=False, poll_interval=JOBS_POLL_INTERVAL_SEC,
                  models_cache_ttl=MODELS_CACHE_TTL_SEC, sleep=None, clock=None,
-                 now_ms=None, max_idle_sec=JOBS_MAX_IDLE_SEC):
+                 now_ms=None, max_idle_sec=JOBS_MAX_IDLE_SEC,
+                 runtime_id=DEFAULT_RUNTIME_ID):
         self.data_dir = Path(data_dir)
         self.clock = clock or time.monotonic
         self.now_ms = now_ms or (lambda: int(time.time() * 1000))
         self.sleep = sleep or time.sleep
         self.poll_interval = max(0.001, float(poll_interval))
         self.max_idle = max(self.poll_interval, float(max_idle_sec))
-        # Constructed here so a non-loopback or malformed base is refused
-        # before a single stored credential is read.
+        # Both are checked here so a bad runtime id or a non-loopback or
+        # malformed upstream is refused before a stored credential is read.
+        self.runtime_id = check_runtime_id(runtime_id)
         self.ganglion = GanglionClient(ganglion_base or default_ganglion_base(),
                                        token=ganglion_token,
                                        allow_non_loopback=allow_non_loopback,
@@ -661,7 +689,8 @@ class JobRunner:
                   file=sys.stderr)
             return pairing.EXIT_USAGE
         try:
-            lease = validate_envelope(envelope, resource_id, deadline, self.now_ms())
+            lease = validate_envelope(envelope, resource_id, deadline, self.now_ms(),
+                                      self.runtime_id)
         except EnvelopeRejected as exc:
             return self._post_failure(meta, job_id, lease_id, exc.reason, exc.detail)
         if self.ledger.contains(job_id):
@@ -684,7 +713,7 @@ class JobRunner:
         if remaining <= 0:
             return self._post_failure(meta, job_id, lease_id,
                                       DEADLINE_EXCEEDED, None)
-        # Commit the attempt before calling Ganglion: a crash after this
+        # Commit the attempt before calling the upstream: a crash after this
         # point must leave the job marked as started, never silently rerun.
         try:
             self.ledger.record(job_id)
@@ -764,7 +793,8 @@ def cmd_serve_jobs(args):
             ganglion_token=os.environ.get(GANGLION_TOKEN_ENV) or None,
             allow_non_loopback=args.allow_non_loopback_ganglion,
             poll_interval=args.interval,
-            models_cache_ttl=args.models_cache_ttl)
+            models_cache_ttl=args.models_cache_ttl,
+            runtime_id=getattr(args, "runtime_id", DEFAULT_RUNTIME_ID))
         return runner.run(max_cycles=1 if args.once else None)
     except PairingError as exc:
         print(f"jobs failed [{exc.code}]: {exc}", file=sys.stderr)
@@ -776,14 +806,21 @@ def main(argv=None):
         description="AIPSTER worker inference job runner (uses stored pairing)")
     parser.add_argument("--data-dir", default=None,
                         help="worker data dir (default: installed location)")
-    parser.add_argument("--ganglion-base", default=None,
-                        help=f"local Ganglion base (default: {DEFAULT_GANGLION_BASE})")
+    parser.add_argument("--ganglion-base", "--upstream-url", dest="ganglion_base",
+                        default=None,
+                        help="local upstream base URL, Ganglion or llama-server "
+                             f"(default: {DEFAULT_GANGLION_BASE}); "
+                             "--upstream-url is an alias")
     parser.add_argument("--allow-non-loopback-ganglion", action="store_true",
-                        help="permit a non-loopback Ganglion base (not qualified)")
+                        help="permit a non-loopback upstream base (not qualified)")
+    parser.add_argument("--runtime-id", default=DEFAULT_RUNTIME_ID,
+                        help="runtime identity this worker claims, one of "
+                             f"{', '.join(RUNTIME_ALLOWLIST)} "
+                             f"(default: {DEFAULT_RUNTIME_ID})")
     parser.add_argument("--interval", type=float, default=JOBS_POLL_INTERVAL_SEC,
                         help="base idle poll interval in seconds")
     parser.add_argument("--models-cache-ttl", type=float, default=MODELS_CACHE_TTL_SEC,
-                        help="seconds to cache the Ganglion model list")
+                        help="seconds to cache the upstream model list")
     parser.add_argument("--once", action="store_true", help="poll once and exit")
     return cmd_serve_jobs(parser.parse_args(argv))
 

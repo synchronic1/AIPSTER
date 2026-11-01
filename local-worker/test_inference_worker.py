@@ -945,6 +945,50 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertNotIn(FAKE_SECRET, posted, "the key never rides in a result body")
         self.assertNotIn("hello there", out + err, "prompt is not echoed to logs")
 
+    # -- runtime identity (Addendum B) -----------------------------------
+
+    def test_llama_server_mode_runs_and_echoes_runtime_id(self):
+        env = envelope(task_body=task(runtime_id="llama-server"))
+        self.api.leases = [lease(env=env)]
+        code, out, err = self.run_quiet(self.runner(runtime_id="llama-server"),
+                                        max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.hits["completions"], 1)
+        body = self.api.results[0]["body"]
+        self.assertEqual(body["status"], "succeeded")
+        self.assertEqual(body["result"]["runtime_id"], "llama-server")
+        self.assertEqual(body["result"]["runtime_instance"], RUNTIME_INSTANCE)
+        self.assertNotIn("Ganglion", out + err,
+                         "the log names the upstream generically, not Ganglion")
+
+    def test_rejects_ganglion_envelope_for_llama_server_worker(self):
+        env = envelope(task_body=task(runtime_id="ganglion"))
+        self.api.leases = [lease(env=env)]
+        code, _, err = self.run_quiet(self.runner(runtime_id="llama-server"),
+                                      max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.hits["completions"], 0)
+        result = self.api.results[0]["body"]["result"]
+        self.assertEqual(result["reason"], "ENVELOPE_INVALID")
+        self.assertEqual(result["detail"], "runtime_id")
+
+    def test_rejects_llama_server_envelope_for_ganglion_worker(self):
+        env = envelope(task_body=task(runtime_id="llama-server"))
+        self.api.leases = [lease(env=env)]
+        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.hits["completions"], 0)
+        result = self.api.results[0]["body"]["result"]
+        self.assertEqual(result["reason"], "ENVELOPE_INVALID")
+        self.assertEqual(result["detail"], "runtime_id")
+
+    def test_unknown_runtime_id_is_refused_before_polling(self):
+        with self.assertRaises(pairing.PairingError) as cm:
+            inference_worker.JobRunner(self.data, ganglion_base=self.gbase,
+                                       runtime_id="ollama")
+        self.assertEqual(cm.exception.code, "BAD_RUNTIME")
+        self.assertEqual(self.api.next_hits, 0)
+
     # -- transport policy ------------------------------------------------
 
     def test_non_loopback_ganglion_base_is_refused_without_flag(self):
@@ -985,6 +1029,57 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(code, pairing.EXIT_USAGE)
         self.assertIn("BAD_GANGLION_BASE", err.getvalue())
         self.assertEqual(self.api.next_hits, 0)
+
+    def test_cli_upstream_url_alias_serves_jobs(self):
+        self.api.leases = [lease()]
+        out = StringIO()
+        with redirect_stdout(out):
+            code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
+                                 "--upstream-url", self.gbase, "--interval", "0.01"])
+        self.assertEqual(code, pairing.EXIT_OK)
+        self.assertIn("succeeded posted", out.getvalue())
+        self.assertEqual(self.ganglion.hits["completions"], 1)
+
+    def test_cli_upstream_url_alias_keeps_the_loopback_rule(self):
+        err = StringIO()
+        with redirect_stderr(err):
+            code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
+                                 "--upstream-url", "http://192.168.1.203:8471"])
+        self.assertEqual(code, pairing.EXIT_USAGE)
+        self.assertIn("BAD_GANGLION_BASE", err.getvalue())
+        self.assertEqual(self.api.next_hits, 0)
+
+    def test_cli_llama_server_mode(self):
+        self.api.leases = [lease(env=envelope(task_body=task(runtime_id="llama-server")))]
+        out = StringIO()
+        with redirect_stdout(out):
+            code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
+                                 "--runtime-id", "llama-server",
+                                 "--upstream-url", self.gbase, "--interval", "0.01"])
+        self.assertEqual(code, pairing.EXIT_OK)
+        self.assertEqual(self.api.results[0]["body"]["status"], "succeeded")
+        self.assertEqual(self.api.results[0]["body"]["result"]["runtime_id"],
+                         "llama-server")
+
+    def test_cli_rejects_unknown_runtime_id(self):
+        err = StringIO()
+        with redirect_stderr(err):
+            code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
+                                 "--runtime-id", "ollama", "--ganglion-base", self.gbase])
+        self.assertEqual(code, pairing.EXIT_USAGE)
+        self.assertIn("BAD_RUNTIME", err.getvalue())
+        self.assertEqual(self.api.next_hits, 0)
+
+    def test_module_cli_accepts_upstream_url_alias(self):
+        self.api.leases = [lease()]
+        out = StringIO()
+        with redirect_stdout(out):
+            code = inference_worker.main(["--data-dir", str(self.data), "--once",
+                                          "--upstream-url", self.gbase,
+                                          "--interval", "0.01"])
+        self.assertEqual(code, pairing.EXIT_OK)
+        self.assertEqual(self.ganglion.hits["completions"], 1)
+        self.assertEqual(self.api.results[0]["body"]["status"], "succeeded")
 
 
 if __name__ == "__main__":

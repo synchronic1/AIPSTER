@@ -156,7 +156,7 @@ POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
 ## Serving inference jobs (dark by default)
 
 This checkout can run *leased* inference jobs for its paired resource against a
-local Ganglion OpenAI-compatible server (any OpenAI `/v1`-shaped local server
+local upstream (Ganglion or llama-server — any OpenAI `/v1`-shaped local server
 that lists its models works). It is dark by default in both directions: nothing runs unless you start
 it here, and the server keeps `POST /api/jobs` at `INFERENCE_DISABLED` (every
 worker job route 404s) unless `INFERENCE_ENABLED` is set. No live deployment,
@@ -167,10 +167,11 @@ Prerequisites:
 
 - a paired worker (`pairing.py pair`) whose heartbeat key is bound to a
   resource; the same private credential is reused, never copied or re-minted;
-- a running Ganglion server on `http://127.0.0.1:8471` (or `AIPSTER_GANGLION_URL`).
-  The address must be loopback unless you pass `--allow-non-loopback-ganglion`;
-  remote mode is not qualified.
-- if your Ganglion requires a token, set `AIPSTER_GANGLION_TOKEN` in the
+- a running upstream — Ganglion or, on macOS, a plain `llama-server` — on
+  `http://127.0.0.1:8471` (or `AIPSTER_GANGLION_URL`, `--upstream-url`,
+  `--ganglion-base`). The address must be loopback unless you pass
+  `--allow-non-loopback-ganglion`; remote mode is not qualified.
+- if your upstream requires a token, set `AIPSTER_GANGLION_TOKEN` in the
   environment. Do not put it on a command line, in a config file or in pairing
   state.
 
@@ -181,20 +182,22 @@ Prerequisites:
 
 | Flag | Meaning |
 |---|---|
-| `--ganglion-base URL` | Ganglion base (default `http://127.0.0.1:8471`, or `AIPSTER_GANGLION_URL`) |
-| `--allow-non-loopback-ganglion` | Permit a non-loopback base. Unqualified; refuses otherwise |
+| `--upstream-url URL` | Upstream base URL (default `http://127.0.0.1:8471`, or `AIPSTER_GANGLION_URL`). `--ganglion-base` is an alias |
+| `--runtime-id ID` | Runtime this worker claims: `ganglion` (default) or `llama-server`. Anything else exits 2 |
+| `--allow-non-loopback-ganglion` | Permit a non-loopback upstream base. Unqualified; refuses otherwise |
 | `--interval SECONDS` | Base idle poll interval (default 2). Grows while idle, capped at 30 |
-| `--models-cache-ttl SECONDS` | How long the Ganglion model list is cached (default 30) |
+| `--models-cache-ttl SECONDS` | How long the upstream model list is cached (default 30) |
 | `--once` | Poll once and exit; still takes the single-runner lock |
 
 Per job the runner: leases one job from `GET /api/worker/jobs/next` with the
 stored heartbeat key; validates the leased envelope strictly; checks the model
-against Ganglion `GET /v1/models`; then makes one non-streaming
+against the upstream `GET /v1/models`; then makes one non-streaming
 `POST /v1/completions` (`temperature: 0`, timeout = the deadline minus now, no
 redirects, no retries) and posts `{lease_id, status, result}` to
 `POST /api/worker/jobs/:job_id/result`. A `404` on completions means the route
 does not exist, so one single-message `/v1/chat/completions` fallback is tried;
-every other failure is final.
+every other failure is final. Behaviour is identical against either upstream;
+only the runtime identity you configure changes.
 
 The lease frame is `{job_id, lease_id, envelope, deadline_at}`: `job_id` and
 `lease_id` are opaque strings and `deadline_at` is integer Unix milliseconds.
@@ -211,11 +214,12 @@ The envelope is nested, as the coordinator builds it
 
 `protocol` must match exactly; `task` is validated field by field
 (`capability` `complete`, `placement.device` `cpu`, node id equal to this
-resource, runtime `ganglion`, model, prompt, `max_tokens` 1..4096,
-`temperature` present and 0, `allow_simulated` present and false, no unknown
-fields); `binding` must carry exactly those five fields, with
-`binding.deadline_at` equal to the lease `deadline_at` and in the future. There
-is no flat-envelope form: an envelope without the protocol wrapper is refused.
+resource, runtime id equal to the configured `--runtime-id` — `ganglion` or
+`llama-server` — model, prompt, `max_tokens` 1..4096, `temperature` present
+and 0, `allow_simulated` present and false, no unknown fields); `binding` must
+carry exactly those five fields, with `binding.deadline_at` equal to the lease
+`deadline_at` and in the future. There is no flat-envelope form: an envelope
+without the protocol wrapper is refused.
 
 A failure is always reported as `failed` with a stable `reason`
 (`ENVELOPE_INVALID`, `MODEL_UNAVAILABLE`, `GANGLION_UNAVAILABLE`,
@@ -227,11 +231,11 @@ model, `simulated` or `content` field, because a failure claims nothing about
 the job's identity. A success is exactly
 `{request_id, node_id, runtime_id, model_id, runtime_instance,
 model_fingerprint, simulated: false, content, elapsed_ms, usage, cache}`;
-`runtime_instance` and `model_fingerprint` are echoed from the lease binding,
-never invented. Both shapes match L2's validator in
-`website/src/inference/worker-transport.mjs`.
+`runtime_id` is the configured runtime identity, and `runtime_instance` and
+`model_fingerprint` are echoed from the lease binding — never invented. Both
+shapes match L2's validator in `website/src/inference/worker-transport.mjs`.
 
-Before calling Ganglion the job id is written to a private started-job ledger
+Before calling the upstream the job id is written to a private started-job ledger
 (`jobs-started.json` in the worker data dir). A job whose result post was never
 confirmed is therefore not re-executed after a restart: the outcome stays
 uncertain instead of being guessed. Only one `serve-jobs` runs per data dir

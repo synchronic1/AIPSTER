@@ -1058,15 +1058,20 @@ def build_parser():
     # command keeps working with the frozen pairing-only bundle; the import
     # happens only when this command is used.
     jobs = sub.add_parser("serve-jobs",
-                          help="run leased inference jobs on local Ganglion (dark by default)")
+                          help="run leased inference jobs on the local upstream (dark by default)")
     jobs.add_argument("--interval", type=float, default=2.0,
                       help="base idle poll interval in seconds")
-    jobs.add_argument("--ganglion-base", default=None,
-                      help="local Ganglion base (default http://127.0.0.1:8471)")
+    jobs.add_argument("--ganglion-base", "--upstream-url", dest="ganglion_base",
+                      default=None,
+                      help="local upstream base URL, Ganglion or llama-server "
+                           "(default http://127.0.0.1:8471); --upstream-url is an alias")
     jobs.add_argument("--allow-non-loopback-ganglion", action="store_true",
-                      help="permit a non-loopback Ganglion base (not qualified)")
+                      help="permit a non-loopback upstream base (not qualified)")
+    jobs.add_argument("--runtime-id", default="ganglion",
+                      help="runtime identity this worker claims: ganglion or "
+                           "llama-server (default ganglion)")
     jobs.add_argument("--models-cache-ttl", type=float, default=30.0,
-                      help="seconds to cache the Ganglion model list")
+                      help="seconds to cache the upstream model list")
     jobs.add_argument("--once", action="store_true",
                       help="poll for one job and exit")
     return parser

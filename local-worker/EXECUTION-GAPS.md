@@ -20,9 +20,10 @@ Real in this tree and unit-tested against fake loopback servers:
   backoff, `Retry-After` handling and the repair-required exit on a revoked key.
 - Strict envelope validation of the nested coordinator envelope: exact
   `aipster-bound-cpu-internal/1` protocol, capability, CPU placement bound to
-  this resource, runtime `ganglion`, model, prompt, token ceiling, future
-  deadline equal to the binding deadline, no simulation, exactly the five
-  binding fields and no unknown top-level or task fields.
+  this resource, runtime equal to the configured `--runtime-id` (`ganglion`
+  or `llama-server`), model, prompt, token ceiling, future deadline equal to
+  the binding deadline, no simulation, exactly the five binding fields and no
+  unknown top-level or task fields.
 - Model gating against Ganglion `GET /v1/models` (briefly cached), one completion
   with `temperature: 0` and a deadline-bounded timeout, no redirects and no
   retries, and a stable `failed` reason for every failure path.
