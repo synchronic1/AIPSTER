@@ -139,9 +139,15 @@ npx wrangler d1 migrations list aipster-app --remote
 npx wrangler d1 migrations apply aipster-app --remote
 ```
 
-Confirm the prompt names only `0024_inference_dispatch.sql`. Wrangler journals
-the file in `d1_migrations` and takes a backup marker; re-running the apply is a
-no-op because the journal already records it.
+Confirm the prompt names only `0024_inference_dispatch.sql`. Wrangler then asks
+`Your database may not be available to serve requests during the migration,
+continue?` — answer yes only when the pending list above showed that one file.
+It reports `25 commands executed successfully`: the file's 24 statements plus
+the `d1_migrations` row. Check the header says `Resource location: remote`; a
+`local` header means `--remote` was dropped, so stop and re-run.
+
+Wrangler journals the file in `d1_migrations` and takes a backup marker;
+re-running the apply is a no-op because the journal already records it.
 
 ## 5. Verify 0024
 
@@ -510,7 +516,8 @@ Verify and prove idempotency:
 ```powershell
 npx wrangler d1 execute aipster-app --local --persist-to "$tmp\persist" `
   --command "SELECT id, name FROM d1_migrations ORDER BY id;"
-# 22 rows: 0001-0018, 0021-0024
+# 22 rows: ids 1-21 are 0001-0018 then 0021-0023 (0021 takes id 19 because
+# 0019/0020 were never inserted), and id 22 is 0024_inference_dispatch.sql
 npx wrangler d1 execute aipster-app --local --persist-to "$tmp\persist" `
   --command "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'dispatch_%' ORDER BY name;"
 # the same eight tables as step 5
