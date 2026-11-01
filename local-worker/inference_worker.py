@@ -31,6 +31,10 @@ Safety rules this module enforces:
   * The job id is written to a private started-job ledger before the
     completion call. After a crash, an already-started job id is never
     executed again; its outcome stays uncertain instead of being guessed.
+  * SIGTERM/SIGINT ask for a stop between jobs. A completion already handed
+    to Ganglion is allowed to finish and post first, so stopping never turns
+    a started job into an unrecorded one; the process then exits 0. A second
+    signal restores the default action.
 
 Wire shapes (canonical worker wire shapes, dispatch lane Addendum A):
 
@@ -50,10 +54,13 @@ Wire shapes (canonical worker wire shapes, dispatch lane Addendum A):
 """
 
 import argparse
+import errno
 import http.client
 import json
 import os
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -528,38 +535,74 @@ class _Lock:
 
 
 def _hold_lock(data_dir, name):
-    """Take an OS-held lock non-blocking. Never wedges on a stale marker."""
+    """Take an OS-held lock non-blocking. Never wedges on a stale marker.
+
+    Returns None only for contention. An unusable lock path (wrong type,
+    unreadable, or a symlink) raises PairingError(PRIVATE_STORAGE): reporting
+    that as "another runner holds this data dir" would send the operator
+    looking for a process that does not exist. POSIX opens the file
+    user-only and with O_NOFOLLOW, so a linked path is refused rather than
+    flock-ed through.
+    """
     path = Path(data_dir) / name
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise PairingError(None, "PRIVATE_STORAGE",
+                           "cannot create the worker job store") from exc
     if os.name == "nt":
         try:
             handle = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            return None
+        except OSError as exc:
+            raise PairingError(None, "PRIVATE_STORAGE",
+                               "cannot open the worker job lock") from exc
         try:
             msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
-        except (OSError, ImportError):
+        except OSError as exc:
             os.close(handle)
-            return None
+            if exc.errno == errno.EACCES:  # held by another process
+                return None
+            raise PairingError(None, "PRIVATE_STORAGE",
+                               "cannot lock the worker job store") from exc
+        except ImportError as exc:
+            os.close(handle)
+            raise PairingError(None, "PRIVATE_STORAGE",
+                               "cannot lock the worker job store") from exc
         try:
             stream = os.fdopen(handle, "r")
-        except OSError:
+        except OSError as exc:
             os.close(handle)
-            return None
+            raise PairingError(None, "PRIVATE_STORAGE",
+                               "cannot open the worker job lock") from exc
         return _Lock(stream)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     try:
-        handle = open(path, "a+b")
+        handle = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        raise PairingError(None, "PRIVATE_STORAGE",
+                           "cannot open the worker job lock") from exc
+    try:
+        stream = os.fdopen(handle, "r+b")
+    except OSError as exc:
+        os.close(handle)
+        raise PairingError(None, "PRIVATE_STORAGE",
+                           "cannot open the worker job lock") from exc
+    try:
+        # A file created before this rule (or by another tool) must not keep
+        # group/other bits inside the private store.
+        os.fchmod(stream.fileno(), 0o600)
     except OSError:
-        return None
+        pass
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, ImportError):
-        handle.close()
-        return None
-    return _Lock(handle)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        stream.close()
+        if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK) \
+                or isinstance(exc, BlockingIOError):
+            return None
+        raise PairingError(None, "PRIVATE_STORAGE",
+                           "cannot lock the worker job store") from exc
+    return _Lock(stream)
 
 
 class JobRunner:
@@ -585,9 +628,16 @@ class JobRunner:
                                        models_cache_ttl=models_cache_ttl,
                                        clock=self.clock)
         self.ledger = None
+        # Set by a POSIX stop signal. Never interrupts an in-flight completion:
+        # the loop only leaves between jobs, so a stop cannot strand a job that
+        # may already have run.
+        self._stop = threading.Event()
+        self._stop_signum = None
 
     def run(self, max_cycles=None):
         """Serve jobs until stopped. max_cycles bounds the polls (--once: 1)."""
+        self._stop = threading.Event()
+        self._stop_signum = None
         try:
             # Provision before writing anything: the lock and ledger must not
             # be the first files to create an inherited, non-private store.
@@ -597,7 +647,11 @@ class JobRunner:
             code = getattr(exc, "code", "PRIVATE_STORAGE")
             print(f"jobs: [{code}] {exc}", file=sys.stderr)
             return pairing.EXIT_USAGE
-        guard = _hold_lock(self.data_dir, JOBS_LOCK_NAME)
+        try:
+            guard = _hold_lock(self.data_dir, JOBS_LOCK_NAME)
+        except PairingError as exc:
+            print(f"jobs: [{exc.code}] {exc}", file=sys.stderr)
+            return pairing.EXIT_USAGE
         if guard is None:
             print("jobs: [JOBS_RUNNING] another serve-jobs already holds this "
                   "data dir; not starting a second", file=sys.stderr)
@@ -607,16 +661,84 @@ class JobRunner:
                 sys.stdout.reconfigure(line_buffering=True)
             except (OSError, ValueError):
                 pass
+        restore_handlers = self._install_stop_handlers()
         try:
             return self._loop(max_cycles)
         finally:
+            restore_handlers()
             guard.release()
+
+    def _install_stop_handlers(self):
+        """Turn SIGTERM/SIGINT into a bounded, recorded stop.
+
+        A daemon killed by the default SIGTERM action never reports anything;
+        here the first signal is recorded and the loop leaves between jobs.
+        A completion already on the wire is allowed to finish and post, which
+        is the only honest outcome once Ganglion may have run it. A second
+        signal restores the default action, so an operator can always escape
+        a wedged upstream.
+        """
+        if os.name == "nt" or threading.current_thread() is not threading.main_thread():
+            return lambda: None
+        previous = {}
+
+        def handler(signum, _frame):
+            if self._stop.is_set():
+                for sig, old in previous.items():
+                    try:
+                        signal.signal(sig, old if old is not None else signal.SIG_DFL)
+                    except (OSError, ValueError, RuntimeError):
+                        pass
+                try:
+                    signal.raise_signal(signum)
+                except (AttributeError, OSError, RuntimeError):
+                    raise KeyboardInterrupt
+                return
+            self._stop_signum = signum
+            self._stop.set()
+
+        for name in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                previous[sig] = signal.getsignal(sig)
+                signal.signal(sig, handler)
+            except (OSError, ValueError, RuntimeError):
+                previous.pop(sig, None)
+
+        def restore():
+            for sig, old in previous.items():
+                try:
+                    signal.signal(sig, old if old is not None else signal.SIG_DFL)
+                except (OSError, ValueError, RuntimeError):
+                    pass
+
+        return restore
+
+    def _wait(self, seconds):
+        """Idle wait that a stop signal ends immediately."""
+        if self.sleep is not None:
+            self.sleep(seconds)
+            return
+        self._stop.wait(seconds)
+
+    def _stop_exit(self):
+        try:
+            name = signal.Signals(self._stop_signum).name
+        except (TypeError, ValueError):
+            name = "signal"
+        print(f"jobs: stop requested ({name}); no job was re-run and none is "
+              "left mid-flight", file=sys.stderr)
+        return pairing.EXIT_OK
 
     def _loop(self, max_cycles):
         cycles = 0
         idle = 0
         failures = 0
         while max_cycles is None or cycles < max_cycles:
+            if self._stop.is_set():
+                return self._stop_exit()
             cycles += 1
             try:
                 with pairing.pair_lock(self.data_dir):
@@ -625,7 +747,7 @@ class JobRunner:
                 if exc.code == "PAIR_IN_PROGRESS":
                     print("jobs: pair in progress; rechecking after the interval",
                           file=sys.stderr)
-                    self.sleep(self.poll_interval)
+                    self._wait(self.poll_interval)
                     continue
                 print(f"jobs: [{exc.code}] {exc}", file=sys.stderr)
                 return pairing.EXIT_REPAIR_REQUIRED if exc.code == "NOT_PAIRED" \
@@ -646,7 +768,7 @@ class JobRunner:
                 wait = retry_after if retry_after else min(
                     self.poll_interval * (2 ** idle), self.max_idle)
                 idle += 1
-                self.sleep(wait)
+                self._wait(wait)
                 continue
             idle = 0
             try:
@@ -663,7 +785,7 @@ class JobRunner:
         if exc.status == 429:
             wait = exc.retry_after or self.poll_interval
             print(f"jobs: rate limited; retrying in {wait}s", file=sys.stderr)
-            self.sleep(wait)
+            self._wait(wait)
             return None, 0
         if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
             failures += 1
@@ -674,7 +796,7 @@ class JobRunner:
             wait = min(2 ** failures, 60)
             print(f"jobs: [{exc.code}] {exc}; retry {failures}/"
                   f"{pairing.MAX_ATTEMPTS_NETWORK} in {wait}s", file=sys.stderr)
-            self.sleep(wait)
+            self._wait(wait)
             return None, failures
         print(f"jobs: [{exc.code}] {exc}", file=sys.stderr)
         return pairing.EXIT_PAIRING_REJECTED, failures

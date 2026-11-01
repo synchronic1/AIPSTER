@@ -245,6 +245,14 @@ lease frame or unreadable ledger exits 2; five consecutive transport/5xx
 failures exit 5. Prompts and completions are never logged, and neither the
 heartbeat key nor the Ganglion token is printed.
 
+On macOS and other POSIX systems `serve-jobs` stops on `SIGTERM` or `SIGINT`
+(the signal launchd and Ctrl+C send): the request is recorded, a completion
+already handed to Ganglion is allowed to finish and report, and the process
+then exits 0 without re-running anything. A second signal restores the default
+action, so a wedged upstream can still be killed. The job lock is created
+user-only (`0600`) and opened without following symlinks; a lock path that
+cannot be used exits 2 rather than being misreported as a second runner.
+
 `status`, `heartbeat-once`/`heartbeat-loop`, `pair` and `unpair` are unchanged,
 and heartbeats still prove reachability only: `usable` stays false for the mock
 config, and running jobs here does not change what the dashboard reports.
