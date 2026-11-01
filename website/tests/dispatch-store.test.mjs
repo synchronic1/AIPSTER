@@ -862,6 +862,100 @@ test('release: only uncharged holds and only when no start can still be redeemed
   assert.equal(ownerPool(h.sqlite, 'owner:user-alice:2026-03-01').used_tokens, 128);
 });
 
+// ------------------------------------------------ per-principal state caps
+
+// Finding 4437303806 (P2 security): retained dispatch state is bounded per
+// principal. Expired admissions do not count and are swept; one principal's
+// cap never affects another.
+test('limits: live admissions per principal are capped and expired rows are swept', async () => {
+  const h = createStoreHarness({ env: { INFERENCE_DISPATCH_MAX_ADMISSIONS: '2' } });
+  const a1 = await h.store.issueAdmission({ principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64 });
+  const a2 = await h.store.issueAdmission({ principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64 });
+  await assert.rejects(
+    h.store.issueAdmission({ principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64 }),
+    (e) => e.status === 429 && e.code === 'DISPATCH_LIMIT',
+  );
+  // A different principal has its own allowance.
+  const b1 = await h.store.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 64, grant: 'grant-1',
+  });
+  assert.ok(b1.admission_ref);
+
+  // Expired admissions are dead: they stop counting and are deleted by the
+  // next issuance's sweep.
+  h.sqlite.prepare('UPDATE dispatch_admissions SET expires_at = 0 WHERE principal_id = ?').run(alice.principal_id);
+  const a3 = await h.store.issueAdmission({ principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64 });
+  assert.ok(a3.admission_ref);
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_admissions WHERE principal_id = ?')
+    .get(alice.principal_id).n, 1);
+  assert.equal(await h.store.resolveAdmission({ principal: alice, admission_ref: a1.admission_ref }), null);
+  assert.equal(await h.store.resolveAdmission({ principal: alice, admission_ref: a2.admission_ref }), null);
+});
+
+test('limits: non-terminal operations per principal are capped; terminal ones free a slot', async () => {
+  const h = createStoreHarness({ env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '2' } });
+  const a = await h.store.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 64, grant: 'grant-1',
+  });
+  const rec = await h.store.resolveAdmission({ principal: bob, admission_ref: a.admission_ref });
+  const binding = bindingFor(rec, { principal: bob });
+  const claim = (key) => h.store.claimOperation({
+    op_key: key, request_digest: 'sha256:cap', principal_id: bob.principal_id,
+    tenant_id: bob.tenant_id, binding,
+  });
+  const c1 = await claim('cap-op-1');
+  const c2 = await claim('cap-op-2');
+  assert.equal(c1.claimed, true);
+  assert.equal(c2.claimed, true);
+  // A replay of an existing key still reconciles while the principal is full.
+  const replay = await claim('cap-op-2');
+  assert.equal(replay.claimed, false);
+  assert.equal(replay.op.op_id, c2.op.op_id);
+  await assert.rejects(claim('cap-op-3'), (e) => e.status === 429 && e.code === 'DISPATCH_LIMIT');
+  // Released/settled operations are terminal and stop consuming the cap.
+  h.sqlite.prepare("UPDATE dispatch_operations SET phase = 'released' WHERE op_id = ?").run(c1.op.op_id);
+  const c3 = await claim('cap-op-3');
+  assert.equal(c3.claimed, true);
+});
+
+test('limits: the queued-job cap is enforced atomically in the enqueue statement', async () => {
+  const h = createStoreHarness();
+  await dispatchedOperation(h, { principal: bob, grant: 'grant-1', op_key: 'qcap-key-1' });
+  await dispatchedOperation(h, { principal: bob, grant: 'grant-1', op_key: 'qcap-key-2' });
+
+  // A third redeemed operation that has not queued yet.
+  const a3 = await h.store.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 128, grant: 'grant-1',
+  });
+  const rec3 = await h.store.resolveAdmission({ principal: bob, admission_ref: a3.admission_ref });
+  const binding = bindingFor(rec3, { principal: bob });
+  const c3 = await h.store.claimOperation({
+    op_key: 'qcap-key-3', request_digest: 'sha256:qcap', principal_id: bob.principal_id,
+    tenant_id: bob.tenant_id, binding,
+  });
+  const hold = await h.store.acquireHold({
+    op_id: c3.op.op_id, generation: 1, pool_id: binding.pools[0].pool_id, amount: 128,
+  });
+  assert.equal(hold.held, true);
+  assert.equal((await h.store.admit({
+    op_id: c3.op.op_id, generation: 1, holds: [hold.hold_id],
+    authority: { grant_id: binding.grant_id, grant_revision: binding.grant_revision, incarnation: binding.incarnation },
+  })).outcome, 'admitted');
+  assert.equal((await h.store.redeemStart({
+    op_id: c3.op.op_id, generation: 1,
+    worker: { node_id: binding.node_id, runtime_instance: binding.runtime_instance },
+  })).outcome, 'redeemed');
+  const envelope = envelopeFor(rec3, { ...binding, op_id: c3.op.op_id });
+
+  const capped = createD1DispatchStore(h.db, {
+    now: h.clock.now, env: { INFERENCE_OWNER_DAILY_TOKENS: '10000', INFERENCE_DISPATCH_MAX_OPERATIONS: '2' },
+  });
+  assert.deepEqual(await capped.enqueueJob(envelope), { accepted: false, reason: 'dispatch_limit' });
+  assert.equal(h.sqlite.prepare("SELECT COUNT(*) AS n FROM dispatch_jobs WHERE status = 'queued'").get().n, 2);
+  // The same enqueue succeeds under the original allowance.
+  assert.equal((await h.store.enqueueJob(envelope)).accepted, true);
+});
+
 // ------------------------------------------------- coordinator over the store
 
 test('coordinator: full lifecycle over the real store settles once and releases content', async () => {

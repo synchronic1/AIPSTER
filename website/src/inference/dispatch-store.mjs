@@ -45,6 +45,13 @@ import { resourceLiveness } from '../lib/status.mjs';
 import { CONTENT_MAX } from './worker-transport.mjs';
 
 export const ADMISSION_TTL_MS = 10 * 60 * 1000;
+// Per-principal retained-state caps (finding 4437303806). Expired admissions
+// are swept, so they never count; settled/released operations are terminal.
+// Queued jobs are one per operation and only non-terminal operations own one,
+// so the operation cap bounds both.
+export const DEFAULT_DISPATCH_MAX_ADMISSIONS = 20;
+export const DEFAULT_DISPATCH_MAX_OPERATIONS = 20;
+export const DISPATCH_LIMIT_CODE = 'DISPATCH_LIMIT';
 export const INFERENCE_RUNTIME_IDS = Object.freeze(['ganglion', 'llama-server']);
 const RUNTIME_IDS = new Set(INFERENCE_RUNTIME_IDS);
 const TRANSPORT_PROTOCOL = 'aipster-bound-cpu-internal/1';
@@ -88,6 +95,19 @@ function ownerCeiling(env) {
   const n = env ? Number(env.INFERENCE_OWNER_DAILY_TOKENS) : NaN;
   // Missing or invalid means 0: the pool fails closed rather than defaulting open.
   return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+}
+
+function limitFromEnv(env, name, fallback) {
+  const n = env ? Number(env[name]) : NaN;
+  return Number.isSafeInteger(n) && n >= 1 ? n : fallback;
+}
+
+function admissionLimit(env) {
+  return limitFromEnv(env, 'INFERENCE_DISPATCH_MAX_ADMISSIONS', DEFAULT_DISPATCH_MAX_ADMISSIONS);
+}
+
+function operationLimit(env) {
+  return limitFromEnv(env, 'INFERENCE_DISPATCH_MAX_OPERATIONS', DEFAULT_DISPATCH_MAX_OPERATIONS);
 }
 
 function principalOf(value) {
@@ -273,14 +293,28 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
       const expires_at = t + ADMISSION_TTL_MS;
       const runtime = runtime_id;
       const pools = [{ pool_id, amount: max_tokens }];
-      await db.prepare(`INSERT INTO dispatch_admissions
-        (admission_ref, principal_id, tenant_id, grant_id, grant_revision, resource_id, incarnation,
-         peer_node, peer_workspace, route, node_id, runtime_id, runtime_instance, model_id,
-         model_fingerprint, max_tokens, pools_json, expires_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
-        admission_ref, p.principal_id, p.tenant_id, grant_id, revision, resource_id, resource.incarnation,
-        resource.node_id || resource.id, resource.owner_id, INFERENCE_ROUTE, resource_id, runtime,
-        runtime, model_id, model_id, max_tokens, json(pools), expires_at, isoAt(t)).run();
+      const cap = admissionLimit(env);
+      // Finding 4437303806: bound retained state per principal. The sweep
+      // discards admissions that are already dead (the coordinator rejects
+      // them by expires_at anyway), and the guarded insert counts only live
+      // ones, so expired rows never consume the cap.
+      const [, inserted] = await db.batch([
+        db.prepare('DELETE FROM dispatch_admissions WHERE expires_at <= ?').bind(t),
+        db.prepare(`INSERT INTO dispatch_admissions
+          (admission_ref, principal_id, tenant_id, grant_id, grant_revision, resource_id, incarnation,
+           peer_node, peer_workspace, route, node_id, runtime_id, runtime_instance, model_id,
+           model_fingerprint, max_tokens, pools_json, expires_at, created_at)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE (SELECT COUNT(*) FROM dispatch_admissions
+            WHERE principal_id = ? AND expires_at > ?) < ?`).bind(
+          admission_ref, p.principal_id, p.tenant_id, grant_id, revision, resource_id, resource.incarnation,
+          resource.node_id || resource.id, resource.owner_id, INFERENCE_ROUTE, resource_id, runtime,
+          runtime, model_id, model_id, max_tokens, json(pools), expires_at, isoAt(t),
+          p.principal_id, t, cap),
+      ]);
+      if (changed(inserted) !== 1) {
+        throw httpError(429, 'Too many live inference admissions for this principal.', DISPATCH_LIMIT_CODE);
+      }
       return { admission_ref, expires_at, model_id, max_tokens };
     });
   }
@@ -346,14 +380,27 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
       if (existing) return { claimed: false, op: mapOperation(existing) };
       const op_id = rid16('dispatch-op-');
       const t = isoAt(clock());
-      await db.prepare(`INSERT OR IGNORE INTO dispatch_operations
-        (op_id, op_key, principal_id, tenant_id, request_digest, binding_json, generation, phase,
-         cancel_intent, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, 'claimed', 0, ?, ?)`).bind(
-        op_id, op_key, principal_id, tenant_id, request_digest, json(binding), t, t).run();
+      const cap = operationLimit(env);
+      // Finding 4437303806: the insert is conditional on this principal's
+      // non-terminal operation count, so the cap is enforced atomically in the
+      // same statement as the write.
+      const [inserted] = await db.batch([
+        db.prepare(`INSERT OR IGNORE INTO dispatch_operations
+          (op_id, op_key, principal_id, tenant_id, request_digest, binding_json, generation, phase,
+           cancel_intent, created_at, updated_at)
+          SELECT ?, ?, ?, ?, ?, ?, 1, 'claimed', 0, ?, ?
+          WHERE (SELECT COUNT(*) FROM dispatch_operations
+            WHERE principal_id = ? AND phase NOT IN ('settled', 'released')) < ?`).bind(
+          op_id, op_key, principal_id, tenant_id, request_digest, json(binding), t, t, principal_id, cap),
+      ]);
+      const wrote = changed(inserted) === 1;
       const row = await first(db, 'SELECT * FROM dispatch_operations WHERE op_key = ?', op_key);
-      // A concurrent claim in another isolate may have won the insert.
-      return { claimed: row.op_id === op_id, op: mapOperation(row) };
+      // A concurrent claim of the same key leaves a row (replay). A missing row
+      // therefore means the guarded insert was refused by the cap.
+      if (!row) {
+        throw httpError(429, 'Too many in-flight inference operations for this principal.', DISPATCH_LIMIT_CODE);
+      }
+      return { claimed: wrote && row.op_id === op_id, op: mapOperation(row) };
     });
   }
 
@@ -787,14 +834,28 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
           WHERE EXISTS (SELECT 1 FROM dispatch_operations o WHERE o.op_id = ? AND o.generation = ?
               AND o.phase = 'redeemed')
             AND EXISTS (SELECT 1 FROM dispatch_start_redemptions s WHERE s.op_id = ? AND s.generation = ?)
-            AND NOT EXISTS (SELECT 1 FROM dispatch_fences f WHERE f.op_id = ? AND f.generation = ?)`).bind(
+            AND NOT EXISTS (SELECT 1 FROM dispatch_fences f WHERE f.op_id = ? AND f.generation = ?)
+            AND (SELECT COUNT(*) FROM dispatch_jobs j
+              JOIN dispatch_operations q ON q.op_id = j.op_id
+              WHERE q.principal_id = ? AND j.status = 'queued') < ?`).bind(
           job_id, b.op_id, b.generation, placement.node_id, placement.node_id, placement.runtime_id,
           task.model_id, b.runtime_instance, b.model_fingerprint, json(envelope), b.deadline_at, t, t,
-          b.op_id, b.generation, b.op_id, b.generation, b.op_id, b.generation),
+          b.op_id, b.generation, b.op_id, b.generation, b.op_id, b.generation,
+          op.principal_id, operationLimit(env)),
       ]);
       const row = await first(db, `SELECT job_id FROM dispatch_jobs WHERE op_id = ? AND generation = ?`,
         b.op_id, b.generation);
       if (row) return { accepted: true, job_id: row.job_id };
+      // The guarded insert wrote nothing. If the operation is still live and
+      // unfenced, the principal's queued-job cap refused it.
+      const fresh = await opRow(b.op_id);
+      const redeemed = await first(db,
+        'SELECT 1 AS ok FROM dispatch_start_redemptions WHERE op_id = ? AND generation = ?',
+        b.op_id, b.generation);
+      if (fresh && redeemed && Number(fresh.generation) === b.generation && fresh.phase === 'redeemed'
+        && !(await fencedAt(b.op_id, b.generation))) {
+        return { accepted: false, reason: 'dispatch_limit' };
+      }
       return { accepted: false, reason: 'not_dispatchable' };
     });
   }

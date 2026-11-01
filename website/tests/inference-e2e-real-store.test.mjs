@@ -185,6 +185,51 @@ test('real store: deleting a resource revokes its admissions and queued jobs', a
   assert.ok([401, 403].includes(leaseAfter.status), `lease refused, got ${leaseAfter.status}`);
 });
 
+// Finding 4437303806 (P2 security): dispatch state is bounded per principal,
+// and a cap refusal is a stable retryable 429 DISPATCH_LIMIT, not an outage.
+test('real store: live admissions are capped per principal and expired rows do not count', async () => {
+  const t = await createTestEnv({ ...ENABLED, INFERENCE_DISPATCH_MAX_ADMISSIONS: '2' });
+  const r = await ready(t);
+  const mint = async () => readJson(await t.call('/api/inference/admissions', {
+    method: 'POST', headers: S(t, t.alice), body: { resource_id: r.resourceId, model_id: MODEL, max_tokens: 64 },
+  }));
+  assert.equal((await mint()).status, 201);
+  assert.equal((await mint()).status, 201);
+  const third = await mint();
+  assert.equal(third.status, 429, third.text);
+  assert.equal(third.json.code, 'DISPATCH_LIMIT');
+
+  // Expired admissions stop counting and are swept by the next issuance.
+  await t.DB.prepare('UPDATE dispatch_admissions SET expires_at = 0 WHERE principal_id = ?')
+    .bind(t.alice.id).run();
+  const after = await mint();
+  assert.equal(after.status, 201, after.text);
+  const live = await t.DB.prepare('SELECT COUNT(*) AS n FROM dispatch_admissions WHERE principal_id = ?')
+    .bind(t.alice.id).all();
+  assert.equal(live.results[0].n, 1, 'expired admissions were swept');
+});
+
+test('real store: non-terminal operations are capped per principal with 429 DISPATCH_LIMIT', async () => {
+  const t = await createTestEnv({ ...ENABLED, INFERENCE_DISPATCH_MAX_OPERATIONS: '2' });
+  const r = await ready(t);
+  const admission = await readJson(await t.call('/api/inference/admissions', {
+    method: 'POST', headers: S(t, t.alice), body: { resource_id: r.resourceId, model_id: MODEL, max_tokens: 64 },
+  }));
+  assert.equal(admission.status, 201, admission.text);
+  const submit = async (key) => readJson(await t.call('/api/jobs', {
+    method: 'POST', headers: S(t, t.alice),
+    body: { contract_version: 'v1.0.0', admission_ref: admission.json.admission_ref, idempotency_key: key,
+      model_id: MODEL, prompt: 'hello', max_tokens: 64, deadline_at: Date.now() + 60000 },
+  }));
+  assert.equal((await submit('alice-e2e-cap-0000001')).status, 202);
+  assert.equal((await submit('alice-e2e-cap-0000002')).status, 202);
+  const third = await submit('alice-e2e-cap-0000003');
+  assert.equal(third.status, 429, third.text);
+  assert.equal(third.json.code, 'DISPATCH_LIMIT');
+  const queued = await t.DB.prepare("SELECT COUNT(*) AS n FROM dispatch_jobs WHERE status = 'queued'").all();
+  assert.equal(queued.results[0].n, 2, 'the refused claim queued nothing');
+});
+
 test('real store: owner budget of 0 fails closed before any job is queued', async () => {
   const t = await createTestEnv({ INFERENCE_ENABLED: '1' });
   const r = await ready(t);

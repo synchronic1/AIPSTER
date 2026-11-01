@@ -63,13 +63,22 @@ function result(status, fields = {}) {
 const reject = (code, http, extra = {}) => result('rejected', { code, http, ...extra });
 const uncertain = (phase, code, extra = {}) => result('uncertain', { phase, code, http: 503, ...extra });
 
-class Unknown extends Error {}
+class Unknown extends Error {
+  // Keep the store's stable code/status so a defined refusal (for example the
+  // DISPATCH_LIMIT cap) can reach the route instead of becoming uncertain.
+  constructor(message, code, status) {
+    super(message);
+    this.code = code;
+    this.status = status;
+  }
+}
 // Await a store/transport call; any throw is an unknown outcome, never success.
 async function call(fn, ...args) {
   try {
     return await fn(...args);
   } catch (err) {
-    throw new Unknown(err && err.message ? err.message : 'unknown outcome');
+    throw new Unknown(err && err.message ? err.message : 'unknown outcome',
+      err && err.code, err && err.status);
   }
 }
 
@@ -246,7 +255,8 @@ export function createDispatchCoordinator({ resolvePrincipal = null, authority =
     try {
       claim = await call(authority.claimOperation, { op_key, request_digest, principal_id: principal.principal_id,
         tenant_id: principal.tenant_id, binding });
-    } catch {
+    } catch (e) {
+      if (e && e.code === 'DISPATCH_LIMIT') return reject('DISPATCH_LIMIT', 429);
       return uncertain('claim', 'OUTCOME_UNCERTAIN');
     }
     if (!isObj(claim) || typeof claim.claimed !== 'boolean' || !validOp(claim.op)) {

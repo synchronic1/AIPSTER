@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS dispatch_admissions (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_principal
   ON dispatch_admissions(principal_id, tenant_id);
+-- Per-principal live-admission cap counts principal_id + expires_at (0024 is
+-- not applied yet, so this is still an additive in-place edit).
+CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_principal_expiry
+  ON dispatch_admissions(principal_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_grant
   ON dispatch_admissions(grant_id);
 CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_expiry
@@ -82,6 +86,9 @@ CREATE TABLE IF NOT EXISTS dispatch_operations (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_operations_job ON dispatch_operations(job_id);
 CREATE INDEX IF NOT EXISTS idx_dispatch_operations_phase ON dispatch_operations(phase);
+-- Per-principal in-flight operation cap (non-terminal phases).
+CREATE INDEX IF NOT EXISTS idx_dispatch_operations_principal_phase
+  ON dispatch_operations(principal_id, phase);
 
 CREATE TABLE IF NOT EXISTS dispatch_holds (
   hold_id TEXT PRIMARY KEY,
@@ -160,6 +167,7 @@ CREATE TABLE IF NOT EXISTS dispatch_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_jobs_queue ON dispatch_jobs(resource_id, status, deadline_at);
 CREATE INDEX IF NOT EXISTS idx_dispatch_jobs_lease ON dispatch_jobs(lease_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_jobs_status ON dispatch_jobs(status);
 
 CREATE TABLE IF NOT EXISTS dispatch_settlements (
   op_id TEXT PRIMARY KEY,

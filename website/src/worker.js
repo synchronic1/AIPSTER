@@ -2948,7 +2948,11 @@ async function handleApi(request, env, url) {
         resource_id: resource.id, model_id: body.model_id, max_tokens: body.max_tokens,
         runtime_id, grant,
       });
-    } catch {
+    } catch (err) {
+      // A per-principal cap is a stable, retryable refusal, not an outage.
+      if (err && err.status === 429 && err.code === 'DISPATCH_LIMIT') {
+        return json(429, { error: err.message, code: 'DISPATCH_LIMIT' });
+      }
       return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
     }
     if (!admission || typeof admission.admission_ref !== 'string' || !admission.admission_ref
