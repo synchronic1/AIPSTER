@@ -33,6 +33,14 @@ const RETENTION_MS = storeModule.DEFAULT_DISPATCH_RETENTION_MS ?? 7 * 24 * 60 * 
 const retained = (sqlite, principal = alice.principal_id) => sqlite.prepare(
   'SELECT COUNT(*) AS n FROM dispatch_operations WHERE principal_id = ?').get(principal).n;
 
+// Every durable table a pruned operation can leave rows in. The cap has to
+// bound all of them, not just dispatch_operations: the follow-up finding is a
+// hold row that outlived its operation because only the operation was pruned.
+const DURABLE = ['dispatch_operations', 'dispatch_holds', 'dispatch_settlements',
+  'dispatch_jobs', 'dispatch_start_redemptions', 'dispatch_fences'];
+const durableCounts = (sqlite) => Object.fromEntries(DURABLE.map(
+  (table) => [table, sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n]));
+
 const phases = (sqlite, principal = alice.principal_id) => Object.fromEntries(sqlite.prepare(
   'SELECT phase, COUNT(*) AS n FROM dispatch_operations WHERE principal_id = ? GROUP BY phase')
   .all(principal).map((r) => [r.phase, r.n]));
@@ -181,6 +189,132 @@ test('retention: uncertain, held or queued work is never pruned even at the cap'
     (e) => e.status === 429 && e.code === 'DISPATCH_LIMIT');
   // The uncertain rows survive the refusal.
   assert.deepEqual(phases(h.sqlite), { released: 2 });
+});
+
+test('retention: repeated reserve/release cycles leave no hold rows behind', async () => {
+  const h = createStoreHarness({
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '2', INFERENCE_DISPATCH_MAX_ADMISSIONS: '64' },
+  });
+  const binding = await admissionBinding(h);
+  const poolId = binding.pools[0].pool_id;
+  for (let i = 0; i < 25; i += 1) {
+    const c = await claim(h, binding, `cycle-key-${i}`);
+    assert.equal(c.claimed, true, `cycle ${i} could not claim`);
+    const hold = await h.store.acquireHold({
+      op_id: c.op.op_id, generation: 1, pool_id: poolId, amount: binding.pools[0].amount,
+    });
+    assert.equal(hold.held, true, `cycle ${i} could not reserve`);
+    const released = await h.store.releaseHolds({ op_id: c.op.op_id, generation: 1, reason: 'cancelled' });
+    assert.equal(released.released, 1, `cycle ${i} did not release its hold`);
+  }
+
+  const counts = durableCounts(h.sqlite);
+  assert.ok(counts.dispatch_operations <= 2,
+    `retained ${counts.dispatch_operations} operations for one principal exceeds the cap of 2`);
+  assert.ok(counts.dispatch_holds <= 2,
+    `retained ${counts.dispatch_holds} hold rows for one principal exceeds the cap of 2`);
+  // A released hold refunded its reservation: the pool counter is back to zero
+  // and pruning must not touch it a second time.
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?')
+    .get(poolId).used_tokens, 0);
+});
+
+test('retention: settled expiry prunes charged holds and receipts but never refunds the charge', async () => {
+  const h = createStoreHarness({ env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '2' } });
+  const poolId = 'owner:user-alice:2026-03-01';
+  await settledOperation(h, 'settled-hold-1');
+  await settledOperation(h, 'settled-hold-2');
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?')
+    .get(poolId).used_tokens, 256);
+
+  // Resolve the admission before time moves: the resource heartbeat is only
+  // fresh at T0, and claimOperation itself does not re-check admission expiry.
+  const binding = await admissionBinding(h);
+  h.clock.advance(RETENTION_MS + 1);
+  const c3 = await claim(h, binding, 'settled-hold-3');
+  assert.equal(c3.claimed, true);
+
+  const counts = durableCounts(h.sqlite);
+  assert.equal(counts.dispatch_holds, 0, 'charged hold rows outlived their pruned operations');
+  assert.equal(counts.dispatch_settlements, 0);
+  assert.equal(counts.dispatch_jobs, 0);
+  // Settlement already charged the pool; deleting the receipt rows must not
+  // decrement the counters as a release would.
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?')
+    .get(poolId).used_tokens, 256);
+});
+
+test('retention: a held hold protects its operation from eviction', async () => {
+  const h = createStoreHarness({
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '2', INFERENCE_DISPATCH_MAX_ADMISSIONS: '64' },
+  });
+  const binding = await admissionBinding(h);
+  const poolId = binding.pools[0].pool_id;
+
+  // op1 reserves and keeps its hold; op2 reserves, releases and is terminal.
+  const c1 = await claim(h, binding, 'protect-key-1');
+  const held = await h.store.acquireHold({
+    op_id: c1.op.op_id, generation: 1, pool_id: poolId, amount: binding.pools[0].amount,
+  });
+  assert.equal(held.held, true);
+  const c2 = await claim(h, binding, 'protect-key-2');
+  assert.equal(c2.claimed, true);
+  assert.equal((await h.store.acquireHold({
+    op_id: c2.op.op_id, generation: 1, pool_id: poolId, amount: binding.pools[0].amount,
+  })).held, true);
+  assert.equal((await h.store.releaseHolds({ op_id: c2.op.op_id, generation: 1 })).released, 1);
+
+  // At the cap, the released operation makes room; the holding one does not.
+  const c3 = await claim(h, binding, 'protect-key-3');
+  assert.equal(c3.claimed, true);
+  const live = h.sqlite.prepare("SELECT op_id, phase FROM dispatch_operations WHERE phase <> 'released'")
+    .all().map((r) => r.op_id).sort();
+  assert.deepEqual(live, [c1.op.op_id, c3.op.op_id].sort());
+  assert.deepEqual(
+    h.sqlite.prepare("SELECT op_id, state FROM dispatch_holds WHERE state IN ('held', 'committed')").all()
+      .map((r) => r.op_id),
+    [c1.op.op_id],
+  );
+  assert.equal(durableCounts(h.sqlite).dispatch_holds, 1);
+});
+
+test('retention: evicting a released operation is safe to cancel again and never replays its charge', async () => {
+  const h = createStoreHarness({
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '1', INFERENCE_DISPATCH_MAX_ADMISSIONS: '64' },
+  });
+  const binding = await admissionBinding(h);
+  const poolId = binding.pools[0].pool_id;
+  const reserveAndRelease = async (key) => {
+    const c = await claim(h, binding, key);
+    assert.equal(c.claimed, true, `${key} could not claim`);
+    assert.equal((await h.store.acquireHold({
+      op_id: c.op.op_id, generation: 1, pool_id: poolId, amount: binding.pools[0].amount,
+    })).held, true);
+    assert.equal((await h.store.releaseHolds({ op_id: c.op.op_id, generation: 1 })).released, 1);
+    return c.op;
+  };
+
+  const first = await reserveAndRelease('evict-key-a');
+  await reserveAndRelease('evict-key-b'); // evicts the released A at the cap
+  assert.equal(await h.store.getOperation({ op_key: 'evict-key-a' }), null);
+
+  // Cancelling or redeeming an already-evicted operation is a harmless no-op:
+  // no throw, no charge, nothing released twice.
+  assert.deepEqual(await h.store.releaseHolds({ op_id: first.op_id, generation: 1 }),
+    { released: 0 });
+  assert.equal((await h.store.redeemStart({ op_id: first.op_id, generation: 1 })).outcome, 'refused');
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?')
+    .get(poolId).used_tokens, 0);
+
+  // Past eviction the same key is a new operation (the documented replay
+  // bound). It starts clean: no inherited hold, no inherited charge.
+  const replayed = await reserveAndRelease('evict-key-a');
+  assert.notEqual(replayed.op_id, first.op_id);
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_holds WHERE op_id = ?')
+    .get(first.op_id).n, 0);
+  assert.equal(h.sqlite.prepare('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?')
+    .get(poolId).used_tokens, 0);
+  assert.equal(durableCounts(h.sqlite).dispatch_operations, 1);
 });
 
 test('retention: the cap applies at the store instance boundary, not per store object', async () => {

@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS dispatch_operations (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_operations_job ON dispatch_operations(job_id);
 CREATE INDEX IF NOT EXISTS idx_dispatch_operations_phase ON dispatch_operations(phase);
--- Per-principal in-flight operation cap (non-terminal phases).
+-- Per-principal retained-operation cap lookup. The store counts rows in every
+-- phase, terminal phases included; this index is only the lookup path.
 CREATE INDEX IF NOT EXISTS idx_dispatch_operations_principal_phase
   ON dispatch_operations(principal_id, phase);
 

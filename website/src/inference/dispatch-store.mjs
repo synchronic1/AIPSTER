@@ -53,8 +53,10 @@ export const ADMISSION_TTL_MS = 10 * 60 * 1000;
 // receipt, so they are pruned as soon as a principal is at the cap; settled
 // rows are the replay record and are kept for DISPATCH_RETENTION_MS. Queued jobs
 // are one per dispatched operation, so the operation cap bounds them too; a
-// pruned operation takes its terminal queue rows and its settlement receipt with
-// it in the same batch.
+// pruned operation takes its terminal queue rows, its settlement receipt, its
+// start-redemption/fence tombstones and its released/charged hold rows with it
+// in the same batch, so no durable table keeps a row the cap does not count.
+// Held/committed holds belong to live reservations and are never pruned.
 export const DEFAULT_DISPATCH_MAX_ADMISSIONS = 20;
 export const DEFAULT_DISPATCH_MAX_OPERATIONS = 20;
 // Long enough to outlive the longest admitted deadline (180 s) and the worker's
@@ -429,6 +431,15 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
         db.prepare(`DELETE FROM dispatch_fences WHERE op_id IN (${prunable})`).bind(...pruneBinds),
         db.prepare(`DELETE FROM dispatch_settlements WHERE op_id IN (${prunable})`).bind(...pruneBinds),
         db.prepare(`DELETE FROM dispatch_jobs WHERE op_id IN (${prunable})`).bind(...pruneBinds),
+        // A terminal operation's hold rows are history, not accounting: a
+        // released hold already refunded its charge in releaseHolds and a
+        // charged hold is the settled charge itself, so deleting them moves no
+        // counter. Only those two states are deletable; `held`/`committed`
+        // belong to live reservations and are excluded twice — by this state
+        // filter and by the held/committed guard in `prunable`, which also keeps
+        // their operation.
+        db.prepare(`DELETE FROM dispatch_holds WHERE op_id IN (${prunable})
+          AND state IN ('released', 'charged')`).bind(...pruneBinds),
         db.prepare(`DELETE FROM dispatch_operations WHERE op_id IN (${prunable})`).bind(...pruneBinds),
         db.prepare(`INSERT OR IGNORE INTO dispatch_operations
           (op_id, op_key, principal_id, tenant_id, request_digest, binding_json, generation, phase,

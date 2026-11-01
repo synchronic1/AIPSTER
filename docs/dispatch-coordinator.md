@@ -45,6 +45,25 @@ Heartbeat and read-scoped keys get `KEY_SCOPE`, expired keys get `KEY_EXPIRED`, 
 
 Every response is shape-checked. A throw, a malformed response or an unexpected value is treated as **unknown** and never as success.
 
+### Retained state and retention
+
+Durable state is bounded per principal. `INFERENCE_DISPATCH_MAX_ADMISSIONS` (default 20) caps live admissions; expired admissions are swept and never count. `INFERENCE_DISPATCH_MAX_OPERATIONS` (default 20) caps retained operations in **every** phase, terminal ones included, and is enforced by a guarded insert inside the claim batch: at the cap the claim either makes room by pruning or fails with `429 DISPATCH_LIMIT`.
+
+Only state that cannot be replayed is pruned, and only for the claiming principal:
+
+| State | When it is pruned |
+|---|---|
+| `released` operation | As soon as the principal is at the cap. `releaseHolds` requires that no start was redeemed (and that an admitted operation is fenced), so nothing ran and no result or receipt exists. |
+| `settled` operation | After `INFERENCE_DISPATCH_RETENTION_MS` (default 7 days; values under 1 hour are ignored). This row is the replay/receipt record, so it is kept for that window. |
+| `dispatch_settlements`, terminal `dispatch_jobs`, `dispatch_start_redemptions`, `dispatch_fences` | With their pruned operation, in the same batch. |
+| `dispatch_holds` in `released` or `charged` | With their pruned operation. These rows are history, not accounting: a released hold already refunded its charge in `releaseHolds` and a charged hold *is* the settlement charge, so deleting either moves no pool or grant counter. |
+
+Never pruned at any age: an operation with `uncertain_phase`, one owning a `held`/`committed` hold, one owning a `queued`/`leased` job, or any non-terminal phase. Such an operation keeps counting against the cap, so unresolved work blocks new claims for that principal with `429 DISPATCH_LIMIT` until it is resolved or cancelled — the deliberate trade of availability for never re-running uncertain work.
+
+Pruning runs in the same D1 batch as the claim, so it cannot interleave with `acquireHold`, `releaseHolds` or `reconcile`, and no statement can observe an operation without its holds or the reverse. Eviction is a delete only; pool ceilings and counters are preserved, and pruning never refunds or re-charges.
+
+Idempotency is bounded by retention: a retained `op_key` always reconciles to its original operation, and a key whose row was pruned becomes a new operation. Because only released and aged-settled rows are pruned, that bound cannot lose a live result: released work never executed, and settled work is past its replay window. `getOperation` for a pruned key returns `null` (the coordinator's unknown outcome), and nothing in eviction re-dispatches.
+
 ### `transport`
 - **Capabilities** must be `{protocol: 'aipster-bound-cpu-internal/1', instance_pin: true, deadline: true}`. A transport without them, such as the legacy EIF execute frame, is refused with `TARGET_CAPABILITY_UNSUPPORTED` before any side effect. The coordinator never downgrades or strips fields.
 - **`dispatch(envelope)`** returns `{accepted:true, job_id}`. The envelope is `encodeBoundCpuTask(...)`, the legacy bound CPU codec, plus an internal `binding` of op, generation, runtime instance, model fingerprint and deadline.
