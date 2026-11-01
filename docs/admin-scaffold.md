@@ -96,9 +96,12 @@ checked first.
   starts `hidden` and CSS keeps it hidden until a measured total arrives.
 - Tests: `website/tests/admin-overview.test.mjs` (6 tests: denial matrix,
   empty inventory, liveness buckets, pagination, item-shape isolation,
-  malformed-row skip) and `website/tests/admin-ui.test.mjs` (7 tests:
+  malformed-row skip) and `website/tests/admin-ui.test.mjs` (13 tests:
   rendering, escaping, empty/unknown states, pager flow, shell structure
-  and live regions). Run `npm test` from `website/`.
+  and live regions, plus six regressions: superseded Overview/Resources
+  success and failure responses never paint or clear a painted page, a
+  sparse final window keeps bounds from offset plus limit, and a page past
+  a shrunken total reports an empty window). Run `npm test` from `website/`.
 
 ## DGM fixture preview (0.5.0)
 
