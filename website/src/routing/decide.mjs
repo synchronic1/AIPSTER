@@ -94,7 +94,7 @@ export async function decideRoute({ db, env = {}, tenant, features = {}, tenantP
     };
 
     if (scored.ranked.length === 0) {
-      return finish({ source: 'none', ranking: [], completed: false, route: null, degraded: false, failure: { code: 'NO_CANDIDATES', status: 200 } });
+      return await finish({ source: 'none', ranking: [], completed: false, route: null, degraded: false, failure: { code: 'NO_CANDIDATES', status: 200 } });
     }
 
     const key = cacheKeyFor(tenant, digests.featureDigest, digests.candidateDigest, ROUTING_POLICY_VERSION, policy.mode);
@@ -106,14 +106,14 @@ export async function decideRoute({ db, env = {}, tenant, features = {}, tenantP
         // Same absolute-deadline gate as the advice path: a lapsed
         // request keeps its cached ranking as evidence but holds nothing.
         if (request.deadlineMs <= now()) {
-          return finish({
+          return await finish({
             source: cached.stale ? 'degraded-stale' : 'cached',
             ranking: served.ranking, completed: served.completed, route: null,
             degraded: true, failure: { code: 'DEADLINE_EXCEEDED', status: 200 },
           });
         }
         const route = await cascadeFor(db, tenant, opId, served.ranking, scored.ranked, request, now());
-        return finish({
+        return await finish({
           source: cached.stale ? 'degraded-stale' : 'cached',
           ranking: served.ranking, completed: served.completed, route,
           degraded: cached.stale || route === null,
@@ -137,14 +137,14 @@ export async function decideRoute({ db, env = {}, tenant, features = {}, tenantP
     }
     // Recheck before admission: capacity holds must not start past deadline.
     if (request.deadlineMs <= now()) {
-      return finish({
+      return await finish({
         source: advice.outcome === 'advice' ? 'advice' : 'fallback',
         ranking: advice.ranking, completed: !!advice.completed, route: null, degraded: true,
         failure: advice.failure || { code: 'DEADLINE_EXCEEDED', status: 200 },
       });
     }
     const route = await cascadeFor(db, tenant, opId, advice.ranking, scored.ranked, request, now());
-    return finish({
+    return await finish({
       source: advice.outcome === 'advice' ? 'advice' : 'fallback',
       ranking: advice.ranking, completed: !!advice.completed, route,
       degraded: route === null,

@@ -364,3 +364,28 @@ test('routing decide: cascade skips raced quota, dispatch stays 501', async () =
   assert.equal(res.status, 501);
   assert.equal(res.json.code, 'INFERENCE_DISABLED');
 });
+
+test('routing decide: finalization failure runs leader cleanup, retry proceeds', async () => {
+  const t = await createTestEnv(ENV);
+  await seed(t);
+  const ok = async () => new Response(JSON.stringify(rankResponse(['r3', 'r1', 'r2'])), { status: 200 });
+  const feat = { model: 'fast-path', maxTokens: 500, requestId: 'req_fin' };
+  // Fail the commit UPDATE only (steal/cancel shapes differ): the claim,
+  // advice charge and reservation all land before finalization throws.
+  const failDb = {
+    ...t.DB,
+    prepare: (sql) => {
+      if (!sql.includes('UPDATE routing_ops SET state = ?, source')) return t.DB.prepare(sql);
+      return { bind: (...p) => ({ ...t.DB.prepare(sql).bind(...p), run: async () => { throw new Error('injected finalize failure'); } }) };
+    },
+  };
+  await assert.rejects(decideRoute({ db: failDb, env: t.env, tenant: 'u_alice', features: feat, fetchImpl: ok, nowMs: NOW }), /injected finalize failure/);
+  // Cleanup ran: the hold is refunded and the claim freed for same-id retry.
+  assert.deepEqual(await grantUsage(t.DB, 'g_rb'), { used_jobs: 0, used_tokens: 0 });
+  const retry = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: feat, fetchImpl: ok, nowMs: NOW });
+  // The failed attempt cached its ranking before finalization threw, so the
+  // retry serves from cache with a fresh hold instead of wedging in flight.
+  assert.equal(retry.source, 'cached');
+  assert.ok(retry.route && retry.route.reservation);
+  assert.ok(!retry.failure || retry.failure.code !== 'ROUTE_OP_IN_FLIGHT');
+});
