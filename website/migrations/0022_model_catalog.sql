@@ -1,5 +1,5 @@
 -- Built with Meta Muse.
--- Migration 0018: model/adapter catalog schema (read-only discovery,
+-- Migration 0022: model/adapter catalog schema (read-only discovery,
 -- compatibility, private assets, deployment jobs). Additive only.
 --
 -- node_capabilities: worker-reported capability snapshots. Written ONLY by

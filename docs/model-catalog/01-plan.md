@@ -28,7 +28,7 @@ fake implementation. Real dispatch stays disabled with explicit
 `WORKER_API_UNAVAILABLE` + missing dependency per action — no cosmetic
 success path.
 
-## Migration 0018 (`0018_model_catalog.sql`)
+## Migration 0022 (`0022_model_catalog.sql`)
 
 - `node_capabilities(node_id PK→resources, schema_version, reported_at,
   os, arch, runtimes_json, mem_json, disk_json, workload_json)` —

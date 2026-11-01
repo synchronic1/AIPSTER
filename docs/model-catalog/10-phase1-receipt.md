@@ -9,7 +9,7 @@
 
 ## Delivered
 
-- Migration `0018_model_catalog.sql`: `node_capabilities`, `catalog_assets`,
+- Migration `0022_model_catalog.sql`: `node_capabilities`, `catalog_assets`,
   `catalog_asset_files`, `catalog_uploads`, `catalog_compat_cache`,
   `catalog_deployments`, `catalog_deployment_events`. Readiness contract
   (`schema.js`) + test shim + migration-count assertions updated.
