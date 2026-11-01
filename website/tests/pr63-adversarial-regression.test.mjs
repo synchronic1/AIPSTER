@@ -15,7 +15,10 @@
  *                       worker tests, not representable here)
  *   F5  4437303806  P2  per-principal retained admissions/operations
  *   F6  4437415004  P2  macOS-only path guard (Python; not representable here)
- *   F7  4437419399  P2  terminal retained operations bypass the operation cap
+ *   F7  4437419399  P2  terminal retained operations bypass the operation cap:
+ *                       retained state must stay bounded (a 429 at the cap is
+ *                       the supported bounded refusal) and eviction must not
+ *                       leave side-table rows behind
  *
  * Evidence engines:
  *  - node:sqlite through the repo D1 shim (real SQL, real store, real worker
@@ -423,6 +426,66 @@ test('F5: idempotent replay and unknown-outcome retention each consume the cap h
   }), (e) => e.status === 429 && e.code === 'DISPATCH_LIMIT');
 });
 
+test('F7: on real D1 pruning is per principal and concurrent claims keep each cap', async (c) => {
+  const { db, clock } = await realD1(c);
+  const env = envFor({ INFERENCE_DISPATCH_MAX_OPERATIONS: '1', INFERENCE_DISPATCH_MAX_ADMISSIONS: '10' });
+  const a = createD1DispatchStore(db, { now: clock.now, env });
+  const b = createD1DispatchStore(db, { now: clock.now, env });
+  const first = (sql, ...params) => db.prepare(sql).bind(...params).first();
+
+  // Alice (owner) settles one operation: her single slot is now a receipt.
+  const flow = await dispatchedOperation({ store: a }, { principal: alice, op_key: 'd1-alice-1' });
+  const frame = await a.leaseNextJob({ resource_id: RES_1 });
+  assert.equal((await a.completeJob({
+    job_id: frame.job_id, lease_id: frame.lease_id, resource_id: RES_1,
+    status: 'succeeded', result: workerResult(frame),
+  })).accepted, true);
+  assert.equal((await a.settle({
+    op_id: flow.op.op_id, generation: 1, job_id: frame.job_id,
+    outcome: 'succeeded', result_digest: 'sha256:d1-alice-1',
+  })).settled, true);
+  const pool = flow.binding.pools[0].pool_id;
+  assert.equal((await first('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?', pool)).used_tokens, 128);
+
+  // Both principals prepare their claim while every admission is still live.
+  const aliceAdmission = await a.issueAdmission({
+    principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64,
+  });
+  const aliceBinding = bindingFor(await a.resolveAdmission({
+    principal: alice, admission_ref: aliceAdmission.admission_ref,
+  }), { principal: alice });
+  const bobAdmission = await b.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 64, grant: 'grant-1',
+  });
+  const bobBinding = bindingFor(await b.resolveAdmission({
+    principal: bob, admission_ref: bobAdmission.admission_ref,
+  }), { principal: bob });
+
+  clock.advance(RETENTION_MS + 1);
+
+  const claim = (store, key, principal, binding) => store.claimOperation({
+    op_key: key, request_digest: `sha256:${key}`, principal_id: principal.principal_id,
+    tenant_id: principal.tenant_id, binding,
+  }).then((v) => ({ ok: true, v }), (e) => ({ ok: false, status: e.status, code: e.code }));
+
+  const [ca, cb] = await Promise.all([
+    claim(a, 'd1-alice-2', alice, aliceBinding),
+    claim(b, 'd1-bob-1', bob, bobBinding),
+  ]);
+  assert.equal(ca.ok && ca.v.claimed, true, `alice claim: ${JSON.stringify(ca)}`);
+  assert.equal(cb.ok && cb.v.claimed, true, `bob claim: ${JSON.stringify(cb)}`);
+
+  // Alice's expired receipt was pruned for Alice only; Bob's new row is intact.
+  const rows = await db.prepare('SELECT principal_id, op_key FROM dispatch_operations ORDER BY op_key').all();
+  assert.deepEqual(rows.results.map((r) => `${r.principal_id}:${r.op_key}`),
+    [`${alice.principal_id}:d1-alice-2`, `${bob.principal_id}:d1-bob-1`].sort(),
+    'pruning never borrows or removes another principal\'s row');
+  assert.equal((await first('SELECT COUNT(*) AS n FROM dispatch_settlements WHERE op_id = ?', flow.op.op_id)).n, 0,
+    'the expired receipt is gone');
+  assert.equal((await first('SELECT used_tokens FROM dispatch_pool_usage WHERE pool_id = ?', pool)).used_tokens, 128,
+    'pruning a receipt must not refund the settled charge');
+});
+
 test('F7: repeated released budget failures cannot grow retained operations past the cap', async () => {
   const cap = 2;
   const h = createStoreHarness({
@@ -469,14 +532,18 @@ test('F7: repeated released budget failures cannot grow retained operations past
   }
 });
 
-test('F7: settled operations are retained rows and cannot be used to bypass the cap', async () => {
+// Documented default retention window for settled replay receipts
+// (DEFAULT_DISPATCH_RETENTION_MS). Spelled out rather than imported so this
+// file still loads against the base commit, where the constant does not exist.
+const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+test('F7: settled operations are bounded retained state — refusal, not a leak', async () => {
   const cap = 2;
   const h = createStoreHarness({
     env: { INFERENCE_DISPATCH_MAX_OPERATIONS: String(cap), INFERENCE_DISPATCH_MAX_ADMISSIONS: '100' },
   });
-
-  for (let i = 0; i < 3; i += 1) {
-    const flow = await dispatchedOperation(h, { principal: bob, grant: 'grant-1', op_key: `f7-settled-${i}` });
+  const settleOne = async (key) => {
+    const flow = await dispatchedOperation(h, { principal: bob, grant: 'grant-1', op_key: key });
     const frame = await h.store.leaseNextJob({ resource_id: RES_1 });
     assert.equal((await h.store.completeJob({
       job_id: frame.job_id, lease_id: frame.lease_id, resource_id: RES_1,
@@ -484,15 +551,159 @@ test('F7: settled operations are retained rows and cannot be used to bypass the 
     })).accepted, true);
     assert.equal((await h.store.settle({
       op_id: flow.op.op_id, generation: 1, job_id: frame.job_id,
-      outcome: 'succeeded', result_digest: `sha256:settled-${i}`,
+      outcome: 'succeeded', result_digest: `sha256:${key}`,
     })).settled, true);
-    // A second admission is issued per operation by dispatchedOperation, so the
-    // admission allowance is raised above; the operation cap is the subject.
     h.clock.advance(1000);
-  }
+    return flow;
+  };
 
-  const retained = opRows(h.sqlite, bob.principal_id);
-  assert.equal(retained.length, 3, 'the three settled operations are retained rows');
-  assert.ok(retained.length <= cap,
-    `retained settled operations (${retained.length}) must stay within the cap (${cap}) or be pruned atomically`);
+  await settleOne('f7-settled-0');
+  await settleOne('f7-settled-1');
+  assert.equal(opRows(h.sqlite, bob.principal_id).length, cap, 'two settled operations are retained');
+  assert.deepEqual(grantUsed(h.sqlite), { used_jobs: 2, used_tokens: 256 }, 'each settlement charged once');
+
+  const admission = await h.store.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 128, grant: 'grant-1',
+  });
+  const rec = await h.store.resolveAdmission({ principal: bob, admission_ref: admission.admission_ref });
+  const binding = bindingFor(rec, { principal: bob });
+  const third = () => h.store.claimOperation({
+    op_key: 'f7-settled-2', request_digest: 'sha256:third',
+    principal_id: bob.principal_id, tenant_id: bob.tenant_id, binding,
+  });
+
+  // Inside the replay window the settled rows ARE the retained state, so a
+  // third distinct key must be refused. A bounded 429 is the supported
+  // behaviour; silently accepting it would be the storage leak this finding is
+  // about. Either way the retained row count may never exceed the cap.
+  await assert.rejects(third(), (e) => e.status === 429 && e.code === 'DISPATCH_LIMIT',
+    'at the cap a fresh key is a bounded refusal, not an unbounded row');
+  assert.equal(opRows(h.sqlite, bob.principal_id).length, cap, 'a refusal never adds a retained row');
+
+  // The refusal must also be bounded in time: past the retention window the
+  // expired receipts are pruned in the same batch as the new claim.
+  h.clock.advance(RETENTION_MS + 1);
+  const claimed = await third();
+  assert.equal(claimed.claimed, true, 'after the replay window a claim is admitted by pruning');
+  assert.ok(opRows(h.sqlite, bob.principal_id).length <= cap);
+  assert.deepEqual(grantUsed(h.sqlite), { used_jobs: 2, used_tokens: 256 },
+    'pruning receipts must never refund a settled charge');
+});
+
+test('F7: an evicted released key is a fresh operation; a retained one still reconciles', async () => {
+  const h = createStoreHarness({
+    ownerDaily: '0',
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '1', INFERENCE_DISPATCH_MAX_ADMISSIONS: '100' },
+  });
+  const admission = await h.store.issueAdmission({
+    principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64,
+  });
+  const rec = await h.store.resolveAdmission({ principal: alice, admission_ref: admission.admission_ref });
+  const binding = bindingFor(rec, { principal: alice });
+  const submit = async (key) => {
+    const claim = await h.store.claimOperation({
+      op_key: key, request_digest: `sha256:${key}`,
+      principal_id: alice.principal_id, tenant_id: alice.tenant_id, binding,
+    });
+    if (!claim.claimed) return claim;
+    assert.deepEqual(await h.store.acquireHold({
+      op_id: claim.op.op_id, generation: 1, pool_id: binding.pools[0].pool_id, amount: binding.pools[0].amount,
+    }), { held: false, reason: 'insufficient' });
+    await h.store.releaseHolds({ op_id: claim.op.op_id, generation: 1, reason: 'budget' });
+    return claim;
+  };
+
+  const first = await submit('rel-key-1');
+  assert.equal(first.claimed, true);
+  const replay = await submit('rel-key-1');
+  assert.equal(replay.claimed, false, 'a released key reconciles while its row is retained');
+  assert.equal(replay.op.op_id, first.op.op_id);
+
+  // At the cap the released row is evicted inside the same claim batch.
+  const second = await submit('rel-key-2');
+  assert.equal(second.claimed, true);
+  assert.equal(count(h.sqlite, 'SELECT COUNT(*) AS n FROM dispatch_operations WHERE op_key = ?', 'rel-key-1'), 0,
+    'the released row is evicted to make room at the cap');
+  assert.equal(count(h.sqlite, 'SELECT COUNT(*) AS n FROM dispatch_operations WHERE principal_id = ?',
+    alice.principal_id), 1);
+
+  // The evicted key is a NEW operation, not a vanished replay: released work
+  // never executed, so a retry must run. Once retained again it reconciles.
+  const third = await submit('rel-key-1');
+  assert.equal(third.claimed, true);
+  assert.notEqual(third.op.op_id, first.op.op_id, 'an evicted release is not a replay target');
+  const fourth = await submit('rel-key-1');
+  assert.equal(fourth.claimed, false);
+  assert.equal(fourth.op.op_id, third.op.op_id);
+  assert.equal(ownerPoolUsed(h.sqlite, binding.pools[0].pool_id), 0,
+    'evicting a released row must not charge or refund the pool');
+});
+
+const SIDE_TABLES = ['dispatch_holds', 'dispatch_start_redemptions', 'dispatch_fences',
+  'dispatch_settlements', 'dispatch_jobs'];
+const orphanRows = (sqlite) => Object.fromEntries(SIDE_TABLES.map((table) => [table, count(sqlite,
+  `SELECT COUNT(*) AS n FROM ${table} t
+   WHERE NOT EXISTS (SELECT 1 FROM dispatch_operations o WHERE o.op_id = t.op_id)`)]));
+const NO_ORPHANS = Object.fromEntries(SIDE_TABLES.map((table) => [table, 0]));
+
+test('F7: eviction never leaves a side-table row pointing at a pruned operation', async () => {
+  // Released path: 25 reserve/release cycles at cap 2 prune operations, and a
+  // pruned operation must take its released hold rows with it.
+  const h = createStoreHarness({
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '2', INFERENCE_DISPATCH_MAX_ADMISSIONS: '100' },
+  });
+  const admission = await h.store.issueAdmission({
+    principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64,
+  });
+  const rec = await h.store.resolveAdmission({ principal: alice, admission_ref: admission.admission_ref });
+  const binding = bindingFor(rec, { principal: alice });
+  for (let i = 0; i < 25; i += 1) {
+    const claim = await h.store.claimOperation({
+      op_key: `f7-side-released-${i}`, request_digest: `sha256:side-${i}`,
+      principal_id: alice.principal_id, tenant_id: alice.tenant_id, binding,
+    });
+    assert.equal(claim.claimed, true);
+    assert.equal((await h.store.acquireHold({
+      op_id: claim.op.op_id, generation: 1, pool_id: binding.pools[0].pool_id, amount: binding.pools[0].amount,
+    })).held, true);
+    assert.deepEqual(await h.store.releaseHolds({ op_id: claim.op.op_id, generation: 1, reason: 'cancelled' }),
+      { released: 1 });
+  }
+  assert.ok(count(h.sqlite, 'SELECT COUNT(*) AS n FROM dispatch_operations') <= 2);
+  assert.deepEqual(orphanRows(h.sqlite), NO_ORPHANS,
+    'pruned operations left side-table rows behind (storage outlives the operation)');
+
+  // Settled path: an expired receipt is pruned with its charged hold, its
+  // settlement, its queue row and its start/fence tombstones.
+  const s = createStoreHarness({ env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '2' } });
+  for (const key of ['f7-side-settled-0', 'f7-side-settled-1']) {
+    const flow = await dispatchedOperation(s, { principal: bob, grant: 'grant-1', op_key: key });
+    const frame = await s.store.leaseNextJob({ resource_id: RES_1 });
+    assert.equal((await s.store.completeJob({
+      job_id: frame.job_id, lease_id: frame.lease_id, resource_id: RES_1,
+      status: 'succeeded', result: workerResult(frame),
+    })).accepted, true);
+    assert.equal((await s.store.settle({
+      op_id: flow.op.op_id, generation: 1, job_id: frame.job_id,
+      outcome: 'succeeded', result_digest: `sha256:${key}`,
+    })).settled, true);
+    s.clock.advance(1000);
+  }
+  // Resolve the post-retention claim's binding while the resource is still
+  // live: issueAdmission checks liveness, claimOperation does not, and the
+  // clock is about to jump past the heartbeat window.
+  const fresh = await s.store.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 64, grant: 'grant-1',
+  });
+  const freshBinding = bindingFor(
+    await s.store.resolveAdmission({ principal: bob, admission_ref: fresh.admission_ref }), { principal: bob });
+  s.clock.advance(RETENTION_MS + 1);
+  assert.equal((await s.store.claimOperation({
+    op_key: 'f7-side-after', request_digest: 'sha256:side-after',
+    principal_id: bob.principal_id, tenant_id: bob.tenant_id, binding: freshBinding,
+  })).claimed, true);
+  assert.deepEqual(orphanRows(s.sqlite), NO_ORPHANS,
+    'expired settled operations left charged holds or receipts behind');
+  assert.deepEqual(grantUsed(s.sqlite), { used_jobs: 2, used_tokens: 256 },
+    'pruning must not refund the settled charge');
 });
