@@ -4,6 +4,11 @@ These are offline, stdlib-only checks. They were written failing-first against
 `9c2c479` (docs carried over from `main` without the reviewed patch-0002
 documentation) and pass on the repaired tree. Nothing here inspects a runtime,
 a model, a credential or a network endpoint.
+
+Scope is deliberately bounded: these are structural assertions over headings,
+recorded counts, patch names and limit vocabulary. They are not a semantic or
+security truth proof, and they will not catch a wrong detail inside prose that
+uses the right words (for example a missing state name in a list).
 """
 
 import json

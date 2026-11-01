@@ -117,12 +117,17 @@ patched (patch 0001: `api.py`, `config.py`; patch 0002: `fabric.py`, `node.py`,
 upstream hashes, and forward-applying both to those upstream bytes reproduces the
 committed files byte-for-byte.
 
-Against the same test file with patch 0002 reversed in an isolated tree, **17 of
-24 fail** and 7 pass. The failures cover job-id binding, exact/resident admission,
-the under-lane residency guard, fingerprint-aware managed residency, timeout and
-post-timeout behavior, permanent handshake/close rejection, probe handling,
-connect-failure quarantine and fabric-job `last_error` sanitization. They are the
-falsifiable before/after evidence for this patch.
+The original patch author recorded **17 of 24 fail** (7 pass) for the same test
+file with patch 0002 reversed in an isolated tree, covering job-id binding,
+exact/resident admission, the under-lane residency guard, fingerprint-aware
+managed residency, timeout and post-timeout behavior, permanent handshake/close
+rejection, probe handling, connect-failure quarantine and fabric-job `last_error`
+sanitization. **Those counts are an unverified historical author claim**: the
+reversal log was not retained, and the prepared reproduction was deferred and not
+executed, so nothing in this lane reproduces "17 of 24" at this candidate. What
+was run here and is reproducible is `verify_vendor.py --check-patches` (exit 0),
+which reverses both recorded patches in an isolated temporary tree and reproduces
+the pinned upstream SHA-256 values.
 
 The new tests use a local fake fabric WebSocket and the mock runtime only. They
 cover: authenticated connect; one immediate heartbeat; resident-only capacity in
@@ -138,8 +143,12 @@ retry; 4001 replacement and 4003 revocation stop states; and attach quarantine
 only after an unanswered sent request, not after connect-phase failures.
 
 The worker's cloud snapshot was also checked against the Ganglion reference
-sanitizer and scheduler (AiTinkerersVenice HEAD `f5223d39`, unmodified) offline:
-`sanitizeNodeSnapshot` accepted both a resident and a cold snapshot, and
+sanitizer and scheduler in the AiTinkerersVenice checkout at its then-HEAD
+`f5223d39`, unmodified at the time of the check. That checkout's HEAD has since
+advanced to `fe5ef6c07e3147debb33028629f77e29541531b5` (2026-11-01 08:46:05
+-0800), so `f5223d39` is not that repository's current HEAD and this check was
+not rerun here. Offline, `sanitizeNodeSnapshot` accepted both a resident and a
+cold snapshot, and
 `placementCandidates` returned the resident model while returning no placement
 for the cold/non-resident model. That check used the existing `fabric` checkout's
 `tsx` and a local JSON snapshot; no fabric connection or credential was used.
@@ -161,8 +170,12 @@ eight patch-0002 artifacts — `patches/0002-fabric-resident-binding.patch`,
 patched `vendor/eif/dendrite` modules — are byte-identical to the reviewed tree,
 while `pairing.py` and its lifecycle tests stay on the newer `origin/main` R4
 sender-lock work. An independent coordinator re-ran `test_fabric_bridge.py`
-against a local fake fabric and mock runtime at that commit: **24 passed in
-4.20 s**, no live daemon, model, provider or credential.
+against a local fake fabric and mock runtime at `9c2c479`. That run is recorded
+in `/private/tmp/aipster-mac-pr62-reconcile/COORDINATOR-FABRIC-VALIDATION.md`:
+**24 passed in 4.20 s**, no live daemon, model, provider or credential. It
+belongs to `9c2c479` and was not rerun at the successor candidate below; the
+successor's own fabric evidence is its 36-passed run, which is a separate run at
+a different commit.
 
 A successor candidate on top of `9c2c479` restores the patch-0002 documentation
 this section belongs to (`README.md`, `EXECUTION-GAPS.md`, `LICENSING.md` and this
@@ -186,3 +199,22 @@ verify_vendor.py --check-patches               16 files: 10 upstream-identical,
 No package was installed; the interpreter was an existing CPython 3.12.13
 virtual environment. The deployed fabric, a node enrollment, a Fabric Access
 Token, a live model and the AIPSTER dispatch path were not touched.
+
+A later documentation-only delta on that candidate changes no runtime, vendor or
+provenance byte; it corrects report accuracy (initial `fabric.state`, the
+`f5223d39` then-HEAD attribution, and the provenance of the reversal and
+coordinator evidence). Those runs were therefore not repeated, and the only suite
+rerun for the delta is `test_docs_consistency.py`.
+
+`test_docs_consistency.py` is a bounded structural check: it asserts headings,
+recorded counts, patch names and limit vocabulary across the four documents. It
+does not execute the worker, verify semantic or security truth, or catch an
+omission such as a missing state name in a prose list. Passing it means the
+documentation is internally consistent with `provenance.json`; it is not a
+complete truth proof.
+
+One vendor documentation limitation is left unchanged: the comment at
+`vendor/eif/dendrite/node.py:36` calls the fabric block "local operator
+visibility only", which is misleading after the activated security work even
+though the block itself is secret-free. Editing vendor bytes would require a
+provenance bump, so it is recorded here rather than changed.

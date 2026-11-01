@@ -234,8 +234,10 @@ upstream_model = "the-exact-id-from-GET-/v1/models"
 capabilities = ["complete", "summarize"]
 ```
 
-`GET /v1/node` reports `fabric.state` (`disabled`, `connecting`, `connected`,
-`reconnecting`, `rejected`, `superseded`) plus a status code and a generic error.
+`GET /v1/node` reports `fabric.state` (`disabled`, `disconnected`, `connecting`,
+`connected`, `reconnecting`, `rejected`, `superseded`) plus a status code and a
+generic error. `disabled` means no `fabric_url` is configured; `disconnected` is
+the real initial state once it is set and before the bridge has ever connected.
 The `fabric` block never includes the token or prompt text; a failed fabric job's
 runtime `last_error` is a fixed message rather than backend detail.
 
