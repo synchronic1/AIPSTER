@@ -11,5 +11,8 @@ It is a protocol codec only: no transport, credentials, placement or
 authorization. `aipster_contract.py` mirrors it and the test suite re-checks the
 mirror's field sets against this file on every run.
 
-The worker branch this fixture runs against does not contain `website/`, so the
-copy is the only offline way to compare the two real interfaces without Node.
+The worker branch does contain `website/` (`git cat-file -e
+0763d87:website/src/inference/eif-task-contract.mjs` succeeds and that blob is
+byte-identical to this copy), but this lane's sparse worktree does not
+materialise `website/` on disk. The copy is therefore the only offline way to
+compare the two real interfaces without Node or a full checkout.

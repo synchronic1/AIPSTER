@@ -44,9 +44,14 @@ PLACEMENT_FIELDS = ("device", "node_id", "runtime_id")
 
 # Known, deliberate mirror divergences: (1) prompt length is measured in Python
 # code points, while JS ``prompt.length`` counts UTF-16 code units; they differ
-# only for astral-plane characters near the 65536 limit. (2) The 1 MiB limit uses
-# ``json.dumps(separators=(",", ":"))``, which is byte-identical to
-# ``JSON.stringify`` only for the ASCII/simple values this codec admits.
+# only for astral-plane characters near the 65536 limit. The same unit differs
+# for ``_is_id`` (JS ``x.length``) and for the ``{7,127}`` operation-key regex.
+# (2) The 1 MiB limit uses ``json.dumps(separators=(",", ":"))``, which is
+# byte-identical to ``JSON.stringify`` only for the ASCII/simple values this
+# codec admits. (3) JS ``Number.isInteger(2.0)`` is true, but Python ints and
+# floats are distinct, so a JS caller could in principle pass ``maxTokens: 2.0``
+# where this mirror rejects it. None of these is reachable from
+# ``encodeCpuTask``'s own integer/string inputs, so the fixture is unaffected.
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPERATION_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
