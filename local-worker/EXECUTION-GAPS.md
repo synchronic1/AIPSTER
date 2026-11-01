@@ -1,8 +1,11 @@
 # Installation is not execution qualification
 
 The vendored worker is the public snapshot, not newer private EIF source. No
-private histories or patches were accessed or copied for this PR. The comparison
-is against public `dendrite/config.py`, `schemas.py`, `node.py`, `runtimes/llama.py`
+private patch was copied into the vendor tree; local patch 0002 is an original
+change implementing the documented Ganglion v0.2.0 node socket. It was checked
+offline against the Ganglion reference snapshot sanitizer and scheduler; the
+deployed fabric was not connected or exercised. The remaining comparison is
+against public `dendrite/config.py`, `schemas.py`, `node.py`, `runtimes/llama.py`
 and AIPSTER's [published contract](../docs/eif-atomic-admission-contract.md).
 
 | Boundary | Public snapshot / outstanding work |
