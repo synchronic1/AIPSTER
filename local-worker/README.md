@@ -153,6 +153,73 @@ with the published installer.
 See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
 POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
 
+## Serving inference jobs (dark by default)
+
+This checkout can run *leased* inference jobs for its paired resource against a
+local Ganglion OpenAI-compatible server (any OpenAI `/v1`-shaped local server
+that lists its models works). It is dark by default in both directions: nothing runs unless you start
+it here, and the server keeps `POST /api/jobs` at `INFERENCE_DISABLED` (every
+worker job route 404s) unless `INFERENCE_ENABLED` is set. No live deployment,
+live job route or live inference was exercised to add this; see
+[execution gaps](EXECUTION-GAPS.md).
+
+Prerequisites:
+
+- a paired worker (`pairing.py pair`) whose heartbeat key is bound to a
+  resource; the same private credential is reused, never copied or re-minted;
+- a running Ganglion server on `http://127.0.0.1:8471` (or `AIPSTER_GANGLION_URL`).
+  The address must be loopback unless you pass `--allow-non-loopback-ganglion`;
+  remote mode is not qualified.
+- if your Ganglion requires a token, set `AIPSTER_GANGLION_TOKEN` in the
+  environment. Do not put it on a command line, in a config file or in pairing
+  state.
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py serve-jobs --once   # one poll cycle, then exit
+.\.venv\Scripts\python.exe pairing.py serve-jobs          # keep serving (Ctrl+C)
+```
+
+| Flag | Meaning |
+|---|---|
+| `--ganglion-base URL` | Ganglion base (default `http://127.0.0.1:8471`, or `AIPSTER_GANGLION_URL`) |
+| `--allow-non-loopback-ganglion` | Permit a non-loopback base. Unqualified; refuses otherwise |
+| `--interval SECONDS` | Base idle poll interval (default 2). Grows while idle, capped at 30 |
+| `--models-cache-ttl SECONDS` | How long the Ganglion model list is cached (default 30) |
+| `--once` | Poll once and exit; still takes the single-runner lock |
+
+Per job the runner: leases one job from `GET /api/worker/jobs/next` with the
+stored heartbeat key; validates the bound envelope strictly (`capability`
+`complete`, `placement.device` `cpu`, node id equal to this resource, runtime
+`ganglion`, model, prompt, `max_tokens` 1..4096, a deadline in the future,
+`temperature` 0, no simulation, no unknown fields); checks the model against
+Ganglion `GET /v1/models`; then makes one non-streaming `POST /v1/completions`
+(`temperature: 0`, timeout = the deadline minus now, no redirects, no retries)
+and posts `{lease_id, status, result}` to
+`POST /api/worker/jobs/:job_id/result`. A `404` on completions means the route
+does not exist, so one single-message `/v1/chat/completions` fallback is tried;
+every other failure is final.
+
+A failure is always reported as `failed` with a stable `reason`
+(`ENVELOPE_INVALID`, `MODEL_UNAVAILABLE`, `GANGLION_UNAVAILABLE`,
+`GANGLION_HTTP_ERROR`, `GANGLION_TIMEOUT`, `GANGLION_INVALID_RESPONSE`,
+`EMPTY_CONTENT`, `DEADLINE_EXCEEDED`) and no content, so it can never be
+mistaken for a successful result. Success carries `simulated: false` and the
+EIF result shape.
+
+Before calling Ganglion the job id is written to a private started-job ledger
+(`jobs-started.json` in the worker data dir). A job whose result post was never
+confirmed is therefore not re-executed after a restart: the outcome stays
+uncertain instead of being guessed. Only one `serve-jobs` runs per data dir
+(`jobs.lock`); a second one exits 6, matching the heartbeat sender's
+`SENDER_RUNNING`. A revoked key exits 4 (pairing again required); a malformed
+lease frame or unreadable ledger exits 2; five consecutive transport/5xx
+failures exit 5. Prompts and completions are never logged, and neither the
+heartbeat key nor the Ganglion token is printed.
+
+`status`, `heartbeat-once`/`heartbeat-loop`, `pair` and `unpair` are unchanged,
+and heartbeats still prove reachability only: `usable` stays false for the mock
+config, and running jobs here does not change what the dashboard reports.
+
 In a second terminal, set `$env:DENDRITE_API_TOKEN` to the same value, then:
 
 ```powershell

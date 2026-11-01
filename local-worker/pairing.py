@@ -1054,6 +1054,21 @@ def build_parser():
     loop.add_argument("--interval", type=int, default=HEARTBEAT_INTERVAL_SEC)
     sub.add_parser("status", help="show pairing state (never secrets)")
     sub.add_parser("unpair", help="forget local pairing (server key untouched)")
+    # Inference job runner (lane L3). Kept in its own module so every other
+    # command keeps working with the frozen pairing-only bundle; the import
+    # happens only when this command is used.
+    jobs = sub.add_parser("serve-jobs",
+                          help="run leased inference jobs on local Ganglion (dark by default)")
+    jobs.add_argument("--interval", type=float, default=2.0,
+                      help="base idle poll interval in seconds")
+    jobs.add_argument("--ganglion-base", default=None,
+                      help="local Ganglion base (default http://127.0.0.1:8471)")
+    jobs.add_argument("--allow-non-loopback-ganglion", action="store_true",
+                      help="permit a non-loopback Ganglion base (not qualified)")
+    jobs.add_argument("--models-cache-ttl", type=float, default=30.0,
+                      help="seconds to cache the Ganglion model list")
+    jobs.add_argument("--once", action="store_true",
+                      help="poll for one job and exit")
     return parser
 
 
@@ -1075,6 +1090,11 @@ def main(argv=None):
             return cmd_status(args)
         if args.command == "unpair":
             return cmd_unpair(args)
+        if args.command == "serve-jobs":
+            # Lazy: the job runner is a separate, opt-in module. Importing it
+            # here keeps a pair/heartbeat-only frozen bundle self-contained.
+            import inference_worker
+            return inference_worker.cmd_serve_jobs(args)
     except KeyboardInterrupt:
         # Ctrl+C stops the sender cleanly: no traceback, no partial claim
         # (pair's manifest commit is atomic under the pair mutex).

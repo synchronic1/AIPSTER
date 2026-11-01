@@ -396,6 +396,7 @@ class InferenceWorkerTests(unittest.TestCase):
 
     def assert_envelope_rejected(self, frame, detail):
         before = len(self.api.results)
+        self.api.leases = [frame]
         code, out, err = self.run_quiet(self.runner(), max_cycles=1)
         self.assertEqual(code, pairing.EXIT_OK, err)
         self.assertEqual(self.ganglion.hits["completions"], 0,
@@ -608,6 +609,15 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.api.results), 1,
                          "nothing is posted for an already-started job")
 
+    def test_second_runner_exits_jobs_running(self):
+        guard = inference_worker._hold_lock(self.data, inference_worker.JOBS_LOCK_NAME)
+        self.assertIsNotNone(guard)
+        self.addCleanup(guard.release)
+        code, _, err = self.run_quiet(self.runner(), max_cycles=1)
+        self.assertEqual(code, pairing.EXIT_SENDER_RUNNING)
+        self.assertIn("JOBS_RUNNING", err)
+        self.assertEqual(self.api.next_hits, 0, "a second runner does not poll")
+
     def test_prerecorded_job_is_refused(self):
         ledger = StartedLedger(self.data)
         ledger.record("job_1")
@@ -663,7 +673,8 @@ class InferenceWorkerTests(unittest.TestCase):
                          ["succeeded", "failed", "failed"])
         combined = out + err + out2 + err2 + out3 + err3
         self.assertNotIn(FAKE_SECRET, combined)
-        self.assertNotIn(FAKE_SECRET, json.dumps(self.api.results))
+        posted = json.dumps([entry["body"] for entry in self.api.results])
+        self.assertNotIn(FAKE_SECRET, posted, "the key never rides in a result body")
         self.assertNotIn("hello there", out + err, "prompt is not echoed to logs")
 
     # -- transport policy ------------------------------------------------
@@ -688,16 +699,23 @@ class InferenceWorkerTests(unittest.TestCase):
 
     def test_cli_serve_jobs_once(self):
         self.api.leases = [lease()]
-        code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
-                             "--ganglion-base", self.gbase, "--interval", "0.01"])
+        out = StringIO()
+        with redirect_stdout(out):
+            code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
+                                 "--ganglion-base", self.gbase, "--interval", "0.01"])
         self.assertEqual(code, pairing.EXIT_OK)
+        self.assertIn("succeeded posted", out.getvalue())
+        self.assertNotIn(FAKE_SECRET, out.getvalue())
         self.assertEqual(self.ganglion.hits["completions"], 1)
         self.assertEqual(self.api.results[0]["body"]["status"], "succeeded")
 
     def test_cli_refuses_non_loopback_ganglion_base(self):
-        code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
-                             "--ganglion-base", "http://192.168.1.203:8471"])
+        err = StringIO()
+        with redirect_stderr(err):
+            code = pairing.main(["--data-dir", str(self.data), "serve-jobs", "--once",
+                                 "--ganglion-base", "http://192.168.1.203:8471"])
         self.assertEqual(code, pairing.EXIT_USAGE)
+        self.assertIn("BAD_GANGLION_BASE", err.getvalue())
         self.assertEqual(self.api.next_hits, 0)
 
 
