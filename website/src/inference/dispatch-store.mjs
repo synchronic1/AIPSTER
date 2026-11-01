@@ -42,6 +42,7 @@
 import { all, first, rid16 } from '../lib/store.js';
 import { httpError } from '../lib/validate.js';
 import { resourceLiveness } from '../lib/status.mjs';
+import { CONTENT_MAX } from './worker-transport.mjs';
 
 export const ADMISSION_TTL_MS = 10 * 60 * 1000;
 export const INFERENCE_RUNTIME_IDS = Object.freeze(['ganglion', 'llama-server']);
@@ -54,7 +55,6 @@ const OWNER_PREFIX = 'owner:';
 const GRANT_POOL_PREFIX = 'grant:';
 const OWNER_GRANT_REVISION = 1;
 const FAR_FUTURE = '9999-12-31T23:59:59.999Z';
-const MAX_CONTENT = 1024 * 1024;
 
 const SUCCEEDED_KEYS = new Set(['request_id', 'node_id', 'runtime_id', 'model_id', 'runtime_instance',
   'model_fingerprint', 'simulated', 'content', 'elapsed_ms', 'usage', 'cache', 'truncated']);
@@ -822,7 +822,9 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
         || result.model_fingerprint !== job.model_fingerprint) return { ok: false, reason: 'result_mismatch' };
       if (result.simulated !== false) return { ok: false, reason: 'simulated_result' };
       if (result.truncated !== undefined && result.truncated !== false) return { ok: false, reason: 'invalid_result' };
-      if (!isStr(result.content) || !result.content.trim() || result.content.length > MAX_CONTENT) {
+      // Same limit as the HTTP worker-result validator (worker-transport.mjs):
+      // a real completion is far longer than the 256-char identifier default.
+      if (!isStr(result.content, CONTENT_MAX) || !result.content.trim()) {
         return { ok: false, reason: 'invalid_result' };
       }
       if (!Number.isFinite(result.elapsed_ms) || result.elapsed_ms < 0) return { ok: false, reason: 'invalid_result' };

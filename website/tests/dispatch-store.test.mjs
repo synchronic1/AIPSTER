@@ -13,6 +13,7 @@ import {
   nextOpKey, admittedOperation, dispatchedOperation, workerResult, coordinatorOverStore, submitBody,
 } from './fixtures/dispatch-store-fixture.mjs';
 import { ADMISSION_TTL_MS } from '../src/inference/dispatch-store.mjs';
+import { CONTENT_MAX } from '../src/inference/worker-transport.mjs';
 import { createDispatchCoordinator } from '../src/inference/dispatch-coordinator.mjs';
 
 const used = (sqlite, id = 'grant-1') => sqlite.prepare(
@@ -639,6 +640,40 @@ test('complete: validates the exact result shape and the instance/fingerprint bi
     id: job.job_id, node_id: RES_1, runtime_id: 'ganglion', model_id: 'model-x', status: 'failed',
     result: { reason: 'MODEL_UNAVAILABLE', detail: 'no model' },
   });
+});
+
+// Finding 4437293854 (P1): result content was validated with the default
+// 256-char identifier limit, so ordinary completions were rejected as
+// RESULT_REJECTED while the HTTP validator accepted them.
+test('complete: accepts real completion content up to the shared transport limit', async () => {
+  const h = createStoreHarness();
+  const job = await dispatchedOperation(h);
+  const frame = await h.store.leaseNextJob({ resource_id: RES_1 });
+  const base = { job_id: frame.job_id, lease_id: frame.lease_id, resource_id: RES_1, status: 'succeeded' };
+
+  const longer = `hello ${'world '.repeat(200)}`; // well past the 256-char default
+  assert.ok(longer.length > 256 && longer.length <= CONTENT_MAX);
+  assert.deepEqual(await h.store.completeJob({ ...base, result: workerResult(frame, { content: longer }) }),
+    { accepted: true });
+  assert.equal((await h.store.readJob({ job_id: job.job_id })).result.content, longer);
+
+  // The cap is the transport's CONTENT_MAX, not an arbitrary larger body cap.
+  const exact = 'x'.repeat(CONTENT_MAX);
+  const h2 = createStoreHarness();
+  const job2 = await dispatchedOperation(h2);
+  const frame2 = await h2.store.leaseNextJob({ resource_id: RES_1 });
+  const base2 = { job_id: frame2.job_id, lease_id: frame2.lease_id, resource_id: RES_1, status: 'succeeded' };
+  assert.deepEqual(await h2.store.completeJob({ ...base2, result: workerResult(frame2, { content: exact }) }),
+    { accepted: true });
+
+  const h3 = createStoreHarness();
+  const job3 = await dispatchedOperation(h3);
+  const frame3 = await h3.store.leaseNextJob({ resource_id: RES_1 });
+  const over = await h3.store.completeJob({
+    job_id: frame3.job_id, lease_id: frame3.lease_id, resource_id: RES_1, status: 'succeeded',
+    result: workerResult(frame3, { content: 'x'.repeat(CONTENT_MAX + 1) }),
+  });
+  assert.deepEqual(over, { accepted: false, reason: 'invalid_result' });
 });
 
 test('readJob: queued/leased are running; a completed job carries the worker result', async () => {

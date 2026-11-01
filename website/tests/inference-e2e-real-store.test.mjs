@@ -97,6 +97,22 @@ test('real store: admit -> submit -> lease -> result -> reconcile releases conte
   assert.ok(settlements >= 1, 'migration 0024 settlement table exists');
 });
 
+// Finding 4437293854 (P1): the route validator accepted this completion but
+// the real store rejected anything over 256 chars as RESULT_REJECTED.
+test('real store: a completion longer than 256 chars is stored and released', async () => {
+  const t = await createTestEnv(ENABLED);
+  const r = await ready(t);
+  await admitAndSubmit(t, r, { key: 'alice-e2e-content-0001' });
+  const l = await lease(t, r);
+  const content = `hello ${'worker '.repeat(200)}`; // > 256 chars
+  assert.ok(content.length > 256);
+  const ok = await readJson(await post(t, r, l.job_id, succeeded(l, content)));
+  assert.equal(ok.status, 200, ok.text);
+  const done = await readJson(await t.call('/api/jobs/alice-e2e-content-0001', { headers: S(t, t.alice) }));
+  assert.equal(done.status, 200, done.text);
+  assert.equal(done.json.outcome.content, content);
+});
+
 test('real store: a llama-server admission flows to the envelope and a failed result settles without content', async () => {
   const t = await createTestEnv(ENABLED);
   const r = await ready(t);

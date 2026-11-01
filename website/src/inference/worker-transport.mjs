@@ -16,7 +16,9 @@ export const WORKER_TRANSPORT_CAPABILITIES = Object.freeze({
 
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MODEL_ID_MAX = 256;
-const CONTENT_MAX = 65536;
+// Shared with the store's result normalizer (dispatch-store.mjs) so the HTTP
+// validator and the durable store accept exactly the same completions.
+export const CONTENT_MAX = 65536;
 export const WORKER_RESULT_MAX_BYTES = 1024 * 1024;
 
 const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
