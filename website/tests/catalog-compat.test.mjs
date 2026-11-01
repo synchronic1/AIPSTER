@@ -9,6 +9,7 @@ import { createTestEnv, readJson } from './d1-shim.mjs';
 import { fixtureSnapshot, fixtureSmallSnapshot } from '../src/lib/catalog/fixtures.mjs';
 import { evaluateCompatibility } from '../src/lib/catalog/estimate.mjs';
 import { budgetWindow } from '../src/lib/quotas.js';
+import { __resetHubMetaCache } from '../src/lib/catalog/hub.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 const BASE = 'fixture-org/tiny-base';
@@ -89,6 +90,73 @@ test('Codex-P2: a cached decision never outlives its telemetry freshness', async
   const second = await evaluate(t, t.alice, body);
   assert.equal(second.json.state, 'unknown', second.text);
   assert.equal(second.json.cached, false, 'stale telemetry misses the cache');
+});
+
+test('R2: spent budget blocks uncached Hub resolution before any fetch', async () => {
+  const t = await createTestEnv({});
+  __resetHubMetaCache();
+  const node = await register(t, t.alice, 'r2-node');
+  await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+    .bind('u_alice', budgetWindow(), 120).run();
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    assert.equal(url.hostname, 'huggingface.co', 'all network is mocked; unexpected destinations are refused');
+    upstreamCalls += 1;
+    return new Response('{}', { status: 404, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    for (let i = 0; i < 3; i += 1) {
+      const r = await evaluate(t, t.alice, { repo: `r2-missing/model-${i}`, nodeId: node.id, runtime: 'llama', context: 2048, concurrency: 1 });
+      assert.equal(r.status, 429, r.text);
+      assert.equal(r.json.code, 'WRITE_RATE_LIMITED');
+    }
+    assert.equal(upstreamCalls, 0, 'fresh names fetch nothing on a spent budget');
+  } finally {
+    globalThis.fetch = realFetch;
+    __resetHubMetaCache();
+  }
+});
+
+test('R2: admitted Hub metadata serves later lookups without new fetches or claims', async () => {
+  const t = await createTestEnv({});
+  __resetHubMetaCache();
+  const node = await register(t, t.alice, 'r2-cached');
+  await report(t, node.id, fixtureSnapshot());
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  const model = { id: 'r2-org/model-a', sha: 'b'.repeat(40), tags: [], siblings: [], likes: 3 };
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    assert.equal(url.hostname, 'huggingface.co', 'all network is mocked; unexpected destinations are refused');
+    upstreamCalls += 1;
+    return new Response(JSON.stringify(model), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  const spent = async () => t.DB.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('u_alice', budgetWindow()).first('count');
+  try {
+    const body = { repo: 'r2-org/model-a', nodeId: node.id, runtime: 'fixture-llama', context: 2048, concurrency: 1 };
+    const c0 = await spent();
+    const first = await evaluate(t, t.alice, body);
+    assert.equal(first.status, 200, first.text);
+    assert.equal(first.json.cached, false);
+    assert.equal(upstreamCalls, 1, 'first lookup fetches once');
+    const c1 = await spent();
+    assert.equal(c1, c0 + 2, 'first lookup admits the Hub fetch and the compat-cache write');
+    const second = await evaluate(t, t.alice, body);
+    assert.equal(second.status, 200, second.text);
+    assert.equal(second.json.cached, true, 'identical input replays the cached decision');
+    assert.equal(upstreamCalls, 1, 'Hub metadata is not re-fetched');
+    assert.equal(await spent(), c1, 'cached reads claim nothing');
+    const third = await evaluate(t, t.alice, { ...body, context: 4096 });
+    assert.equal(third.status, 200, third.text);
+    assert.equal(third.json.cached, false, 'changed input misses the compat cache');
+    assert.equal(upstreamCalls, 1, 'Hub-cache hit needs no outbound fetch');
+    assert.equal(await spent(), c1 + 1, 'only the compat-cache write is metered on a Hub hit');
+  } finally {
+    globalThis.fetch = realFetch;
+    __resetHubMetaCache();
+  }
 });
 
 test('AC06: two nodes never combine; evaluation uses exactly the named node', async () => {

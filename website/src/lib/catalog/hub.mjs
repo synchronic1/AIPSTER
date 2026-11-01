@@ -181,7 +181,7 @@ function hubQuery(params) {
 
 // Live search follows Hub `Link: next` pages (bounded) to honor offset
 // without inventing results. Returns items + total-when-known.
-export async function hubSearch(params = {}, { token } = {}) {
+export async function hubSearch(params = {}, { token, admit } = {}) {
   const limit = Math.min(Math.max(Number(params.limit) || 20, 1), HUB_PAGE_LIMIT);
   const offset = Math.max(Number(params.offset) || 0, 0);
   const want = offset + limit;
@@ -189,6 +189,10 @@ export async function hubSearch(params = {}, { token } = {}) {
   let url = `https://${HUB_API_HOST}/api/models?${hubQuery({ ...params, limit: Math.min(want, 100) })}`;
   let calls = 0;
   let total = null;
+  // Outbound admission (R2): every search pages the Hub, so the caller
+  // admits the principal before the first fetch; a spent budget 429s
+  // with zero upstream calls.
+  if (admit) await admit();
   for (; calls < 5 && items.length < want; calls++) {
     const res = await hubFetch(url, { token });
     if (res.status === 429) throw hubError(502, 'HUB_RATE_LIMITED', 'The model Hub rate-limited this search; retry shortly.', { retryable: true });
@@ -236,7 +240,7 @@ function hubCacheStore(key, value) {
   hubMetaCache.set(key, { at: Date.now(), value });
 }
 
-export async function hubDetail(repo, { token } = {}) {
+export async function hubDetail(repo, { token, admit } = {}) {
   if (!isRepoId(repo)) throw hubError(400, 'BAD_REPO', 'Repository must look like org/name.');
   const cacheKey = await hubCacheKey(repo, token);
   const cached = hubMetaCache.get(cacheKey);
@@ -244,6 +248,12 @@ export async function hubDetail(repo, { token } = {}) {
     if (cached.value === null) return null;
     return { ...cached.value, calls: { metadata: 0, weights: 0 } };
   }
+  // Outbound admission (R2): cache hits return free above, but a miss
+  // fetches - so the caller admits the principal first. The admission
+  // covers whatever the fetch returns (metadata, cached 404, cached
+  // 401/403, or an uncached error that re-admits on retry); a spent
+  // budget 429s with zero upstream calls.
+  if (admit) await admit();
   const res = await hubFetch(`https://${HUB_API_HOST}/api/models/${repo}`, { token });
   if (res.status === 404) {
     hubCacheStore(cacheKey, null);

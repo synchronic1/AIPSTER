@@ -6,7 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
-import { assertHubUrl, normalizeHubModel, hubDetail, __resetHubMetaCache } from '../src/lib/catalog/hub.mjs';
+import { assertHubUrl, normalizeHubModel, hubDetail, hubSearch, __resetHubMetaCache } from '../src/lib/catalog/hub.mjs';
+import { budgetWindow } from '../src/lib/quotas.js';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 
@@ -217,5 +218,75 @@ test('Codex-sec-P2: hub cache stores 404s, never errors', async () => {
   } finally {
     globalThis.fetch = realFetch;
     __resetHubMetaCache();
+  }
+});
+
+test('R2: hub misses admit before fetching; cached hits never admit', async () => {
+  __resetHubMetaCache();
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  let admits = 0;
+  const model = { id: 'o/m', sha: 'a'.repeat(40), tags: [], siblings: [], likes: 1 };
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { status: 200, ok: true, headers: new Headers(), json: async () => model };
+  };
+  const admit = async () => { admits += 1; };
+  try {
+    await hubDetail('o/m', { admit });
+    assert.equal(admits, 1, 'first lookup admits the fetch');
+    assert.equal(calls, 1);
+    await hubDetail('o/m', { admit });
+    assert.equal(admits, 1, 'cache hits never admit');
+    assert.equal(calls, 1, 'cache hits fetch nothing');
+    await assert.rejects(() => hubDetail('o/other', { admit: async () => { throw new Error('spent'); } }), /spent/);
+    assert.equal(calls, 1, 'refused admission fetches nothing');
+  } finally {
+    globalThis.fetch = realFetch;
+    __resetHubMetaCache();
+  }
+});
+
+test('R2: hubSearch admits once before paging', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  let admits = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { status: 200, ok: true, headers: new Headers(), json: async () => [] };
+  };
+  try {
+    await hubSearch({ q: 'x' }, { admit: async () => { admits += 1; } });
+    assert.equal(admits, 1);
+    assert.equal(calls, 1);
+    await assert.rejects(() => hubSearch({ q: 'y' }, { admit: async () => { throw new Error('spent'); } }), /spent/);
+    assert.equal(calls, 1, 'refused admission pages nothing');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('R2: live search admits before outbound paging', async () => {
+  const t = await createTestEnv({});
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    assert.equal(url.hostname, 'huggingface.co', 'all network is mocked; unexpected destinations are refused');
+    calls += 1;
+    return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const ok = await readJson(await t.call('/api/catalog/search?limit=2', { headers: t.as(t.alice) }));
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(calls, 1, 'fresh search pages once');
+    await t.DB.prepare('INSERT OR REPLACE INTO write_budget (user_id, window, count) VALUES (?, ?, ?)')
+      .bind('u_alice', budgetWindow(), 120).run();
+    const denied = await readJson(await t.call('/api/catalog/search?limit=2', { headers: t.as(t.alice) }));
+    assert.equal(denied.status, 429, denied.text);
+    assert.equal(denied.json.code, 'WRITE_RATE_LIMITED');
+    assert.equal(calls, 1, 'spent budget pages nothing');
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });

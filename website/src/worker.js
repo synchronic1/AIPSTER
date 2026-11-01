@@ -382,7 +382,7 @@ function validateCapabilityBody(body) {
 // One resolver for hub/fixture/private refs (compat + plans share it).
 // Private refs re-check ownership (404 like any missing id);
 // non-validated private bytes cannot evaluate (AC12).
-async function resolveCatalogRef(db, env, userId, ref, role) {
+async function resolveCatalogRef(db, env, userId, ref, role, admit = null) {
   const fixture = isFixtureEnv(env);
   let asset = null;
   if (ref.startsWith('priv:')) {
@@ -390,7 +390,7 @@ async function resolveCatalogRef(db, env, userId, ref, role) {
     if (row) asset = await privateAssetShape(db, row);
   } else {
     const clean = ref.startsWith('hub:') ? ref.slice(4) : ref;
-    asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, {});
+    asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, { admit });
   }
   if (!asset || asset.gated === true) return { http: json(404, { error: `${role} not found or not visible to you.`, code: 'ASSET_NOT_FOUND' }) };
   if (asset.source === 'private' && asset.validation !== 'validated') {
@@ -1334,7 +1334,7 @@ async function handleApi(request, env, url) {
     }
     try {
       const fixture = isFixtureEnv(env) || isDemo();
-      const result = fixture ? fixtureSearch(params) : await hubSearch(params, {});
+      const result = fixture ? fixtureSearch(params) : await hubSearch(params, { admit: () => checkWriteBudget(db, me()) });
       if (!compat) return json(200, { ...result, fixture });
       // Per-item evaluation against the named node only (AC06: nodes are
       // never combined). Snapshot loads once; evaluation is pure.
@@ -1374,7 +1374,7 @@ async function handleApi(request, env, url) {
       if (!validateRepoId(clean)) return json(400, { error: 'Repository must look like org/name.', code: 'BAD_REPO' });
       try {
         const fixture = isFixtureEnv(env) || isDemo();
-        const asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, {});
+        const asset = fixture ? fixtureDetail(clean) : await hubDetail(clean, { admit: () => checkWriteBudget(db, me()) });
         if (!asset) return json(404, { error: 'Model not found on the Hub.', code: 'ASSET_NOT_FOUND' });
         return json(200, { ...asset, fixture });
       } catch (e) {
@@ -1428,7 +1428,7 @@ async function handleApi(request, env, url) {
     if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
     try {
       const fixture = isFixtureEnv(env);
-      const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role);
+      const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role, () => checkWriteBudget(db, me()));
       const resolved = await ref(repo || assetId, 'Model');
       if (resolved.http) return resolved.http;
       const asset = resolved.asset;
@@ -2348,7 +2348,7 @@ async function handleApi(request, env, url) {
     }
     const node = await catalogNodeAccess(db, me(), nodeId);
     if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
-    const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role);
+    const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role, () => checkWriteBudget(db, me()));
     const resolved = await ref(assetRef, 'Model');
     if (resolved.http) return resolved.http;
     const asset = resolved.asset;
@@ -2448,7 +2448,7 @@ async function handleApi(request, env, url) {
     // pins, snapshot freshness, and the full evaluation re-run now.
     const node = await catalogNodeAccess(db, me(), plan.nodeId);
     if (!node) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
-    const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role);
+    const ref = async (r, role) => resolveCatalogRef(db, env, me(), r, role, () => checkWriteBudget(db, me()));
     const resolved = await ref(plan.asset.ref, 'Model');
     if (resolved.http) return resolved.http;
     let adapterAsset = null;
