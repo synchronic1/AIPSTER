@@ -81,7 +81,7 @@ def make_server(state):
                 self._send(state.claim_status, payload)
             elif self.path.endswith("/heartbeat"):
                 secret = (self.headers.get("Authorization") or "").replace("Bearer ", "")
-                state.beats.append({"usable": body.get("usable"), "key": secret})
+                state.beats.append({"usable": body.get("usable"), "key": secret, "body": body})
                 if state.beat_plan:
                     status, payload, retry = state.beat_plan.pop(0)
                 elif secret not in state.live_keys:
@@ -179,6 +179,63 @@ class PairingTests(unittest.TestCase):
         body = send_heartbeat(meta["api_base"], meta["resource_id"], meta["heartbeat_key"], False)
         self.assertTrue(body["ok"])
         self.assertEqual(self.state.beats[0]["usable"], False)
+
+    def test_heartbeat_body_is_unchanged_without_models(self):
+        run_cli("pair", self.pair_args())
+        meta = load_pairing(self.data)
+        send_heartbeat(meta["api_base"], meta["resource_id"], meta["heartbeat_key"], True)
+        self.assertEqual(self.state.beats[0]["body"], {"usable": True},
+                         "the pre-inventory body is exactly {\"usable\": bool}")
+
+    def test_heartbeat_carries_a_bounded_model_list_when_given(self):
+        run_cli("pair", self.pair_args())
+        meta = load_pairing(self.data)
+        advert = {"runtime_id": "llama-server", "model_ids": ["m-1", "m-2"]}
+        send_heartbeat(meta["api_base"], meta["resource_id"], meta["heartbeat_key"], True,
+                       models=advert)
+        self.assertEqual(self.state.beats[0]["body"]["models"], advert)
+        self.assertNotIn(FAKE_SECRET, json.dumps(self.state.beats[0]["body"]),
+                         "the advertised inventory carries no credential")
+
+    def test_bound_advertised_models_enforces_the_intake_bounds(self):
+        ids = (["ok", "dup", "dup", "x" * 129, "bad\u0001", " pad "]
+               + ["m%02d" % i for i in range(40)])
+        bound = pairing.bound_advertised_models("llama-server", ids)
+        self.assertEqual(bound["runtime_id"], "llama-server")
+        self.assertEqual(len(bound["model_ids"]), pairing.ADVERTISED_MODELS_MAX)
+        self.assertEqual(bound["model_ids"][0], "ok")
+        self.assertEqual(bound["model_ids"].count("dup"), 1, "duplicates collapsed")
+        self.assertNotIn("x" * 129, bound["model_ids"])
+        self.assertNotIn("bad\u0001", bound["model_ids"])
+        self.assertIsNone(pairing.bound_advertised_models("ganglion", []),
+                          "an empty advertisement is never sent")
+        self.assertIsNone(pairing.bound_advertised_models("ganglion", ["x" * 129]))
+
+    def test_advertise_models_is_off_unless_the_flag_is_set(self):
+        self.assertIsNone(pairing.build_model_advertiser(argparse_namespace({})))
+        self.assertIsNone(pairing.build_model_advertiser(
+            argparse_namespace({"advertise_models": False})))
+
+    def test_advertise_config_is_validated_before_any_beat(self):
+        run_cli("pair", self.pair_args())
+        args = argparse_namespace({
+            "api_base": self.base, "data_dir": str(self.data), "config": None,
+            "interval": 60, "advertise_models": True, "runtime_id": "llama-cpp",
+            "upstream_url": "http://127.0.0.1:1", "allow_non_loopback_ganglion": False,
+        })
+        with redirect_stderr(io.StringIO()) as err:
+            code = cmd_heartbeat(args, loop=False)
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("BAD_RUNTIME", err.getvalue())
+        self.assertEqual(self.state.beats, [], "no beat with an invalid advertising config")
+
+        args.runtime_id = "ganglion"
+        args.upstream_url = "http://192.0.2.10:8471"
+        with redirect_stderr(io.StringIO()) as err:
+            code = cmd_heartbeat(args, loop=False)
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("BAD_GANGLION_BASE", err.getvalue())
+        self.assertEqual(self.state.beats, [])
 
     def test_heartbeat_revoked_key_demands_repair(self):
         run_cli("pair", self.pair_args())

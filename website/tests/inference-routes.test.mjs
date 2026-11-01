@@ -191,16 +191,20 @@ test('inference key and session+CSRF are both accepted for admissions and submit
 
 // ------------------------------------------------------------- admissions
 
-test('admissions: only {admission_ref, expires_at, model_id, max_tokens} is returned', async () => {
+test('admissions: only {admission_ref, expires_at, model_id, max_tokens, model_advertised} is returned', async () => {
   const t = await createTestEnv(ENABLED);
   const store = useStore(t);
   const r = await ready(t);
   const out = await admit(t, t.alice, { resource_id: r.resource.id, max_tokens: 128 });
   assert.equal(out.status, 201, out.text);
-  assert.deepEqual(Object.keys(out.json).sort(), ['admission_ref', 'expires_at', 'max_tokens', 'model_id']);
+  assert.deepEqual(Object.keys(out.json).sort(),
+    ['admission_ref', 'expires_at', 'max_tokens', 'model_advertised', 'model_id']);
   assert.match(out.json.admission_ref, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
   assert.equal(out.json.model_id, MODEL);
   assert.equal(out.json.max_tokens, 128);
+  // This fixture never advertises models, so the pre-inventory path applies
+  // and the response says so explicitly (W1).
+  assert.equal(out.json.model_advertised, false);
   assert.ok(out.json.expires_at > Date.now());
   assert.equal(Object.keys(store.state.admissions).length, 1);
 });

@@ -120,6 +120,33 @@ Compute after pairing to refresh the resource list. If the key is revoked or
 expires, the sender exits asking for a fresh pairing code. `pairing.py status`
 shows secret-free local status and marks old success as stale.
 
+### Advertising models (opt-in, off by default)
+
+A heartbeat proves reachability only. If you also want the server to refuse an
+unknown model *before* it holds budget, opt the sender in:
+
+```powershell
+.\.venv\Scripts\python.exe pairing.py heartbeat-loop --config configs/mock.toml `
+  --advertise-models --upstream-url http://127.0.0.1:8471 --runtime-id ganglion
+```
+
+With `--advertise-models` each beat additionally carries the upstream's current
+`GET /v1/models` ids (bounded: at most 32 ids of at most 128 printable
+characters, duplicates collapsed) and the configured `--runtime-id`, so
+admission refuses a model this machine does not serve with
+`409 MODEL_NOT_ADVERTISED` instead of queueing a job that would fail later.
+The list is stored per resource with the beat that carried it as its
+observation time; admission trusts it for 5 minutes and a beat without models
+leaves it in place to age out.
+
+Default off: without the flag the body is exactly `{"usable": ...}`, as before.
+If the upstream is down, slow, or returns junk, the beat is still sent — without
+models — and never blocks, fails, or changes an exit code. The upstream token is
+used only against the upstream and is never placed in a heartbeat; nothing but
+model ids and the runtime id is sent. The same flags exist on
+`heartbeat-once`; both validate the upstream URL and runtime id at startup and
+exit 2 on a bad one before sending any beat.
+
 No packaged installer is published yet: the built 0.1.0 package predates the
 API edge-compat fix and will not be published, so tray pairing arrives with
 the next published qualified installer. Until then, packaged installs cannot
@@ -253,9 +280,10 @@ action, so a wedged upstream can still be killed. The job lock is created
 user-only (`0600`) and opened without following symlinks; a lock path that
 cannot be used exits 2 rather than being misreported as a second runner.
 
-`status`, `heartbeat-once`/`heartbeat-loop`, `pair` and `unpair` are unchanged,
-and heartbeats still prove reachability only: `usable` stays false for the mock
-config, and running jobs here does not change what the dashboard reports.
+`status`, `heartbeat-once`/`heartbeat-loop`, `pair` and `unpair` are unchanged
+apart from the opt-in `--advertise-models` above, and heartbeats still prove
+reachability only: `usable` stays false for the mock config, and running jobs
+here does not change what the dashboard reports.
 
 In a second terminal, set `$env:DENDRITE_API_TOKEN` to the same value, then:
 

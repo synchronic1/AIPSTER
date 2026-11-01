@@ -66,13 +66,22 @@ try {
   step('mint pairing code', mint.status === 201, String(mint.status));
   const pair = await pyAsync(['pair', '--code', mint.json.code]);
   step('python pair', pair.code === 0, `exit ${pair.code}`);
-  const beat = await pyAsync(['heartbeat-once']);
-  step('python heartbeat-once', beat.code === 0, `exit ${beat.code}`);
+  // W1: the opt-in inventory. The heartbeat still proves reachability only,
+  // and the bounded model list it carries lets admission refuse unknown models.
+  const beat = await pyAsync(['heartbeat-once', '--advertise-models', '--upstream-url', UP, '--runtime-id', RUNTIME]);
+  step('python heartbeat-once --advertise-models', beat.code === 0, `exit ${beat.code} ${beat.out.replace(/\s+/g, ' ').slice(0, 200)}`);
+  const modelHits = calls.filter((c) => c.method === 'GET' && c.url === '/v1/models');
+  step('worker probed /v1/models once', modelHits.length === 1, String(modelHits.length));
   const inv = await readJson(await t.call('/api/inventory', { headers: S }));
   const resourceId = inv.json.items[0].id;
   const adm = await readJson(await t.call('/api/inference/admissions', { method: 'POST', headers: S,
     body: { resource_id: resourceId, model_id: MODEL, max_tokens: 32, runtime_id: RUNTIME } }));
   step('admission', adm.status === 201, adm.text.slice(0, 160));
+  step('admission reports the advertised model', adm.json?.model_advertised === true, JSON.stringify(adm.json?.model_advertised));
+  const unknown = await readJson(await t.call('/api/inference/admissions', { method: 'POST', headers: S,
+    body: { resource_id: resourceId, model_id: 'not-a-listed-model', max_tokens: 32, runtime_id: RUNTIME } }));
+  step('unknown model refused at admission', unknown.status === 409 && unknown.json?.code === 'MODEL_NOT_ADVERTISED',
+    `${unknown.status} ${unknown.text.slice(0, 160)}`);
   const key = 'alice-pye2e-00000001';
   const sub = await readJson(await t.call('/api/jobs', { method: 'POST', headers: S, body: { contract_version: 'v1.0.0',
     admission_ref: adm.json.admission_ref, idempotency_key: key, model_id: MODEL, prompt: 'Say hello', max_tokens: 32,

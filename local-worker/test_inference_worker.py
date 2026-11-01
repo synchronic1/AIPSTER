@@ -233,6 +233,7 @@ class FakeApiState:
         self.result_plan = []     # (status, body) overriding the accepted result
         self.live_keys = {FAKE_SECRET}
         self.claims = []
+        self.beats = []           # {"body", "key"} heartbeat intake records
         self.next_hits = 0
         self.auth_seen = []
         self.user_agents = []
@@ -306,6 +307,13 @@ def make_api_server(state):
                 else:
                     status, payload = 200, {"accepted": True}
                 return self._send(status, payload)
+            if path.endswith("/heartbeat"):
+                key = self._auth()
+                state.beats.append({"body": body, "key": key})
+                if key not in state.live_keys:
+                    return self._send(401, {"code": "KEY_REVOKED", "error": "revoked"})
+                return self._send(200, {"ok": True, "heartbeatAt": "2026-11-01T00:00:00.000Z",
+                                        "online": True, "usable": body.get("usable")})
             return self._send(404, {"code": "NOT_FOUND", "error": "no route"})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -318,6 +326,7 @@ class FakeGanglionState:
         self.models = [MODEL]
         self.models_status = 200
         self.models_hits = 0
+        self.models_headers = []
         self.completion_status = 200
         self.completion_body = completion_body()
         self.completion_delay = 0.0
@@ -348,6 +357,7 @@ def make_ganglion_server(state):
         def do_GET(self):
             if urlparse(self.path).path == "/v1/models":
                 state.models_hits += 1
+                state.models_headers.append(dict(self.headers))
                 if state.models_status != 200:
                     return self._send(state.models_status, {"error": "boom"})
                 return self._send(200, {"object": "list",
@@ -1278,6 +1288,111 @@ class InferenceWorkerTests(unittest.TestCase):
                          inference_worker.DEADLINE_EXCEEDED)
         self.assertFalse(StartedLedger(self.data).contains("job_1"),
                          "an expired lease is never recorded as started")
+
+
+class HeartbeatModelAdvertisingTests(unittest.TestCase):
+    """Opt-in heartbeat model inventory (W1): worker side.
+
+    The same synthetic API/Ganglion fakes as the job tests. Nothing here
+    touches a real upstream: the model probe is an ordinary loopback GET.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name) / "data"
+        self.api = FakeApiState()
+        self.api_server, self.base = make_api_server(self.api)
+        self.addCleanup(self.api_server.server_close)
+        self.addCleanup(self.api_server.shutdown)
+        self.ganglion = FakeGanglionState()
+        self.ganglion_server, self.gbase = make_ganglion_server(self.ganglion)
+        self.addCleanup(self.ganglion_server.server_close)
+        self.addCleanup(self.ganglion_server.shutdown)
+        args = type("Args", (), {})()
+        args.api_base = self.base
+        args.data_dir = str(self.data)
+        args.config = None
+        args.name = None
+        args.code = FAKE_CODE
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(pairing.cmd_pair(args), pairing.EXIT_OK)
+
+    def heartbeat_args(self, **over):
+        values = {"api_base": self.base, "data_dir": str(self.data), "config": None,
+                  "interval": 60, "advertise_models": False,
+                  "upstream_url": self.gbase, "runtime_id": "ganglion",
+                  "allow_non_loopback_ganglion": False}
+        values.update(over)
+        args = type("Args", (), {})()
+        for key, value in values.items():
+            setattr(args, key, value)
+        return args
+
+    def beat(self, **over):
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = pairing.cmd_heartbeat(self.heartbeat_args(**over), loop=False)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_default_off_sends_no_models_and_never_probes_the_upstream(self):
+        code, _, err = self.beat()
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.models_hits, 0, "opt-in: no upstream probe")
+        self.assertEqual(len(self.api.beats), 1)
+        self.assertEqual(self.api.beats[0]["body"], {"usable": False})
+
+    def test_advertises_the_bounded_upstream_list_for_the_configured_runtime(self):
+        self.ganglion.models = ["m-a", "m-b"]
+        code, _, err = self.beat(advertise_models=True, runtime_id="llama-server")
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(self.ganglion.models_hits, 1)
+        body = self.api.beats[0]["body"]
+        self.assertEqual(body["models"],
+                         {"runtime_id": "llama-server", "model_ids": ["m-a", "m-b"]})
+        self.assertEqual(body["usable"], False)
+
+    def test_oversized_and_excess_ids_are_dropped_and_capped(self):
+        self.ganglion.models = (["first", "x" * 200]
+                                + ["m%02d" % i for i in range(40)])
+        code, _, err = self.beat(advertise_models=True)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        ids = self.api.beats[0]["body"]["models"]["model_ids"]
+        self.assertEqual(len(ids), pairing.ADVERTISED_MODELS_MAX)
+        self.assertEqual(ids[0], "first")
+        self.assertNotIn("x" * 200, ids)
+        for value in ids:
+            self.assertLessEqual(len(value), pairing.ADVERTISED_MODEL_ID_MAX_CHARS)
+
+    def test_upstream_down_still_sends_the_heartbeat_without_models(self):
+        code, _, err = self.beat(advertise_models=True,
+                                 upstream_url="http://127.0.0.1:1")
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(len(self.api.beats), 1, "the reachability beat is never blocked")
+        self.assertNotIn("models", self.api.beats[0]["body"])
+
+    def test_upstream_error_or_empty_list_omits_models(self):
+        self.ganglion.models_status = 503
+        code, _, err = self.beat(advertise_models=True)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertNotIn("models", self.api.beats[0]["body"])
+
+        self.ganglion.models_status = 200
+        self.ganglion.models = []
+        self.api.beats.clear()
+        code, _, err = self.beat(advertise_models=True)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertNotIn("models", self.api.beats[0]["body"])
+
+    def test_upstream_token_is_sent_only_to_the_upstream_never_in_the_beat(self):
+        token = "synthetic-upstream-token-0123456789abcdef"
+        with mock.patch.dict(os.environ, {inference_worker.GANGLION_TOKEN_ENV: token}):
+            code, _, err = self.beat(advertise_models=True)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertTrue(any(h.get("Authorization") == "Bearer " + token
+                            for h in self.ganglion.models_headers),
+                        "the configured upstream token reaches the loopback upstream")
+        self.assertNotIn(token, json.dumps(self.api.beats[0]["body"]))
 
 
 if __name__ == "__main__":

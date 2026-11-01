@@ -14,7 +14,7 @@ lazily and its absence fails closed with `503 DISPATCH_UNAVAILABLE`.
 
 | Route | Auth | Body / query | Success |
 |---|---|---|---|
-| `POST /api/inference/admissions` | session + CSRF, or inference-scoped key | `{resource_id, model_id, max_tokens, runtime_id?}` | `201 {admission_ref, expires_at, model_id, max_tokens}` |
+| `POST /api/inference/admissions` | session + CSRF, or inference-scoped key | `{resource_id, model_id, max_tokens, runtime_id?}` | `201 {admission_ref, expires_at, model_id, max_tokens, model_advertised}` |
 | `POST /api/jobs` | session + CSRF, or inference-scoped key | coordinator `v1.0.0` body | `202` dispatched, or coordinator state |
 | `GET /api/jobs/:idempotency_key` | session or inference-scoped key | — | `200` settled (`outcome.released` / withheld), `202` still dispatched, `409` pending |
 | `POST /api/jobs/:idempotency_key/cancel` | session + CSRF, or inference-scoped key | — | `202` with `cancel: UNSUPPORTED_CAPABILITY` after start; pre-start fence+release returns `200 CANCELLED` |
@@ -36,8 +36,18 @@ The issuer checks, before calling `store.issueAdmission`:
    (`lib/status.mjs` `resourceLiveness` with `STALE_AFTER_MS`, i.e. `online = 1`
    and a heartbeat inside the 5-minute window). Anything else is
    `409 RESOURCE_STALE`.
-3. `max_tokens` is an integer in `1..4096` (`400 BAD_MAX_TOKENS`).
-4. `runtime_id` is absent (default `ganglion`) or exactly `ganglion` or
+3. The requested `model_id` is in the resource's **fresh advertised inventory**
+   (`resource_models`, migration 0025). A worker that opts in
+   (`--advertise-models`) sends the ids from its upstream's `GET /v1/models`
+   with each heartbeat; admission refuses an id outside that list with
+   `409 MODEL_NOT_ADVERTISED` instead of queueing a job that the worker would
+   only reject later (`MODEL_UNAVAILABLE`, after a budget hold). "Fresh" is the
+   same 5-minute window as reachability; an older list is not authority.
+   Without a fresh list — never advertised, stale, or unreadable — the
+   pre-inventory behaviour is kept (accepted), and the response carries
+   `model_advertised: false` so the caller can tell the two apart.
+4. `max_tokens` is an integer in `1..4096` (`400 BAD_MAX_TOKENS`).
+5. `runtime_id` is absent (default `ganglion`) or exactly `ganglion` or
    `llama-server` (`400 BAD_RUNTIME` otherwise, including any non-string). This
    check runs before the store, so a refused value mints nothing.
 
@@ -60,7 +70,9 @@ is one complete no-stitching authority. Exhausted quota is
 `429 GRANT_QUOTA_EXHAUSTED`; a grant that does not cover the exact request is
 `403 NO_MATCHING_GRANT`.
 
-The response carries only the four admission fields. The record itself
+The response carries only the five admission fields (`model_advertised` is
+`true` when a fresh inventory vouched for the model, `false` when the issuer
+fell back to the pre-inventory behaviour). The record itself
 (principal, tenant, resource, node/runtime ids, model, ceiling, grant
 id/revision, 10-minute expiry, pools) is server-side. The owner self-use pool is
 `owner:<user_id>:<yyyy-mm-dd UTC>` with the ceiling from
