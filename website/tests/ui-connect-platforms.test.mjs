@@ -334,3 +334,16 @@ test('denied copy focuses the read-only fallback for keyboard users', async () =
   assert.ok(retry, 'keyboard-focusable retry control');
   assert.equal(buttonText(retry), 'Try copying again');
 });
+
+test('retry failure rebuilds a lost redaction; download never carries the code', async () => {
+  const ui = fixture({ platform: 'Win32', get clipboard() { throw new Error('denied'); } },
+    { mint: async () => mintResponse(fakeMintBody()) });
+  await ui.pick('windows');
+  await ui.press('gen-setup');
+  ui.run(`connect.fallbackRedacted = ''`);
+  await ui.press('setup-copy');
+  ui.save();
+  const text = await ui.blob().text();
+  assert.doesNotMatch(text, new RegExp(FAKE_CODE), 'rebuilt redaction carries no code');
+  assert.match(text, /PAIRING CODE: \[code redacted/, 'redaction marker rebuilt in place');
+});

@@ -855,6 +855,13 @@ async function retrySetupCopy() {
     if (!bound()) return;
     card.phase = 'setup-failed';
     card.fallback = setup.packet;
+    if (!card.fallbackRedacted) {
+      // Never route the download to a code-bearing packet: rebuild the
+      // redaction from the packet itself when nothing persisted.
+      card.fallbackRedacted = setup.code
+        ? setup.packet.replace(`PAIRING CODE: ${setup.code}`, `PAIRING CODE: ${REDACTED_CODE}`)
+        : '';
+    }
   }
   paintConnectCard();
 }
@@ -1229,6 +1236,7 @@ function resetState() {
 
 document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('click', () => {
   clearPairingCode();
+  clearSetupCode();
   if (connect) paintConnectCard();
   generation++;
   document.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', b === btn ? 'true' : 'false'));
