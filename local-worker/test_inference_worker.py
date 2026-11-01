@@ -59,6 +59,18 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def dir_reached_through_a_symlink(path):
+    """True when `path` is a directory whose path traverses a symlink.
+
+    Finding 4437415004: deciding the macOS-only test on
+    ``Path("/var/tmp").is_dir()`` alone enabled it on Linux, where /var is a
+    real directory, and its symlink-prefix assertion then failed
+    unconditionally. The layout, not mere existence, has to decide.
+    """
+    path = Path(path)
+    return path.is_dir() and path.resolve() != path
+
+
 def task(model=MODEL, prompt="hello there", max_tokens=16,
          node_id=FAKE_RESOURCE, runtime_id="ganglion", **over):
     """One bound-CPU task: exactly what encodeBoundCpuTask emits.
@@ -528,6 +540,45 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(idle, cap)
         # Even a direct probe far past the cap never computes 2 ** idle.
         self.assertEqual(runner._idle_delay(10 ** 6), 30.0)
+
+    def test_idle_backoff_resets_after_a_leased_job(self):
+        # Independent check of a5c2674: capping the exponent must not stop a
+        # leased job from resetting the counter. Without the reset the next
+        # empty poll would keep waiting at the 30 s cap instead of restarting.
+        sleeps = []
+        self.api.next_plan = [(204, None, {})] * 4
+        self.api.leases = [lease()]
+        runner = self.runner(sleep=sleeps.append, poll_interval=2.0,
+                             max_idle_sec=30.0)
+        code, _, err = self.run_quiet(runner, max_cycles=6)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(len(self.api.results), 1)
+        self.assertEqual(sleeps[:4], [2.0, 4.0, 8.0, 16.0])
+        self.assertEqual(sleeps[4], 2.0,
+                         "a leased job resets the idle backoff to its base")
+
+    def test_retry_after_wins_over_the_capped_idle_delay(self):
+        # Independent check of a5c2674: Retry-After keeps precedence even once
+        # the idle delay has reached max_idle, so a server hint shorter than
+        # the cap is still honoured.
+        sleeps = []
+        polls = {"n": 0}
+
+        def fake_fetch(*args, **kwargs):
+            polls["n"] += 1
+            if polls["n"] <= 6:
+                return None, None
+            return None, 3.0
+
+        with mock.patch.object(inference_worker, "fetch_next", fake_fetch):
+            code, _, err = self.run_quiet(
+                self.runner(sleep=sleeps.append, poll_interval=2.0,
+                            max_idle_sec=30.0),
+                max_cycles=7)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(sleeps[:6], [2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+        self.assertEqual(sleeps[6], 3.0,
+                         "Retry-After takes precedence over the capped delay")
 
     def test_retry_after_on_204_is_honored(self):
         sleeps = []
@@ -1239,15 +1290,11 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertTrue(StartedLedger(self.data).contains("job_1"))
         self.assertNotIn(FAKE_SECRET, err)
 
-    @unittest.skipUnless(Path("/var/tmp").is_dir(), "macOS /var -> /private/var layout")
-    def test_private_store_reached_through_the_var_symlink_prefix(self):
-        # macOS reaches /private/var through the /var symlink, and
-        # tempfile.gettempdir() hands back such a prefix-only path. The
-        # private-store checks look at the final component only, so a data
-        # dir under it must still be provisioned 0700 with 0600 files.
-        raw = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="aipster-l4-"))
+    def _assert_private_store_under_prefix(self, base):
+        """The private store must be provisioned through a symlinked prefix."""
+        raw = Path(tempfile.mkdtemp(dir=str(base), prefix="aipster-l4-"))
         self.addCleanup(shutil.rmtree, str(raw), True)
-        self.assertNotEqual(raw.resolve(), raw, "/var is a symlink prefix")
+        self.assertNotEqual(raw.resolve(), raw, f"{base} is a symlink prefix")
         data = raw / "data"
         runner = JobRunner(data, ganglion_base=self.gbase, poll_interval=0.01)
         code, _, err = self.run_quiet(runner, max_cycles=0)
@@ -1260,6 +1307,47 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(ledger_path.stat().st_mode), 0o600)
         self.assertEqual(sorted(json.loads(ledger_path.read_text())["job_ids"]),
                          ["job_var"])
+
+    @unittest.skipUnless(dir_reached_through_a_symlink("/var/tmp"),
+                         "macOS /var -> /private/var layout")
+    def test_private_store_reached_through_the_var_symlink_prefix(self):
+        # macOS reaches /private/var through the /var symlink, and
+        # tempfile.gettempdir() hands back such a prefix-only path. The
+        # private-store checks look at the final component only, so a data
+        # dir under it must still be provisioned 0700 with 0600 files.
+        self._assert_private_store_under_prefix(Path("/var/tmp"))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink fixture")
+    def test_private_store_reached_through_a_symlinked_prefix_fixture(self):
+        # The same layout, built portably, so non-macOS hosts such as Linux
+        # (finding 4437415004) still exercise a symlinked prefix. The root is
+        # resolved first: only the fixture's own `var` link may be unresolved.
+        root = Path(tempfile.mkdtemp(prefix="aipster-l4-root-")).resolve()
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "private" / "var").mkdir(parents=True)
+        link = root / "var"
+        os.symlink(os.path.join("private", "var"), str(link))
+        self.addCleanup(lambda: link.is_symlink() and link.unlink())
+        self.assertEqual(link.resolve(), root / "private" / "var")
+        self._assert_private_store_under_prefix(link)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink fixture")
+    def test_symlink_prefix_guard_ignores_a_real_directory(self):
+        # Finding 4437415004: a real directory prefix (Linux /var) must not
+        # enable the macOS-only test, or the suite fails on that host.
+        root = Path(tempfile.mkdtemp(prefix="aipster-l4-real-")).resolve()
+        self.addCleanup(shutil.rmtree, str(root), True)
+        real = root / "var" / "tmp"
+        real.mkdir(parents=True)
+        self.assertTrue(real.is_dir())
+        self.assertFalse(dir_reached_through_a_symlink(real),
+                         "a real directory prefix is not the macOS layout")
+        (root / "private" / "var").mkdir(parents=True)
+        link = root / "var-link"
+        os.symlink(os.path.join("private", "var"), str(link))
+        self.addCleanup(lambda: link.is_symlink() and link.unlink())
+        self.assertTrue(dir_reached_through_a_symlink(link),
+                        "a symlinked prefix is the layout this test guards")
 
     def test_deadline_expiring_during_model_listing_fails_without_completion(self):
         # Wall-clock expiry, not the monotonic clock, decides a lease: a
