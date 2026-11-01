@@ -388,24 +388,36 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
       if (!['claimed', 'holding'].includes(op.phase)) return { held: false, reason: 'fenced' };
 
       const hold_id = rid16('hold_');
+      // Finding 4437293864: the initial reads above can race a cancellation
+      // that fences and releases in another isolate. Re-check the operation's
+      // exact generation and the fence tombstone inside the same atomic batch
+      // as the budget charge, so a fenced/released operation can never gain a
+      // hold and no orphaned charge can land.
+      const opAlive = `EXISTS (SELECT 1 FROM dispatch_operations o
+          WHERE o.op_id = ? AND o.generation = ? AND o.phase IN ('claimed', 'holding'))
+        AND NOT EXISTS (SELECT 1 FROM dispatch_fences f WHERE f.op_id = ? AND f.generation = ?)`;
       const insertHold = db.prepare(`INSERT OR IGNORE INTO dispatch_holds
         (hold_id, op_id, generation, pool_id, pool_kind, amount, jobs, state, created_at, updated_at)
-        SELECT ?, ?, ?, ?, ?, ?, ?, 'held', ?, ? WHERE changes() = 1`);
+        SELECT ?, ?, ?, ?, ?, ?, ?, 'held', ?, ?
+        WHERE changes() = 1 AND ${opAlive}`);
       const advance = db.prepare(`UPDATE dispatch_operations SET phase = 'holding', updated_at = ?
         WHERE op_id = ? AND generation = ? AND phase IN ('claimed', 'holding') AND changes() = 1`);
       let batch;
       if (pool_id.startsWith(GRANT_POOL_PREFIX) && pool_id.length > GRANT_POOL_PREFIX.length) {
         const grantId = pool_id.slice(GRANT_POOL_PREFIX.length);
         // Charge at hold, net of routing refunds, only for an unrevoked grant
-        // with headroom and no existing hold for this (op, pool).
+        // with headroom, no existing hold for this (op, pool), and a still-live
+        // unfenced operation at this generation.
         batch = [
           db.prepare(`UPDATE grants SET used_tokens = used_tokens + ?, used_jobs = used_jobs + ?
             WHERE id = ? AND revoked_at IS NULL
               AND used_jobs - (SELECT COALESCE(SUM(jobs), 0) FROM routing_refunds WHERE grant_id = ?) + 1 <= max_jobs
               AND used_tokens - (SELECT COALESCE(SUM(tokens), 0) FROM routing_refunds WHERE grant_id = ?) + ? <= max_tokens
-              AND NOT EXISTS (SELECT 1 FROM dispatch_holds WHERE op_id = ? AND pool_id = ?)`).bind(
-            amount, 1, grantId, grantId, grantId, amount, op_id, pool_id),
-          insertHold.bind(hold_id, op_id, generation, pool_id, 'grant', amount, 1, t, t),
+              AND NOT EXISTS (SELECT 1 FROM dispatch_holds WHERE op_id = ? AND pool_id = ?)
+              AND ${opAlive}`).bind(
+            amount, 1, grantId, grantId, grantId, amount, op_id, pool_id, op_id, generation, op_id, generation),
+          insertHold.bind(hold_id, op_id, generation, pool_id, 'grant', amount, 1, t, t,
+            op_id, generation, op_id, generation),
           advance.bind(t, op_id, generation),
         ];
       } else if (pool_id.startsWith(OWNER_PREFIX) && pool_id.length > OWNER_PREFIX.length) {
@@ -423,17 +435,27 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
             VALUES (?, 'owner', ?, ?, ?, 0, ?, ?)`).bind(pool_id, owner, day, ceiling, t, t),
           db.prepare(`UPDATE dispatch_pool_usage SET used_tokens = used_tokens + ?, updated_at = ?
             WHERE pool_id = ? AND used_tokens + ? <= ceiling_tokens
-              AND NOT EXISTS (SELECT 1 FROM dispatch_holds WHERE op_id = ? AND pool_id = ?)`).bind(
-            amount, t, pool_id, amount, op_id, pool_id),
-          insertHold.bind(hold_id, op_id, generation, pool_id, 'owner', amount, 0, t, t),
+              AND NOT EXISTS (SELECT 1 FROM dispatch_holds WHERE op_id = ? AND pool_id = ?)
+              AND ${opAlive}`).bind(
+            amount, t, pool_id, amount, op_id, pool_id, op_id, generation, op_id, generation),
+          insertHold.bind(hold_id, op_id, generation, pool_id, 'owner', amount, 0, t, t,
+            op_id, generation, op_id, generation),
           advance.bind(t, op_id, generation),
         ];
       } else {
         throw httpError(400, 'Unknown budget pool.', 'INVALID_HOLD');
       }
-      await db.batch(batch);
+      const results = await db.batch(batch);
+      // The guarded hold insert is the second-to-last statement in both
+      // branches; its zero-row result means the charge did not apply either.
+      if (changes(results, batch.length - 2) === 1) return { held: true, hold_id };
+      // A concurrent caller may have won the (op, pool) insert; replay it.
       const held = await first(db, `SELECT * FROM dispatch_holds WHERE op_id = ? AND pool_id = ?`, op_id, pool_id);
-      if (held && Number(held.generation) === generation) return { held: true, hold_id: held.hold_id };
+      if (held && Number(held.generation) === generation
+        && (held.state === 'held' || held.state === 'committed')) {
+        return { held: true, hold_id: held.hold_id };
+      }
+      if (await fencedAt(op_id, generation)) return { held: false, reason: 'fenced' };
       return { held: false, reason: 'insufficient' };
     });
   }

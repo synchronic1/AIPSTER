@@ -142,6 +142,52 @@ test('real D1: concurrent holds cannot exceed the grant ceiling or drive it nega
   assert.deepEqual(await grantUsed(db), { used_tokens: 0, used_jobs: 0 });
 });
 
+test('real D1: a cancel racing a hold cannot charge or leave an orphan hold', async (c) => {
+  const { db, clock, store } = await realD1Fixture(c);
+  const admission = await store.issueAdmission({
+    principal: bob, resource_id: RES_1, model_id: 'model-x', max_tokens: 128, grant: 'grant-1',
+  });
+  const rec = await store.resolveAdmission({ principal: bob, admission_ref: admission.admission_ref });
+  const binding = bindingFor(rec, { principal: bob });
+  const claim = await store.claimOperation({
+    op_key: nextOpKey('d1-cancel-race'), request_digest: 'sha256:cancel-race',
+    principal_id: bob.principal_id, tenant_id: bob.tenant_id, binding,
+  });
+
+  // Two stores over one real D1: the cancel commits after acquireHold's reads
+  // and before its atomic batch (the wrapper runs it on the first batch call).
+  const other = createD1DispatchStore(db, { now: clock.now, env: { INFERENCE_OWNER_DAILY_TOKENS: '10000' } });
+  let injected = false;
+  const racingDb = {
+    prepare: (...args) => db.prepare(...args),
+    batch: async (stmts) => {
+      if (!injected) {
+        injected = true;
+        assert.deepEqual(await other.fenceStart({ op_id: claim.op.op_id, generation: 1, reason: 'cancel' }),
+          { outcome: 'fenced' });
+        assert.deepEqual(await other.releaseHolds({ op_id: claim.op.op_id, generation: 1, reason: 'cancel' }),
+          { released: 0 });
+      }
+      return db.batch(stmts);
+    },
+  };
+  const racing = createD1DispatchStore(racingDb, {
+    now: clock.now, env: { INFERENCE_OWNER_DAILY_TOKENS: '10000' },
+  });
+
+  const hold = await racing.acquireHold({
+    op_id: claim.op.op_id, generation: 1, pool_id: 'grant:grant-1', amount: 128,
+  });
+  assert.deepEqual(hold, { held: false, reason: 'fenced' });
+  const holds = await db.prepare('SELECT COUNT(*) AS n FROM dispatch_holds WHERE op_id = ?')
+    .bind(claim.op.op_id).first();
+  assert.equal(holds.n, 0, 'no orphaned hold row');
+  assert.deepEqual(await grantUsed(db), { used_tokens: 0, used_jobs: 0 });
+  const op = await db.prepare('SELECT phase FROM dispatch_operations WHERE op_id = ?')
+    .bind(claim.op.op_id).first();
+  assert.equal(op.phase, 'released');
+});
+
 test('real D1: owner daily pool fails closed without a valid ceiling', async (c) => {
   const { db, store } = await realD1Fixture(c, { ownerDaily: 'not-a-number' });
   const flow = await admittedOperation({ store }, { principal: alice, max_tokens: 128 });

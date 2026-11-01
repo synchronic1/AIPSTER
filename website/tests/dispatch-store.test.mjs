@@ -12,7 +12,7 @@ import {
   T0, RES_1, RES_2, alice, bob, createStoreHarness, bindingFor, envelopeFor,
   nextOpKey, admittedOperation, dispatchedOperation, workerResult, coordinatorOverStore, submitBody,
 } from './fixtures/dispatch-store-fixture.mjs';
-import { ADMISSION_TTL_MS } from '../src/inference/dispatch-store.mjs';
+import { ADMISSION_TTL_MS, createD1DispatchStore } from '../src/inference/dispatch-store.mjs';
 import { CONTENT_MAX } from '../src/inference/worker-transport.mjs';
 import { createDispatchCoordinator } from '../src/inference/dispatch-coordinator.mjs';
 
@@ -309,6 +309,86 @@ test('holds: concurrent callers cannot exceed the owner daily ceiling', async ()
   await h.store.fenceStart({ op_id: winner.op.op_id, generation: 1 });
   await h.store.releaseHolds({ op_id: winner.op.op_id, generation: 1 });
   assert.equal(ownerPool(h.sqlite, 'owner:user-alice:2026-03-01').used_tokens, 0);
+});
+
+// Finding 4437293864 (P1): acquireHold reads the operation, then writes. A
+// cancellation that fences and releases in that window must not let the hold
+// insert (or its budget charge) land. Two store instances over one database
+// model the two HTTP requests; the racing batch runs the cancel first.
+async function claimForCancelledRace(h, { principal = bob, grant = 'grant-1' } = {}) {
+  const a = await h.store.issueAdmission({
+    principal, resource_id: RES_1, model_id: 'model-x', max_tokens: 128, ...(grant ? { grant } : {}),
+  });
+  const rec = await h.store.resolveAdmission({ principal, admission_ref: a.admission_ref });
+  const claim = await h.store.claimOperation({
+    op_key: nextOpKey('cancel-race'), request_digest: 'sha256:cancel-race',
+    principal_id: principal.principal_id, tenant_id: principal.tenant_id,
+    binding: bindingFor(rec, { principal }),
+  });
+  return { admission: a, rec, claim };
+}
+
+function racingStore(h, cancel) {
+  const other = createD1DispatchStore(h.db, {
+    now: h.clock.now, env: { INFERENCE_OWNER_DAILY_TOKENS: '10000' },
+  });
+  let injected = false;
+  const racingDb = {
+    prepare: (...args) => h.db.prepare(...args),
+    batch: async (stmts) => {
+      if (!injected) {
+        injected = true;
+        await cancel(other);
+      }
+      return h.db.batch(stmts);
+    },
+  };
+  return createD1DispatchStore(racingDb, {
+    now: h.clock.now, env: { INFERENCE_OWNER_DAILY_TOKENS: '10000' },
+  });
+}
+
+test('holds: a cancel racing a grant hold cannot charge or leave an orphan hold', async () => {
+  const h = createStoreHarness();
+  const { claim } = await claimForCancelledRace(h);
+  const store = racingStore(h, async (other) => {
+    assert.deepEqual(await other.fenceStart({ op_id: claim.op.op_id, generation: 1, reason: 'cancel' }),
+      { outcome: 'fenced' });
+    assert.deepEqual(await other.releaseHolds({ op_id: claim.op.op_id, generation: 1, reason: 'cancel' }),
+      { released: 0 });
+  });
+
+  const hold = await store.acquireHold({
+    op_id: claim.op.op_id, generation: 1, pool_id: 'grant:grant-1', amount: 128,
+  });
+  assert.deepEqual(hold, { held: false, reason: 'fenced' });
+  const states = holdRows(h.sqlite, claim.op.op_id);
+  assert.deepEqual(states, [], 'no orphaned hold row');
+  assert.equal(used(h.sqlite).used_tokens, 0, 'no orphaned token charge');
+  assert.equal(used(h.sqlite).used_jobs, 0, 'no orphaned job charge');
+  assert.equal(h.sqlite.prepare('SELECT phase FROM dispatch_operations WHERE op_id = ?')
+    .get(claim.op.op_id).phase, 'released');
+});
+
+test('holds: a cancel racing an owner hold cannot charge or leave an orphan hold', async () => {
+  const h = createStoreHarness({ ownerDaily: '10000' });
+  const { claim } = await claimForCancelledRace(h, { principal: alice, grant: null });
+  const poolId = 'owner:user-alice:2026-03-01';
+  const store = racingStore(h, async (other) => {
+    assert.deepEqual(await other.fenceStart({ op_id: claim.op.op_id, generation: 1, reason: 'cancel' }),
+      { outcome: 'fenced' });
+    assert.deepEqual(await other.releaseHolds({ op_id: claim.op.op_id, generation: 1, reason: 'cancel' }),
+      { released: 0 });
+  });
+
+  const hold = await store.acquireHold({ op_id: claim.op.op_id, generation: 1, pool_id: poolId, amount: 128 });
+  assert.deepEqual(hold, { held: false, reason: 'fenced' });
+  assert.deepEqual(holdRows(h.sqlite, claim.op.op_id), [], 'no orphaned hold row');
+  const pool = ownerPool(h.sqlite, poolId);
+  if (pool) assert.equal(pool.used_tokens, 0, 'no orphaned token charge');
+  assert.ok(!pool || pool.used_tokens <= pool.ceiling_tokens, 'accounting stays inside the ceiling');
+  assert.equal(h.sqlite.prepare('SELECT phase FROM dispatch_operations WHERE op_id = ?')
+    .get(claim.op.op_id).phase, 'released');
 });
 
 // ----------------------------------------------------------- admission CAS
