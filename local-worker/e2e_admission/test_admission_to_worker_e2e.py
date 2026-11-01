@@ -196,7 +196,10 @@ async def stop_bridge(task):
 
 class AdmissionToWorkerFixtureTests(unittest.IsolatedAsyncioTestCase):
     def test_reference_codec_fields_match_the_pinned_aipster_source(self):
-        """The Python mirror must not drift from the pinned JS source."""
+        """Static drift check only: the mirror's field sets and anchors must match
+        the pinned JS source. No JavaScript is executed (Node 24 is absent), so
+        this proves textual agreement with the pinned file, not runtime parity.
+        """
         self.assertEqual(
             hashlib.sha256(aipster_contract.REFERENCE.read_bytes()).hexdigest(),
             aipster_contract.REFERENCE_SHA256,

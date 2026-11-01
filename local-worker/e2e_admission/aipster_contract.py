@@ -17,9 +17,16 @@ This is NOT admission authority. AIPSTER main has no inference admission and
 ``POST /api/jobs`` is unconditionally 501. Nothing here authenticates, reserves,
 authorizes or dispatches anything.
 
-Pinned reference: ``reference/eif-task-contract.f6e45f5.mjs``
+Pinned reference:: ``reference/eif-task-contract.f6e45f5.mjs``
 (commit f6e45f556a48dd5f75a8e8b90992e8d9cfa0393e, sha256 recorded in
 ``reference/PROVENANCE.md``).
+
+NO JAVASCRIPT WAS EXECUTED. Every conformance statement here rests on two
+static anchors only: the sha256 of the pinned file, and a field-name extraction
+from its ``return`` object literals. The behavior of this module is a Python
+transcription of the reference, not an observation of the running JS. A genuine
+JS/Node conformance run needs Node 24 and is BLOCKED in this lane; nothing here
+should be cited as proof that the two implementations agree at runtime.
 """
 
 import hashlib

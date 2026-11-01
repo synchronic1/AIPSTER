@@ -42,8 +42,14 @@ Proven (component evidence, not production E2E):
 * A wrong bearer is rejected once at the handshake and not retried.
 
 The pinned reference copy is digest-checked on every run; the mirror's known
-divergences (prompt length counted in code points, JSON byte-length encoding) are
+divergences (prompt length counted in code points, JSON byte-length encoding,
+`Number.isInteger` on integral floats, UTF-16 vs code-point id lengths) are
 documented in `aipster_contract.py`.
+
+**No JavaScript was executed.** Conformance rests on the pinned file's sha256 and
+a field-name extraction from it; behavior is a Python transcription, not an
+observation of the running JS. A real JS/Node conformance run needs Node 24,
+which is absent here, so that edge is BLOCKED.
 
 Not proven / BLOCKED:
 
