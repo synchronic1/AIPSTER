@@ -2,8 +2,11 @@
 
 Frozen as `aipster-worker.exe` (console, shared bundle). Foreground server
 plus visible control/query commands for the windowed tray (`tray ...`), whose
-own stdout has nowhere to go. First-run setup is shared with the tray via
-aipster_tray.firstrun. The token value is never printed or logged.
+own stdout has nowhere to go, plus the pairing entry (`pair`: no-echo code
+prompt, in-process claim) and the supervised sender (`sender`: foreground
+heartbeat-loop for the tray child). First-run setup is shared with the tray
+via aipster_tray.firstrun. The token value is never printed or logged, and
+neither is any pairing code or sender key.
 """
 import argparse
 import os
@@ -12,6 +15,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+if not getattr(sys, "frozen", False):
+    # Source runs also need local-worker/ itself for the pairing CLI
+    # (frozen builds get it from the spec pathex instead).
+    _SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+    if _SOURCE_ROOT not in sys.path:
+        sys.path.insert(0, _SOURCE_ROOT)
 
 from aipster_tray.child import port_busy
 from aipster_tray.firstrun import (build_info, data_dir, ensure_private_token,
@@ -75,14 +84,68 @@ def run_server(config, data, inspect_only):
         raise SystemExit(2)
 
 
+def pair_forward(args):
+    """Argv for the in-process pairing CLI. Secrets stay out of argv by default."""
+    from pairing import main as pairing_main
+    print("Pairing links THIS computer to the AIPSTER account that minted the code.")
+    print("The code is single-use and is never stored; typing it is your consent.")
+    print("Leave it empty to cancel.")
+    # pairing's parser takes globals before the subcommand; pair-only flags after.
+    argv = []
+    if args.api_base:
+        argv += ["--api-base", args.api_base]
+    if args.data_dir:
+        argv += ["--data-dir", args.data_dir]
+    argv += ["pair"]
+    if args.config:
+        argv += ["--config", args.config]
+    if args.name:
+        argv += ["--name", args.name]
+    if args.code:
+        argv += ["--code", args.code]
+    return pairing_main(argv)
+
+
+def sender_forward(args, config):
+    """Argv for the in-process sender (foreground, for tray supervision)."""
+    from pairing import main as pairing_main
+    argv = []
+    if args.api_base:
+        argv += ["--api-base", args.api_base]
+    if args.data_dir:
+        argv += ["--data-dir", args.data_dir]
+    argv += ["heartbeat-once" if args.once else "heartbeat-loop"]
+    argv += ["--config", args.config or str(config)]
+    if args.interval is not None:
+        argv += ["--interval", str(args.interval)]
+    return pairing_main(argv)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="AIPSTER local worker launcher")
-    parser.add_argument("command", nargs="?", choices=["run", "inspect", "tray"], default="run")
+    parser.add_argument("command", nargs="?", choices=["run", "inspect", "tray", "pair", "sender"],
+                        default="run")
     parser.add_argument("tray_command", nargs="?",
                         help="with 'tray': status | start | stop | restart | quit")
     parser.add_argument("--rotate-token", action="store_true",
                         help="replace the stored API token with a fresh one and exit")
     parser.add_argument("--version", action="store_true")
+    parser.add_argument("--api-base", default=None,
+                        help="with 'pair'/'sender': AIPSTER API base (default: production)")
+    parser.add_argument("--data-dir", default=None,
+                        help="with 'pair'/'sender': worker data dir (default: installed location)")
+    parser.add_argument("--config", default=None,
+                        help="with 'pair'/'sender': worker config (sender default: installed config)")
+    parser.add_argument("--name", default=None,
+                        help="with 'pair': display-name hint (default: hostname)")
+    parser.add_argument("--code", default=None,
+                        help="with 'pair': one-time code (fixture/bridge use only; "
+                             "humans are prompted without echo and must not pass --code, "
+                             "which would expose it on the command line)")
+    parser.add_argument("--interval", type=int, default=None,
+                        help="with 'sender': seconds between beats (default 60, floor 30)")
+    parser.add_argument("--once", action="store_true",
+                        help="with 'sender': post a single beat and exit")
     args = parser.parse_args(argv)
     if args.version:
         print(build_info())
@@ -90,8 +153,15 @@ def main(argv=None):
     if args.command == "tray":
         from aipster_tray.controller import main as tray_main
         return tray_main([args.tray_command or "status"])
-    data = data_dir()
+    if args.command in ("pair", "sender") and args.data_dir:
+        data = Path(args.data_dir)
+    else:
+        data = data_dir()
     config, fresh_config = ensure_setup(data)
+    if args.command == "pair":
+        return pair_forward(args)
+    if args.command == "sender":
+        return sender_forward(args, config)
     if args.rotate_token:
         token_path = data / "api-token.txt"
         if token_path.exists():

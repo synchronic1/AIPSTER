@@ -868,6 +868,94 @@ class PairMutexTests(unittest.TestCase):
         self.assertEqual(self.state.beats[-1]["key"], minted[1], "beat uses the repaired key")
 
 
+class EdgeDiagnosticsTests(unittest.TestCase):
+    """Worker-connect W1: sanitized diagnosis for non-JSON HTTP error bodies."""
+
+    def serve(self, status, raw, content_type=None):
+        body = raw.encode("utf-8", "replace") if isinstance(raw, str) else raw
+
+        class EdgeHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(status)
+                if content_type is not None:
+                    self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), EdgeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_html_403_claim_surfaces_sanitized_edge_block(self):
+        # Cloudflare-style refusal: an HTML page, not an API verdict.
+        base = self.serve(403, "<html><body>error code: 1010 synthetic</body></html>",
+                          "text/html; charset=utf-8")
+        status, body, _ = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual(status, 403)
+        self.assertEqual(body.get("code"), "EDGE_BLOCKED")
+        self.assertIn("HTTP 403", body.get("error", ""))
+        self.assertIn("HTML", body.get("error", ""))
+        self.assertNotIn("1010", body.get("error", ""), "no response bytes echoed")
+        self.assertNotIn("<html>", body.get("error", ""), "no response bytes echoed")
+        with self.assertRaises(PairingError) as raised:
+            claim(base, FAKE_CODE, "n_edge01", {})
+        self.assertEqual(raised.exception.code, "EDGE_BLOCKED")
+        self.assertEqual(raised.exception.status, 403)
+
+    def test_html_sniffed_without_content_type(self):
+        base = self.serve(403, "\n  <html>synthetic edge page</html>")
+        _, body, _ = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual(body.get("code"), "EDGE_BLOCKED")
+        self.assertIn("HTML", body.get("error", ""))
+
+    def test_text_and_binary_classes_stay_sanitized(self):
+        base = self.serve(502, "synthetic proxy failure", "text/plain")
+        _, body, _ = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual(body.get("code"), "EDGE_BLOCKED")
+        self.assertIn("text", body.get("error", ""))
+        self.assertNotIn("synthetic proxy failure", body.get("error", ""))
+        base = self.serve(500, b"\x00\x01\x02\xff binary", "application/octet-stream")
+        _, body, _ = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual(body.get("code"), "EDGE_BLOCKED")
+        self.assertIn("binary", body.get("error", ""))
+
+    def test_json_api_errors_and_empty_bodies_unchanged(self):
+        base = self.serve(400, '{"error": "bad code", "code": "BAD_CODE"}',
+                          "application/json")
+        _, body, _ = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual(body, {"error": "bad code", "code": "BAD_CODE"})
+        base = self.serve(429, "", "application/json")
+        _, body, retry = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual(body, {})
+        self.assertIsNone(retry)
+        base = self.serve(200, "not json", "text/plain")
+        status, body, _ = pairing.post_json(base + "/x", {}, FAKE_SECRET)
+        self.assertEqual((status, body), (200, {}), "success payloads keep legacy shape")
+
+    def test_heartbeat_maps_edge_block_to_actionable_failure(self):
+        base = self.serve(403, "<html>synthetic edge block</html>", "text/html")
+        with self.assertRaises(PairingError) as raised:
+            send_heartbeat(base, "r_edge01", FAKE_SECRET, False)
+        self.assertEqual(raised.exception.code, "EDGE_BLOCKED")
+        self.assertNotIn("synthetic edge block", str(raised.exception))
+
+    def test_keyboard_interrupt_exits_cleanly(self):
+        with patch.object(pairing, "cmd_status", side_effect=KeyboardInterrupt):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(pairing.main(["status"]), 130)
+        self.assertIn("interrupted", err.getvalue())
+
+
 def argparse_namespace(values):
     ns = type("Args", (), {})()
     for key, value in values.items():

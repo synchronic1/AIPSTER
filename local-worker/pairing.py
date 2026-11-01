@@ -71,6 +71,7 @@ EXIT_USAGE = 2
 EXIT_PAIRING_REJECTED = 3
 EXIT_REPAIR_REQUIRED = 4
 EXIT_NETWORK = 5
+EXIT_SENDER_RUNNING = 6
 
 
 class PairingError(Exception):
@@ -153,6 +154,22 @@ def private_dir(path):
     if created:
         if not _restrict_path(path, directory=True, new=True):
             raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage")
+        return path
+    if os.name != "nt":
+        # Existing POSIX directories are verified, never repaired. Silently
+        # chmod-ing a directory (e.g. 0300 -> 0700) before enumerating managed
+        # keys can mask a read failure and let destructive cleanup claim
+        # completeness over a listing it could not fully read, so fail closed
+        # on shared ownership instead and leave owner-only modes untouched.
+        try:
+            if path.is_symlink():
+                raise OSError("linked worker state")
+            if not path.is_dir():
+                raise OSError("unexpected worker state type")
+            if path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+                raise OSError("shared worker state")
+        except OSError as exc:
+            raise PairingError(None, "PRIVATE_STORAGE", "cannot establish user-only worker storage") from exc
         return path
     # Another process may have created the directory an instant ago and still
     # be replacing the token's default owner (e.g. Administrators on an
@@ -367,6 +384,36 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
+def edge_block_marker(status, raw, content_type):
+    """Sanitized diagnosis for a non-JSON HTTP error body. Never echoes bytes.
+
+    An edge/CDN/proxy refusal (e.g. Cloudflare HTML on 403) carries no API
+    payload; reporting only the status left users with a generic
+    CLAIM_FAILED. The marker names the status plus a fixed content class
+    derived from the Content-Type header and the first non-space byte, and
+    hints at the pre-API block. Response bytes are never included.
+    """
+    claimed = (content_type or "").split(";")[0].strip().lower()
+    first = raw.lstrip()[:1]
+    if "html" in claimed or first == "<":
+        kind = "HTML"
+    elif "json" in claimed:
+        kind = "unparseable JSON"
+    elif "text" in claimed or (first and first.isprintable()):
+        kind = "text"
+    elif not raw.strip():
+        kind = "empty"
+    else:
+        kind = "binary"
+    return {
+        "code": "EDGE_BLOCKED",
+        "error": (f"API refused with a non-JSON {kind} error page "
+                  f"(HTTP {status}); the request was blocked before reaching "
+                  f"the API (edge or proxy). Update the worker and retry; "
+                  f"no response content is shown."),
+    }
+
+
 def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
     """POST JSON, returning (status, body-dict, retry-after)."""
     data = json.dumps(payload).encode("utf-8")
@@ -379,6 +426,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             status = response.status
             raw = response.read().decode("utf-8", "replace")
             retry_after = response.headers.get("Retry-After")
+            content_type = response.headers.get("Content-Type")
     except HTTPError as exc:
         try:
             if 300 <= exc.code < 400:
@@ -386,6 +434,7 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
             raw = exc.read().decode("utf-8", "replace")
             status = exc.code
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            content_type = exc.headers.get("Content-Type") if exc.headers else None
         except (http.client.HTTPException, OSError) as fault:
             raise PairingError(None, "NETWORK", "incomplete API response") from fault
         finally:
@@ -393,12 +442,20 @@ def post_json(url, payload, secret=None, timeout=REQUEST_TIMEOUT_SEC):
     except (URLError, TimeoutError, socket.timeout, OSError, http.client.HTTPException) as exc:
         # A truncated response belongs to the same bounded transport backoff.
         raise PairingError(None, "NETWORK", "API transport failed") from exc
+    parsed = True
     try:
         body = json.loads(raw) if raw.strip() else {}
     except ValueError:
         body = {}
+        parsed = False
     if not isinstance(body, dict):
         body = {}
+        parsed = False
+    if not parsed and status >= 400:
+        # Error statuses without an API payload are edge/proxy refusals, not
+        # API verdicts: surface the sanitized marker instead of a bare {} that
+        # callers would render as a generic CLAIM_FAILED/HEARTBEAT_FAILED.
+        body = edge_block_marker(status, raw, content_type)
     retry_sec = None
     for candidate in (body.get("retryAfterSec"), retry_after):
         try:
@@ -531,6 +588,120 @@ def write_status(data_dir, payload, meta=None):
     record = {**payload, "pairing_generation": pairing_status_binding(selected)}
     write_private(files["status"], json.dumps(record, indent=2) + "\n")
 
+
+class _SenderLock:
+    """Held-open handle on data-dir `sender.lock` for one heartbeat loop.
+
+    The OS releases the handle at process death (including kill -9 /
+    Taskkill / crash), so a dead sender never wedges the next start.
+    Visibility settles within about a second: a probe immediately after
+    a kill may still see the dying holder. The
+    file is a marker only: it carries no PID, no credential, and no path,
+    and readers must never infer liveness from its mere existence.
+    """
+
+    def __init__(self, handle, path):
+        self.handle = handle
+        self.path = path
+
+    def release(self):
+        handle, self.handle = self.handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def _hold_sender_lock(data_dir):
+    """Open (creating) `sender.lock` and take it non-blocking, or None.
+
+    Windows: the open always succeeds and msvcrt.locking on byte 0
+    decides, so a stale file from a dead sender is reusable. POSIX: the
+    open always succeeds and LOCK_EX|LOCK_NB on the descriptor decides.
+    Either way only a live conflicting holder refuses us.
+    """
+    path = Path(data_dir) / "sender.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    if os.name == "nt":
+        try:
+            # Function-level: msvcrt exists on Windows only, and this
+            # module imports on every platform.
+            import msvcrt
+            handle = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        except (OSError, ImportError):
+            return None
+        try:
+            msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        except (OSError, ImportError):
+            os.close(handle)
+            return None
+        try:
+            stream = os.fdopen(handle, "r")
+        except OSError:
+            os.close(handle)
+            return None
+        return _SenderLock(stream, path)
+    try:
+        # Function-level: fcntl exists on POSIX only, and this module
+        # imports on every platform.
+        import fcntl
+        handle = open(path, "a+b")
+    except (OSError, ImportError):
+        return None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, ImportError):
+        handle.close()
+        return None
+    return _SenderLock(handle, path)
+
+
+def sender_lock_held(data_dir):
+    """True when another live process currently holds `sender.lock`.
+
+    Never raises on lock mechanics: any uncertainty answers False and the
+    caller spawns; the child then reports exit 6 itself, which is the same
+    outcome with one extra short-lived process. Never True from a stale
+    file: only a live conflicting holder counts.
+    """
+    path = Path(data_dir) / "sender.lock"
+    if os.name == "nt":
+        try:
+            import msvcrt
+            probe = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        except (OSError, ImportError):
+            return False
+        try:
+            msvcrt.locking(probe, msvcrt.LK_NBLCK, 1)
+        except (OSError, ImportError):
+            os.close(probe)
+            return True
+        try:
+            msvcrt.locking(probe, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        os.close(probe)
+        return False
+    try:
+        import fcntl
+        probe = open(path, "a+b")
+    except (OSError, ImportError):
+        return False
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, ImportError):
+        probe.close()
+        return True
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    probe.close()
+    return False
 
 @contextlib.contextmanager
 def pair_lock(data_dir):
@@ -673,96 +844,123 @@ def cmd_heartbeat(args, loop):
         print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
         return EXIT_USAGE if exc.status is None else EXIT_NETWORK
     interval = max(args.interval, HEARTBEAT_MIN_INTERVAL_SEC)
+    sender_guard = None
+    if loop:
+        # One sender per data dir: a second loop exits SENDER_RUNNING
+        # instead of doubling heartbeats. The try/finally below releases
+        # promptly at return, and the OS drops the handle at process
+        # death, so a crash never wedges the next start. --once never
+        # takes the lock.
+        sender_guard = _hold_sender_lock(data_dir)
+        if sender_guard is None:
+            print("heartbeat: [SENDER_RUNNING] another sender is already "
+                  "running for this data dir; not starting a second",
+                  file=sys.stderr)
+            return EXIT_SENDER_RUNNING
     failures = 0
     first_beat = True
-    while True:
-        if not first_beat:
-            # Reload every beat: unpair stops the sender instead of beating on
-            # a cached credential, and a re-pair switches it to the new key.
-            # Under the mutex (Muse W3 round 11): the reload must not
-            # race a concurrent pair's writes. A contested lock just
-            # delays one beat; it never stops the sender.
-            try:
-                with pair_lock(data_dir):
-                    meta = load_pairing(data_dir)
-            except PairingError as exc:
-                if exc.code == "PAIR_IN_PROGRESS":
-                    print("heartbeat: pair in progress; rechecking after the interval",
-                          file=sys.stderr)
-                    time.sleep(interval)
-                    continue
-                if exc.code != "NOT_PAIRED":
-                    print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
-                    return EXIT_USAGE
-                write_status(data_dir, {"at": time.time(), "ok": False, "status": "unpaired",
-                                        "code": exc.code}, meta)
-                print("heartbeat: worker was unpaired; sender stopping", file=sys.stderr)
-                return EXIT_REPAIR_REQUIRED
-        first_beat = False
-        # Recomputed per beat (Codex P2): installed/removed models and
-        # engines change readiness, and a stale true would misreport ready.
-        usable = decide_usable(args.config)
+    if loop and hasattr(sys.stdout, "reconfigure"):
+        # Supervised senders pipe stdout to the tray log: line-buffer so
+        # each beat lands promptly instead of sitting in the block buffer.
         try:
-            result = send_heartbeat(meta["api_base"], meta["resource_id"],
-                                    meta["heartbeat_key"], usable)
-        except RePairRequired as exc:
-            # A re-pair can land between the reload and the beat: the old key
-            # is revoked but a newer credential is already installed. The
-            # sender loop retries with it instead of reporting the fresh
-            # pairing as dead; a one-shot beat reports and exits.
-            # Under the mutex (Muse W3 round 12): compare against a
-            # store snapshot no concurrent pair is mid-write on.
+            sys.stdout.reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            pass
+    try:
+        while True:
+            if not first_beat:
+                # Reload every beat: unpair stops the sender instead of beating on
+                # a cached credential, and a re-pair switches it to the new key.
+                # Under the mutex (Muse W3 round 11): the reload must not
+                # race a concurrent pair's writes. A contested lock just
+                # delays one beat; it never stops the sender.
+                try:
+                    with pair_lock(data_dir):
+                        meta = load_pairing(data_dir)
+                except PairingError as exc:
+                    if exc.code == "PAIR_IN_PROGRESS":
+                        print("heartbeat: pair in progress; rechecking after the interval",
+                              file=sys.stderr)
+                        time.sleep(interval)
+                        continue
+                    if exc.code != "NOT_PAIRED":
+                        print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
+                        return EXIT_USAGE
+                    write_status(data_dir, {"at": time.time(), "ok": False, "status": "unpaired",
+                                            "code": exc.code}, meta)
+                    print("heartbeat: worker was unpaired; sender stopping", file=sys.stderr)
+                    return EXIT_REPAIR_REQUIRED
+            first_beat = False
+            # Recomputed per beat (Codex P2): installed/removed models and
+            # engines change readiness, and a stale true would misreport ready.
+            usable = decide_usable(args.config)
             try:
-                with pair_lock(data_dir):
-                    latest = load_pairing(data_dir)
-            except PairingError:
-                latest = None
-            if loop and latest is not None and latest["heartbeat_key"] != meta["heartbeat_key"]:
-                meta = latest
-                first_beat = True
-                continue
-            write_status(data_dir, {"at": time.time(), "ok": False,
-                                    "status": "repair-required", "code": exc.code}, meta)
-            print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
-                  file=sys.stderr)
-            return EXIT_REPAIR_REQUIRED
-        except PairingError as exc:
-            state = "rate-limited" if exc.status == 429 else "network-error" if exc.status is None else "failed"
-            write_status(data_dir, {"at": time.time(), "ok": False, "status": state,
-                                    "code": exc.code, "retryAfterSec": exc.retry_after}, meta)
-            if exc.status == 429:
-                wait = exc.retry_after or interval
-                print(f"heartbeat: rate limited; retrying in {wait}s", file=sys.stderr)
-                if not loop:
-                    return EXIT_NETWORK
-                time.sleep(wait)
-                continue
-            if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
-                # Transport faults AND transient server failures share the
-                # bounded backoff (Codex P2): a 5xx must not terminate the
-                # sender while the service recovers.
-                failures += 1
-                if failures > MAX_ATTEMPTS_NETWORK:
-                    print(f"heartbeat: giving up after {MAX_ATTEMPTS_NETWORK} tries: [{exc.code}] {exc}",
-                          file=sys.stderr)
-                    return EXIT_NETWORK
-                wait = min(2 ** failures, 60)
-                print(f"heartbeat: [{exc.code}] {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
+                result = send_heartbeat(meta["api_base"], meta["resource_id"],
+                                        meta["heartbeat_key"], usable)
+            except RePairRequired as exc:
+                # A re-pair can land between the reload and the beat: the old key
+                # is revoked but a newer credential is already installed. The
+                # sender loop retries with it instead of reporting the fresh
+                # pairing as dead; a one-shot beat reports and exits.
+                # Under the mutex (Muse W3 round 12): compare against a
+                # store snapshot no concurrent pair is mid-write on.
+                try:
+                    with pair_lock(data_dir):
+                        latest = load_pairing(data_dir)
+                except PairingError:
+                    latest = None
+                if loop and latest is not None and latest["heartbeat_key"] != meta["heartbeat_key"]:
+                    meta = latest
+                    first_beat = True
+                    continue
+                write_status(data_dir, {"at": time.time(), "ok": False,
+                                        "status": "repair-required", "code": exc.code}, meta)
+                print(f"heartbeat: [{exc.code}] sender key is dead; pair again with a new code",
                       file=sys.stderr)
-                if not loop:
-                    return EXIT_NETWORK
-                time.sleep(wait)
-                continue
-            print(f"heartbeat failed [{exc.code}]: {exc}", file=sys.stderr)
-            return EXIT_PAIRING_REJECTED
-        failures = 0
-        write_status(data_dir, {"at": time.time(), "ok": True, "usable": usable,
-                                "heartbeatAt": result.get("heartbeatAt"),
-                                "note": "reachability only; not inference-ready"}, meta)
-        print(f"heartbeat ok: usable={usable} at={result.get('heartbeatAt')}")
-        if not loop:
-            return EXIT_OK
-        time.sleep(interval)
+                return EXIT_REPAIR_REQUIRED
+            except PairingError as exc:
+                state = "rate-limited" if exc.status == 429 else "network-error" if exc.status is None else "failed"
+                write_status(data_dir, {"at": time.time(), "ok": False, "status": state,
+                                        "code": exc.code, "retryAfterSec": exc.retry_after}, meta)
+                if exc.status == 429:
+                    wait = exc.retry_after or interval
+                    print(f"heartbeat: rate limited; retrying in {wait}s", file=sys.stderr)
+                    if not loop:
+                        return EXIT_NETWORK
+                    time.sleep(wait)
+                    continue
+                if exc.status is None or (isinstance(exc.status, int) and exc.status >= 500):
+                    # Transport faults AND transient server failures share the
+                    # bounded backoff (Codex P2): a 5xx must not terminate the
+                    # sender while the service recovers.
+                    failures += 1
+                    if failures > MAX_ATTEMPTS_NETWORK:
+                        print(f"heartbeat: giving up after {MAX_ATTEMPTS_NETWORK} tries: [{exc.code}] {exc}",
+                              file=sys.stderr)
+                        return EXIT_NETWORK
+                    wait = min(2 ** failures, 60)
+                    print(f"heartbeat: [{exc.code}] {exc}; retry {failures}/{MAX_ATTEMPTS_NETWORK} in {wait}s",
+                          file=sys.stderr)
+                    if not loop:
+                        return EXIT_NETWORK
+                    time.sleep(wait)
+                    continue
+                print(f"heartbeat failed [{exc.code}]: {exc}", file=sys.stderr)
+                return EXIT_PAIRING_REJECTED
+            failures = 0
+            write_status(data_dir, {"at": time.time(), "ok": True, "usable": usable,
+                                    "heartbeatAt": result.get("heartbeatAt"),
+                                    "note": "reachability only; not inference-ready"}, meta)
+            print(f"heartbeat ok: usable={usable} at={result.get('heartbeatAt')}")
+            if not loop:
+                return EXIT_OK
+            time.sleep(interval)
+    finally:
+        # Explicit release: a traceback cycle through a
+        # mocked beat can outlive this frame past temp-dir
+        # cleanup, so prompt GC timing must not matter.
+        if sender_guard is not None:
+            sender_guard.release()
 
 
 def cmd_status(args):
@@ -851,7 +1049,7 @@ def build_parser():
     beat = sub.add_parser("heartbeat-once", help="post a single heartbeat")
     beat.add_argument("--config", default=None, help="worker config for the usable-bit policy")
     beat.add_argument("--interval", type=int, default=HEARTBEAT_INTERVAL_SEC)
-    loop = sub.add_parser("heartbeat-loop", help="post heartbeats until stopped")
+    loop = sub.add_parser("heartbeat-loop", help="post heartbeats until stopped (one sender per data dir; a second loop exits SENDER_RUNNING)")
     loop.add_argument("--config", default=None, help="worker config for the usable-bit policy")
     loop.add_argument("--interval", type=int, default=HEARTBEAT_INTERVAL_SEC)
     sub.add_parser("status", help="show pairing state (never secrets)")
@@ -861,17 +1059,27 @@ def build_parser():
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "pair":
-        return cmd_pair(args)
-    if args.command == "heartbeat-once":
-        return cmd_heartbeat(args, loop=False)
-    if args.command == "heartbeat-loop":
-        return cmd_heartbeat(args, loop=True)
-    if args.command == "status":
-        return cmd_status(args)
-    if args.command == "unpair":
-        return cmd_unpair(args)
+    try:
+        args = parser.parse_args(argv)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    try:
+        if args.command == "pair":
+            return cmd_pair(args)
+        if args.command == "heartbeat-once":
+            return cmd_heartbeat(args, loop=False)
+        if args.command == "heartbeat-loop":
+            return cmd_heartbeat(args, loop=True)
+        if args.command == "status":
+            return cmd_status(args)
+        if args.command == "unpair":
+            return cmd_unpair(args)
+    except KeyboardInterrupt:
+        # Ctrl+C stops the sender cleanly: no traceback, no partial claim
+        # (pair's manifest commit is atomic under the pair mutex).
+        print("interrupted", file=sys.stderr)
+        return 130
     parser.print_help()
     return EXIT_USAGE
 

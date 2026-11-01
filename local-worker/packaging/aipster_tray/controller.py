@@ -15,9 +15,19 @@ import urllib.request
 from pathlib import Path
 
 from . import state as st
-from .child import WorkerChild, port_busy, looks_like_bind_error
+from .child import (EXIT_REPAIR_REQUIRED, EXIT_SENDER_RUNNING, SenderChild,
+                      WorkerChild, port_busy, looks_like_bind_error)
 from .firstrun import (APP_NAME, bundle_dir, build_info, data_dir, ensure_setup,
                        ensure_private_token, private_directory)
+
+if not getattr(sys, "frozen", False):
+    # Source runs need local-worker/ itself for the pairing CLI probe
+    # (frozen builds get it from the spec pathex instead; launcher.py
+    # applies the same rule). The names at that root shadow nothing the
+    # tray imports.
+    _SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
+    if _SOURCE_ROOT not in sys.path:
+        sys.path.insert(0, _SOURCE_ROOT)
 
 HEALTH_TIMEOUT = 25
 TICK_SECONDS = 1
@@ -50,6 +60,9 @@ class Controller:
         self.token_env = "DENDRITE_API_TOKEN"
         self.token_value = ""
         self.child = None
+        self.sender = None
+        self.pairing = None
+        self.sender_notified = None
         self.state = st.STOPPED
         self.detail = ""
         self.restarts = []
@@ -80,6 +93,7 @@ class Controller:
         self.log_file = RotatingLog(self.data / "logs" / "tray.log")
         self.log(f"tray start {build_info()} data={self.data} fresh_config={fresh}")
         self.child = WorkerChild(bundle_dir(), self.data / "logs" / "worker.log")
+        self.sender = SenderChild(bundle_dir(), self.data / "logs" / "sender.log", self.data)
         error = self._reload()
         if error:
             self.set_state(st.ERROR, error)
@@ -117,14 +131,39 @@ class Controller:
         return {k: v for k, v in env.items() if v}
 
     # -- state ---------------------------------------------------------------
+    def sender_label(self):
+        """Short sender line for the pairing overlay. Never raises."""
+        try:
+            if self.sender is not None and self.sender.running():
+                return "running"
+            if self.sender_notified == EXIT_SENDER_RUNNING:
+                return "already running in another process"
+            if self.sender is not None and self.sender.last_exit is not None:
+                return f"stopped (exit {self.sender.last_exit})"
+        except Exception:
+            pass
+        return "stopped"
+
+    def refresh_pairing(self):
+        """Re-derive the pairing overlay. Never raises (overlay degrades)."""
+        try:
+            self.pairing = st.pairing_overlay(self.data, self.sender_label())
+        except Exception as exc:  # noqa: BLE001 - overlay must never break us
+            self.log(f"pairing overlay failed: {exc}")
+            self.pairing = {"key": st.PAIR_ERROR,
+                            "line": "Pairing state unreadable — see tray.log",
+                            "sender": "Sender: stopped"}
+
     def set_state(self, state, detail=""):
         self.state = state
         self.detail = detail
+        self.refresh_pairing()
         host = self.loaded.node.host if self.loaded else ""
         port = self.loaded.node.port if self.loaded else 0
         st.write_state(self.data / "state.json", state, detail,
                        self.child.pid() if self.child else None,
-                       host, port, len(self.restarts), build_info())
+                       host, port, len(self.restarts), build_info(),
+                       pairing=self.pairing)
         self.last_heartbeat = time.monotonic()
         try:
             self.backend.refresh(state, detail)
@@ -152,6 +191,9 @@ class Controller:
             self.restart_at = None
             self.set_state(st.PORT_BUSY, f"port {port} is already in use")
             self.backend.notify("port_busy", st.PORT_BUSY, str(port))
+            # The sender is port-independent (outbound HTTPS): a foreign
+            # holder never blocks pairing or heartbeats.
+            self.start_sender()
             return False
         self.log(f"spawning worker {host}:{port}")
         self.child.start(self.config, self.child_env())
@@ -162,6 +204,123 @@ class Controller:
         self.restart_at = None
         self.health_deadline = time.monotonic() + HEALTH_TIMEOUT
         self.set_state(st.STARTING)
+        self.start_sender()
+        return True
+
+    def start_sender(self):
+        """Run the heartbeat sender while serving. Returns True when beating.
+
+        Starts only when paired (pairing.json present); never auto-mints,
+        auto-claims, or retries with stored codes (none exist). A start
+        failure is logged and surfaced in the overlay, never fatal to the
+        daemon: the next Start retries it.
+        """
+        if self.sender is None:
+            return False
+        if self.sender.running():
+            return True
+        if not (self.data / "pairing.json").exists():
+            self.log("sender not started: worker is not paired")
+            return False
+        try:
+            from pairing import sender_lock_held
+        except ImportError:
+            self.log("sender lock probe unavailable; spawning (exit 6 still safe)")
+        else:
+            if sender_lock_held(self.data):
+                self.log("sender already running in another process; not spawning another")
+                self.sender_notified = EXIT_SENDER_RUNNING
+                self.set_state(self.state, self.detail)  # overlay follows
+                return True
+        try:
+            pid = self.sender.start()
+        except SystemExit as exc:
+            self.log(f"sender failed to start: {exc}")
+            self.set_state(self.state, self.detail)  # overlay shows stopped
+            return False
+        self.sender_notified = None
+        self.log(f"sender started pid={pid} confined={self.sender.confined} "
+                 f"confine_error={self.sender.confine_error!r}")
+        self.set_state(self.state, self.detail)  # overlay shows running
+        return True
+
+    def stop_sender(self):
+        # A stop ends the external-sender report too: the overlay returns
+        # to a plain stopped sender until the next Start rechecks.
+        self.sender_notified = None
+        if self.sender is None:
+            return
+        try:
+            self.sender.stop()
+        except Exception as exc:  # noqa: BLE001 - stop must complete
+            self.log(f"sender stop failed: {exc}")
+
+    def pair_target(self):
+        """(exe, args) for the pair prompt console, or None when unavailable."""
+        exe = bundle_dir() / ("aipster-worker.exe" if os.name == "nt" else "aipster-worker")
+        if exe.exists():
+            return (str(exe), ["pair"])
+        if getattr(sys, "frozen", False):
+            return None
+        launcher = Path(__file__).resolve().parent.parent / "windows" / "launcher.py"
+        if launcher.exists():
+            return (sys.executable, [str(launcher), "pair"])
+        return None
+
+    def connect(self):
+        """One-click connect: serve locally, pair if needed, beat when paired.
+
+        Idempotent: already serving + paired + sender running is a no-op
+        True. Pairing stays interactive (the console prompt collects the
+        typed code); nothing is auto-minted. Port-busy still pairs (port
+        independent) but returns False: the worker is not serving.
+        """
+        paired = (self.data / "pairing.json").exists()
+        serving = self.state in (st.RUNNING, st.STARTING)
+        sender_up = bool(self.sender is not None and self.sender.running())
+        if paired and serving and sender_up:
+            self.log("connect: already running and paired; nothing to do")
+            return True
+        if paired and serving:
+            revived = self.start_sender()
+            self.log("connect: sender revived" if revived else "connect: sender failed to start")
+            return revived
+        started = self.start_worker()
+        if not paired:
+            if not self.launch_pair():
+                self.log("connect: worker starting; pair step unavailable")
+                return started
+            self.log("connect: worker starting; pair prompt opened")
+        else:
+            self.log("connect: worker starting; sender runs when serving")
+        return started
+
+    def open_settings(self):
+        """Open the worker config file. Returns the config path."""
+        target = str(self.config) if self.config else ""
+        if not target:
+            self.log("settings unavailable: no config loaded")
+            return ""
+        return self.backend.open_config(target)
+
+    def copy_endpoint(self):
+        """Copy the serving endpoint (host:port only, never secrets)."""
+        text = self.endpoint_label()
+        if not text:
+            self.log("copy endpoint: worker is not serving")
+            return False
+        ok = bool(self.backend.copy_text(text))
+        self.log("endpoint address copied" if ok else "endpoint copy failed")
+        return ok
+
+    def launch_pair(self):
+        target = self.pair_target()
+        if target is None:
+            self.log("pair unavailable: console launcher missing from bundle")
+            return False
+        exe, args = target
+        self.log(f"pair console: {exe} {' '.join(args)}")
+        self.backend.run_pair_console(exe, args)
         return True
 
     def stop_worker(self):
@@ -169,7 +328,9 @@ class Controller:
         # window must win over the automatic restart.
         self.restart_at = None
         self.health_deadline = None
+        self.stop_sender()
         if self.state == st.STOPPED and not (self.child and self.child.running()):
+            self.set_state(st.STOPPED)  # overlay shows the stopped sender
             return True
         self.intentional_stop = True
         try:
@@ -196,6 +357,8 @@ class Controller:
     # -- periodic ---------------------------------------------------------------
     def tick(self):
         now = time.monotonic()
+        if self.sender is not None:
+            self._poll_sender()
         if now - self.last_heartbeat >= HEARTBEAT_SECONDS:
             self.set_state(self.state, self.detail)
             return
@@ -238,6 +401,29 @@ class Controller:
         else:
             self._on_crash(code)
 
+    def _poll_sender(self):
+        """Surface sender death once; never auto-restart (no stored codes).
+
+        Exit 4 means the sender key died: the user pairs again with a fresh
+        code, then Start runs the sender again. Other exits (bounded network
+        retries exhausted, config errors) report and wait for Start too.
+        """
+        code = self.sender.exited()
+        if code is None or code == self.sender_notified:
+            return
+        self.sender_notified = code
+        if code == EXIT_SENDER_RUNNING:
+            self.log("sender already running in another process; not spawning another")
+        elif code == EXIT_REPAIR_REQUIRED:
+            self.log("sender key is dead; pair again with a new code")
+            self.backend.notify("pair_again", self.state, "")
+        elif code != 0:
+            self.log(f"sender stopped (exit {code}); Start worker runs it again")
+            self.backend.notify("sender_stopped", self.state, f"exit {code}")
+        else:
+            self.log("sender exited cleanly")
+        self.set_state(self.state, self.detail)  # overlay + state file follow
+
     def _on_crash(self, code):
         now = time.monotonic()
         self.restarts.append(now)
@@ -268,6 +454,14 @@ class Controller:
             self.start_worker()
         elif action == "stop":
             self.stop_worker()
+        elif action == "pair":
+            self.launch_pair()
+        elif action == "connect":
+            self.connect()
+        elif action == "settings":
+            self.open_settings()
+        elif action == "copy_endpoint":
+            self.copy_endpoint()
         elif action == "quit":
             self.request_quit()
 
@@ -294,6 +488,10 @@ class Controller:
                 self.child.stop(timeout=5)
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
             self.log(f"shutdown child stop failed: {exc}")
+        try:
+            self.stop_sender()
+        except Exception as exc:  # noqa: BLE001 - shutdown must complete
+            self.log(f"shutdown sender stop failed: {exc}")
         try:
             self.backend.detach()
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
@@ -431,7 +629,8 @@ def _redirect_to_log(data):
     try:
         data = Path(data)
         private_directory(data)
-        (data / "logs").mkdir(exist_ok=True)
+        from .firstrun import private_child_directory
+        private_child_directory(data, "logs")
         handle = open(data / "logs" / "tray.log", "a", encoding="utf-8")
         sys.stdout = handle
         sys.stderr = handle

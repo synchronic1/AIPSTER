@@ -23,8 +23,8 @@ From PowerShell in a fresh directory (these commands match the tested Windows x6
 git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git
 cd AIPSTER
 git sparse-checkout set --no-cone /local-worker/ /LICENSE
-git fetch origin f3e115e0c42fcd83e8a6f2e769de427710f7acc1
-git checkout --detach f3e115e0c42fcd83e8a6f2e769de427710f7acc1
+git fetch origin 3fa309cb08461ea046ee23e801404911c1f3bcc2
+git checkout --detach 3fa309cb08461ea046ee23e801404911c1f3bcc2
 cd local-worker
 uv run --no-project --python 3.12.14 python install.py
 .\.venv\Scripts\dendrite.exe inspect --config configs/mock.toml
@@ -51,6 +51,49 @@ Network access to public Python distribution/PyPI hosts is required on first use
 The locks pin dependency artifacts, not a bit-for-bit native build or a promise
 that upstream distribution hosts will remain available.
 
+## Update an existing source install
+
+Use this procedure when the checkout already has local changes from a reviewed
+pairing overlay (for example, an `f3e115e` checkout with the `adfe357`
+`pairing.py` compatibility fix applied by hand). A plain `git checkout` would
+abort on those local changes; the hash gate below verifies the overlay is
+exactly the reviewed file before discarding it. Run the `git` steps from the
+`AIPSTER` repo root (the directory above `local-worker`):
+
+```powershell
+git status --short
+```
+
+Continue only if the single modified file is `local-worker/pairing.py`. If
+anything else changed, back it up and use a fresh clone instead.
+
+1. Stop the running `heartbeat-loop` sender terminal with Ctrl+C. Old senders
+   hold no lock, so confirm only one sender runs afterwards.
+2. Fetch the reviewed revision (current pin `3fa309c`):
+```powershell
+git fetch origin 3fa309cb08461ea046ee23e801404911c1f3bcc2
+```
+3. Hash-gate the overlay: the LF-normalized local `pairing.py` must equal the
+   reviewed blob:
+```powershell
+$blob = .\local-worker\.venv\Scripts\python.exe -c "import hashlib,pathlib;b=pathlib.Path('local-worker/pairing.py').read_bytes().replace(b'\r\n',b'\n');print(hashlib.sha1(b'blob '+str(len(b)).encode()+b'\x00'+b).hexdigest())"
+$want = git rev-parse 3fa309cb08461ea046ee23e801404911c1f3bcc2:local-worker/pairing.py
+if ($blob.Trim() -ne $want.Trim()) { Write-Output 'STOP: pairing.py does not match the reviewed overlay; use a fresh clone instead' }
+```
+   If it prints STOP, do not continue; use a fresh clone.
+4. Discard the verified overlay:
+```powershell
+git checkout -- local-worker/pairing.py
+```
+5. Move to the reviewed revision:
+```powershell
+git checkout --detach 3fa309cb08461ea046ee23e801404911c1f3bcc2
+```
+6. Keep `.venv` and do not rerun `install.py`: there are no lock or vendor
+   changes between `f3e115e` and `3fa309c`.
+7. Restart one `heartbeat-loop` sender from `local-worker`. Pairing state
+   lives in `%LOCALAPPDATA%\AIPSTER-Worker` and survives the update.
+
 ## Pairing with AIPSTER
 
 Installing never shares anything. To link this computer to your AIPSTER
@@ -76,6 +119,17 @@ inference readiness; `/api/jobs` remains disabled. Choose Done or reopen My
 Compute after pairing to refresh the resource list. If the key is revoked or
 expires, the sender exits asking for a fresh pairing code. `pairing.py status`
 shows secret-free local status and marks old success as stale.
+
+No packaged installer is published yet: the built 0.1.0 package predates the
+API edge-compat fix and will not be published, so tray pairing arrives with
+the next published qualified installer. Until then, packaged installs cannot
+pair; use this source checkout. The published installer will supervise the
+heartbeat sender while serving and show the pairing overlay (unpaired /
+registered / reachable / stale / repair-required) in the menu and
+`aipster-worker tray status`. A busy daemon port never blocks pairing or the
+sender: they need no local port. When AIPSTER publishes a qualified
+installer, update packaged installs by reinstalling from its reviewed pin
+(uninstall preserves pairing by default).
 Status belongs to the selected pairing generation: a previous sender's status,
 including an in-flight response finishing after re-pairing, is not attributed
 to the new key or resource. Unbound older status records await a fresh heartbeat.
@@ -94,7 +148,8 @@ If any pairing file cannot be removed, unpair exits nonzero and reports
 incomplete cleanup. Stop the sender or other process holding the file, revoke
 the server key, and retry; an already missing file is harmless.
 Preserve unrelated models and engines. This source setup adds no startup task,
-service or automatic update. Packaged launcher integration is still pending.
+service or automatic update. Packaged-install tray pairing will be documented
+with the published installer.
 See [pairing/storage integration details](PAIRING-INTEGRATION.md). For unqualified
 POSIX adaptation the corresponding Python entry point is `.venv/bin/python`.
 

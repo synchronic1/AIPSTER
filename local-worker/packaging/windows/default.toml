@@ -1,6 +1,8 @@
 # AIPSTER Worker default configuration (written on first run; safe to edit).
 # Simulation only: the mock engine answers locally. No model downloads, no
-# cloud connection, no sharing. Pairing is not implemented.
+# cloud connection, no sharing. Pairing: mint a code in the dashboard
+# (My Compute, Pair this computer), then use the tray menu Pair item
+# (or run `aipster-worker pair` in a terminal).
 [node]
 id = "standalone-demo"
 host = "127.0.0.1"

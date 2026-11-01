@@ -12,6 +12,8 @@ import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_P
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
 import { dgmPreviewEnabled } from './dgm/router.mjs';
+import { advisorEnabled, advisorDescriptor, handleAdvisorPost } from './advisor/router.mjs';
+import { ADVISOR_BODY_MAX } from './advisor/validate.mjs';
 import { schemaReady } from './lib/schema.js';
 import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
@@ -19,6 +21,7 @@ import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimat
 import { validateManifestStructure, validateFileBytes, isByteEligible, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_MANIFEST_BYTES, MAX_PARTS_PER_UPLOAD, MAX_FINALIZE_FILE_BYTES } from './lib/catalog/validate.mjs';
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES, assetPrefix, assetKey } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
+import { grantPartiesSameSide, grantUsage } from './lib/access.js';
 
 const VERSION = '0.5.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -136,25 +139,6 @@ async function actorFrom(request, env, auth) {
     return { kind: 'invalid-key' };
   }
   return { kind: 'none' };
-}
-
-async function canUseResource(db, userId, resource) {
-  if (resource.owner_id === userId) return { ok: true, grantId: null, grant: null };
-  const g = await first(db, 'SELECT * FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', resource.id, userId);
-  if (!g) return { ok: false, reason: 'No grant gives you access to this resource.' };
-  if (!(await grantPartiesSameSide(db, g))) return { ok: false, reason: 'No grant gives you access to this resource.' };
-  if (g.used_jobs >= g.max_jobs) return { ok: false, reason: 'Grant job quota exhausted.' };
-  if (g.used_tokens >= g.max_tokens) return { ok: false, reason: 'Grant token quota exhausted.' };
-  return { ok: true, grantId: g.id, grant: g };
-}
-
-async function grantPartiesSameSide(db, grant) {
-  // Grants never cross the demo sandbox boundary in either direction, and
-  // legacy/stale cross-boundary rows authorize nothing.
-  const o = await first(db, 'SELECT demo FROM "user" WHERE id = ?', grant.owner_id);
-  const g = await first(db, 'SELECT demo FROM "user" WHERE id = ?', grant.grantee_id);
-  if (!o || !g) return false;
-  return Number(o.demo || 0) === Number(g.demo || 0);
 }
 
 async function ownerName(db, userId) {
@@ -1119,7 +1103,8 @@ async function handleApi(request, env, url) {
     const items = [];
     for (const g of page.items) {
       const r = await first(db, 'SELECT name FROM resources WHERE id = ?', g.resource_id);
-      items.push({ ...mapGrantLite(g), resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'recorded', policyNote: 'Inference-only grant recorded by the owner; quotas are checked when dispatch is enabled. Dispatch is currently disabled.' });
+      const net = await grantUsage(db, g.id);
+      items.push({ ...mapGrantLite(g), usedJobs: net.used_jobs, usedTokens: net.used_tokens, resourceName: r ? r.name : '(removed)', ownerName: await ownerName(db, g.owner_id), enforcement: 'recorded', policyNote: 'Inference-only grant recorded by the owner; quotas are checked when dispatch is enabled. Dispatch is currently disabled.' });
     }
     return json(200, { ...page, items });
   }
@@ -1127,7 +1112,12 @@ async function handleApi(request, env, url) {
     const d = needSession(); if (d) return deny(d);
     const q = pagination(url);
     const page = await pageQuery(db, { select: 'SELECT g.*', from: 'FROM grants g JOIN "user" o ON o.id = g.owner_id JOIN "user" r ON r.id = g.grantee_id WHERE g.owner_id = ? AND o.demo = r.demo', params: [me()], order: 'ORDER BY g.created_at DESC', ...q });
-    return json(200, { ...page, items: page.items.map(mapGrantLite) });
+    const items = [];
+    for (const g of page.items) {
+      const net = await grantUsage(db, g.id);
+      items.push({ ...mapGrantLite(g), usedJobs: net.used_jobs, usedTokens: net.used_tokens });
+    }
+    return json(200, { ...page, items });
   }
   if (path === '/api/grants' && method === 'POST') {
     const d = needSession() || needCsrf() || needNotDemo(); if (d) return deny(d);
@@ -1154,6 +1144,18 @@ async function handleApi(request, env, url) {
     assertClaimed(gc, 'grant');
     await audit(db, me(), 'grant.create', id, `${resource.id} -> ${grantee.email}`);
     return json(201, mapGrantLite(await first(db, 'SELECT * FROM grants WHERE id = ?', id)));
+  }
+  // Fabric adviser (flag-gated). Authorization precedes routing: anonymous
+  // callers get 401 even when the flag is off, so the flag is not an oracle.
+  // Demo sessions are served fixtures by the router, never live calls.
+  if (path === '/api/advisor' && (method === 'GET' || method === 'POST')) {
+    const d = method === 'GET' ? needSession() : (needSession() || needCsrf());
+    if (d) return deny(d);
+    if (!advisorEnabled(env)) return json(404, { error: 'Not found.', code: 'NOT_FOUND' });
+    if (method === 'GET') return json(200, advisorDescriptor(env, { demo: isDemo() }));
+    const body = await readJson(request, ADVISOR_BODY_MAX);
+    const out = await handleAdvisorPost({ db, env, actor, demo: isDemo(), body, now: new Date() });
+    return json(out.status, out.body);
   }
   {
     const m = /^\/api\/grants\/([A-Za-z0-9_-]{1,64})$/.exec(path);

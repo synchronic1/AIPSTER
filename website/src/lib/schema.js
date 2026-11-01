@@ -26,6 +26,7 @@ const appSchema = {
   catalog_reservations: 'id deployment_id owner_id node_id bytes state created_at released_at',
   pairing_codes: 'id owner_id salt verifier created_at expires_at used_at attempts node_id resource_id',
   idempotency_keys: 'owner_id key resource_id created_at',
+  routing_refunds: 'reservation_id grant_id jobs tokens created_at',
 };
 
 const federationSchema = {
