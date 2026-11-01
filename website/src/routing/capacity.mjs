@@ -2,9 +2,13 @@
 // Atomic capacity holds on grant quotas. A reservation is a conditional
 // UPDATE (revoked/headroom checked in the same statement that charges),
 // so concurrent racers cannot overdraw and revocation wins immediately.
-// Every hold has a ledger row and a TTL: explicit release, op-scoped
-// release, and time-based sweep all converge on the same end state, and
-// double release is a no-op (only held rows move).
+// Accounting is gross charges on grants.used_* minus durable refund
+// receipts (routing_refunds, one row per reservation at most): a refund is
+// an INSERT OR IGNORE, so it applies at most once across crashes, retries,
+// and concurrent releasers by construction — no trigger, no batch, no
+// token dance. Every hold has a ledger row and a TTL: explicit release,
+// op-scoped release, and time-based sweep all converge on the same end
+// state, and double release is a no-op (only held rows move).
 // Gate 1 honesty: holds exist for a dispatch path that stays 501-disabled;
 // they prove the mechanism, they do not execute anything.
 import { httpError } from '../lib/validate.js';
@@ -13,9 +17,6 @@ import { rid } from '../lib/store.js';
 import { grantPartiesSameSide } from '../lib/access.js';
 
 export const ROUTING_RESERVE_TTL_MS = 300000;
-// Stuck refund-tokens (a crash between token claim and finalize) become
-// stealable after this age; the sweeper completes exactly one refund.
-export const ROUTING_TOKEN_REAP_MS = 60000;
 
 function exhausted() {
   return httpError(429, 'Grant capacity exhausted for this route.', 'ROUTE_CAPACITY_EXHAUSTED');
@@ -45,8 +46,10 @@ export async function reserveCapacity(db, { opId, tenant, grantId, jobs, tokens,
   const at = new Date(now).toISOString();
   const charge = await run(db,
     `UPDATE grants SET used_jobs = used_jobs + ?, used_tokens = used_tokens + ?
-     WHERE id = ? AND revoked_at IS NULL AND used_jobs + ? <= max_jobs AND used_tokens + ? <= max_tokens`,
-    jobs, tokens, grantId, jobs, tokens);
+     WHERE id = ? AND revoked_at IS NULL
+     AND used_jobs - (SELECT COALESCE(SUM(jobs), 0) FROM routing_refunds WHERE grant_id = ?) + ? <= max_jobs
+     AND used_tokens - (SELECT COALESCE(SUM(tokens), 0) FROM routing_refunds WHERE grant_id = ?) + ? <= max_tokens`,
+    jobs, tokens, grantId, grantId, jobs, grantId, tokens);
   if (Number(charge.meta.changes) !== 1) {
     const again = await first(db, 'SELECT revoked_at FROM grants WHERE id = ?', grantId);
     if (!again || again.revoked_at !== null) throw httpError(409, 'Grant revoked or missing.', 'ROUTE_CAPACITY_REVOKED');
@@ -58,31 +61,40 @@ export async function reserveCapacity(db, { opId, tenant, grantId, jobs, tokens,
   return { id, opId, tenant, grantId, jobs, tokens, state: 'held' };
 }
 
+/** Effective (net) usage of one grant: gross charges minus refund receipts. */
+export async function grantUsage(db, grantId) {
+  const row = await first(db,
+    `SELECT used_jobs - (SELECT COALESCE(SUM(jobs), 0) FROM routing_refunds WHERE grant_id = ?) AS used_jobs,
+            used_tokens - (SELECT COALESCE(SUM(tokens), 0) FROM routing_refunds WHERE grant_id = ?) AS used_tokens
+     FROM grants WHERE id = ?`, grantId, grantId, grantId);
+  return { used_jobs: Math.max(0, row.used_jobs), used_tokens: Math.max(0, row.used_tokens) };
+}
+
 /**
- * Release every held reservation for one op. Each refund claims its row
- * under a per-call token, refunds conditional on that token, then
- * finalizes — three self-sufficient statements, no batch, no
- * cross-statement changes() chaining — so concurrent releasers refund
- * exactly once under any interleave (only the claim winner's token ever
- * matches). A failure between claim and finalize leaves a stuck token;
- * the sweeper reaps those after ROUTING_TOKEN_REAP_MS. Idempotent.
- * Returns count of rows this call moved out of held.
+ * Release every held reservation for one op. Each refund is an INSERT OR
+ * IGNORE receipt (the quota effect, idempotent by primary key) followed by
+ * the terminal state flip (the bookkeeping). A crash before the receipt
+ * leaves a fully charged held row; a crash after it leaves a refunded row
+ * a retry completes without re-applying; concurrent releasers share the
+ * one receipt and elect one flip winner. The receipt row is the durable
+ * recovery evidence: net usage is always gross minus receipts, so state
+ * and counters can never disagree twice. Idempotent. Returns rows moved.
  */
 export async function releaseCapacity(db, { opId, reason = 'release', nowMs = null } = {}) {
   if (typeof opId !== 'string' || !opId) throw new Error('opId required.');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const iso = new Date(now).toISOString();
   const held = await db.prepare("SELECT * FROM routing_reservations WHERE op_id = ? AND state = 'held'").bind(opId).all();
   let n = 0;
   for (const r of (held.results || [])) {
-    n += await flipAndRefund(db, r.id, r.grant_id, r.jobs, r.tokens, 'released', now);
+    n += await receiptAndFlip(db, r, 'released', iso);
   }
   return n;
 }
 
 /**
- * Release held reservations past their TTL, and complete refunds for
- * refund-tokens stuck by a mid-refund failure (older than the reap age).
- * Returns rows moved.
+ * Release held reservations past their TTL. Same receipt-then-flip as
+ * release; racing release and sweep share one receipt. Returns rows moved.
  */
 export async function sweepReservations(db, nowMs = null) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -90,43 +102,16 @@ export async function sweepReservations(db, nowMs = null) {
   const stale = await db.prepare("SELECT * FROM routing_reservations WHERE state = 'held' AND expires_at < ?").bind(iso).all();
   let n = 0;
   for (const r of (stale.results || [])) {
-    n += await flipAndRefund(db, r.id, r.grant_id, r.jobs, r.tokens, 'expired', now);
-  }
-  const cutoff = new Date(now - ROUTING_TOKEN_REAP_MS).toISOString();
-  const stuck = await db.prepare("SELECT * FROM routing_reservations WHERE state LIKE 'releasing:%' AND updated_at < ?").bind(cutoff).all();
-  for (const r of (stuck.results || [])) {
-    n += await reapToken(db, r, now);
+    n += await receiptAndFlip(db, r, 'expired', iso);
   }
   return n;
 }
 
-async function flipAndRefund(db, id, grantId, jobs, tokens, toState, now) {
-  const claiming = `releasing:${rid('rel_')}`;
-  const iso = new Date(now).toISOString();
-  const flip = await run(db, 'UPDATE routing_reservations SET state = ?, updated_at = ? WHERE id = ? AND state = \'held\'', claiming, iso, id);
-  if (Number(flip.meta.changes) !== 1) return 0;
-  await run(db,
-    `UPDATE grants SET used_jobs = MAX(0, used_jobs - ?), used_tokens = MAX(0, used_tokens - ?)
-     WHERE id = ? AND EXISTS (SELECT 1 FROM routing_reservations WHERE id = ? AND state = ?)`,
-    jobs, tokens, grantId, id, claiming);
-  await run(db, 'UPDATE routing_reservations SET state = ?, updated_at = ? WHERE id = ? AND state = ?', toState, iso, id, claiming);
-  return 1;
-}
-
-// Complete a stuck token: steal it under a fresh token (conditional on the
-// exact observed state, so racing reapers elect one winner), then refund
-// and finalize conditional on the new token.
-async function reapToken(db, row, now) {
-  const claiming = `releasing:${rid('rel_')}`;
-  const iso = new Date(now).toISOString();
-  const flip = await run(db, 'UPDATE routing_reservations SET state = ?, updated_at = ? WHERE id = ? AND state = ?', claiming, iso, row.id, row.state);
-  if (Number(flip.meta.changes) !== 1) return 0;
-  await run(db,
-    `UPDATE grants SET used_jobs = MAX(0, used_jobs - ?), used_tokens = MAX(0, used_tokens - ?)
-     WHERE id = ? AND EXISTS (SELECT 1 FROM routing_reservations WHERE id = ? AND state = ?)`,
-    row.jobs, row.tokens, row.grant_id, row.id, claiming);
-  await run(db, 'UPDATE routing_reservations SET state = ?, updated_at = ? WHERE id = ? AND state = ?', 'expired', iso, row.id, claiming);
-  return 1;
+async function receiptAndFlip(db, r, toState, iso) {
+  await run(db, 'INSERT OR IGNORE INTO routing_refunds (reservation_id, grant_id, jobs, tokens, created_at) VALUES (?, ?, ?, ?, ?)',
+    r.id, r.grant_id, r.jobs, r.tokens, iso);
+  const flip = await run(db, 'UPDATE routing_reservations SET state = ?, updated_at = ? WHERE id = ? AND state = \'held\'', toState, iso, r.id);
+  return Number(flip.meta.changes) === 1 ? 1 : 0;
 }
 
 /**

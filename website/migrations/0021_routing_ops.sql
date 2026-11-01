@@ -47,3 +47,19 @@ CREATE TABLE IF NOT EXISTS routing_advice_cache (
   expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_routing_cache_tenant ON routing_advice_cache(tenant_id, expires_at);
+-- At-most-once refunds via receipt rows (NOT a trigger: the repo's D1
+-- harnesses split migration files on semicolons, so NO multi-statement
+-- body — trigger, compound select body, etc. — may appear in any migration
+-- consumed by those paths). grants.used_* is gross charged; each refund is
+-- one receipt row keyed by reservation id (INSERT OR IGNORE), and effective
+-- usage is gross minus receipts. A receipt can exist at most once, so a
+-- refund can never apply twice across crashes, retries, or concurrent
+-- releasers; a crash between receipt and state flip is completed by retry.
+CREATE TABLE IF NOT EXISTS routing_refunds (
+  reservation_id TEXT PRIMARY KEY,
+  grant_id TEXT NOT NULL,
+  jobs INTEGER NOT NULL,
+  tokens INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_routing_refunds_grant ON routing_refunds(grant_id);

@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { claimRequest, finalizeDecision, getOpByRequest, expireOps } from '../src/routing/ledger.mjs';
-import { reserveCapacity, releaseCapacity, sweepReservations, reserveCascade } from '../src/routing/capacity.mjs';
+import { reserveCapacity, releaseCapacity, sweepReservations, reserveCascade, grantUsage } from '../src/routing/capacity.mjs';
 import { putCached, getCached, sweepCache, cacheKeyFor } from '../src/routing/cache.mjs';
 import { decideRoute } from '../src/routing/decide.mjs';
 
@@ -68,7 +68,7 @@ test('routing ledger: claim, finalize, replay, steal, expiry', async () => {
 test('routing capacity: reserve, overdraw, revoke, release, double-release', async () => {
   const t = await createTestEnv({});
   await seed(t);
-  const used = async () => ({ ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rc').first()) });
+  const used = () => grantUsage(t.DB, 'g_rc');
   const r = await reserveCapacity(t.DB, { opId: 'op_r', tenant: 'u_alice', grantId: 'g_rc', jobs: 1, tokens: 100, nowMs: NOW });
   assert.equal(r.state, 'held');
   assert.deepEqual(await used(), { used_jobs: 1, used_tokens: 100 });
@@ -90,10 +90,10 @@ test('routing capacity: concurrent racers cannot overdraw', async () => {
   const rs = await Promise.allSettled([mk('op_c1'), mk('op_c2'), mk('op_c3')]);
   assert.equal(rs.filter((r) => r.status === 'fulfilled').length, 1);
   assert.ok(rs.filter((r) => r.status === 'rejected').every((r) => r.reason.code === 'ROUTE_CAPACITY_EXHAUSTED'));
-  const u = { ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rc').first()) };
+  const u = await grantUsage(t.DB, 'g_rc');
   assert.deepEqual(u, { used_jobs: 1, used_tokens: 100 });
   assert.equal(await sweepReservations(t.DB, NOW + 3600 * 1000), 1);
-  const u2 = { ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rc').first()) };
+  const u2 = await grantUsage(t.DB, 'g_rc');
   assert.deepEqual(u2, { used_jobs: 0, used_tokens: 0 });
 });
 
@@ -199,7 +199,7 @@ test('routing capacity: concurrent releases refund exactly once, no row on rejec
     releaseCapacity(t.DB, { opId: 'op_x1' }),
   ]);
   assert.deepEqual([a, b].sort(), [0, 1]);
-  const u = { ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rb').first()) };
+  const u = await grantUsage(t.DB, 'g_rb');
   assert.deepEqual(u, { used_jobs: 1, used_tokens: 100 });
   await assert.rejects(reserveCapacity(t.DB, { opId: 'op_x3', tenant: 'u_alice', grantId: 'g_rc', jobs: 99, tokens: 99, nowMs: NOW }), (e) => e.code === 'ROUTE_CAPACITY_EXHAUSTED');
   const rows = await t.DB.prepare('SELECT COUNT(*) n FROM routing_reservations WHERE op_id = ?').bind('op_x3').first();
@@ -256,30 +256,68 @@ test('routing decide: live clock in production, scripted clock proves rechecks',
   }
 });
 
-test('routing capacity: failed refunds leave the hold recoverable', async () => {
+test('routing capacity: release and sweep racing one hold refund exactly once', async () => {
   const t = await createTestEnv({});
   await seed(t);
-  await reserveCapacity(t.DB, { opId: 'op_f', tenant: 'u_alice', grantId: 'g_rc', jobs: 1, tokens: 100, nowMs: NOW });
-  const failDb = {
+  await reserveCapacity(t.DB, { opId: 'op_rs', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW, ttlMs: 1 });
+  await reserveCapacity(t.DB, { opId: 'op_rs2', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW });
+  const [a, b] = await Promise.all([
+    releaseCapacity(t.DB, { opId: 'op_rs' }),
+    sweepReservations(t.DB, NOW + 120000),
+  ]);
+  assert.equal(a + b, 1);
+  const u = await grantUsage(t.DB, 'g_rb');
+  assert.deepEqual(u, { used_jobs: 1, used_tokens: 100 });
+  const s2 = await t.DB.prepare('SELECT state FROM routing_reservations WHERE op_id = ?').bind('op_rs2').first();
+  assert.equal(s2.state, 'held');
+});
+
+test('routing capacity: recovery after a post-refund crash refunds at most once', async () => {
+  const t = await createTestEnv({});
+  await seed(t);
+  await reserveCapacity(t.DB, { opId: 'op_ra', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW });
+  await reserveCapacity(t.DB, { opId: 'op_rb', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW });
+  await reserveCapacity(t.DB, { opId: 'op_rc', tenant: 'u_alice', grantId: 'g_rb', jobs: 1, tokens: 100, nowMs: NOW });
+  const used = () => grantUsage(t.DB, 'g_rb');
+  const stateOf = async (op) => (await t.DB.prepare('SELECT state FROM routing_reservations WHERE op_id = ?').bind(op).first()).state;
+  const receipts = async () => (await t.DB.prepare('SELECT COUNT(*) n FROM routing_refunds WHERE grant_id = ?').bind('g_rb').first()).n;
+  assert.deepEqual(await used(), { used_jobs: 3, used_tokens: 300 });
+  // Crash BEFORE the receipt lands: nothing applied, plain retry completes.
+  const failBefore = {
     ...t.DB,
     prepare: (sql) => {
-      if (!sql.includes('UPDATE grants')) return t.DB.prepare(sql);
-      return {
-        bind: (...p) => {
-          const real = t.DB.prepare(sql).bind(...p);
-          return { ...real, run: async () => { throw new Error('injected refund failure'); } };
-        },
-      };
+      if (!sql.includes('INSERT OR IGNORE INTO routing_refunds')) return t.DB.prepare(sql);
+      return { bind: (...p) => ({ ...t.DB.prepare(sql).bind(...p), run: async () => { throw new Error('injected pre-refund crash'); } }) };
     },
   };
-  await assert.rejects(releaseCapacity(failDb, { opId: 'op_f', nowMs: NOW }), /injected/);
-  const row = await t.DB.prepare('SELECT state FROM routing_reservations WHERE op_id = ?').bind('op_f').first();
-  assert.match(row.state, /^releasing:/);
-  // A plain retry finds no held row; the sweeper reaps the aged token.
-  assert.equal(await releaseCapacity(t.DB, { opId: 'op_f', nowMs: NOW }), 0);
-  assert.equal(await sweepReservations(t.DB, NOW + 120000), 1);
-  const u = { ...(await t.DB.prepare('SELECT used_jobs, used_tokens FROM grants WHERE id = ?').bind('g_rc').first()) };
-  assert.deepEqual(u, { used_jobs: 0, used_tokens: 0 });
+  await assert.rejects(releaseCapacity(failBefore, { opId: 'op_ra', nowMs: NOW }), /pre-refund/);
+  assert.deepEqual(await used(), { used_jobs: 3, used_tokens: 300 });
+  assert.equal(await stateOf('op_ra'), 'held');
+  assert.equal(Number(await receipts()), 0);
+  assert.equal(await releaseCapacity(t.DB, { opId: 'op_ra', nowMs: NOW }), 1);
+  assert.deepEqual(await used(), { used_jobs: 2, used_tokens: 200 });
+  // Crash AFTER the receipt commits but before the state flip lands: the
+  // refund is already durable, so recovery must complete the flip without
+  // a second receipt. White-box seam: the flip is the only UPDATE on the
+  // reservations table; the receipt INSERT passes through untouched.
+  const failAfter = {
+    ...t.DB,
+    prepare: (sql) => {
+      if (!sql.includes('UPDATE routing_reservations')) return t.DB.prepare(sql);
+      return { bind: (...p) => ({ ...t.DB.prepare(sql).bind(...p), run: async () => { throw new Error('injected post-refund crash'); } }) };
+    },
+  };
+  await assert.rejects(releaseCapacity(failAfter, { opId: 'op_rb', nowMs: NOW }), /post-refund/);
+  assert.equal(await stateOf('op_rb'), 'held');
+  assert.deepEqual(await used(), { used_jobs: 1, used_tokens: 100 });
+  // Recovery on a fresh worker: retry plus an aged sweep. op_rb must end
+  // terminal with exactly one receipt while op_rc stays held and receiptless.
+  await releaseCapacity(t.DB, { opId: 'op_rb', nowMs: NOW });
+  await sweepReservations(t.DB, NOW + 120000);
+  assert.notEqual(await stateOf('op_rb'), 'held');
+  assert.equal(await stateOf('op_rc'), 'held');
+  assert.equal(Number(await receipts()), 2);
+  assert.deepEqual(await used(), { used_jobs: 1, used_tokens: 100 });
 });
 
 test('routing ledger: concurrent stealers elect exactly one leader', async () => {
