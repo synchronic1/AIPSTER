@@ -389,3 +389,41 @@ test('routing decide: finalization failure runs leader cleanup, retry proceeds',
   assert.ok(retry.route && retry.route.reservation);
   assert.ok(!retry.failure || retry.failure.code !== 'ROUTE_OP_IN_FLIGHT');
 });
+
+test('routing decide: post-commit read failure does not roll back a committed route', async () => {
+  const t = await createTestEnv(ENV);
+  await seed(t);
+  const ok = async () => new Response(JSON.stringify(rankResponse(['r3', 'r1', 'r2'])), { status: 200 });
+  const feat = { model: 'fast-path', maxTokens: 500, requestId: 'req_rc' };
+  // Fail any op-row read AFTER the commit UPDATE lands: with a post-commit
+  // re-read this rejects into rollback cleanup; read-before-write finality
+  // has no post-commit read left to fail.
+  let committed = false;
+  const failDb = {
+    ...t.DB,
+    prepare: (sql) => {
+      if (sql.includes('UPDATE routing_ops SET state = ?, source')) {
+        return {
+          bind: (...p) => {
+            const real = t.DB.prepare(sql).bind(...p);
+            return { ...real, run: async () => { const out = await real.run(); committed = true; return out; } };
+          },
+        };
+      }
+      if (committed && sql.includes('SELECT * FROM routing_ops WHERE tenant_id')) {
+        const fail = async () => { throw new Error('injected post-commit read failure'); };
+        return { bind: (...p) => ({ ...t.DB.prepare(sql).bind(...p), first: fail, all: fail }) };
+      }
+      return t.DB.prepare(sql);
+    },
+  };
+  const out = await decideRoute({ db: failDb, env: t.env, tenant: 'u_alice', features: feat, fetchImpl: ok, nowMs: NOW });
+  assert.equal(out.source, 'advice');
+  assert.equal(out.route.reservation.state, 'held');
+  assert.deepEqual(await grantUsage(t.DB, 'g_rb'), { used_jobs: 1, used_tokens: 500 });
+  // Same-request retry replays the committed route with its hold intact.
+  const replay = await decideRoute({ db: t.DB, env: t.env, tenant: 'u_alice', features: feat, fetchImpl: ok, nowMs: NOW });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.route.reservation.state, 'held');
+  assert.deepEqual(await grantUsage(t.DB, 'g_rb'), { used_jobs: 1, used_tokens: 500 });
+});

@@ -55,6 +55,10 @@ export async function claimRequest(db, { opId, tenant, requestId, nowMs = null }
 /**
  * Finalize the leader's claim with the served outcome. Only the owning
  * proposed row moves; anything else means the claim lapsed mid-flight.
+ * Read-before-write: the row is selected BEFORE the commit UPDATE and the
+ * committed values are returned from memory, so there is no fallible step
+ * after the commit that could falsely trigger rollback-style cleanup of an
+ * admitted decision.
  */
 export async function finalizeDecision(db, { opId, tenant, requestId, ranking, source, failure = null, outcome = null, digests = {}, policyVersion = 'route/v1', ttlMs = ROUTING_OP_TTL_MS, nowMs = null } = {}) {
   if (!SOURCES.includes(source)) throw new Error('unknown source.');
@@ -66,14 +70,24 @@ export async function finalizeDecision(db, { opId, tenant, requestId, ranking, s
     failure: failure ? { code: failure.code || 'UNKNOWN', status: failure.status || 502 } : null,
     outcome: outcome && typeof outcome === 'object' ? outcome : null,
   };
+  const prev = await getOpByRequest(db, tenant, requestId);
+  const state = row.ranking.length > 0 ? 'admitted' : 'rejected';
+  const rankingJson = JSON.stringify(row);
+  const failureCode = row.failure ? row.failure.code : null;
+  const featureDigest = digests.featureDigest || null;
+  const candidateDigest = digests.candidateDigest || null;
+  const expiresAt = new Date(now + ttlMs).toISOString();
   const res = await run(db,
     `UPDATE routing_ops SET state = ?, source = ?, ranking_json = ?, failure_code = ?, feature_digest = ?, candidate_digest = ?, policy_version = ?, updated_at = ?, expires_at = ?
      WHERE tenant_id = ? AND request_id = ? AND id = ? AND state = 'proposed'`,
-    row.ranking.length > 0 ? 'admitted' : 'rejected', source, JSON.stringify(row),
-    row.failure ? row.failure.code : null, digests.featureDigest || null, digests.candidateDigest || null,
-    policyVersion, at, new Date(now + ttlMs).toISOString(), tenant, requestId, opId);
+    state, source, rankingJson, failureCode, featureDigest, candidateDigest,
+    policyVersion, at, expiresAt, tenant, requestId, opId);
   if (Number(res.meta.changes) !== 1) throw httpError(503, 'Routing claim lapsed before commit.', 'ROUTE_OP_SUPERSEDED');
-  return getOpByRequest(db, tenant, requestId);
+  return {
+    ...(prev || {}), id: opId, tenant_id: tenant, request_id: requestId, state, source,
+    ranking_json: rankingJson, failure_code: failureCode, feature_digest: featureDigest,
+    candidate_digest: candidateDigest, policy_version: policyVersion, updated_at: at, expires_at: expiresAt,
+  };
 }
 
 /** Best-effort cancel of our own pending claim (leader error path). */
