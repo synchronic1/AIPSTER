@@ -49,6 +49,8 @@ Every response is shape-checked. A throw, a malformed response or an unexpected 
 
 Durable state is bounded per principal. `INFERENCE_DISPATCH_MAX_ADMISSIONS` (default 20) caps live admissions; expired admissions are swept and never count. `INFERENCE_DISPATCH_MAX_OPERATIONS` (default 20) caps retained operations in **every** phase, terminal ones included, and is enforced by a guarded insert inside the claim batch: at the cap the claim either makes room by pruning or fails with `429 DISPATCH_LIMIT`.
 
+With the defaults, 20 settled operations can exhaust capacity for up to seven days even when no jobs are in flight. Confirm this retained-state budget before enabling inference; increasing throughput requires an explicit budget or retention decision.
+
 Only state that cannot be replayed is pruned, and only for the claiming principal:
 
 | State | When it is pruned |
