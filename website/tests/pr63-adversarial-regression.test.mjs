@@ -37,6 +37,7 @@ import { readFile } from 'node:fs/promises';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { MIGRATION_FILES, applyMigrations, createD1Shim, createTestEnv, readJson, TEST_URL } from './d1-shim.mjs';
 import { createD1DispatchStore } from '../src/inference/dispatch-store.mjs';
+import { createDispatchCoordinator } from '../src/inference/dispatch-coordinator.mjs';
 import { CONTENT_MAX, validateWorkerResultReport } from '../src/inference/worker-transport.mjs';
 import {
   T0, RES_1, alice, bob, createClock, createStoreHarness, bindingFor, envelopeFor,
@@ -706,4 +707,91 @@ test('F7: eviction never leaves a side-table row pointing at a pruned operation'
     'expired settled operations left charged holds or receipts behind');
   assert.deepEqual(grantUsed(s.sqlite), { used_jobs: 2, used_tokens: 256 },
     'pruning must not refund the settled charge');
+});
+
+// ---------------------------------------------------------------------------
+// F7 retention race (reported during final review) — a stale cancel must not
+// fence an operation that cap-pressure retention already pruned
+// ---------------------------------------------------------------------------
+
+test('F7: a stale coordinator cancel cannot fence a pruned operation', async () => {
+  const cap = 1;
+  const h = createStoreHarness({
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: String(cap), INFERENCE_DISPATCH_MAX_ADMISSIONS: '100' },
+  });
+  const other = createD1DispatchStore(h.db, {
+    now: h.clock.now,
+    env: envFor({ INFERENCE_DISPATCH_MAX_OPERATIONS: String(cap), INFERENCE_DISPATCH_MAX_ADMISSIONS: '100' }),
+  });
+  const opKey = (k) => JSON.stringify([alice.principal_id, k]);
+  const orphanFences = () => count(h.sqlite, `SELECT COUNT(*) AS n FROM dispatch_fences f
+    WHERE NOT EXISTS (SELECT 1 FROM dispatch_operations o WHERE o.op_id = f.op_id)`);
+
+  for (let i = 0; i < 3; i += 1) {
+    const admission = await h.store.issueAdmission({
+      principal: alice, resource_id: RES_1, model_id: 'model-x', max_tokens: 64,
+    });
+    const rec = await h.store.resolveAdmission({ principal: alice, admission_ref: admission.admission_ref });
+    const binding = bindingFor(rec, { principal: alice });
+    const key = opKey(`race-cancel-${i}`);
+    assert.equal((await h.store.claimOperation({
+      op_key: key, request_digest: `sha256:race-${i}`,
+      principal_id: alice.principal_id, tenant_id: alice.tenant_id, binding,
+    })).claimed, true, `iteration ${i}: the operation is claimable`);
+
+    // The real coordinator, paused at its own read: authority.getOperation
+    // returns the still-live operation, then another store cancels it and
+    // cap-pressure retention prunes the released row before cancel resumes
+    // into fenceStart with the now-stale op_id.
+    let injected = false;
+    const authority = {
+      ...h.store,
+      getOperation: async (args) => {
+        const op = await h.store.getOperation(args);
+        if (op && !injected) {
+          injected = true;
+          assert.deepEqual(await other.fenceStart({ op_id: op.op_id, generation: 1, reason: 'cancel' }),
+            { outcome: 'fenced' }, 'the competing cancel fences first');
+          assert.deepEqual(await other.releaseHolds({ op_id: op.op_id, generation: 1, reason: 'cancel' }),
+            { released: 0 });
+          assert.equal((await other.claimOperation({
+            op_key: opKey(`race-pressure-${i}`), request_digest: `sha256:pressure-${i}`,
+            principal_id: alice.principal_id, tenant_id: alice.tenant_id, binding,
+          })).claimed, true, 'cap pressure prunes the released operation');
+          assert.equal(await other.getOperation({ op_key: key }), null,
+            'the operation the stale cancel still holds is pruned');
+        }
+        return op;
+      },
+    };
+    const coordinator = createDispatchCoordinator({
+      resolvePrincipal: async (ctx) => (ctx === 'ctx-alice' ? { ...alice } : null),
+      authority,
+      transport: { capabilities: { protocol: 'aipster-bound-cpu-internal/1', instance_pin: true, deadline: true } },
+      now: h.clock.now,
+    });
+
+    const cancelled = await coordinator.cancel('ctx-alice', `race-cancel-${i}`);
+    assert.equal(injected, true, 'the race ran inside the coordinator lookup');
+    assert.equal(cancelled.status, 'cancelled_before_start', JSON.stringify(cancelled));
+
+    // No tombstone may outlive the operation, and the stale cancel may not
+    // replay, charge or resurrect anything.
+    assert.equal(orphanFences(), 0,
+      `iteration ${i}: a stale cancel wrote ${orphanFences()} fence row(s) for pruned operations`);
+    assert.equal(await h.store.getOperation({ op_key: key }), null, 'the pruned operation stays gone');
+    assert.equal(count(h.sqlite, 'SELECT COUNT(*) AS n FROM dispatch_jobs'), 0);
+    assert.equal(ownerPoolUsed(h.sqlite, binding.pools[0].pool_id), 0, 'no charge landed');
+
+    // Retire the pressure operation so the next iteration can prune again.
+    const pressure = await h.store.getOperation({ op_key: opKey(`race-pressure-${i}`) });
+    assert.equal((await other.releaseHolds({ op_id: pressure.op_id, generation: 1 })).released, 0);
+  }
+
+  // A fence request for an operation that never existed is a no-op, not a row.
+  assert.deepEqual(await h.store.fenceStart({ op_id: 'dispatch-op-never-existed', generation: 1 }),
+    { outcome: 'fenced' });
+  assert.equal(count(h.sqlite,
+    "SELECT COUNT(*) AS n FROM dispatch_fences WHERE op_id = 'dispatch-op-never-existed'"), 0,
+  'fenceStart must not create a tombstone for a missing operation');
 });
