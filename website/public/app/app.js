@@ -227,7 +227,9 @@ const WORKER_LINKS = {
   securityFix: 'https://github.com/synchronic1/AIPSTER/pull/17',
   heartbeat: 'https://github.com/synchronic1/AIPSTER/pull/20'
 };
-const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
+// Redacted stand-in for the code field in downloaded templates: the file
+// export never carries a Bearer [REDACTED]
+const REDACTED_CODE = '[code redacted \u2014 regenerate in My Compute for a fresh pairing code]';
 
 // Verified installer availability per platform. A platform is honestly
 // unavailable until a packaging PR ships a worker-only artifact (the worker
@@ -247,10 +249,12 @@ const INSTALLERS = {
   macos: { available: false, reason: 'no verified installer package exists yet' },
   linux: { available: false, reason: 'no verified installer package exists yet' }
 };
+// Platform metadata. Qualification is honest labelling (Advanced), never a
+// gate: every picked OS gets the one-action setup prompt.
 const OS_META = {
-  windows: { label: 'Windows x64', shell: 'PowerShell', venvBin: '.\\.venv\\Scripts', posix: false, agentQualified: true },
-  macos: { label: 'macOS', shell: 'Terminal', venvBin: '.venv/bin', posix: true, agentQualified: false },
-  linux: { label: 'Linux', shell: 'a shell', venvBin: '.venv/bin', posix: true, agentQualified: false }
+  windows: { label: 'Windows x64', shell: 'PowerShell', venvBin: '.\\.venv\\Scripts', posix: false },
+  macos: { label: 'macOS', shell: 'Terminal', venvBin: '.venv/bin', posix: true },
+  linux: { label: 'Linux', shell: 'a shell', venvBin: '.venv/bin', posix: true }
 };
 
 // Best-effort platform suggestion; the picker always lets the user correct
@@ -313,10 +317,12 @@ function workerPairingCommands(os) {
   return [py + ' pairing.py pair', py + ' pairing.py heartbeat-loop --config configs/mock.toml', py + ' pairing.py unpair'];
 }
 
-// Complete, version-pinned instructions for the user's own local agent. They
-// contain no credential: the owner performs pairing locally and explicitly
-// starts the sender. Installation alone never contacts AIPSTER.
-function agentInstructions(os) {
+// Complete, version-pinned setup packet for the user's own local agent,
+// carrying the freshly minted code the deliberate generate action produced.
+// The code sits in a delimited data field, never interpolated into a shell
+// command. Display-only values are flattened to single lines; the code
+// itself stays byte-exact (validated, never mutated) so the claim succeeds.
+function agentSetupPacket(os, setup) {
   const meta = OS_META[os] || OS_META.windows;
   const lines = workerCommands(os);
   const pairing = workerPairingCommands(os);
@@ -328,18 +334,26 @@ function agentInstructions(os) {
   const tested = os === 'windows'
     ? 'Windows x64 is the only tested platform (mock check only).'
     : 'Only Windows x64 is tested; macOS and Linux steps are untested adaptation, so verify each step before continuing.';
-  return ['AIPSTER agent setup packet v1.',
+  const account = String(setup.account ?? '').replace(/[\r\n\t]+/g, ' ').slice(0, 120);
+  const expiresAt = String(setup.expiresAt ?? '').replace(/[\r\n\t]+/g, ' ');
+  return ['AIPSTER agent setup packet v2.',
     'Set up the AIPSTER local worker on THIS computer (assisted install).',
     '',
     'READ FIRST - what this does and does NOT do:',
     '- Install the local Dendrite worker (ganglion-dendrite 0.1.0) from the reviewed',
     '  AIPSTER source revision below, in an isolated folder on this machine.',
     '- Installing does NOT share this computer and does NOT enable inference. The',
-    '  worker does not contact AIPSTER until I pair it (my step below): until then',
+    '  worker does not contact AIPSTER until the pair step below runs: until then',
     '  it holds no AIPSTER credential. AIPSTER dispatch stays disabled.',
     '- Inspect this machine first, then explain every change BEFORE making it and',
     '  wait for my approval. Do not change system Python, install global packages,',
     '  add services or startup tasks, or expose anything to a network.',
+    '',
+    'TEMPORARY PAIRING CODE - single use, expires ' + expiresAt + ':',
+    '- This code registers THIS computer to my account (' + account + '). It is short-lived',
+    '  and single-use; it is NOT a password, API key, or heartbeat key. Do not store',
+    '  it in a file, log, URL, or chat history beyond this task.',
+    '  PAIRING CODE: ' + setup.code,
     '',
     'Pinned source - do not substitute another revision:',
     '- Repository: https://github.com/synchronic1/AIPSTER',
@@ -385,13 +399,18 @@ function agentInstructions(os) {
     '  simulated output. A running worker is NOT proof of inference readiness: no',
     '  engine or model is installed by these steps.',
     '',
-    'Step 6 - link this computer in AIPSTER (I do this myself, not you):',
-    '- In a second terminal, open the same local-worker directory. I use Pair this',
-    '  computer in AIPSTER My Compute, then run: ' + pairing[0],
-    '- I type the one-time code into that local prompt. Never ask me to paste the',
-    '  code or stored sender key into this chat. Pairing registers the resource',
-    '  and stores its heartbeat credential privately; it does not start a sender.',
-    '- In that terminal I explicitly start reachability heartbeats with:',
+    'Step 6 - link this computer to my account (use the code above exactly once):',
+    '- If this machine is already paired (a pairing.json exists in local-worker), STOP:',
+    '  do not consume the code, rotate keys, unpair, or start a second sender. Ask me',
+    '  whether this is a repair or an account change before doing anything.',
+    '- Otherwise, in the local-worker directory, run: ' + pairing[0],
+    '- Supply the code through the private no-echo prompt that command shows. Never pass',
+    '  the code as a command-line argument, shell variable, or file content, and never',
+    '  print, log, or commit it. If you cannot type into that private prompt, stop and',
+    '  report that limitation instead of working around it.',
+    '- Pairing registers the resource and stores its heartbeat credential privately; it',
+    '  does not start a sender.',
+    '- Then explicitly start reachability heartbeats with:',
     '  ' + pairing[1],
     '- Mock reports usable=false. Choose Done or reopen My Compute to load the paired resource;',
     '  a heartbeat proves reachability only, never inference readiness.',
@@ -415,6 +434,11 @@ function clearPairingCode() {
   if (!connect || !connect.pair) return;
   Object.assign(connect.pair, { phase: 'idle', code: '', expiresAt: '', error: '', op: (connect.pair.op || 0) + 1 });
 }
+function clearSetupCode() {
+  if (!connect || !connect.setup) return;
+  Object.assign(connect.setup, { phase: 'idle', code: '', expiresAt: '', packet: '', packetOs: '', error: '', accountId: '', op: (connect.setup.op || 0) + 1 });
+}
+const accountName = () => (me && (me.name || me.username || me.email)) || 'signed-in account';
 
 // Approved installer origins (dormant: no installer is available yet). A
 // future available entry renders a download only when its URL is an AIPSTER
@@ -476,10 +500,12 @@ function paintConnectCard() {
       : packaged
         ? `<button type="button" class="btn" disabled>Installer rebuild pending for ${esc(meta.label)}</button>`
         : `<button type="button" class="btn" disabled>Installer coming soon for ${esc(meta.label)}</button>`;
+  // The one-action prompt is available for every picked OS; demo and
+  // signed-out viewers get an honest disabled control instead of a mint.
   const secondary = unpickedTarget ? ''
-    : meta.agentQualified
-      ? '<button type="button" class="btn secondary" data-action="copy-agent">Set up with my agent</button>'
-      : '<button type="button" class="btn secondary" data-action="platforms">View supported platforms</button>';
+    : !(me && !me.demo)
+      ? `<button type="button" class="btn secondary" disabled>${me && me.demo ? 'Setup prompt unavailable for demo' : 'Sign in to generate a setup prompt'}</button>`
+      : '<button type="button" class="btn secondary" data-action="gen-setup">Generate and copy setup prompt</button>';
   // Pairing is platform-independent (a browser code mint), so it stays
   // available even before an OS pick. Demo accounts cannot mint: the server
   // would 403, so the card says so up front instead of failing on click.
@@ -505,14 +531,20 @@ function paintConnectCard() {
       : packaged
         ? `<p class="muted">Installer for ${esc(meta.label)} ${esc(inst.version)} is packaged (built from <code>${esc((inst.built_from || '').slice(0, 7))}</code>), but that build predates the API edge-compat fix, so it will not be published; a rebuilt installer is pending qualification and there is nothing to download. The unpublished build's SHA-256 is <code>${esc(inst.sha256)}</code> for reference.</p>`
         : `<p class="muted">Installer for ${esc(meta.label)}: <strong>not available</strong> — ${esc(inst.reason)}, so there is nothing to download. The worker is published as source only.</p>`;
+  const disclosure = unpickedTarget || !(me && !me.demo) ? ''
+    : `<p class="muted">Includes a temporary pairing code that can register this computer to your account. Share only with your trusted installation agent. Target: ${esc(meta.label)}; account ${esc(accountName())}.</p>`;
   let status = '';
-  if (connect.phase === 'platforms') {
-    status = `<p class="notice" role="status"><strong>Supported platforms:</strong> Windows x64 — tested (mock check only). macOS and Linux are not qualified, so agent setup is offered for Windows only. See Advanced for the pinned manual steps.</p>`;
-  } else if (connect.phase === 'copied') {
-    status = `<p class="notice" role="status"><span class="pill ok">Copied</span> ${esc(COPIED_MESSAGE)} The agent needs authorized access to this computer — a browser-only chat cannot install software by itself.</p>`;
-  } else if (connect.phase === 'copy-failed') {
+  if (connect.phase === 'generating') {
+    status = '<p class="notice" role="status">Generating your setup prompt\u2026</p>';
+  } else if (connect.phase === 'copying') {
+    status = '<p class="notice" role="status">Copying your setup prompt\u2026</p>';
+  } else if (connect.phase === 'setup-copied') {
+    status = `<p class="notice" role="status"><span class="pill ok">Copied</span> Setup prompt copied. Paste it into your trusted installation agent. The agent needs authorized access to this computer \u2014 a browser-only chat cannot install software by itself. The temporary code expires ${esc(connect.setup.expiresAt)}. <span class="actions"><button type="button" class="btn secondary" data-action="setup-again">Generate new setup prompt</button></span></p>`;
+  } else if (connect.phase === 'setup-failed') {
     const saveNote = connect.saveFailed ? ' The file download failed in this browser, so use the selectable text.' : '';
-    status = `<p class="notice" role="status"><span class="pill warn">Copy unavailable</span> This browser would not let the page copy automatically. Select the instructions below and copy them yourself, download them as a file, or press "Set up with my agent" to try again.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="save-instructions">Download instructions</button></p><label>Setup instructions (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
+    status = `<p class="notice" role="status"><span class="pill warn">Generated, not copied</span> This browser would not let the page copy automatically. The same prompt is below; retrying will not mint another code.${esc(saveNote)}</p><p class="actions"><button type="button" class="btn secondary" data-action="setup-copy">Try copying again</button><button type="button" class="btn secondary" data-action="save-instructions">Download redacted template</button></p><label>Setup prompt (select and copy)<textarea class="copy-fallback" readonly rows="18">${esc(connect.fallback)}</textarea></label>`;
+  } else if (connect.phase === 'setup-error') {
+    status = `<p class="notice" role="status"><span class="pill warn">Setup prompt failed</span> ${esc(connect.setup.error)} <span class="actions"><button type="button" class="btn secondary" data-action="setup-again">Generate new setup prompt</button></span></p>`;
   } else if (connect.phase === 'load-error') {
     status = `<p class="notice" role="status"><span class="pill warn">Refresh failed</span> ${esc(connect.loadError || 'The resource list could not be loaded.')} <span class="actions"><button type="button" class="btn secondary" data-action="retry-load">Try again</button></span></p>`;
   }
@@ -522,17 +554,24 @@ function paintConnectCard() {
   // link; reachable needs a fresh heartbeat and still claims only
   // reachability.
   const stage = connectStage();
-  const authorizing = !!connect.pair && (connect.pair.phase === 'minting' || connect.pair.phase === 'shown');
+  const setupActive = !!connect.setup && (connect.setup.phase === 'generating' || connect.setup.phase === 'copying' || connect.setup.phase === 'ready');
+  const authorizing = (!!connect.pair && (connect.pair.phase === 'minting' || connect.pair.phase === 'shown')) || setupActive;
+  const setupAuthStage = !connect.setup ? ''
+    : connect.setup.phase === 'generating' || connect.setup.phase === 'copying'
+      ? 'Authorizing: generating a setup prompt\u2026'
+      : connect.setup.phase === 'ready'
+        ? 'Authorizing: setup prompt generated \u2014 paste it into your trusted agent.'
+        : '';
   const current = stage === 'reachable' ? 3 : (stage === 'awaiting' || authorizing) ? 2 : 0;
   const pairingStage = connect.pair && connect.pair.phase === 'minting'
-    ? 'Authorizing: minting a one-time code…'
-    : authorizing
-      ? "Authorizing: code minted — type it into the worker's pair step."
+    ? 'Authorizing: minting a one-time code\u2026'
+    : setupAuthStage || (authorizing
+      ? "Authorizing: code minted \u2014 type it into the worker's pair step."
       : stage === 'awaiting'
         ? 'Paired, awaiting heartbeat: start the sender, then choose Done to refresh.'
         : stage === 'reachable'
           ? 'Linked: the worker is paired and beating.'
-          : "Available: mint a one-time code below, then type it into the worker's pair step. Packaged installs start the sender from the tray; source installs use the manual steps below.";
+          : 'Available: generate a setup prompt above, or mint a one-time code under Advanced. Packaged installs start the sender from the tray; source installs use the manual steps below.');
   const connectedStage = stage === 'reachable'
     ? 'Reachable now: fresh heartbeat on file. Reachability only — dispatch stays disabled and nothing can run.'
     : 'Needs verified worker evidence. A download or a running worker is not proof.';
@@ -565,11 +604,15 @@ function paintConnectCard() {
 <li><span class="pill warn">macOS / Linux: not qualified</span> <span class="muted">commands are for adaptation only (use <code>.venv/bin/</code>). They are untested.</span></li></ul>
 <p class="muted">The worker is published as source, pinned to the <a href="${esc(L.securityFix)}">security-fixed revision</a> that requires a local token and checks Host/Origin.</p>
 <h3>Connect</h3>
-<p>Mint a one-time pairing code above (10-minute expiry, single use). In a second terminal in the same <code>local-worker</code> directory, run <code>${esc(pairingCommands[0])}</code> and type the code locally. Pairing contacts AIPSTER, registers this computer automatically and stores a private heartbeat key. Do not paste the code or key into an agent chat.</p>
+<p>Mint a one-time pairing code in Manual repair below (10-minute expiry, single use). In a second terminal in the same <code>local-worker</code> directory, run <code>${esc(pairingCommands[0])}</code> and type the code locally. Pairing contacts AIPSTER, registers this computer automatically and stores a private heartbeat key. Do not paste the code or key into an agent chat.</p>
 <p>Pairing does not start the sender. In that terminal, run <code>${esc(pairingCommands[1])}</code> to post reachability heartbeats. The mock stays <code>usable=false</code>; no inference is enabled. Keep this sender terminal open. See the <a href="${esc(L.pairing)}">pairing and sender details</a>.</p>
 <p>Status: <strong>not linked until paired</strong>. Choose Done or reopen My Compute after pairing to load the resource below. Heartbeats prove reachability only, never readiness. Manual entry stays under <strong>Advanced: manual resource registration</strong>. See the <a href="${esc(L.heartbeat)}">heartbeat intake</a> and the <a href="${esc(L.gaps)}">execution gaps</a>.</p>
     ${packagedPairPara}
 <p class="muted">If the key is revoked or expires, the sender exits asking for a re-pair with a fresh code.</p>
+<h3>Manual repair: mint a code to type yourself</h3>
+<p>Use the generate action above for agent setup. If you install by hand, mint a one-time code here and type it into the worker's pair step.</p>
+<p class="actions">${pairBtn}</p>
+${pairBlock}
 <details><summary>Troubleshooting</summary><ul><li>Existing <code>.venv</code>: use a fresh clone, or stop the worker and remove that local venv.</li><li>uv version mismatch: install uv 0.12.12. Do not update the lock files.</li><li>Hash mismatch: restore the exact public commit and run <code>verify_vendor.py</code>.</li><li><code>serve</code> exits asking for <code>DENDRITE_API_TOKEN</code>: generate a fresh value of 32+ characters as shown above.</li><li>401 from <code>/v1/...</code>: send <code>Authorization: Bearer</code> with the exact token the worker started with.</li><li>400 Host or 403 Origin not allowed: call the worker by its loopback address and port, not another hostname.</li><li>Port 8090 in use: stop the other worker through its own controls (never kill it), or pick a free loopback port in the config. Pairing needs no local port, so it stays available.</li><li>TLS or package index failure: check access to public PyPI.</li></ul><p><a href="${esc(L.troubleshoot)}">Full troubleshooting table</a></p></details>
 <details><summary>Disconnect and uninstall</summary><p>Stop both sender and daemon terminals with Ctrl+C, then discard the worker-local token. A paired worker also holds an AIPSTER heartbeat key: revoke this resource's key in AIPSTER Keys. Run <code>${esc(pairingCommands[2])}</code> to forget its local pairing; this does not revoke the server key. Then remove only <code>local-worker/.venv</code> and <code>.state</code> if present. Keep unrelated models and engines. This setup adds no service, startup task, global package or automatic update. Keep the daemon on loopback.</p></details>
 </details>`;
@@ -582,12 +625,12 @@ ${progressItems}
 </ol>
 ${stagePill}
 </div><div class="connect-body">
-<p class="lede">Prepare this computer in two steps: install the local worker (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>), then pair it below with a one-time code. AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; dispatch is not available, so nothing can run.</p>
+<p class="lede">Prepare this computer in one action: generate a setup prompt with a short-lived pairing code, then paste it into your trusted installation agent (<code>ganglion-dendrite 0.1.0</code>, reviewed AIPSTER commit <code>${WORKER_COMMIT.slice(0, 7)}</code>). AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant; dispatch is not available, so nothing can run.</p>
 <div class="osrow"><label for="connect-os">Your system</label><select id="connect-os" data-action="os" aria-describedby="connect-os-note">${options}</select><span class="muted" id="connect-os-note">${detectedNote}</span></div>
-<p class="actions">${primary}${secondary}${pairBtn}</p>
+<p class="actions">${primary}${secondary}</p>
 ${installerLine}
+${disclosure}
 ${status}
-${pairBlock}
 ${advanced}
 </div></div>`;
   el.hidden = false;
@@ -596,7 +639,7 @@ ${advanced}
       const adv = el.querySelector('details');
       if (adv) adv.open = true;
     }
-    if (connect.phase === 'copy-failed') {
+    if (connect.phase === 'setup-failed') {
       const ta = el.querySelector('textarea.copy-fallback');
       if (ta) ta.focus();
     } else if (focusAction) {
@@ -611,12 +654,12 @@ function onConnectClick(ev) {
   const t = ev && ev.target;
   const near = t && typeof t.closest === 'function' ? t.closest('[data-action]') : null;
   const action = (near && near.dataset && near.dataset.action) || (t && t.dataset && t.dataset.action);
-  if (action === 'platforms') {
-    connect.phase = 'platforms';
-    connect.copyOp = (connect.copyOp || 0) + 1;
-    paintConnectCard();
-  } else if (action === 'copy-agent') {
-    copyAgentInstructions();
+  if (action === 'gen-setup') {
+    genSetupPacket(false);
+  } else if (action === 'setup-again') {
+    genSetupPacket(true);
+  } else if (action === 'setup-copy') {
+    retrySetupCopy();
   } else if (action === 'save-instructions') {
     saveInstructions();
   } else if (action === 'pair') {
@@ -639,7 +682,10 @@ function saveInstructions() {
   if (typeof document === 'undefined' || !document.createElement || !document.body) return;
   let url = null;
   try {
-    url = URL.createObjectURL(new Blob([connect.fallback], { type: 'text/plain' }));
+    // The file export carries the redacted template when the in-memory
+    // packet holds a code; the code-bearing packet itself is never downloadable.
+    const text = connect.fallbackRedacted || connect.fallback;
+    url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
     const a = document.createElement('a');
     a.href = url;
     a.download = 'aipster-worker-setup.txt';
@@ -662,40 +708,153 @@ function onConnectChange(ev) {
     connect.picked = true;
     connect.phase = 'idle';
     connect.fallback = '';
+    connect.fallbackRedacted = '';
     clearPairingCode();
+    clearSetupCode();
     connect.saveFailed = false;
-    connect.copyOp = (connect.copyOp || 0) + 1;
+    connect.setupOp = (connect.setupOp || 0) + 1;
     paintConnectCard();
   }
 }
 
-async function copyAgentInstructions() {
-  if (!connect) return;
+function setupBindingOk(card, op, os, accountId) {
+  return connect === card && card.setupOp === op && card.os === os
+    && card.setup && card.setup.accountId === accountId;
+}
+
+// The mint must carry an id, a byte-exact code and a parseable expiry.
+// Anything else is unusable: report it, never clipboard it, never retry it.
+function validSetupMint(data) {
+  if (!data || typeof data !== 'object') return null;
+  const id = typeof data.id === 'string' ? data.id : '';
+  const code = typeof data.code === 'string' ? data.code : '';
+  const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : '';
+  if (!id || id.length > 64 || !code || code.length > 256) return null;
+  if (!expiresAt || !Number.isFinite(Date.parse(expiresAt))) return null;
+  return { id, code, expiresAt };
+}
+
+function setupErrorText(e) {
+  const msg = String((e && e.message) || '');
+  if (e && e.mintMalformed) return 'The pairing service returned an unusable response. Nothing was copied.';
+  if (/AUTH_REQUIRED/.test(msg)) return 'Sign-in required. Sign in again, then generate a new setup prompt.';
+  if (/PAIRING_LIMIT/.test(msg)) return 'You already have the maximum active codes. Let one expire first.';
+  if (/WRITE_RATE_LIMITED/.test(msg)) return 'Too many requests. Wait a little while, then generate a new setup prompt.';
+  if (/DEMO_RESTRICTED/.test(msg)) return 'Setup prompts are unavailable for demo accounts.';
+  if (/CSRF_REQUIRED|KEY_FORBIDDEN/.test(msg)) return 'Request refused. Reload My Compute and try again.';
+  if (/ \([A-Z_]{3,}\)$/.test(msg)) return 'Setup request failed. Try again explicitly if needed.';
+  return 'The request may or may not have minted a code; nothing was copied. Try again explicitly if needed.';
+}
+
+// One deliberate action: mint a code, build the packet for the picked OS,
+// and copy it. Fenced by session generation, card identity, op counter,
+// picked OS and account id; a second click while mint or copy is in flight
+// starts nothing. Explicit regeneration passes replace=true for a new op.
+async function genSetupPacket(replace) {
+  if (!connect || !me || me.demo) return;
   const gen = generation;
-  // Operation identity: a slow clipboard write must not report success for a
-  // card the user has since re-rendered, switched OS on, or re-clicked.
   const card = connect;
   const os = card.os;
-  if (!OS_META[os] || !OS_META[os].agentQualified || needsTargetSelection(card)) return;
-  const op = (card.copyOp = (card.copyOp || 0) + 1);
-  const text = card.detected === 'mobile'
-    ? `Target computer: ${OS_META[os].label} (these steps run on that computer, not on this phone or tablet).\n` + agentInstructions(os)
-    : agentInstructions(os);
+  const accountId = me.id;
+  if (!OS_META[os] || needsTargetSelection(card)) return;
+  if (!replace && (card.setup.phase === 'generating' || card.setup.phase === 'copying')) return;
+  const op = (card.setupOp = (card.setupOp || 0) + 1);
+  card.setup = { phase: 'generating', code: '', expiresAt: '', packet: '', packetOs: '', error: '', accountId, op };
+  card.phase = 'generating';
+  card.fallback = '';
+  card.fallbackRedacted = '';
+  card.saveFailed = false;
+  paintConnectCard();
+  // The binding covers session generation too, so no separate stale check
+  // is needed: any navigation, sign-out, OS change or regeneration fails it.
+  const bound = () => gen === generation && setupBindingOk(card, op, os, accountId);
+  let mint;
+  try {
+    const data = await api('/api/pairing/codes', { method: 'POST', body: JSON.stringify({ ttlMinutes: 10 }) });
+    if (!bound()) return;
+    mint = validSetupMint(data);
+    if (!mint) throw Object.assign(new Error('unusable mint response'), { mintMalformed: true });
+  } catch (e) {
+    if (!bound()) return;
+    card.setup = { phase: 'error', code: '', expiresAt: '', packet: '', packetOs: '', error: setupErrorText(e), accountId, op };
+    card.phase = 'setup-error';
+    paintConnectCard();
+    return;
+  }
+  const prefix = card.detected === 'mobile' ? `Target computer: ${OS_META[os].label} (these steps run on that computer, not on this phone or tablet).\n` : '';
+  const packet = prefix + agentSetupPacket(os, { ...mint, account: accountName() });
+  const redacted = prefix + agentSetupPacket(os, { ...mint, code: REDACTED_CODE, account: accountName() });
+  if (!bound()) return; // never write a stale packet to any clipboard
+  card.setup.phase = 'copying';
+  card.setup.code = mint.code;
+  card.setup.expiresAt = mint.expiresAt;
+  card.setup.packet = packet;
+  card.setup.packetOs = os;
+  card.phase = 'copying';
+  paintConnectCard();
   let clipboard = null;
   try {
     clipboard = (typeof navigator !== 'undefined' && navigator.clipboard) || null;
   } catch { clipboard = null; }
   try {
     if (!clipboard || typeof clipboard.writeText !== 'function') throw new Error('clipboard unavailable');
-    await clipboard.writeText(text);
-    if (gen !== generation || connect !== card || card.copyOp !== op || card.os !== os) return;
-    card.phase = 'copied';
+    if (!bound()) return;
+    // A browser clipboard write, once issued, may be uncancellable: the
+    // pre-write binding check above is the last point that can prevent a
+    // stale write. The post-write check below only suppresses stale UI.
+    await clipboard.writeText(packet);
+    if (!bound()) return;
+    card.setup.phase = 'ready';
+    card.phase = 'setup-copied';
     card.fallback = '';
+    card.fallbackRedacted = '';
   } catch {
-    if (gen !== generation || connect !== card || card.copyOp !== op || card.os !== os) return;
-    card.phase = 'copy-failed';
-    card.fallback = text;
+    if (!bound()) return;
+    card.setup.phase = 'ready';
+    card.phase = 'setup-failed';
+    card.fallback = packet;
+    card.fallbackRedacted = redacted;
     card.saveFailed = false;
+  }
+  paintConnectCard();
+}
+
+// Retry reuses the known packet only: same OS, same account, unexpired.
+// It never mints.
+async function retrySetupCopy() {
+  if (!connect || !me || me.demo) return;
+  const gen = generation;
+  const card = connect;
+  const setup = card.setup;
+  if (!setup || setup.phase !== 'ready' || !setup.packet || setup.packetOs !== card.os
+    || setup.accountId !== me.id || needsTargetSelection(card)) return;
+  if (!Number.isFinite(Date.parse(setup.expiresAt)) || Date.parse(setup.expiresAt) <= Date.now()) {
+    setup.error = `That prompt expired at ${setup.expiresAt}.`;
+    card.phase = 'setup-error';
+    paintConnectCard();
+    return;
+  }
+  const op = (card.setupOp = (card.setupOp || 0) + 1);
+  setup.op = op;
+  card.phase = 'copying';
+  paintConnectCard();
+  const bound = () => gen === generation && setupBindingOk(card, op, card.os, me.id);
+  let clipboard = null;
+  try {
+    clipboard = (typeof navigator !== 'undefined' && navigator.clipboard) || null;
+  } catch { clipboard = null; }
+  try {
+    if (!clipboard || typeof clipboard.writeText !== 'function') throw new Error('clipboard unavailable');
+    if (!bound()) return;
+    await clipboard.writeText(setup.packet);
+    if (!bound()) return;
+    card.phase = 'setup-copied';
+    card.fallback = '';
+    card.fallbackRedacted = '';
+  } catch {
+    if (!bound()) return;
+    card.phase = 'setup-failed';
+    card.fallback = setup.packet;
   }
   paintConnectCard();
 }
@@ -731,7 +890,7 @@ function renderConnectCard() {
   clearPairingCode();
   const detected = detectOs();
   const os = detected && detected !== 'mobile' ? detected : 'windows';
-  connect = { os, detected, picked: false, phase: 'idle', fallback: '', saveFailed: false, copyOp: 0, inv: null, loadError: '', pair: { phase: 'idle', code: '', expiresAt: '', error: '', op: 0 } };
+  connect = { os, detected, picked: false, phase: 'idle', fallback: '', fallbackRedacted: '', saveFailed: false, setupOp: 0, inv: null, loadError: '', pair: { phase: 'idle', code: '', expiresAt: '', error: '', op: 0 }, setup: { phase: 'idle', code: '', expiresAt: '', packet: '', packetOs: '', error: '', accountId: '', op: 0 } };
   paintConnectCard();
   const el = $('connect-card');
   el.onclick = onConnectClick;
