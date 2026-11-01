@@ -8,10 +8,14 @@ and public EIF worker files and selected Apache-2.0 on 2026-10-28.
 local-worker/vendor/eif contains source files from
 https://github.com/synchronic1/elastic-inference-fabric
 commit 536508832b12d993dc272e03d4f09aca53801f68.
-Fourteen are unmodified. dendrite/api.py and dendrite/config.py were modified
+Ten are unmodified. dendrite/api.py and dendrite/config.py were modified
 by AIPSTER on 2026-10-28 (local patch 0001: API token required on every bind,
-Host/Origin validation); each carries a change notice, and
-local-worker/patches plus provenance.json record the patch, the upstream hashes
+Host/Origin validation). dendrite/fabric.py, dendrite/node.py,
+dendrite/runtimes/base.py and dendrite/runtimes/llama.py were modified by
+AIPSTER on 2026-11-01 (local patch 0002: resident-only Ganglion fabric binding,
+result job-id binding, rejection handling and attach-quarantine scoping).
+Each modified file carries a change notice, and
+local-worker/patches plus provenance.json record both patches, the upstream hashes
 and the patched hashes. The upstream repository itself is not changed.
 The upstream snapshot contained no root LICENSE and no per-file license notices
 in these files. The license for this copy is an explicit owner grant, not an
