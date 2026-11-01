@@ -373,3 +373,30 @@ test('admin ui: page past a shrunken total reports an empty window', async () =>
   assert.equal(h.el('resources-prev').disabled, false);
   assert.equal(h.el('resources-next').disabled, true);
 });
+
+test('admin ui: superseded overview responses never paint', async () => {
+  const first = deferred();
+  const second = deferred();
+  let n = 0;
+  const h = harness({
+    '/api/admin/v1/overview': () => {
+      n += 1;
+      const gate = n === 1 ? first.promise : second.promise;
+      const observed = n === 1 ? '2026-10-31T17:00:00.000Z' : '2026-10-31T18:00:00.000Z';
+      return gate.then(() => ({ status: 200, body: { ...AVAILABLE_OVERVIEW.body, observed_at: observed } }));
+    },
+  });
+  h.buttons[0].click();
+  h.buttons[0].click();
+  second.resolve();
+  await settled(() => h.sections.overview.state.textContent === 'Loaded 2026-10-31T18:00:00.000Z.', 'newer overview paints');
+  assert.ok(h.el('overview-result').innerHTML.includes('>3</td>'), 'newer counts painted');
+  first.resolve();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(
+    h.sections.overview.state.textContent,
+    'Loaded 2026-10-31T18:00:00.000Z.',
+    'older response did not overwrite state',
+  );
+  assert.ok(h.el('overview-result').innerHTML.includes('>3</td>'), 'painted counts survive a stale response');
+});
