@@ -118,7 +118,13 @@ test('admin overview/resources: liveness buckets derive from heartbeat freshness
 test('admin resources: pagination windows are stable and bounded', async () => {
   const t = await createTestEnv();
   await grant(t, 'u_alice', 'operations_observer');
-  for (const id of ['r_01', 'r_02', 'r_03', 'r_04', 'r_05']) await seedResource(t, { id });
+  // Pinned newest-first timestamps: ORDER BY created_at DESC, id ASC is then
+  // deterministic regardless of insert timing (no same-millisecond tie reliance).
+  const base = Date.parse('2026-10-31T18:00:00.000Z');
+  const ids = ['r_01', 'r_02', 'r_03', 'r_04', 'r_05'];
+  for (let i = 0; i < ids.length; i++) {
+    await seedResource(t, { id: ids[i], created_at: new Date(base + (ids.length - i) * 1000).toISOString() });
+  }
   const page = async (qs) => readJson(await t.call('/api/admin/v1/resources' + qs, { headers: t.as(t.alice) }));
   const p1 = await page('?limit=2&offset=0');
   assert.equal(p1.status, 200);
