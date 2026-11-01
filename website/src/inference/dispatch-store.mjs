@@ -680,15 +680,28 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
     return exclusive(async () => {
       if (!isStr(op_id) || !isGen(generation)) return { outcome: 'fenced' };
       const t = isoAt(clock());
-      // The tombstone is inserted only while no start can already exist. A
+      // The tombstone is inserted only for an operation that exists at exactly
+      // this generation, and only while no start can already exist. A
       // concurrent redemption in another isolate makes this a no-op, and the
       // re-read below reports it as already redeemed.
+      //
+      // The EXISTS guard is what keeps a fence bounded: the coordinator's
+      // cancel() reads the operation with lookup() and calls fenceStart with
+      // that snapshot, so a cancel paused across another store's fence+release
+      // and a cap-pressure prune would otherwise write a tombstone for an
+      // operation that no longer exists. Such a row is keyed only by the dead
+      // op_id, so no retention pass can reach it and repeated unique op_ids grow
+      // it without bound. An unknown or pruned operation is a safe no-op that
+      // still reports 'fenced'; a fence for a generation the operation does not
+      // have is refused the same way and never blocks the real generation.
       const [res] = await db.batch([
         db.prepare(`INSERT OR IGNORE INTO dispatch_fences (op_id, generation, fenced_at, reason)
           SELECT ?, ?, ?, ?
-          WHERE NOT EXISTS (SELECT 1 FROM dispatch_start_redemptions r WHERE r.op_id = ? AND r.generation = ?)
-            AND NOT EXISTS (SELECT 1 FROM dispatch_operations o
-              WHERE o.op_id = ? AND o.generation = ? AND o.phase IN ('redeemed', 'dispatched', 'settled'))`).bind(
+          WHERE EXISTS (SELECT 1 FROM dispatch_operations o
+              WHERE o.op_id = ? AND o.generation = ?
+                AND o.phase NOT IN ('redeemed', 'dispatched', 'settled'))
+            AND NOT EXISTS (SELECT 1 FROM dispatch_start_redemptions r
+              WHERE r.op_id = ? AND r.generation = ?)`).bind(
           op_id, generation, t, String(reason).slice(0, 200), op_id, generation, op_id, generation),
       ]);
       if (changed(res) === 1) return { outcome: 'fenced' };
@@ -698,7 +711,9 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
       if (redeemed || (op && ['redeemed', 'dispatched', 'settled'].includes(op.phase))) {
         return { outcome: 'already_redeemed' };
       }
-      // The tombstone was already there.
+      // Nothing was written: either the tombstone already exists for a live
+      // operation, or there is no operation to fence at this generation (never
+      // created or already pruned). Both are a no-op under the same contract.
       return { outcome: 'fenced' };
     });
   }

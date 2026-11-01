@@ -317,6 +317,86 @@ test('retention: evicting a released operation is safe to cancel again and never
   assert.equal(durableCounts(h.sqlite).dispatch_operations, 1);
 });
 
+const fenceCount = (sqlite, opId) => sqlite.prepare(
+  'SELECT COUNT(*) AS n FROM dispatch_fences WHERE op_id = ?').get(opId).n;
+
+test('retention: a stale coordinator cancel cannot recreate a fence for a pruned operation', async () => {
+  // The coordinator's cancel() reads the operation with lookup() and only then
+  // calls fenceAndRelease(op) -> fenceStart(op_id, op.generation). If another
+  // store fences and releases the operation, and a cap-pressure claim prunes the
+  // released row, the resumed cancel still calls fenceStart with the stale
+  // op_id. Without an existence guard that call re-inserts a tombstone whose
+  // operation is gone: one orphan dispatch_fences row per unique op_id, which no
+  // prune can ever reach because it is keyed only by the dead op_id.
+  const h = createStoreHarness({
+    env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '1', INFERENCE_DISPATCH_MAX_ADMISSIONS: '64' },
+  });
+  const binding = await admissionBinding(h);
+  const first = await claim(h, binding, 'stale-cancel-key-1');
+  const stale = await h.store.getOperation({ op_key: 'stale-cancel-key-1' }); // the lookup()
+  assert.equal(stale.phase, 'claimed');
+  assert.equal(stale.op_id, first.op.op_id);
+
+  // The request that wins the race fences and releases it.
+  assert.deepEqual(await h.store.fenceStart({ op_id: stale.op_id, generation: stale.generation }),
+    { outcome: 'fenced' });
+  assert.equal(fenceCount(h.sqlite, stale.op_id), 1);
+  assert.deepEqual(await h.store.releaseHolds({ op_id: stale.op_id, generation: stale.generation }),
+    { released: 0 });
+
+  // Cap pressure evicts the released operation together with its tombstone.
+  const second = await claim(h, binding, 'stale-cancel-key-2');
+  assert.equal(second.claimed, true);
+  assert.equal(await h.store.getOperation({ op_key: 'stale-cancel-key-1' }), null);
+  assert.equal(fenceCount(h.sqlite, stale.op_id), 0);
+
+  // The paused cancel resumes with the stale op_id. Under the existing contract
+  // that is a safe no-op that still reports 'fenced' — and it must not write a
+  // tombstone for an operation that no longer exists.
+  assert.deepEqual(await h.store.fenceStart({ op_id: stale.op_id, generation: stale.generation }),
+    { outcome: 'fenced' });
+  assert.equal(fenceCount(h.sqlite, stale.op_id), 0,
+    'the resumed stale cancel recreated an orphan fence tombstone');
+  assert.deepEqual(await h.store.releaseHolds({ op_id: stale.op_id, generation: stale.generation }),
+    { released: 0 });
+
+  // Direct guard boundary: a never-existing op_id is the same no-op.
+  assert.deepEqual(await h.store.fenceStart({ op_id: 'dispatch-op-unknown', generation: 1 }),
+    { outcome: 'fenced' });
+  assert.equal(fenceCount(h.sqlite, 'dispatch-op-unknown'), 0);
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) AS n FROM dispatch_fences').get().n, 0);
+});
+
+test('fence: the existence guard keeps redeemed, wrong-generation and live behavior', async () => {
+  const h = createStoreHarness();
+  // A start that already happened is still reported as such and writes nothing.
+  const done = await dispatchedOperation(h, { principal: alice, max_tokens: 32, op_key: 'fence-guard-done' });
+  assert.deepEqual(await h.store.fenceStart({ op_id: done.op.op_id, generation: 1 }),
+    { outcome: 'already_redeemed' });
+  assert.equal(fenceCount(h.sqlite, done.op.op_id), 0);
+
+  // A fence naming a generation the operation does not have is a no-op: it
+  // never minted a tombstone that could outlive the operation, and it must not
+  // block the operation's real generation.
+  const live = await admittedOperation(h, { principal: alice, max_tokens: 32, op_key: 'fence-guard-live' });
+  assert.deepEqual(await h.store.fenceStart({ op_id: live.op.op_id, generation: 2 }), { outcome: 'fenced' });
+  assert.equal(fenceCount(h.sqlite, live.op.op_id), 0);
+  const worker = { node_id: live.binding.node_id, runtime_instance: live.binding.runtime_instance };
+  assert.deepEqual(await h.store.redeemStart({ op_id: live.op.op_id, generation: 2, worker }),
+    { outcome: 'refused', reason: 'fenced' });
+
+  // The real generation still fences exactly once, and the fence still blocks
+  // the start (the cancellation contract).
+  const other = await admittedOperation(h, { principal: alice, max_tokens: 32, op_key: 'fence-guard-other' });
+  assert.deepEqual(await h.store.fenceStart({ op_id: other.op.op_id, generation: 1 }), { outcome: 'fenced' });
+  assert.deepEqual(await h.store.fenceStart({ op_id: other.op.op_id, generation: 1 }), { outcome: 'fenced' });
+  assert.equal(fenceCount(h.sqlite, other.op.op_id), 1);
+  assert.deepEqual(await h.store.redeemStart({
+    op_id: other.op.op_id, generation: 1,
+    worker: { node_id: other.binding.node_id, runtime_instance: other.binding.runtime_instance },
+  }), { outcome: 'refused', reason: 'fenced' });
+});
+
 test('retention: the cap applies at the store instance boundary, not per store object', async () => {
   const h = createStoreHarness({ env: { INFERENCE_DISPATCH_MAX_OPERATIONS: '1' } });
   await settledOperation(h, 'boundary-key-1');
