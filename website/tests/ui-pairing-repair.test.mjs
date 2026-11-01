@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 
-async function ui({ deferred = false, holdInventory = false } = {}) {
+async function ui({ deferred = false, holdInventory = false, mintStatus = 0, mintBody = null, mintThrows = 0 } = {}) {
   const elements = new Map(), calls = [], pending = [], inventory = [], copied = [], logs = [];
   let holdInventoryNow = false;
+  let mintThrown = 0, mintN = 0;
   const el = id => {
     if (!elements.has(id)) elements.set(id, { id, hidden:true, innerHTML:'', textContent:'', value:'', dataset:{}, listeners:{},
       addEventListener(type, fn) { this.listeners[type] = fn; }, setAttribute() {}, querySelectorAll() { return []; } });
@@ -24,8 +25,11 @@ async function ui({ deferred = false, holdInventory = false } = {}) {
       if(path === '/api/auth/get-session') return response({user:{id:'synthetic-alice',name:'Alice',email:'synthetic@example.invalid'}});
       if(path === '/api/auth/sign-out') return response({ok:true});
       if(path === '/api/pairing/codes') {
+        if (mintThrown < mintThrows) { mintThrown++; throw new TypeError('synthetic network down'); }
+        if (mintBody || mintStatus) return response(mintBody || {error:'SYNTHETIC-MINT-FAILURE'}, mintStatus || 201);
         if(deferred) return new Promise(resolve => pending.push((data,status) => resolve(response(data,status))));
-        return response({code:'SYNTHETIC-PAIR-CODE',expiresAt:'2100-01-01T00:00:00Z'},201);
+        mintN++;
+        return response({id:'p_synth' + mintN, code:'SYNTHETIC-PAIR-CODE-' + mintN, expiresAt:'2100-01-01T00:00:00Z'},201);
       }
       if(path === '/api/inventory?limit=50' && holdInventoryNow) {
         return new Promise(resolve => inventory.push((data,status = 200) => resolve(response(data,status))));
@@ -117,11 +121,13 @@ test('INDEPENDENT UI: navigation, logout and replacement mint fence old response
   assert.equal(t.el('view-app').hidden,true);
 });
 
-test('INDEPENDENT UI: agent setup never clipboard-copies the revealed pairing bearer', async () => {
-  const t = await ui(); await t.press('pair'); await t.press('copy-agent');
+test('INDEPENDENT UI: setup packet carries its own mint, never the manual reveal', async () => {
+  const t = await ui(); await t.press('pair'); await t.press('gen-setup');
   assert.equal(t.copied.length,1);
-  assert.ok(!t.copied[0].includes('SYNTHETIC-PAIR-CODE'));
-  assert.ok(!JSON.stringify(t.logs).includes('SYNTHETIC-PAIR-CODE'));
+  assert.ok(t.copied[0].includes('SYNTHETIC-PAIR-CODE-2'), 'packet carries the setup mint');
+  assert.ok(!t.copied[0].includes('SYNTHETIC-PAIR-CODE-1'), 'packet never reuses the manual reveal');
+  assert.ok(t.el('connect-card').innerHTML.includes('SYNTHETIC-PAIR-CODE-1'), 'manual reveal untouched');
+  assert.ok(!JSON.stringify(t.logs).includes('SYNTHETIC-PAIR-CODE-2'), 'packet code never logged');
 });
 
 test('UI repair: pairing checkout uses the published reviewed source pin and qualified sparse paths', async () => {
@@ -131,7 +137,7 @@ test('UI repair: pairing checkout uses the published reviewed source pin and qua
   assert.equal(pin,'3fa309cb08461ea046ee23e801404911c1f3bcc2');
   assert.match(commands,/sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
   assert.ok(!commands.includes('git clone https://'), 'no full checkout replaces the qualified sparse flow');
-  assert.match(t.context.agentInstructions('windows'), /Use the pinned commands below for pairing/);
+  assert.match(t.context.agentSetupPacket('windows', { id: 'p_direct01', code: 'SYNTHETIC-DIRECT-CODE', expiresAt: '2100-01-01T00:00:00Z', account: 'Direct Owner' }), /Use the pinned commands below for pairing/);
 });
 
 test('UI repair: dismiss and navigation erase shown codes and invalidate pending mint work', async () => {
@@ -169,8 +175,74 @@ test('INDEPENDENT UI: double Pair click while minting starts one mint', async ()
 
 test('INDEPENDENT UI: source instructions start a sender and distinguish paired credential revocation', async () => {
   const t = await ui();
-  const instructions = t.context.agentInstructions('windows');
+  const instructions = t.context.agentSetupPacket('windows', { id: 'p_direct02', code: 'SYNTHETIC-DIRECT-CODE', expiresAt: '2100-01-01T00:00:00Z', account: 'Direct Owner' });
   assert.match(instructions,/heartbeat-loop/, 'pair stores credentials and returns; source daemon does not start the sender');
   assert.ok(!/worker sends reachability heartbeats on its own/.test(instructions));
   assert.ok(!t.el('connect-card').innerHTML.includes('there is nothing to revoke here'), 'paired heartbeat keys remain live until explicitly revoked');
+});
+
+test('INDEPENDENT UI: double generate while minting starts one mint', async () => {
+  const t = await ui({deferred:true});
+  await t.press('gen-setup'); await t.press('gen-setup');
+  assert.equal(t.pending.length,1);
+  t.pending[0]({id:'p_only',code:'ONLY-SETUP-CODE',expiresAt:'2100-01-01T00:00:00Z'},201); await t.flush();
+  assert.equal(t.copied.length,1);
+  assert.ok(t.copied[0].includes('ONLY-SETUP-CODE'));
+});
+
+test('INDEPENDENT UI: target change discards a late setup packet', async () => {
+  const t = await ui({deferred:true});
+  await t.press('gen-setup'); await t.choose('macos');
+  t.pending[0]({id:'p_late',code:'SYNTHETIC-LATE-SETUP',expiresAt:'2100-01-01T00:00:00Z'},201); await t.flush();
+  assert.equal(t.copied.length,0);
+  assert.ok(!t.el('connect-card').innerHTML.includes('SYNTHETIC-LATE-SETUP'));
+});
+
+test('INDEPENDENT UI: lost mint response is honest and regenerates only explicitly', async () => {
+  const t = await ui({mintThrows:1});
+  await t.press('gen-setup');
+  assert.match(t.el('connect-card').innerHTML,/may or may not/);
+  assert.equal(t.calls.filter(c => c.path === '/api/pairing/codes').length,1);
+  assert.equal(t.copied.length,0);
+  await t.press('setup-again');
+  assert.equal(t.calls.filter(c => c.path === '/api/pairing/codes').length,2);
+  assert.equal(t.copied.length,1);
+  assert.ok(t.copied[0].includes('SYNTHETIC-PAIR-CODE-1'));
+});
+
+test('INDEPENDENT UI: navigation fences a late setup mint', async () => {
+  const t = await ui({deferred:true});
+  await t.press('gen-setup');
+  await t.tab('keys');
+  t.pending[0]({id:'p_nav',code:'OLD-NAVIGATION-SETUP',expiresAt:'2100-01-01T00:00:00Z'},201); await t.flush();
+  assert.equal(t.copied.length,0);
+  await t.tab('compute');
+  assert.ok(!t.el('connect-card').innerHTML.includes('OLD-NAVIGATION-SETUP'));
+});
+
+test('INDEPENDENT UI: demo and signed-out guards block setup generation', async () => {
+  const t = await ui({deferred:true});
+  vm.runInContext('me.demo = true', t.context);
+  await t.choose('windows');
+  assert.match(t.el('connect-card').innerHTML, /Setup prompt unavailable for demo/, 'demo action visibly disabled');
+  await t.press('gen-setup'); assert.equal(t.pending.length,0);
+  vm.runInContext('me = null', t.context);
+  await t.press('gen-setup'); assert.equal(t.pending.length,0);
+  assert.equal(t.copied.length,0);
+});
+
+test('INDEPENDENT UI: mint values stay data, never markup', async () => {
+  const t = await ui();
+  const packet = t.context.agentSetupPacket('windows', { id: 'p_x', code: '<script>SYNTHETIC</script>', expiresAt: '2100-01-01T00:00:00Z', account: 'Evil\nName' });
+  assert.ok(packet.includes('PAIRING CODE: <script>SYNTHETIC</script>'), 'code byte-exact in the packet');
+  assert.ok(!packet.includes('Evil\nName') && packet.includes('Evil Name'), 'account newlines flattened');
+});
+
+test('INDEPENDENT UI: code-bearing fallback escapes markup', async () => {
+  const t = await ui({ mintBody: { id: 'p_evil', code: '<script>SYNTHETIC</script>', expiresAt: '2100-01-01T00:00:00Z' } });
+  t.context.navigator.clipboard.writeText = async () => { throw new Error('synthetic denied'); };
+  await t.press('gen-setup');
+  const html = t.el('connect-card').innerHTML;
+  assert.ok(html.includes('&lt;script&gt;'));
+  assert.ok(!html.includes('<script>'));
 });

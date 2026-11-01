@@ -59,3 +59,5 @@ a.btn, button.btn { display:inline-flex; align-items:center; justify-content:cen
 a.btn.secondary, button.btn.secondary { background:transparent; color:var(--accent); }
 @media (max-width:640px){ main{padding:.6rem;} .tabs button{flex:1 1 40%;} .actions .btn{flex:1 1 100%;} }
 @media (prefers-reduced-motion:reduce){ *{transition:none !important;} }
+.cardtext { white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,Consolas,monospace; font-size:.85rem; background:#0b0e12; border:1px solid var(--line); border-radius:.4rem; padding:.75rem; overflow-x:auto; }
+#tab-models a:not(.btn) { color:var(--accent); }

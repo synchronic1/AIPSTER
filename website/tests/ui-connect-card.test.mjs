@@ -1,10 +1,10 @@
 // Installer-first "Connect your computer" onboarding: runs the exact
 // checked-in client against real local handlers (same minimal-DOM pattern as
 // ui-session). Asserts the friendly default view (primary installer action
-// with honest per-platform unavailability, secondary agent-assisted setup),
-// OS suggestion with manual correction, secret-free clipboard instructions
-// with a selectable fallback, a progress stepper that never claims an
-// unverified state, and no API/credential surface.
+// with honest per-platform unavailability, one-action setup-prompt mint and
+// copy), OS suggestion with manual correction, a deliberate credential-bearing
+// packet with a selectable fallback, a progress stepper that never claims an
+// unverified state, and no long-lived credential surface.
 import vm from 'node:vm';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -35,10 +35,22 @@ const EXPECTED_LINKS = [
   'https://github.com/synchronic1/AIPSTER/pull/20'
 ].sort();
 const VULNERABLE_PIN = '7b38ba071d6a6f1520140486835f9d6a01adafab';
-const COPIED_MESSAGE = 'Instructions copied. Paste them into ChatGPT, Claude, or your preferred local agent.';
+const SETUP_COPIED = 'Setup prompt copied';
+const SETUP_DISCLOSURE = 'Includes a temporary pairing code';
+const FAKE_SETUP_CODE = 'pair-SYNTHETIC-CARD-0001';
+const FAKE_SETUP_ID = 'p_cardsynthetic01';
+const FAKE_SETUP_EXPIRY = '2100-01-01T00:00:00.000Z';
+const fakeSetupMint = (over = {}) => async () => new Response(JSON.stringify({
+  id: FAKE_SETUP_ID, code: FAKE_SETUP_CODE, expiresAt: FAKE_SETUP_EXPIRY, ...over }),
+  { status: 201, headers: { 'Content-Type': 'application/json' } });
+const deferredSetupMint = () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  return { stub: async () => { await gate; return fakeSetupMint()(); }, release };
+};
 const SECRET_SHAPED = /aip_[a-z0-9_]{8,}|gh[pousr]_|sk-[\w]{8,}|token=|secret=|key=|[?&](?:code|auth)=/i;
 
-async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent', failPaths = [] } = {}) {
+async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints = 0, userAgent = '', uaMobile, clipboard = 'absent', failPaths = [], mintStub = null } = {}) {
   const source = await readFile(path.join(PUBLIC, 'app', 'app.js'), 'utf8');
   const t = await createTestEnv();
   const elements = new Map();
@@ -79,8 +91,12 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
     cookie = res.headers.getSetCookie().find((c) => c.startsWith('better-auth.session_token=')).split(';')[0];
   }
   const calls = [];
+  let mintHandler = mintStub;
   const fetchImpl = async (fetchPath, opts = {}) => {
     calls.push(`${opts.method ?? 'GET'} ${fetchPath}`);
+    if (mintHandler && fetchPath === '/api/pairing/codes' && (opts.method ?? 'GET') === 'POST') {
+      return mintHandler(fetchPath, opts);
+    }
     if (failPaths.some((p) => fetchPath.startsWith(p))) {
       return new Response(JSON.stringify({ error: 'injected failure' }), { status: 500 });
     }
@@ -146,6 +162,7 @@ async function makeUi({ anonymous = false, asDemo = false, platform, touchPoints
     hasNavigator: typeof context.navigator !== 'undefined',
     resolveDeferred: async () => { deferred(); deferred = null; await flush(); },
     setClipboard: (mode) => { context.navigator.clipboard = clipboards[mode]; },
+    setMintStub: (stub) => { mintHandler = stub; },
     logout: async () => { await el('logout').listeners.click(); await flush(); }
   };
 }
@@ -178,10 +195,10 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const nodes = nodesOf(card.innerHTML);
   const buttons = nodes.filter((n) => n.tagName === 'button');
   const actioned = buttons.filter((b) => attr(b, 'data-action'));
-  assert.deepEqual(actioned.map((b) => attr(b, 'data-action')), ['copy-agent', 'pair'], 'pairing is a browser action, not an install action');
+  assert.deepEqual(actioned.map((b) => attr(b, 'data-action')), ['gen-setup', 'pair'], 'setup mint and manual repair are browser actions, not install actions');
   const copyBtn = actioned[0];
   assert.equal(attr(copyBtn, 'type'), 'button');
-  assert.equal(nodeText(copyBtn), 'Set up with my agent');
+  assert.equal(nodeText(copyBtn), 'Generate and copy setup prompt');
   assert.ok(attr(copyBtn, 'class').split(' ').includes('secondary'));
   const primaryBtn = buttons.find((b) => !attr(b, 'data-action'));
   assert.ok(primaryBtn, 'primary action is present');
@@ -206,10 +223,11 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
   const head = card.innerHTML.slice(0, card.innerHTML.indexOf('<details'));
   assert.ok(!head.includes('<pre') && !head.includes('git clone') && !head.includes('DENDRITE_API_TOKEN'), 'no runbook above Advanced');
   const text = textOf(card.innerHTML);
-  for (const phrase of ['Connect your computer', 'Installer rebuild pending for Windows x64', 'Set up with my agent',
+  for (const phrase of ['Connect your computer', 'Installer rebuild pending for Windows x64', 'Generate and copy setup prompt',
+    'Includes a temporary pairing code', 'Share only with your trusted installation agent', 'Target: Windows x64',
     'Installer for Windows x64 0.1.0', 'will not be published', 'rebuilt installer is pending qualification', 'nothing to download',
     'Setup needed', 'Installing', 'Pairing', 'Connected', 'You are here. Not connected.',
-    'AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant',
+    'AIPSTER dispatch stays disabled, and nothing is shared unless you create a grant', 'Prepare this computer in one action',
     'Advanced: manual install, source and troubleshooting', 'ganglion-dendrite 0.1.0', WORKER_COMMIT]) {
     assert.ok(text.includes(phrase), `missing: ${phrase}`);
   }
@@ -218,26 +236,25 @@ test('signed-in owner gets the installer-first default view, not a runbook', asy
 });
 
 test('OS is suggested but correctable; wrong OS changes instructions honestly', async () => {
-  const win = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  const win = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: fakeSetupMint() });
   await win.clickTab('compute');
   assert.ok(textOf(win.el('connect-card').innerHTML).includes('Detected: Windows. Change it if that is wrong.'));
-  await win.press('copy-agent');
+  await win.press('gen-setup');
   assert.match(win.captured[0], /\.venv\\Scripts\\python\.exe test_installation\.py/);
   assert.ok(win.captured[0].includes('Windows x64 is the only tested platform'));
+  assert.ok(win.captured[0].includes(`PAIRING CODE: ${FAKE_SETUP_CODE}`), 'one action delivers the code-bearing packet');
 
-  // Unqualified platforms get "View supported platforms", never agent setup.
-  const mac = await makeUi({ platform: 'MacIntel', clipboard: 'ok' });
+  // Every picked platform gets the one-action prompt; macOS stays honest about its untested status.
+  const mac = await makeUi({ platform: 'MacIntel', clipboard: 'ok', mintStub: fakeSetupMint() });
   await mac.clickTab('compute');
   const macHtml = mac.el('connect-card').innerHTML;
   assert.ok(textOf(macHtml).includes('Detected: macOS. Change it if that is wrong.'));
   assert.ok(textOf(macHtml).includes('Installer for macOS: not available'));
   const macActions = nodesOf(macHtml).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean);
-  assert.deepEqual(macActions, ['platforms', 'pair'], 'no copy action on an unqualified platform; pairing stays platform-independent');
-  await mac.press('platforms');
-  const platText = textOf(mac.el('connect-card').innerHTML);
-  assert.ok(platText.includes('Supported platforms:'), 'platforms notice');
-  assert.ok(platText.includes('agent setup is offered for Windows only'));
-  assert.deepEqual(mac.captured, [], 'viewing platforms writes nothing to the clipboard');
+  assert.deepEqual(macActions, ['gen-setup', 'pair'], 'prompt available on macOS; manual repair stays platform-independent');
+  await mac.press('gen-setup');
+  assert.ok(mac.captured[0].includes('.venv/bin/python test_installation.py'), 'macOS packet uses POSIX paths');
+  assert.ok(!mac.captured[0].includes('.venv\\Scripts') && !mac.captured[0].includes('$env:'), 'no PowerShell paths in the macOS packet');
 
   // Manual correction overrides detection everywhere (status, Advanced).
   await mac.chooseOs('linux');
@@ -247,21 +264,22 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   const linuxPre = nodesOf(linuxHtml.slice(linuxHtml.indexOf('<pre'), linuxHtml.indexOf('</pre>'))).filter((n) => n.nodeName === '#text').map((n) => n.value).join('');
   assert.ok(linuxPre.includes('.venv/bin/python test_installation.py'), 'Advanced follows the picked OS');
   assert.ok(linuxPre.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
-  await mac.press('copy-agent');
-  assert.deepEqual(mac.captured, [], 'Linux remains unqualified even for a synthetic copy action');
+  await mac.press('gen-setup');
+  assert.equal(mac.captured.length, 2, 'Linux prompt copies too');
+  assert.ok(mac.captured[1].includes('.venv/bin/python test_installation.py'));
   await mac.chooseOs('windows');
-  assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['copy-agent', 'pair'], 'agent setup returns on the qualified platform');
+  assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['gen-setup', 'pair'], 'prompt stays on the qualified platform');
 
   // Unknown platforms, ChromeOS (whose platform may only say Linux), and a
   // missing navigator all require an explicit target before showing commands.
   const unknownTargets = [
-    { name: 'unknown platform', ui: await makeUi({ platform: 'Plan9', clipboard: 'ok' }) },
+    { name: 'unknown platform', ui: await makeUi({ platform: 'Plan9', clipboard: 'ok', mintStub: fakeSetupMint() }) },
     { name: 'ChromeOS with generic Linux platform', ui: await makeUi({
       platform: 'Linux x86_64',
       userAgent: 'Mozilla/5.0 (X11; CrOS x86_64 16093.0.0) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-      clipboard: 'ok'
+      clipboard: 'ok', mintStub: fakeSetupMint()
     }) },
-    { name: 'navigator unavailable', ui: await makeUi() }
+    { name: 'navigator unavailable', ui: await makeUi({ mintStub: fakeSetupMint() }) }
   ];
   for (const { name, ui } of unknownTargets) {
     if (name === 'navigator unavailable') assert.equal(ui.hasNavigator, false, 'test has no navigator global');
@@ -277,20 +295,21 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
       && !text.includes('Windows x64 is the only tested platform'), `${name}: no Windows setup instructions are exposed`);
     const selected = nodesOf(html).filter((n) => n.tagName === 'option' && n.attrs.some((x) => x.name === 'selected'));
     assert.deepEqual(selected.map((o) => attr(o, 'value')), [''], `${name}: target placeholder is selected`);
-    assert.deepEqual(nodesOf(html).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['pair'],
-      `${name}: only platform-independent browser pairing is offered`);
-    await ui.press('copy-agent');
-    assert.deepEqual(ui.captured, [], `${name}: fabricated copy action writes nothing`);
+    assert.deepEqual(nodesOf(html).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [],
+      `${name}: no actions before a target is chosen`);
+    await ui.press('gen-setup');
+    assert.deepEqual(ui.captured, [], `${name}: fabricated setup action writes nothing`);
     assert.ok(!ui.el('connect-card').innerHTML.includes('<textarea'), `${name}: no fallback packet is generated before choosing`);
 
     await ui.chooseOs('windows');
     html = ui.el('connect-card').innerHTML;
     assert.ok(textOf(html).includes('Advanced: manual install'), `${name}: choosing Windows reveals its instructions`);
-    await ui.press('copy-agent');
+    await ui.press('gen-setup');
     const packet = ui.captured[0] || nodesOf(ui.el('connect-card').innerHTML)
       .find((n) => n.tagName === 'textarea')?.childNodes.map((c) => c.value || '').join('');
     assert.ok(packet, `${name}: selected Windows target produces a packet or selectable fallback`);
-    assert.ok(packet.includes('AIPSTER agent setup packet v1.') && packet.includes(WORKER_COMMIT), `${name}: packet uses the pinned worker`);
+    assert.ok(packet.includes('AIPSTER agent setup packet v2.') && packet.includes(WORKER_COMMIT), `${name}: packet uses the pinned worker`);
+    assert.ok(packet.includes(`PAIRING CODE: ${FAKE_SETUP_CODE}`), `${name}: packet carries the minted code`);
     assert.ok(packet.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'), `${name}: packet keeps the worker-only checkout`);
     assert.equal(ui.captured.length, ui.hasNavigator ? 1 : 0, `${name}: no clipboard write when navigator is unavailable`);
   }
@@ -317,93 +336,109 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
     assert.ok(textOf(mobHtml).includes('Pick a target computer to check installer availability.'));
     assert.equal(mobNodes.filter((n) => n.tagName === 'details' || n.tagName === 'pre').length, 0,
       'manual instructions wait until a phone or tablet target is chosen');
-    assert.deepEqual(mobNodes.filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['pair'], 'pairing alone is available before a pick: it mints in the browser, installs nothing');
-    await mob.press('copy-agent');
-    assert.deepEqual(mob.captured, [], 'fabricated copy on an unpicked phone writes nothing');
+    assert.deepEqual(mobNodes.filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), [], 'no actions before a phone pick: manual repair waits for a target');
+    await mob.press('gen-setup');
+    assert.deepEqual(mob.captured, [], 'fabricated setup on an unpicked phone writes nothing');
   }
-  const phone = await makeUi({ platform: 'iPhone', clipboard: 'ok' });
+  const phone = await makeUi({ platform: 'iPhone', clipboard: 'ok', mintStub: fakeSetupMint() });
   await phone.clickTab('compute');
   await phone.chooseOs('windows');
   assert.ok(textOf(phone.el('connect-card').innerHTML).includes('You picked Windows x64 as the target computer.'));
-  await phone.press('copy-agent');
+  await phone.press('gen-setup');
   assert.equal(phone.captured.length, 1, 'explicit target pick enables the copy');
   assert.ok(phone.captured[0].startsWith('Target computer: Windows x64 (these steps run on that computer, not on this phone or tablet).'));
+  assert.ok(phone.captured[0].includes(`PAIRING CODE: ${FAKE_SETUP_CODE}`), 'phone packet carries the code');
 
   // Desktop Linux user agents still classify as Linux.
   const desk = await makeUi({ platform: 'Linux x86_64', userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36', clipboard: 'ok' });
   await desk.clickTab('compute');
   assert.ok(textOf(desk.el('connect-card').innerHTML).includes('Detected: Linux. Change it if that is wrong.'));
 
-  // Agent setup refuses unqualified platforms even when invoked directly.
+  // macOS prompt keeps working after an OS round-trip.
   await mac.chooseOs('macos');
-  await mac.press('copy-agent');
-  assert.deepEqual(mac.captured, [], 'no clipboard write on an unqualified platform');
-  assert.ok(!textOf(mac.el('connect-card').innerHTML).includes(COPIED_MESSAGE));
+  await mac.press('gen-setup');
+  assert.ok(mac.captured[mac.captured.length - 1].includes('.venv/bin/python'), 'macOS packet after round-trip');
 });
 
-test('agent setup copies pinned, secret-free instructions and confirms once', async () => {
-  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+test('one action mints and copies the code-bearing setup packet once', async () => {
+  let mintOpts;
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: async (path, opts) => { mintOpts = opts; return fakeSetupMint()(); } });
   await ui.clickTab('compute');
   const before = ui.calls.length;
-  await ui.press('copy-agent');
+  await ui.press('gen-setup');
   const text = textOf(ui.el('connect-card').innerHTML);
-  assert.ok(text.includes(COPIED_MESSAGE), 'exact confirmation wording');
+  assert.ok(text.includes(SETUP_COPIED), 'exact confirmation wording');
   assert.ok(text.includes('needs authorized access to this computer'), 'agent-access limit is stated');
+  assert.ok(text.includes(FAKE_SETUP_EXPIRY), 'expiry shown');
   assert.equal(ui.captured.length, 1, 'one clipboard write per click');
-  const instructions = ui.captured[0];
-  const flat = instructions.replace(/\s+/g, ' ');
-  for (const phrase of ['AIPSTER agent setup packet v1.', 'THIS computer', WORKER_COMMIT, 'ganglion-dendrite 0.1.0',
+  const packet = ui.captured[0];
+  const flat = packet.replace(/\s+/g, ' ');
+  for (const phrase of ['AIPSTER agent setup packet v2.', 'THIS computer', WORKER_COMMIT, 'ganglion-dendrite 0.1.0',
     'uv 0.12.12', '3.12.14', 'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
     'the root LICENSE only', 'required by local-worker/LICENSING.md', 'install.py', 'test_installation.py',
     'DENDRITE_API_TOKEN', 'worker-LOCAL token', 'NOT an AIPSTER key',
     'these steps cover x64 only', 'no qualified instructions exist',
     'does NOT share this computer', 'does NOT enable inference',
-    'does not contact AIPSTER until I pair it', 'holds no AIPSTER credential',
-    'type the one-time code', 'Pairing registers the resource',
+    'does not contact AIPSTER until the pair step below runs', 'holds no AIPSTER credential',
+    `PAIRING CODE: ${FAKE_SETUP_CODE}`, 'single use, expires', 'NOT a password, API key, or heartbeat key',
+    'already paired', 'do not consume the code', 'private no-echo prompt', 'Never pass',
+    'command-line argument', 'cannot type into that private prompt',
+    'Pairing registers the resource',
     'pairing.py heartbeat-loop --config configs/mock.toml', 'pairing.py unpair',
     'a heartbeat proves reachability only, never inference readiness', 'A running worker is NOT proof of inference readiness',
     'Remove only local-worker/.venv', 'There is no automatic update']) {
     assert.ok(flat.includes(phrase), `missing: ${phrase}`);
   }
   assert.ok(!flat.includes('tray menu') && !flat.includes('aipster-worker pair'), 'no packaged pairing copy while no installer is usable');
-  assert.ok(!SECRET_SHAPED.test(instructions), 'no credential-shaped material in copied instructions');
-  assert.ok(!/127\.0\.0\.1|localhost|C:\\Users/.test(instructions), 'no loopback literal or user path baked in');
-  assert.deepEqual(ui.calls.slice(before), [], 'copying adds no API call');
+  assert.ok(!new RegExp(`--code\\s+${FAKE_SETUP_CODE}`).test(packet), 'code never interpolated into a command');
+  assert.ok(!SECRET_SHAPED.test(packet), 'no long-lived credential shapes in the packet');
+  assert.ok(!/127\.0\.0\.1|localhost|C:\\Users/.test(packet), 'no loopback literal or user path baked in');
+  assert.deepEqual(ui.calls.slice(before), ['POST /api/pairing/codes'], 'one authenticated mint per click');
+  assert.equal(mintOpts.headers['X-Aipster-CSRF'], '1', 'mint carries the CSRF header');
+  assert.equal(JSON.parse(mintOpts.body).ttlMinutes, 10, 'mint uses the default TTL');
   assert.equal(ui.el('connect-card').hidden, false, 'card stays visible after copying');
 });
 
-test('clipboard failure shows selectable instructions; retry recovers', async () => {
-  const ui = await makeUi({ platform: 'Win32', clipboard: 'fail' });
+test('denied copy keeps the packet in memory; retry reuses it without reminting', async () => {
+  let mints = 0;
+  const countingMint = async () => { mints++; return fakeSetupMint()(); };
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'fail', mintStub: countingMint });
   await ui.clickTab('compute');
-  await ui.press('copy-agent');
+  await ui.press('gen-setup');
   let html = ui.el('connect-card').innerHTML;
   let text = textOf(html);
-  assert.ok(!text.includes(COPIED_MESSAGE), 'no false success claim');
+  assert.ok(!text.includes(SETUP_COPIED), 'no false success claim');
+  assert.ok(text.includes('Generated, not copied'), 'honest denial state');
   assert.ok(text.includes('would not let the page copy automatically'), 'honest failure reason');
+  assert.ok(text.includes('will not mint another code'), 'retry honesty');
   const areas = nodesOf(html).filter((n) => n.tagName === 'textarea');
   assert.equal(areas.length, 1, 'one selectable fallback');
   assert.ok(areas[0].attrs.some((x) => x.name === 'readonly'), 'fallback is read-only');
   const fallback = areas[0].childNodes.map((c) => c.value || '').join('');
-  assert.ok(fallback.includes(WORKER_COMMIT) && fallback.includes('THIS computer'), 'fallback carries the complete instructions');
-  assert.ok(!SECRET_SHAPED.test(fallback), 'fallback carries no credential-shaped material');
-  assert.ok(text.includes('download them as a file'), 'file-download fallback is offered');
+  assert.ok(fallback.includes(WORKER_COMMIT) && fallback.includes('THIS computer'), 'fallback carries the complete packet');
+  assert.ok(fallback.includes(FAKE_SETUP_CODE), 'fallback carries the minted code');
+  assert.ok(text.includes('Download redacted template'), 'redacted download offered');
   const saveBtns = nodesOf(html).filter((n) => n.tagName === 'button' && attr(n, 'data-action') === 'save-instructions');
-  assert.equal(saveBtns.length, 1, 'one Download instructions action');
-  assert.equal(nodeText(saveBtns[0]), 'Download instructions');
+  assert.equal(saveBtns.length, 1, 'one download action');
+  assert.equal(nodeText(saveBtns[0]), 'Download redacted template');
   // The file download degrades silently where no DOM download exists.
   await ui.press('save-instructions');
   assert.equal(nodesOf(ui.el('connect-card').innerHTML).filter((n) => n.tagName === 'textarea').length, 1, 'fallback survives a download attempt');
-  // Retry after the browser allows copying again.
+  assert.equal(mints, 1, 'one mint');
+  // Retry after the browser allows copying again: same packet, no new mint.
   ui.setClipboard('ok');
-  await ui.press('copy-agent');
+  await ui.press('setup-copy');
   html = ui.el('connect-card').innerHTML;
-  assert.ok(textOf(html).includes(COPIED_MESSAGE), 'retry succeeds');
+  assert.ok(textOf(html).includes(SETUP_COPIED), 'retry succeeds');
+  assert.equal(mints, 1, 'retry never remints');
+  assert.equal(ui.captured.length, 1, 'one clipboard write');
+  assert.ok(ui.captured[0].includes(FAKE_SETUP_CODE), 'same code delivered');
   assert.equal(nodesOf(html).filter((n) => n.tagName === 'textarea').length, 0, 'fallback clears on success');
 
   // A missing clipboard API takes the same honest path.
-  const bare = await makeUi({ platform: 'Win32' });
+  const bare = await makeUi({ platform: 'Win32', mintStub: fakeSetupMint() });
   await bare.clickTab('compute');
-  await bare.press('copy-agent');
+  await bare.press('gen-setup');
   assert.equal(nodesOf(bare.el('connect-card').innerHTML).filter((n) => n.tagName === 'textarea').length, 1);
 });
 
@@ -429,9 +464,12 @@ test('packaged-but-unpublished installer shows version/checksum with no download
 });
 
 test('progress never claims an unverified installed, paired or connected state', async () => {
-  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: fakeSetupMint() });
   await ui.clickTab('compute');
-  await ui.press('copy-agent');
+  const freshProgress = textOf(ui.el('connect-card').innerHTML.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0]);
+  assert.ok(freshProgress.includes('Available: generate a setup prompt above, or mint a one-time code under Advanced.'), 'setup is offered, not blocked');
+  assert.ok(freshProgress.includes('Packaged installs start the sender from the tray; source installs use the manual steps below.'));
+  await ui.press('gen-setup');
   const html = ui.el('connect-card').innerHTML;
   const text = textOf(html);
   for (const stage of ['Setup needed', 'Installing', 'Pairing', 'Connected']) {
@@ -440,14 +478,14 @@ test('progress never claims an unverified installed, paired or connected state',
   const progressHtml = html.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0];
   const current = nodesOf(progressHtml).filter((n) => n.tagName === 'li' && n.attrs.some((x) => x.name === 'aria-current' && x.value === 'step'));
   assert.equal(current.length, 1, 'exactly one current stage');
-  assert.ok(nodeText(current[0]).startsWith('Setup needed'), 'Setup needed is the current stage');
+  assert.ok(nodeText(current[0]).startsWith('Pairing'), 'Pairing is current while a setup authorization is in flight');
   const progressText = textOf(progressHtml);
+  assert.ok(progressText.includes('Authorizing: setup prompt generated'), 'mint progress is honest');
   assert.ok(progressText.includes('Pending: the packaged installer predates the API edge-compat fix; a rebuilt installer is pending qualification and there is nothing to download yet.'));
   await ui.chooseOs('macos');
   const macProgress = textOf(ui.el('connect-card').innerHTML.match(/<ol class="progress"[\s\S]*?<\/ol>/)[0]);
   assert.ok(macProgress.includes('Blocked: no verified installer is packaged yet.'));
-  assert.ok(progressText.includes('Available: mint a one-time code below'), 'pairing is offered, not blocked');
-  assert.ok(progressText.includes('Packaged installs start the sender from the tray; source installs use the manual steps below.'));
+  assert.ok(progressText.includes('Authorizing: setup prompt generated'), 'in-flight authorization stays honest');
   assert.ok(!progressText.includes('not merged or deployed') && !progressText.includes('not implemented'), 'no stale blocked-pairing copy');
   assert.ok(!/pairing support/i.test(progressText), 'heartbeat intake is never called pairing support');
   assert.ok(progressText.includes('Needs verified worker evidence. A download or a running worker is not proof.'));
@@ -455,70 +493,80 @@ test('progress never claims an unverified installed, paired or connected state',
   assert.ok(!/\bconnected\b/i.test(rest.replace(/not connected/gi, '')), 'never claims a connected state');
   assert.ok(!/\bready\b|\bonline\b/i.test(rest.replace(/offline/gi, '')), 'never claims readiness or liveness');
   assert.ok(!/in (a few|\d+) (minutes?|seconds?)/i.test(text), 'no unmeasured setup-time claim');
-  assert.ok(html.includes('<span class="pill warn">Setup needed</span>'));
+  assert.ok(html.includes('<span class="pill warn">Pairing</span>'), 'stage pill follows the in-flight authorization');
 });
 
 test('interrupted setup restarts cleanly and never paints after sign-out', async () => {
-  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: fakeSetupMint() });
   await ui.clickTab('compute');
-  await ui.press('copy-agent');
-  assert.ok(textOf(ui.el('connect-card').innerHTML).includes(COPIED_MESSAGE), 'positive control');
+  await ui.press('gen-setup');
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes(SETUP_COPIED), 'positive control');
   await ui.clickTab('compute');
   const idle = textOf(ui.el('connect-card').innerHTML);
-  assert.ok(!idle.includes(COPIED_MESSAGE), 'returning to the tab resets to the idle view');
+  assert.ok(!idle.includes(SETUP_COPIED), 'returning to the tab resets to the idle view');
   assert.ok(!ui.el('connect-card').innerHTML.includes('<textarea'), 'no stale fallback survives');
   // Changing OS also resets any in-progress notice.
   await ui.chooseOs('macos');
-  await ui.press('platforms');
-  assert.ok(textOf(ui.el('connect-card').innerHTML).includes('Supported platforms:'), 'positive control');
+  await ui.press('gen-setup');
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes(SETUP_COPIED), 'macOS prompt copies too');
   await ui.chooseOs('windows');
-  assert.ok(!textOf(ui.el('connect-card').innerHTML).includes('Supported platforms:'), 'OS change resets the notice');
+  assert.ok(!textOf(ui.el('connect-card').innerHTML).includes(SETUP_COPIED), 'OS change resets the notice');
 
   // A copy still in flight when the session ends paints nothing.
-  const slow = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  const slow = await makeUi({ platform: 'Win32', clipboard: 'deferred', mintStub: fakeSetupMint() });
   await slow.clickTab('compute');
-  slow.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  slow.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await slow.flush();
   await slow.logout();
   await slow.resolveDeferred();
   assert.equal(slow.el('connect-card').innerHTML, '', 'late clipboard result never repopulates a signed-out card');
   assert.equal(slow.el('connect-card').hidden, true);
 
   // A copy still in flight when the OS changes never reports for the new OS.
-  const race = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  const race = await makeUi({ platform: 'Win32', clipboard: 'deferred', mintStub: fakeSetupMint() });
   await race.clickTab('compute');
-  race.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  race.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await race.flush();
   await race.chooseOs('linux');
   await race.resolveDeferred();
   const raced = textOf(race.el('connect-card').innerHTML);
-  assert.ok(!raced.includes(COPIED_MESSAGE), 'stale clipboard result claims nothing');
+  assert.ok(!raced.includes(SETUP_COPIED), 'stale clipboard result claims nothing');
   assert.ok(raced.includes('Installer for Linux: not available'), 'card stays on the newly picked OS');
 
   // An OS round-trip still invalidates the pending copy.
-  const round = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  const round = await makeUi({ platform: 'Win32', clipboard: 'deferred', mintStub: fakeSetupMint() });
   await round.clickTab('compute');
-  round.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  round.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await round.flush();
   await round.chooseOs('linux');
   await round.chooseOs('windows');
   await round.resolveDeferred();
-  assert.ok(!textOf(round.el('connect-card').innerHTML).includes(COPIED_MESSAGE), 'round-tripped copy claims nothing');
+  assert.ok(!textOf(round.el('connect-card').innerHTML).includes(SETUP_COPIED), 'round-tripped copy claims nothing');
 
-  // A pending copy never overwrites a later platforms notice.
-  const over = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  // A pending copy never overwrites a later error notice.
+  let secondFails = false;
+  const over = await makeUi({ platform: 'Win32', clipboard: 'deferred',
+    mintStub: async () => secondFails
+      ? new Response(JSON.stringify({ error: 'Too many unused pairing codes (5 per user). Let one expire first.', code: 'PAIRING_LIMIT' }), { status: 409 })
+      : fakeSetupMint()() });
   await over.clickTab('compute');
-  over.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
-  await over.chooseOs('macos');
-  await over.press('platforms');
+  over.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await over.flush();
+  secondFails = true;
+  await over.press('setup-again');
   await over.resolveDeferred();
-  assert.ok(textOf(over.el('connect-card').innerHTML).includes('Supported platforms:'), 'platforms notice survives the stale write');
+  assert.ok(textOf(over.el('connect-card').innerHTML).includes('already'), 'error notice survives the stale write');
 
-  // Double-clicking copies once per settled write; the older write wins nothing.
-  const twice = await makeUi({ platform: 'Win32', clipboard: 'deferred' });
+  // Double-clicking mints once; the single write settles once.
+  const twice = await makeUi({ platform: 'Win32', clipboard: 'deferred', mintStub: fakeSetupMint() });
   await twice.clickTab('compute');
-  twice.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
-  twice.el('connect-card').onclick({ target: { dataset: { action: 'copy-agent' } } });
+  twice.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  twice.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await twice.flush();
   await twice.resolveDeferred();
-  assert.equal(twice.captured.length, 1, 'only the latest write settles');
-  assert.ok(textOf(twice.el('connect-card').innerHTML).includes(COPIED_MESSAGE));
+  assert.equal(twice.captured.length, 1, 'only the single write settles');
+  assert.deepEqual(twice.calls.filter((c) => c === 'POST /api/pairing/codes'), ['POST /api/pairing/codes'], 'double click mints once');
+  assert.ok(textOf(twice.el('connect-card').innerHTML).includes(SETUP_COPIED));
 });
 
 test('logout removes the card and disarms its actions', async () => {
@@ -532,19 +580,21 @@ test('logout removes the card and disarms its actions', async () => {
   assert.equal(ui.el('connect-card').innerHTML, '');
   assert.equal(ui.el('connect-card').hidden, true);
   // Stale handlers from the previous session are inert: no cross-account paint.
-  staleClick({ target: { dataset: { action: 'copy-agent' } } });
+  staleClick({ target: { dataset: { action: 'gen-setup' } } });
   staleChange({ target: { dataset: { action: 'os' }, value: 'linux' } });
   await ui.flush();
   assert.equal(ui.el('connect-card').innerHTML, '', 'post-logout actions paint nothing');
   assert.deepEqual(ui.captured, [], 'post-logout actions copy nothing');
 });
 
-test('card carries no credentials and nothing is logged', async () => {
-  const ui = await makeUi({ platform: 'Win32', clipboard: 'fail' });
+test('setup packet carries only its deliberate code; logs and destinations stay clean', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'fail', mintStub: fakeSetupMint() });
   await ui.clickTab('compute');
-  await ui.press('copy-agent');
+  assert.ok(!ui.el('connect-card').innerHTML.includes(FAKE_SETUP_CODE), 'no code before the deliberate action');
+  await ui.press('gen-setup');
   const html = ui.el('connect-card').innerHTML;
-  assert.ok(!SECRET_SHAPED.test(html), 'no credential-shaped material or query secrets, including the fallback');
+  assert.ok(html.includes(FAKE_SETUP_CODE), 'fallback carries the deliberate packet');
+  assert.ok(!SECRET_SHAPED.test(html.replaceAll(FAKE_SETUP_CODE, '')), 'no credential-shaped material beyond the deliberate code');
   assert.ok(!/href="[^"]*\?/.test(html), 'no query strings in any destination');
   assert.ok(!html.includes(VULNERABLE_PIN) && !html.includes(VULNERABLE_PIN.slice(0, 7)), 'never points at the pre-#17 worker without local auth');
   assert.deepEqual(ui.logs, [], 'client logs nothing');
@@ -558,7 +608,8 @@ test('Advanced keeps the pinned manual commands, warnings and platform labels', 
   for (const phrase of ['refuses to start without DENDRITE_API_TOKEN', 'worker-local token',
     'It is not an AIPSTER API key or heartbeat key', 'never paste it into AIPSTER, a URL or a shared config',
     'security-fixed revision', 'Windows x64: tested', 'mock check only', 'macOS / Linux: not qualified',
-    'untested', 'separate prerequisites', 'Mint a one-time pairing code above',
+    'untested', 'separate prerequisites', 'Manual repair', 'mint a code to type yourself',
+    'Mint a one-time pairing code in Manual repair below',
     'not linked until paired', 'Advanced: manual resource registration',
     'pairing.py heartbeat-loop',
     'Disconnect and uninstall', 'Troubleshooting', 'worker and its root LICENSE only']) {
@@ -589,8 +640,8 @@ test('standalone README is background; authoritative pairing commands preserve t
   assert.ok(block[1].includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
   assert.match(block[1], /git fetch origin [a-f0-9]{40}/);
   assert.match(block[1], /git checkout --detach [a-f0-9]{40}/);
-  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok' });
-  await ui.clickTab('compute'); await ui.press('copy-agent');
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: fakeSetupMint() });
+  await ui.clickTab('compute'); await ui.press('gen-setup');
   assert.ok(ui.captured[0].includes(`git fetch origin ${WORKER_COMMIT}`));
   assert.ok(ui.captured[0].includes(`git checkout --detach ${WORKER_COMMIT}`));
   assert.ok(ui.captured[0].includes('do not substitute an older checkout'));
@@ -855,4 +906,64 @@ test('inventory failure is an actionable error with a bounded manual retry', asy
   assert.equal(count(), before + 1, 'one inventory read per retry press');
   await ui.settleList('injected failure', 'retry re-renders the failure');
   assert.ok(textOf(ui.el('connect-card').innerHTML).includes('Refresh failed'), 'error persists honestly');
+});
+
+test('selecting targets never mints or copies', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: fakeSetupMint() });
+  await ui.clickTab('compute');
+  const before = ui.calls.length;
+  await ui.chooseOs('macos');
+  await ui.chooseOs('linux');
+  await ui.chooseOs('windows');
+  assert.deepEqual(ui.calls.slice(before), [], 'selection adds no API call');
+  assert.deepEqual(ui.captured, [], 'selection copies nothing');
+});
+
+test('demo accounts see setup generation as unavailable, never a mint', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', asDemo: true, mintStub: fakeSetupMint() });
+  await ui.clickTab('compute');
+  const html = ui.el('connect-card').innerHTML;
+  assert.ok(textOf(html).includes('Setup prompt unavailable for demo'), 'honest demo state');
+  const before = ui.calls.length;
+  await ui.press('gen-setup');
+  assert.deepEqual(ui.calls.slice(before), [], 'disabled demo action mints nothing');
+  assert.deepEqual(ui.captured, [], 'disabled demo action copies nothing');
+});
+
+test('logout clears a generated packet; revisit shows no code', async () => {
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'fail', mintStub: fakeSetupMint() });
+  await ui.clickTab('compute');
+  await ui.press('gen-setup');
+  assert.ok(ui.el('connect-card').innerHTML.includes(FAKE_SETUP_CODE), 'positive control: fallback shows the packet');
+  await ui.logout();
+  assert.equal(ui.el('connect-card').innerHTML, '', 'logout clears the card');
+  assert.equal(ui.el('connect-card').hidden, true);
+});
+
+test('navigation during mint drops the late packet', async () => {
+  const gate = deferredSetupMint();
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: gate.stub });
+  await ui.clickTab('compute');
+  ui.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await ui.clickTab('keys');
+  gate.release();
+  await ui.flush();
+  assert.ok(ui.calls.some((c) => c === 'POST /api/pairing/codes'), 'mint was attempted, then dropped');
+  assert.deepEqual(ui.captured, [], 'late mint writes nothing');
+  await ui.clickTab('compute');
+  assert.ok(!ui.el('connect-card').innerHTML.includes(FAKE_SETUP_CODE), 'late packet never rendered');
+});
+
+test('generating and copying states show while each step is in flight', async () => {
+  const gate = deferredSetupMint();
+  const ui = await makeUi({ platform: 'Win32', clipboard: 'deferred', mintStub: gate.stub });
+  await ui.clickTab('compute');
+  ui.el('connect-card').onclick({ target: { dataset: { action: 'gen-setup' } } });
+  await ui.flush();
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes('Generating your setup prompt'), 'mint state shown');
+  gate.release();
+  await ui.flush();
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes('Copying your setup prompt'), 'copy state shown');
+  await ui.resolveDeferred();
+  assert.ok(textOf(ui.el('connect-card').innerHTML).includes(SETUP_COPIED), 'success follows');
 });

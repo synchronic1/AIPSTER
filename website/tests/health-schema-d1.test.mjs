@@ -73,6 +73,11 @@ test('HEALTH real D1: 0001-0005 cannot report ready while all key minting needs 
   await f.apply('0013_heartbeat_binding.sql');
   assert.equal((await f.health(undefined)).ready, false, 'pairing schema is also required');
   await f.apply('0015_pairing.sql');
+  assert.equal((await f.health(undefined)).ready, false, 'routing refunds are also required');
+  await f.apply('0021_routing_ops.sql');
+  assert.equal((await f.health(undefined)).ready, false, 'catalog schema is also required');
+  await f.apply('0022_model_catalog.sql');
+  await f.apply('0023_model_catalog_reservations.sql');
   assert.equal((await f.health(undefined)).ready, true, 'disabled federation does not require its migrations');
   assert.equal((await mint()).status, 201);
 });
@@ -84,7 +89,12 @@ test('HEALTH real D1: enabled federation requires the complete schema through re
     await f.apply(file);
     assert.equal((await f.health('1')).ready, false, 'partial federation: ' + file);
   }
-  assert.equal((await f.health(undefined)).ready, true, 'base routes are ready with heartbeat and pairing migrations');
+  assert.equal((await f.health(undefined)).ready, false, 'routing refunds are required');
+  await f.apply('0021_routing_ops.sql');
+  assert.equal((await f.health(undefined)).ready, false, 'catalog schema is also required');
+  await f.apply('0022_model_catalog.sql');
+  await f.apply('0023_model_catalog_reservations.sql');
+  assert.equal((await f.health(undefined)).ready, true, 'base routes are ready with heartbeat, pairing, routing, and catalog migrations');
   await f.apply('0014_fabric_restriction_receipts.sql');
   assert.equal((await f.health('1')).ready, true);
   assert.equal((await f.health('true')).ready, true, 'only the router exact flag value enables federation');
@@ -116,6 +126,11 @@ test('HEALTH real D1: pairing routes require migration 0015 even with federation
   assert.equal(mint.status, 500, 'missing pairing table breaks the compiled route');
   assert.equal((await f.health(undefined)).ready, false, 'base heartbeat schema cannot serve the compiled pairing routes');
   await f.apply('0015_pairing.sql');
+  assert.equal((await f.health(undefined)).ready, false, 'routing refunds are required');
+  await f.apply('0021_routing_ops.sql');
+  assert.equal((await f.health(undefined)).ready, false, 'catalog schema is also required');
+  await f.apply('0022_model_catalog.sql');
+  await f.apply('0023_model_catalog_reservations.sql');
   assert.equal((await f.health(undefined)).ready, true);
   await f.db.prepare('ALTER TABLE pairing_codes DROP COLUMN attempts').run();
   assert.equal((await f.health(undefined)).ready, false, 'pairing columns are part of readiness');
