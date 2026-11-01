@@ -4,6 +4,8 @@ This fork includes the public Dendrite worker source; no EIF checkout, private
 Gitea access, API credentials, native binary or model download is needed for the
 mock quickstart. This is a standalone installation, **not an AIPSTER execution
 connection**. `/api/jobs` remains disabled. Mock output is explicitly simulated.
+The opt-in Ganglion fabric node connection below is a separate control plane, not
+AIPSTER job dispatch.
 
 ## Tested installation
 
@@ -138,11 +140,79 @@ Explicit entries *replace* the derived defaults. So a loopback daemon behind a
 proxy or tunnel that forwards the public Host must list that name **and** the
 loopback names, e.g. `["worker.example.com", "127.0.0.1:8090", "localhost:8090"]`.
 `advertise_url` alone does not add a name to a loopback bind.
-Do not expose this old worker to a network or configure its optional cloud bridge
-as part of this quickstart. No AIPSTER token/endpoint belongs in these examples.
+Do not expose this old worker to a network. The mock quickstart does not configure
+the opt-in fabric bridge; that separate path is documented above and must never
+carry an AIPSTER token/endpoint.
 
 For Unix shells, the corresponding entry points are `.venv/bin/python` and
 `.venv/bin/dendrite`. Those platforms require their own clean-install retest.
+
+## Opt-in Ganglion fabric node connection
+
+This source snapshot can join a Ganglion-compatible fabric as an outbound node.
+It is **off unless configured**, remains separate from AIPSTER pairing and
+`/api/jobs`, and was reviewed only against the documented Ganglion node socket
+(one `execute` frame, one terminal `result`, no streaming). It is not an AIPSTER
+transport and grants no AIPSTER authority.
+
+Prerequisites, all operator-supplied:
+
+- a node-role Fabric Access Token bound to this worker's exact `node.id`;
+- a model already loaded on a loopback runtime that this worker owns;
+- explicit consent to run inference on that model.
+
+Never put the token in TOML, a URL, a prompt, source or a log. Supply it through
+`GANGLION_FABRIC_TOKEN` (or the configured `fabric_token_env`) in the environment
+that starts `serve`. A revoked/expired token, a wrong node binding or a replaced
+connection stops the bridge and records a secret-free state; it does not retry
+forever and does not fight another connection for the same node ID.
+
+```toml
+[node]
+id = "your-node-id"            # must equal the fabric token's node binding
+host = "127.0.0.1"
+port = 8090
+fabric_url = "https://YOUR-FABRIC-ORIGIN"
+
+[[runtimes]]
+id = "attached"
+kind = "ik_llama"
+mode = "attach"                # or a managed runtime already resident
+base_url = "http://127.0.0.1:8081"
+
+[[models]]
+id = "resident-model"
+runtime = "attached"
+upstream_model = "the-exact-id-from-GET-/v1/models"
+capabilities = ["complete", "summarize"]
+```
+
+`GET /v1/node` reports `fabric.state` (`disabled`, `connecting`, `connected`,
+`reconnecting`, `rejected`, `superseded`) plus a status code and a generic error;
+it never includes the token or prompt text.
+
+Execution policy on this path:
+
+- **Resident-only and exact.** The worker advertises only already-loaded models
+  and no model switching. A fabric request for a different model is rejected
+  before any load or switch; load it through the local authenticated API first.
+  There is no fallback model or runtime.
+- **One job, one result.** The result's `request_id` is the fabric `job_id`;
+  duplicate frames for the same job are not re-executed.
+- **No streaming or cancel frame.** A disconnect is the only remote cancellation
+  and cancels local work. A request already sent to an attached server is treated
+  as uncertain and quarantined until operator recovery; a cancellation before
+  dispatch does not quarantine it.
+- **Deadline is local.** The fabric enforces its own admission deadline and
+  discards late results; the execute frame carries no deadline. This worker
+  enforces `node.request_timeout_seconds` only.
+- **Raw prompt only.** Chat `messages` are not advertised and are rejected as an
+  invalid request.
+
+Do not attach this worker to a managed runtime owned by another Dendrite: that
+owner may stop or switch it. A genuine end-to-end run needs the token, a resident
+model this worker owns (or explicit consent for a shared attachment) and the
+operator's authorization to run inference.
 
 ## Optional real engine preparation (not needed for the mock check)
 
@@ -212,13 +282,16 @@ startup task, global Python package or cloud configuration.
 ## Provenance and updates
 
 `vendor/eif` has 14 upstream Python modules plus original `pyproject.toml` and
-`uv.lock` from public EIF `536508832b12d993dc272e03d4f09aca53801f68`. Fourteen
-files are byte-for-byte upstream. `dendrite/api.py` and `dendrite/config.py` carry
+`uv.lock` from public EIF `536508832b12d993dc272e03d4f09aca53801f68`. Ten files
+are byte-for-byte upstream. `dendrite/api.py` and `dendrite/config.py` carry
 AIPSTER local patch [0001](patches/0001-require-token-and-validate-host.patch),
 a security fix that requires the API token on every bind and validates Host/Origin.
+`dendrite/fabric.py`, `dendrite/node.py`, `dendrite/runtimes/base.py` and
+`dendrite/runtimes/llama.py` carry patch [0002](patches/0002-fabric-resident-binding.patch),
+the resident-only fabric binding described above.
 Each patched file has a change notice at the top. `provenance.json` is the
 allowlist and SHA-256 record: `upstream_sha256` identifies the pinned upstream
-bytes and `sha256` the patched bytes in this tree. The patch is not upstream. All modules are retained because CLI/API imports transitively use
+bytes and `sha256` the patched bytes in this tree. Neither patch is upstream. All modules are retained because CLI/API imports transitively use
 them, including the optional fabric bridge; no separate server/scheduler, Oxen
 tools, tests, machine configs, private history or binaries are copied. Sanitized
 configs and installation tests live outside the vendor directory. Runtime logic

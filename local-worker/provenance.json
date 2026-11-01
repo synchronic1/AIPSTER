@@ -35,8 +35,10 @@
     },
     {
       "path": "dendrite/fabric.py",
-      "sha256": "8af8327a3c110bdbe7ff580e852ddf40778b457eeada73f8a83257a13d0c954b",
-      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+      "sha256": "409a16c8913bca021b6a5f1528ac01c9cae9a446bb868380480797bbe885859c",
+      "notice": "Modified locally by AIPSTER patch 0002 (fabric resident-only binding, rejection handling and result binding; prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
+      "upstream_sha256": "8af8327a3c110bdbe7ff580e852ddf40778b457eeada73f8a83257a13d0c954b",
+      "local_patch": "patches/0002-fabric-resident-binding.patch"
     },
     {
       "path": "dendrite/hardware.py",
@@ -45,8 +47,10 @@
     },
     {
       "path": "dendrite/node.py",
-      "sha256": "fa0d5e47b04573975a630938e7010fa8a1c6e4a2b4b990782ea21bf4f5dceb3e",
-      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+      "sha256": "bfd00252be356886a70b8d8dfc47e10ed4cd5a2ee2c3db6b71113506f73a6db4",
+      "notice": "Modified locally by AIPSTER patch 0002 (fabric resident-only binding, rejection handling and result binding; prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
+      "upstream_sha256": "fa0d5e47b04573975a630938e7010fa8a1c6e4a2b4b990782ea21bf4f5dceb3e",
+      "local_patch": "patches/0002-fabric-resident-binding.patch"
     },
     {
       "path": "dendrite/performance.py",
@@ -60,13 +64,17 @@
     },
     {
       "path": "dendrite/runtimes/base.py",
-      "sha256": "f137894780dff249ffdba1a57865be22e9beb2e20eeb37f0881fc6c84b462dc7",
-      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+      "sha256": "c502ccfee6398f2e1f3bddf7afbacd7a993d500db3a9aeeca71b8b416457f919",
+      "notice": "Modified locally by AIPSTER patch 0002 (fabric resident-only binding, rejection handling and result binding; prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
+      "upstream_sha256": "f137894780dff249ffdba1a57865be22e9beb2e20eeb37f0881fc6c84b462dc7",
+      "local_patch": "patches/0002-fabric-resident-binding.patch"
     },
     {
       "path": "dendrite/runtimes/llama.py",
-      "sha256": "7638b3164b074434313ddb74b7a2b6db8b721d6e8d984cb897ceb69299ccef34",
-      "notice": "No per-file copyright/license notice in pinned source; authorized Apache-2.0 grant documented in NOTICE."
+      "sha256": "f4e148a703d24136dc7212adf58275c4d821863ddffe8fbb6329aa25fe755bd5",
+      "notice": "Modified locally by AIPSTER patch 0002 (fabric resident-only binding, rejection handling and result binding; prominent change notice at top of file); upstream bytes identified by upstream_sha256. Authorized Apache-2.0 grant documented in NOTICE.",
+      "upstream_sha256": "7638b3164b074434313ddb74b7a2b6db8b721d6e8d984cb897ceb69299ccef34",
+      "local_patch": "patches/0002-fabric-resident-binding.patch"
     },
     {
       "path": "dendrite/runtimes/mock.py",
@@ -101,6 +109,21 @@
         "dendrite/config.py"
       ],
       "reason": "Security: require the API token on every bind including loopback, validate Host/Origin against node.allowed_hosts (DNS-rebinding defence), remove node identity from the unauthenticated health probe, disable generated API docs. Review: https://github.com/synchronic1/AIPSTER/pull/14#discussion_r4405943472",
+      "upstream_status": "Not submitted upstream; upstream commit above remains unpatched."
+    },
+    {
+      "id": "0002",
+      "path": "patches/0002-fabric-resident-binding.patch",
+      "sha256": "1fe877b2adb270d9f2cd4a152d55f1339cc958945984d975d2add3043dec0c44",
+      "date": "2026-11-01",
+      "applies_to_commit": "536508832b12d993dc272e03d4f09aca53801f68",
+      "files": [
+        "dendrite/fabric.py",
+        "dendrite/node.py",
+        "dendrite/runtimes/base.py",
+        "dendrite/runtimes/llama.py"
+      ],
+      "reason": "Integration: connect the public worker's opt-in fabric bridge to the deployed Ganglion node protocol. Exact resident-model binding (no cold start, switch or fallback), resident-only capacity advertisement, result job-id binding, permanent handshake/close rejection handling, narrow attach quarantine, sanitized failure logging and snapshot host-identity fallbacks.",
       "upstream_status": "Not submitted upstream; upstream commit above remains unpatched."
     }
   ]

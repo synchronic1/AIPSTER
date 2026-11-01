@@ -1,20 +1,35 @@
-"""Opt-in outbound bridge to the Cloudflare fabric. Native inference remains local."""
+"""Opt-in outbound bridge to the Cloudflare fabric. Native inference remains local.
+
+Modified by AIPSTER local patch 0002 (2026-11-01): fabric jobs bind their result
+to the dispatch job_id, execute only an already-resident exact model (never
+cold-start or switch), advertise only resident capacity to the scheduler, stop
+instead of retrying a rejected/revoked/superseded credential, and keep
+execution-failure logging free of prompts and transport secrets. Upstream base
+and hashes: local-worker/provenance.json.
+"""
 
 import asyncio
 import json
 import logging
 import random
+import time
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from pydantic import ValidationError
 from websockets.asyncio.client import connect
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
 from dendrite.node import Node
 from dendrite.runtimes.base import RuntimeFailure
 from dendrite.schemas import ExecuteRequest
 
 logger = logging.getLogger(__name__)
+
+# A rejected upgrade or a policy close cannot be fixed by reconnecting: the node
+# credential is dead, another connection owns this node id, or this worker sent a
+# frame the fabric refuses. Retrying those would hide the fault or flap ownership.
+PERMANENT_HANDSHAKE_STATUS = frozenset({400, 401, 403, 404, 426})
+PERMANENT_CLOSE_CODES = frozenset({1007, 1008, 1009, 4001, 4003})
 
 
 def connection_url(origin: str, node_id: str) -> str:
@@ -33,6 +48,15 @@ def connection_url(origin: str, node_id: str) -> str:
 def cloud_snapshot(node: Node) -> dict:
     snapshot = node.snapshot()
     # The cloud needs capacities, not native binary paths, process IDs, or local errors.
+    # Advertise resident-only execution: a model that is merely cached on disk would
+    # be cold-started or switched in by this worker's local API, not by the fabric.
+    hardware = {
+        key: value for key, value in snapshot["hardware"].items() if key != "binaries"
+    }
+    # A single invalid field makes the fabric close the socket and fail every
+    # in-flight job, so degrade an unavailable host identity instead of looping.
+    hardware["logical_cpus"] = hardware.get("logical_cpus") or 0
+    hardware["hostname"] = hardware.get("hostname") or "unknown"
     return {
         key: snapshot[key]
         for key in (
@@ -43,20 +67,22 @@ def cloud_snapshot(node: Node) -> dict:
             "execution_scope",
             "active_requests",
             "performance",
-            "models",
             "load",
         )
     } | {
-        "hardware": {
-            key: value for key, value in snapshot["hardware"].items() if key != "binaries"
-        },
+        "hardware": hardware,
         "runtimes": [
             {
                 key: value
                 for key, value in runtime.items()
                 if key not in ("process_id", "last_error")
             }
+            | {"supports_model_switch": False, "supports_chat": False}
             for runtime in snapshot["runtimes"]
+        ],
+        "models": [
+            {**model, "available": bool(model["available"] and model["resident"])}
+            for model in snapshot["models"]
         ],
     }
 
@@ -72,13 +98,16 @@ async def serve_connection(node: Node, ws):
         while True:
             await node.refresh_attached()
             await send({"type": "heartbeat", "snapshot": cloud_snapshot(node)})
+            node.fabric["last_heartbeat_at"] = time.time()
             await asyncio.sleep(min(node.config.node.heartbeat_seconds, 10))
 
     async def execute(message: dict):
         job_id = message["job_id"]
         try:
             request = ExecuteRequest.model_validate(message.get("request"))
-            result = await node.execute(request)
+            # The fabric dispatches an explicit model and expects local execution.
+            # Bind the response to the job and refuse any load/switch side effect.
+            result = await node.execute(request, execution_id=job_id, resident_only=True)
             await send({"type": "result", "job_id": job_id, "result": result.model_dump()})
         except ValidationError:
             await send(
@@ -101,8 +130,9 @@ async def serve_connection(node: Node, ws):
             )
         except WebSocketException:
             pass
-        except Exception:
-            logger.exception("Fabric execution failed")
+        except Exception as exc:
+            # Never log exception text: it can contain prompt or backend data.
+            logger.error("Fabric execution failed (%s)", type(exc).__name__)
             await send(
                 {
                     "type": "result",
@@ -160,8 +190,10 @@ async def serve_connection(node: Node, ws):
 
 async def run_fabric_bridge(node: Node, token: str):
     url = connection_url(node.config.node.fabric_url, node.config.node.id)
+    fabric = node.fabric
     delay = 1
     while True:
+        fabric.update(state="connecting", connected_at=None, last_error=None, code=None)
         try:
             async with connect(
                 url,
@@ -175,9 +207,45 @@ async def run_fabric_bridge(node: Node, token: str):
                 close_timeout=3,
             ) as ws:
                 delay = 1
+                fabric.update(
+                    state="connected", connected_at=time.time(), last_error=None, code=None
+                )
                 logger.info("Connected to fabric control plane")
                 await serve_connection(node, ws)
+        except InvalidStatus as exc:
+            status = exc.response.status_code
+            if status in PERMANENT_HANDSHAKE_STATUS:
+                fabric.update(
+                    state="rejected",
+                    connected_at=None,
+                    last_error="Fabric rejected the node connection",
+                    code=status,
+                )
+                logger.error(
+                    "Fabric rejected the node connection (HTTP %s); not retrying", status
+                )
+                return
+        except ConnectionClosed as exc:
+            code = exc.rcvd.code if exc.rcvd is not None else None
+            if code in PERMANENT_CLOSE_CODES:
+                # 4001 means another connection owns this node id. Reconnecting would
+                # replace it back and flap ownership; 4003 is a revoked/expired token.
+                state = "superseded" if code == 4001 else "rejected"
+                fabric.update(
+                    state=state,
+                    connected_at=None,
+                    last_error="Fabric closed the node connection",
+                    code=code,
+                )
+                logger.error("Fabric closed the node connection (%s); not retrying", code)
+                return
         except (OSError, TimeoutError, WebSocketException):
             logger.warning("Fabric connection lost; retrying while local API stays available")
+        fabric.update(
+            state="reconnecting",
+            connected_at=None,
+            last_error="Fabric connection lost",
+            code=None,
+        )
         await asyncio.sleep(delay + random.random())
         delay = min(delay * 2, 30)

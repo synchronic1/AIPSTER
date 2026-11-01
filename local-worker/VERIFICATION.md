@@ -90,3 +90,51 @@ clients and do not use these inbound routes. A network bind already required a
 token; it now also requires `advertise_url` or `allowed_hosts`. Loopback quickstart
 clients must send the bearer token. No native engine, model, inference or AIPSTER
 connection was exercised.
+
+## Local patch 0002: Ganglion fabric resident-only binding (2026-11-01)
+
+Base: AIPSTER `d1de902eb90067459615714941ea048f719d9edd`. Branch
+`claude/worker-ganglion-integration-20261101`. macOS arm64, CPython 3.12.13 with
+pydantic 2.13.5, httpx 0.28.1, websockets 17.1, fastapi 0.141.1 and pytest from
+an existing virtual environment. No package was installed and no model was
+loaded or run. Tests import the vendored package via `PYTHONPATH` and run with
+`PYTHONDONTWRITEBYTECODE=1` so the vendor allowlist stays byte-exact.
+
+```text
+cd local-worker
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/vendor/eif" python -m pytest \
+  test_installation.py test_fabric_bridge.py -q \
+  -k "not installed_cli and not mock_daemon_health_and_execution"
+```
+
+Result: **32 passed** on the patched tree (20 new fabric tests + 12 installation
+tests, including `verify_vendor.py --check-patches`). The two deselected cases
+resolve `dendrite`/the `dendrite` executable from the host environment rather than
+this vendor tree, so they are not evidence for this patch. `verify_vendor.py`
+reports 16 files against the pinned commit: 10 upstream-identical, 6 locally
+patched (patch 0001: `api.py`, `config.py`; patch 0002: `fabric.py`, `node.py`,
+`runtimes/base.py`, `runtimes/llama.py`). Reversing both patches reproduces the
+upstream hashes.
+
+Against the same test file with patch 0002 reversed in an isolated tree, **13 of
+20 fail** and 7 pass. The failures cover job-id binding, exact/resident admission,
+the under-lane residency guard, timeout and post-timeout behavior, permanent
+handshake/close rejection, and attach-quarantine scoping. They are the
+falsifiable before/after evidence for this patch.
+
+The new tests use a local fake fabric WebSocket and the mock runtime only. They
+cover: authenticated connect; one immediate heartbeat; resident-only capacity in
+the cloud snapshot; single result bound to the job ID; duplicate suppression
+during and after execution; unknown model, capability mismatch, missing model and
+unknown field denial before load; model-switch refusal; busy 429; timeout 504 with
+exactly one error and no local retry; disconnect cancellation with no result;
+malformed/oversized/unknown frames; a single heartbeat loop; no prompt or token in
+logs or error frames; permanent 401 handshake rejection without retry; 4001
+replacement and 4003 revocation stop states; and attach quarantine only after an
+unanswered sent request.
+
+Limits: the deployed fabric was not contacted, no credential was read, no node
+was enrolled, no live task or inference ran, and the AIPSTER dispatch path remains
+absent. The Ganglion contract has no streaming, cancel frame or transmitted
+deadline, so the worker enforces only its local request timeout; this is recorded
+in [EXECUTION-GAPS.md](EXECUTION-GAPS.md).
