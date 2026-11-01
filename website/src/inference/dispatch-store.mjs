@@ -45,12 +45,23 @@ import { resourceLiveness } from '../lib/status.mjs';
 import { CONTENT_MAX } from './worker-transport.mjs';
 
 export const ADMISSION_TTL_MS = 10 * 60 * 1000;
-// Per-principal retained-state caps (finding 4437303806). Expired admissions
-// are swept, so they never count; settled/released operations are terminal.
-// Queued jobs are one per operation and only non-terminal operations own one,
-// so the operation cap bounds both.
+// Per-principal retained-state caps (findings 4437303806, 4437419399). Expired
+// admissions are swept, so they never count. Operations are counted in every
+// phase, terminal ones included: a refused hold releases the operation but
+// leaves its row, so counting only non-terminal phases let an exhausted
+// principal park unbounded rows. Released rows never executed and carry no
+// receipt, so they are pruned as soon as a principal is at the cap; settled
+// rows are the replay record and are kept for DISPATCH_RETENTION_MS. Queued jobs
+// are one per dispatched operation, so the operation cap bounds them too; a
+// pruned operation takes its terminal queue rows and its settlement receipt with
+// it in the same batch.
 export const DEFAULT_DISPATCH_MAX_ADMISSIONS = 20;
 export const DEFAULT_DISPATCH_MAX_OPERATIONS = 20;
+// Long enough to outlive the longest admitted deadline (180 s) and the worker's
+// finite task retention; a replay of a settled key inside this window always
+// reconciles to the original operation instead of dispatching again.
+export const DEFAULT_DISPATCH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const MIN_DISPATCH_RETENTION_MS = 60 * 60 * 1000;
 export const DISPATCH_LIMIT_CODE = 'DISPATCH_LIMIT';
 export const INFERENCE_RUNTIME_IDS = Object.freeze(['ganglion', 'llama-server']);
 const RUNTIME_IDS = new Set(INFERENCE_RUNTIME_IDS);
@@ -108,6 +119,13 @@ function admissionLimit(env) {
 
 function operationLimit(env) {
   return limitFromEnv(env, 'INFERENCE_DISPATCH_MAX_OPERATIONS', DEFAULT_DISPATCH_MAX_OPERATIONS);
+}
+
+// A shorter window than an hour would expire replay receipts before any
+// admitted deadline could have elapsed, so it is refused rather than honoured.
+function retentionMs(env) {
+  const n = env ? Number(env.INFERENCE_DISPATCH_RETENTION_MS) : NaN;
+  return Number.isSafeInteger(n) && n >= MIN_DISPATCH_RETENTION_MS ? n : DEFAULT_DISPATCH_RETENTION_MS;
 }
 
 function principalOf(value) {
@@ -379,26 +397,53 @@ export function createD1DispatchStore(db, { now = () => Date.now(), env = null }
       const existing = await first(db, 'SELECT * FROM dispatch_operations WHERE op_key = ?', op_key);
       if (existing) return { claimed: false, op: mapOperation(existing) };
       const op_id = rid16('dispatch-op-');
-      const t = isoAt(clock());
+      const tms = clock();
+      const t = isoAt(tms);
       const cap = operationLimit(env);
-      // Finding 4437303806: the insert is conditional on this principal's
-      // non-terminal operation count, so the cap is enforced atomically in the
-      // same statement as the write.
-      const [inserted] = await db.batch([
+      // Finding 4437419399: count every retained operation, terminal ones
+      // included, and make room in the same batch. Only state that cannot be
+      // replayed is prunable:
+      //   * `released` — releaseHolds requires that no start was redeemed (and
+      //     that an admitted operation is fenced), so nothing ran and no
+      //     receipt exists; the row may go as soon as the principal is at the
+      //     cap. That is what keeps an exhausted budget from parking rows.
+      //   * `settled` — the durable replay/receipt record. Kept for the
+      //     retention window and pruned only after it, so a retry inside the
+      //     window still reconciles instead of dispatching again.
+      // An uncertain operation, a held/committed hold, or a queued/leased job
+      // is never pruned at any age. Every statement is scoped to this
+      // principal, so the cap never borrows another tenant's allowance.
+      const prunable = `SELECT o.op_id FROM dispatch_operations o
+        WHERE o.principal_id = ?
+          AND o.uncertain_phase IS NULL
+          AND NOT EXISTS (SELECT 1 FROM dispatch_holds h
+            WHERE h.op_id = o.op_id AND h.state IN ('held', 'committed'))
+          AND NOT EXISTS (SELECT 1 FROM dispatch_jobs j
+            WHERE j.op_id = o.op_id AND j.status IN ('queued', 'leased'))
+          AND ((o.phase = 'settled' AND o.updated_at <= ?)
+            OR (o.phase = 'released'
+              AND (SELECT COUNT(*) FROM dispatch_operations c WHERE c.principal_id = ?) >= ?))`;
+      const pruneBinds = [principal_id, isoAt(tms - retentionMs(env)), principal_id, cap];
+      const results = await db.batch([
+        db.prepare(`DELETE FROM dispatch_start_redemptions WHERE op_id IN (${prunable})`).bind(...pruneBinds),
+        db.prepare(`DELETE FROM dispatch_fences WHERE op_id IN (${prunable})`).bind(...pruneBinds),
+        db.prepare(`DELETE FROM dispatch_settlements WHERE op_id IN (${prunable})`).bind(...pruneBinds),
+        db.prepare(`DELETE FROM dispatch_jobs WHERE op_id IN (${prunable})`).bind(...pruneBinds),
+        db.prepare(`DELETE FROM dispatch_operations WHERE op_id IN (${prunable})`).bind(...pruneBinds),
         db.prepare(`INSERT OR IGNORE INTO dispatch_operations
           (op_id, op_key, principal_id, tenant_id, request_digest, binding_json, generation, phase,
            cancel_intent, created_at, updated_at)
           SELECT ?, ?, ?, ?, ?, ?, 1, 'claimed', 0, ?, ?
           WHERE (SELECT COUNT(*) FROM dispatch_operations
-            WHERE principal_id = ? AND phase NOT IN ('settled', 'released')) < ?`).bind(
+            WHERE principal_id = ?) < ?`).bind(
           op_id, op_key, principal_id, tenant_id, request_digest, json(binding), t, t, principal_id, cap),
       ]);
-      const wrote = changed(inserted) === 1;
+      const wrote = changes(results, results.length - 1) === 1;
       const row = await first(db, 'SELECT * FROM dispatch_operations WHERE op_key = ?', op_key);
       // A concurrent claim of the same key leaves a row (replay). A missing row
       // therefore means the guarded insert was refused by the cap.
       if (!row) {
-        throw httpError(429, 'Too many in-flight inference operations for this principal.', DISPATCH_LIMIT_CODE);
+        throw httpError(429, 'Too many retained inference operations for this principal.', DISPATCH_LIMIT_CODE);
       }
       return { claimed: wrote && row.op_id === op_id, op: mapOperation(row) };
     });
