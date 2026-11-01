@@ -218,19 +218,21 @@ export function createFakeDispatchStore(db, { now = () => Date.now(), env = {} }
 
   // ---- admission issuance ----------------------------------------------
 
-  async function issueAdmission({ principal, resource_id, model_id, max_tokens, grant = null }) {
+  async function issueAdmission({ principal, resource_id, model_id, max_tokens, runtime_id = 'ganglion', grant = null }) {
     if (!isObj(principal) || typeof principal.principal_id !== 'string' || typeof principal.tenant_id !== 'string') {
       throw new Error('principal required');
     }
     if (!Number.isSafeInteger(max_tokens) || max_tokens < 1 || max_tokens > 4096) throw new Error('max_tokens out of range');
+    // Addendum B: the runtime identity is part of the admission binding, and
+    // both sides of it (id and instance) must come from the server.
+    if (runtime_id !== 'ganglion' && runtime_id !== 'llama-server') throw new Error('runtime_id not allowed');
     const resource = await db.prepare('SELECT id, owner_id, incarnation FROM resources WHERE id = ?').bind(resource_id).first();
     if (!resource) throw new Error('resource missing');
     const at = now();
     const expires_at = at + ADMISSION_TTL_MS;
     const admission_ref = `adm-${randomHex(16)}`;
     const node_id = resource_id;
-    const runtime_id = 'ganglion';
-    const runtime_instance = `${node_id}#ganglion`;
+    const runtime_instance = `${node_id}#${runtime_id}`;
     const model_fingerprint = `sha256:${randomHex(32)}`;
 
     let snapshot;

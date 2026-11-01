@@ -54,9 +54,11 @@ function useStore(t) {
   return store;
 }
 
-async function admit(t, user, { resource_id, model_id = MODEL, max_tokens = 128, headers } = {}) {
+async function admit(t, user, { resource_id, model_id = MODEL, max_tokens = 128, runtime_id, headers } = {}) {
+  const body = { resource_id, model_id, max_tokens };
+  if (runtime_id !== undefined) body.runtime_id = runtime_id;
   return readJson(await t.call('/api/inference/admissions', {
-    method: 'POST', headers: headers || S(t, user), body: { resource_id, model_id, max_tokens },
+    method: 'POST', headers: headers || S(t, user), body,
   }));
 }
 
@@ -251,6 +253,61 @@ test('admissions: unknown fields are rejected', async () => {
   assert.equal(out.json.code, 'UNSUPPORTED_FIELD');
 });
 
+// ------------------------------------------------------- runtime identity
+
+test('admissions: runtime_id defaults to ganglion and a llama-server admission runs end to end', async () => {
+  const t = await createTestEnv(ENABLED);
+  const store = useStore(t);
+  const r = await ready(t);
+
+  // Default: ganglion, unchanged from before the runtime field existed.
+  const def = await admit(t, t.alice, { resource_id: r.resource.id });
+  assert.equal(def.status, 201, def.text);
+  assert.equal(store.state.admissions[def.json.admission_ref].runtime_id, 'ganglion');
+  assert.equal(store.state.admissions[def.json.admission_ref].runtime_instance, `${r.resource.id}#ganglion`);
+  const defSubmit = await submitJob(t, S(t, t.alice), submitBody(def.json.admission_ref));
+  assert.equal(defSubmit.status, 202, defSubmit.text);
+  const defLease = await (await nextJob(t, K(t, r.hb.secret))).json();
+  assert.equal(defLease.envelope.task.placement.runtime_id, 'ganglion');
+  assert.equal(defLease.envelope.binding.runtime_instance, `${r.resource.id}#ganglion`);
+  assert.equal((await readJson(await postResult(t, r.hb.secret, defLease.job_id, resultFor(defLease)))).status, 200);
+
+  // Explicit llama-server: the identity is stored, placed and pinned.
+  const mac = await admit(t, t.alice, { resource_id: r.resource.id, runtime_id: 'llama-server' });
+  assert.equal(mac.status, 201, mac.text);
+  assert.equal(store.state.admissions[mac.json.admission_ref].runtime_id, 'llama-server');
+  assert.equal(store.state.admissions[mac.json.admission_ref].runtime_instance, `${r.resource.id}#llama-server`);
+  const submitted = await submitJob(t, S(t, t.alice), submitBody(mac.json.admission_ref, { idempotency_key: 'alice-op-00000002' }));
+  assert.equal(submitted.status, 202, submitted.text);
+  const lease = await (await nextJob(t, K(t, r.hb.secret))).json();
+  assert.equal(lease.job_id, submitted.json.job_id);
+  assert.deepEqual(lease.envelope.task.placement,
+    { device: 'cpu', node_id: r.resource.id, runtime_id: 'llama-server' });
+  assert.equal(lease.envelope.binding.runtime_instance, `${r.resource.id}#llama-server`);
+
+  const accepted = await readJson(await postResult(t, r.hb.secret, lease.job_id, resultFor(lease)));
+  assert.equal(accepted.status, 200, accepted.text);
+  const done = await readJson(await t.call('/api/jobs/alice-op-00000002', { headers: S(t, t.alice) }));
+  assert.equal(done.status, 200, done.text);
+  assert.equal(done.json.status, 'settled');
+  assert.equal(done.json.outcome.released, true);
+  assert.equal(done.json.outcome.content, 'hello');
+  assert.equal(done.json.outcome.provenance.runtime_instance, `${r.resource.id}#llama-server`);
+});
+
+test('admissions: a runtime_id outside the allowlist is refused with BAD_RUNTIME', async () => {
+  const t = await createTestEnv(ENABLED);
+  const store = useStore(t);
+  const r = await ready(t);
+  for (const runtime_id of ['llama-cpp', 'GANGLION', 'ganglion ', '', null, 42, ['ganglion'], { id: 'ganglion' }]) {
+    const out = await admit(t, t.alice, { resource_id: r.resource.id, runtime_id });
+    assert.equal(out.status, 400, JSON.stringify(runtime_id));
+    assert.equal(out.json.code, 'BAD_RUNTIME', JSON.stringify(runtime_id));
+  }
+  // Refused before the store is consulted, so no admission was minted.
+  assert.deepEqual(store.state.admissions, {});
+});
+
 // ---------------------------------------------------------- worker endpoints
 
 test('worker endpoints refuse sessions and inference keys', async () => {
@@ -408,6 +465,83 @@ test('the result report is validated strictly and size-capped', async () => {
   });
   assert.equal(oversized.status, 413);
   assert.equal((await readJson(oversized)).json.code, 'BODY_TOO_LARGE');
+});
+
+// Addendum A: the worker echoes the lease frame. These two bodies are the
+// exact wire shapes it sends, driven through lease -> result -> reconcile.
+test('worker wire shapes: the exact succeeded and failed reports settle their jobs', async () => {
+  const t = await createTestEnv(ENABLED);
+  useStore(t);
+  const r = await ready(t);
+
+  // ---- succeeded
+  const a1 = await admit(t, t.alice, { resource_id: r.resource.id });
+  const s1 = await submitJob(t, S(t, t.alice), submitBody(a1.json.admission_ref));
+  assert.equal(s1.status, 202, s1.text);
+  const lease = await (await nextJob(t, K(t, r.hb.secret))).json();
+  const p = lease.envelope.task.placement;
+  const b = lease.envelope.binding;
+  const succeeded = {
+    lease_id: lease.lease_id,
+    status: 'succeeded',
+    result: {
+      request_id: lease.job_id,
+      node_id: p.node_id,
+      runtime_id: p.runtime_id,
+      model_id: lease.envelope.task.model_id,
+      runtime_instance: b.runtime_instance,
+      model_fingerprint: b.model_fingerprint,
+      simulated: false,
+      content: 'hello',
+      elapsed_ms: 12,
+      usage: { prompt_tokens: 9, completion_tokens: 1, total_tokens: 10 },
+      cache: { hit: false },
+    },
+  };
+  assert.deepEqual(Object.keys(succeeded.result).sort(), [
+    'cache', 'content', 'elapsed_ms', 'model_fingerprint', 'model_id', 'node_id',
+    'request_id', 'runtime_id', 'runtime_instance', 'simulated', 'usage',
+  ]);
+  const ok = await readJson(await postResult(t, r.hb.secret, lease.job_id, succeeded));
+  assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual(ok.json, { ok: true, job_id: lease.job_id, status: 'succeeded' });
+  const done = await readJson(await t.call('/api/jobs/alice-op-00000001', { headers: S(t, t.alice) }));
+  assert.equal(done.status, 200, done.text);
+  assert.equal(done.json.status, 'settled');
+  assert.equal(done.json.outcome.finish, 'succeeded');
+  assert.equal(done.json.outcome.released, true);
+  assert.equal(done.json.outcome.content, 'hello');
+
+  // ---- failed
+  const a2 = await admit(t, t.alice, { resource_id: r.resource.id });
+  const s2 = await submitJob(t, S(t, t.alice), submitBody(a2.json.admission_ref, { idempotency_key: 'alice-op-00000002' }));
+  assert.equal(s2.status, 202, s2.text);
+  const lease2 = await (await nextJob(t, K(t, r.hb.secret))).json();
+  assert.equal(lease2.job_id, s2.json.job_id);
+
+  // Addendum A forbids content, or any other key, on a failed result. The
+  // refused report must not consume the lease.
+  const withContent = await readJson(await postResult(t, r.hb.secret, lease2.job_id, {
+    lease_id: lease2.lease_id, status: 'failed',
+    result: { reason: 'UPSTREAM_ERROR', content: 'partial' },
+  }));
+  assert.equal(withContent.status, 400);
+  assert.equal(withContent.json.code, 'INVALID_RESULT');
+
+  const failed = {
+    lease_id: lease2.lease_id,
+    status: 'failed',
+    result: { reason: 'UPSTREAM_ERROR', detail: 'llama-server exited 1', elapsed_ms: 40, usage: {}, cache: {} },
+  };
+  assert.deepEqual(Object.keys(failed.result).sort(), ['cache', 'detail', 'elapsed_ms', 'reason', 'usage']);
+  const failedRes = await readJson(await postResult(t, r.hb.secret, lease2.job_id, failed));
+  assert.equal(failedRes.status, 200, failedRes.text);
+  assert.deepEqual(failedRes.json, { ok: true, job_id: lease2.job_id, status: 'failed' });  const done2 = await readJson(await t.call('/api/jobs/alice-op-00000002', { headers: S(t, t.alice) }));
+  assert.equal(done2.status, 200, done2.text);
+  assert.equal(done2.json.status, 'settled');
+  assert.equal(done2.json.outcome.finish, 'failed');
+  assert.equal(done2.json.outcome.released, false);
+  assert.equal(done2.json.outcome.content, undefined);
 });
 
 // ------------------------------------------------------------- forged input

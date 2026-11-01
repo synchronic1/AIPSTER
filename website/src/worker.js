@@ -111,6 +111,11 @@ const DISPATCH_ROUTE_RE = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{7,127})$/;
 const DISPATCH_CANCEL_RE = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{7,127})\/cancel$/;
 const WORKER_RESULT_RE = /^\/api\/worker\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/result$/;
 const MODEL_ID_MAX = 256;
+// Addendum B: a Mac worker may serve a job from plain llama-server (Metal).
+// The runtime identity is server-validated here and pinned into the admission;
+// the coordinator carries it to task.placement.runtime_id and the instance id.
+const INFERENCE_RUNTIME_IDS = new Set(['ganglion', 'llama-server']);
+const DEFAULT_INFERENCE_RUNTIME_ID = 'ganglion';
 
 // Map a coordinator result onto HTTP. An explicit `http` always wins; the
 // fallbacks mirror the coordinator's own vocabulary and never turn an
@@ -2883,8 +2888,8 @@ async function handleApi(request, env, url) {
     const d = needAuthz('inference'); if (d) return deny(d);
     if (actor.kind === 'session') { const c = needCsrf(); if (c) return deny(c); }
     const body = await readJson(request, ADMISSION_BODY_MAX);
-    if (Object.keys(body).some((k) => !['resource_id', 'model_id', 'max_tokens'].includes(k))) {
-      return json(400, { error: 'Only resource_id, model_id and max_tokens are accepted.', code: 'UNSUPPORTED_FIELD' });
+    if (Object.keys(body).some((k) => !['resource_id', 'model_id', 'max_tokens', 'runtime_id'].includes(k))) {
+      return json(400, { error: 'Only resource_id, model_id, max_tokens and runtime_id are accepted.', code: 'UNSUPPORTED_FIELD' });
     }
     if (!isId(body.resource_id)) return json(400, { error: 'resource_id is required.', code: 'BAD_RESOURCE' });
     if (typeof body.model_id !== 'string' || !body.model_id || body.model_id.length > MODEL_ID_MAX) {
@@ -2892,6 +2897,13 @@ async function handleApi(request, env, url) {
     }
     if (!Number.isSafeInteger(body.max_tokens) || body.max_tokens < 1 || body.max_tokens > 4096) {
       return json(400, { error: 'max_tokens must be an integer in 1..4096.', code: 'BAD_MAX_TOKENS' });
+    }
+    // Optional runtime identity (Addendum B). Absent means "ganglion"; any
+    // value outside the allowlist, including a non-string, is refused before
+    // the store is consulted so no admission is minted.
+    const runtime_id = body.runtime_id === undefined ? DEFAULT_INFERENCE_RUNTIME_ID : body.runtime_id;
+    if (typeof runtime_id !== 'string' || !INFERENCE_RUNTIME_IDS.has(runtime_id)) {
+      return json(400, { error: 'runtime_id must be one of: ganglion, llama-server.', code: 'BAD_RUNTIME' });
     }
     const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resource_id);
     // Owner or live same-side grant with remaining quota; foreign and unknown
@@ -2927,7 +2939,8 @@ async function handleApi(request, env, url) {
     try {
       admission = await store.issueAdmission({
         principal: { principal_id: actor.user.id, tenant_id: actor.user.id },
-        resource_id: resource.id, model_id: body.model_id, max_tokens: body.max_tokens, grant,
+        resource_id: resource.id, model_id: body.model_id, max_tokens: body.max_tokens,
+        runtime_id, grant,
       });
     } catch {
       return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });

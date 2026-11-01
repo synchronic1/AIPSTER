@@ -14,7 +14,7 @@ lazily and its absence fails closed with `503 DISPATCH_UNAVAILABLE`.
 
 | Route | Auth | Body / query | Success |
 |---|---|---|---|
-| `POST /api/inference/admissions` | session + CSRF, or inference-scoped key | `{resource_id, model_id, max_tokens}` | `201 {admission_ref, expires_at, model_id, max_tokens}` |
+| `POST /api/inference/admissions` | session + CSRF, or inference-scoped key | `{resource_id, model_id, max_tokens, runtime_id?}` | `201 {admission_ref, expires_at, model_id, max_tokens}` |
 | `POST /api/jobs` | session + CSRF, or inference-scoped key | coordinator `v1.0.0` body | `202` dispatched, or coordinator state |
 | `GET /api/jobs/:idempotency_key` | session or inference-scoped key | — | `200` settled (`outcome.released` / withheld), `202` still dispatched, `409` pending |
 | `POST /api/jobs/:idempotency_key/cancel` | session + CSRF, or inference-scoped key | — | `202` with `cancel: UNSUPPORTED_CAPABILITY` after start; pre-start fence+release returns `200 CANCELLED` |
@@ -37,6 +37,21 @@ The issuer checks, before calling `store.issueAdmission`:
    and a heartbeat inside the 5-minute window). Anything else is
    `409 RESOURCE_STALE`.
 3. `max_tokens` is an integer in `1..4096` (`400 BAD_MAX_TOKENS`).
+4. `runtime_id` is absent (default `ganglion`) or exactly `ganglion` or
+   `llama-server` (`400 BAD_RUNTIME` otherwise, including any non-string). This
+   check runs before the store, so a refused value mints nothing.
+
+### Runtime identity (Addendum B)
+
+`runtime_id` is the worker runtime that will execute the job: `ganglion` (the
+default) or a plain `llama-server` on Metal, for hosts that have no Ganglion
+yet. The issuer passes the validated value to `store.issueAdmission`, which
+pins both halves of the identity in the admission binding — `runtime_id` and
+`runtime_instance` (`<node_id>#<runtime_id>`). The coordinator carries them
+unchanged into `task.placement.runtime_id` and `binding.runtime_instance`, and
+the worker echoes the binding back in its result, so a `llama-server` job can
+never present itself as Ganglion. The test double rejects an out-of-allowlist
+runtime too, so a route bug cannot be masked by the fake.
 
 For a grant-covered request the issuer also normalizes the app grant into the
 `fabric/policy.mjs` shape, pins the remaining token ceiling, and runs
@@ -77,6 +92,15 @@ result must carry a `reason`. The whole body is capped at 1 MiB
 (`413 BODY_TOO_LARGE`). The store accepts a result only for the matching job,
 lease and bound resource, once; anything else changes nothing and answers
 `409 RESULT_REJECTED`.
+
+These are exactly the canonical worker wire shapes in Addendum A: the worker
+echoes `binding.runtime_instance` and `binding.model_fingerprint` from the lease
+frame and sends nothing else. A succeeded `result` allows only
+`request_id, node_id, runtime_id, model_id, runtime_instance, model_fingerprint,
+simulated, content, elapsed_ms, usage, cache` (plus `truncated: false`); a failed
+`result` allows only `reason, detail, elapsed_ms, usage, cache`, with `reason` a
+token of at most 128 characters and no `content`. A rejected report never
+consumes the lease.
 
 The worker may lease and complete only jobs whose `resource_id` equals its
 key's bound resource (migration 0013). Sessions, read keys, inference keys and
