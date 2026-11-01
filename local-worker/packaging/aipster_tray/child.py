@@ -131,6 +131,16 @@ def _stop_own_process(proc, timeout):
     except (OSError, ProcessLookupError):
         proc.wait(timeout=10)
         return
+    if pgid != proc.pid:
+        # Not the group leader (child changed its own pgid): fall back to
+        # single-process signals rather than a group we merely joined.
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        return
     try:
         os.killpg(pgid, signal.SIGTERM)
     except (OSError, ProcessLookupError):

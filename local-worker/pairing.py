@@ -757,7 +757,8 @@ def cmd_heartbeat(args, loop):
                     print(f"heartbeat: [{exc.code}] {exc}; not starting a second sender",
                           file=sys.stderr)
                     return EXIT_USAGE
-                raise
+                print(f"heartbeat: [{exc.code}] {exc}", file=sys.stderr)
+                return EXIT_USAGE if exc.status is None else EXIT_NETWORK
         while True:
             if not first_beat:
                 # Reload every beat: unpair stops the sender instead of beating on
