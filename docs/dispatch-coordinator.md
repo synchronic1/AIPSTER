@@ -5,6 +5,7 @@
 **Status:** an internal, offline-tested server-side module. It is **not** a route, a deployed endpoint, an issuer or authority.
 - `worker.js` does not import it, and `POST /api/jobs` stays `501 INFERENCE_DISABLED` after its existing auth/CSRF checks.
 - No flag, schema, migration or WebSocket was added.
+- Lane L2 adds flag-gated routes on a separate branch (`docs/inference-dispatch-routes.md`). For the default flag-off deployment the two statements above remain exactly true; with `INFERENCE_ENABLED=1` the coordinator is constructed per request over an injected store and transport.
 - All positive lifecycle evidence uses an owned test double (`website/tests/fixtures/dispatch-authority-fake.mjs`). That double is not D1 and not a transport, and its "restart persistence" is modeled.
 
 ## Construction
