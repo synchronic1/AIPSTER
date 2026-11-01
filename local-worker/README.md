@@ -202,9 +202,11 @@ Execution policy on this path:
   for a resident model whose file identity has changed, is rejected before any
   load or switch; load it through the local authenticated API first. There is no
   fallback model or runtime.
-- **One job, one result.** The result's `request_id` is the fabric `job_id`;
-  duplicate frames for the same job, including after a capacity rejection, are
-  not re-executed.
+- **One job, one result (per connection).** The result's `request_id` is the
+  fabric `job_id`; duplicate frames on the same connection are not re-executed,
+  including after a capacity rejection. There is no durable cross-reconnect
+  ledger: a frame re-delivered on a new connection would execute again. The
+  Ganglion fabric does not automatically retry a disconnected job.
 - **No streaming or cancel frame.** A disconnect is the only remote cancellation
   and cancels local work. A cancellation before the native POST is attempted, or
   a POST that failed to connect, does not quarantine the attachment; a request
