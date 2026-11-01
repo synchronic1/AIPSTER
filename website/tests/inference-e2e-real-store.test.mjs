@@ -139,6 +139,52 @@ test('real store: another resource\'s key cannot lease or complete the job', asy
   assert.ok([403, 409].includes(stolen.status), `foreign completion refused, got ${stolen.status}`);
 });
 
+// Finding 4437293871 (P2): dispatch_admissions.resource_id references
+// resources(id), so DELETE /api/inventory/:id failed once an admission
+// existed. Deletion must still work and must revoke the resource's pending
+// admission and queued job.
+test('real store: deleting a resource revokes its admissions and queued jobs', async () => {
+  const t = await createTestEnv(ENABLED);
+  const r = await ready(t);
+  const admission = await readJson(await t.call('/api/inference/admissions', {
+    method: 'POST', headers: S(t, t.alice), body: { resource_id: r.resourceId, model_id: MODEL, max_tokens: 64 },
+  }));
+  assert.equal(admission.status, 201, admission.text);
+  const submitBody = (key) => ({
+    contract_version: 'v1.0.0', admission_ref: admission.json.admission_ref, idempotency_key: key,
+    model_id: MODEL, prompt: 'hello', max_tokens: 64, deadline_at: Date.now() + 60000,
+  });
+  const submitted = await readJson(await t.call('/api/jobs', {
+    method: 'POST', headers: S(t, t.alice), body: submitBody('alice-e2e-delete-0001'),
+  }));
+  assert.equal(submitted.status, 202, submitted.text);
+  assert.equal((await t.DB.prepare('SELECT COUNT(*) AS n FROM dispatch_admissions WHERE resource_id = ?')
+    .bind(r.resourceId).first()).n, 1);
+  assert.equal((await t.DB.prepare("SELECT COUNT(*) AS n FROM dispatch_jobs WHERE resource_id = ? AND status = 'queued'")
+    .bind(r.resourceId).first()).n, 1);
+
+  const del = await readJson(await t.call(`/api/inventory/${r.resourceId}`, {
+    method: 'DELETE', headers: S(t, t.alice),
+  }));
+  assert.equal(del.status, 200, del.text);
+
+  assert.equal((await t.DB.prepare('SELECT COUNT(*) AS n FROM dispatch_admissions WHERE resource_id = ?')
+    .bind(r.resourceId).first()).n, 0, 'admission revoked');
+  assert.equal((await t.DB.prepare("SELECT COUNT(*) AS n FROM dispatch_jobs WHERE resource_id = ? AND status IN ('queued', 'leased')")
+    .bind(r.resourceId).first()).n, 0, 'queued job revoked');
+
+  // The revoked admission cannot start new work, and the revoked heartbeat key
+  // cannot lease the queued job.
+  const resubmit = await readJson(await t.call('/api/jobs', {
+    method: 'POST', headers: S(t, t.alice), body: submitBody('alice-e2e-delete-0002'),
+  }));
+  assert.notEqual(resubmit.status, 202, resubmit.text);
+  assert.equal(resubmit.status, 403, resubmit.text);
+  assert.equal(resubmit.json.code, 'ADMISSION_NOT_AVAILABLE');
+  const leaseAfter = await t.call('/api/worker/jobs/next', { headers: K(r.hb) });
+  assert.ok([401, 403].includes(leaseAfter.status), `lease refused, got ${leaseAfter.status}`);
+});
+
 test('real store: owner budget of 0 fails closed before any job is queued', async () => {
   const t = await createTestEnv({ INFERENCE_ENABLED: '1' });
   const r = await ready(t);

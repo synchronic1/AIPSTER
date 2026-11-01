@@ -56,6 +56,10 @@ CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_grant
   ON dispatch_admissions(grant_id);
 CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_expiry
   ON dispatch_admissions(expires_at);
+-- Resource teardown deletes this resource's admissions before the resource row
+-- (the resource_id FK would otherwise block DELETE /api/inventory/:id).
+CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_resource
+  ON dispatch_admissions(resource_id);
 
 CREATE TABLE IF NOT EXISTS dispatch_operations (
   op_id TEXT PRIMARY KEY,

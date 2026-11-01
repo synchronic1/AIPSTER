@@ -862,10 +862,16 @@ async function handleApi(request, env, url) {
         db.prepare(`UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(now, r.id, r.id, me()),
         db.prepare(`UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM idempotency_keys WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        // Dispatch admissions reference the resource by FK (0024), so they
+        // must go before it; expiring queued/leased jobs revokes any pending
+        // worker pull. A later submit or lease therefore fails.
+        db.prepare(`UPDATE dispatch_jobs SET status = 'expired', updated_at = ?
+          WHERE resource_id = ? AND status IN ('queued', 'leased') AND ${owned}`).bind(now, r.id, r.id, me()),
+        db.prepare(`DELETE FROM dispatch_admissions WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
         db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
       ]);
-      if (Number(deleted[7].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      if (Number(deleted[9].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       return json(200, { ok: true });
     }
   }
