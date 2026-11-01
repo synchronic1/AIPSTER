@@ -1,0 +1,331 @@
+/* Built with Meta Muse. */
+// Asset validator: pure structural checks over an explicit file manifest +
+// bounded byte peeks. NEVER instantiates or executes a model: headers and
+// shard indexes are parsed with hard size/count caps, and anything
+// executable, pickle-serialized, or remote-code-requiring is rejected.
+// Runs identically against R2 bytes (production) and the fixture memory
+// store (tests); the caller supplies bounded reads.
+export const VALIDATOR_VERSION = 'catalog-validate/1.0';
+export const MAX_MANIFEST_FILES = 2000;
+// Session part cap (Codex-sec-P2): the largest admissible session is 500
+// GiB in 8 MiB chunks (65,536 parts); 100,000 leaves headroom while
+// keeping every assembly list bounded. Chunk indexes are likewise 0..100000.
+export const MAX_PARTS_PER_UPLOAD = 100000;
+export const MAX_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_HEADER_PEEK = 64 * 1024;
+export const MAX_FILE_BYTES = 100 * 1024 * 1024 * 1024;
+// Per-file scaffold finalize cap (Codex-sec-P2): finalization assembles
+// one file at a time (single flat + one part + digest workspace), so peak
+// isolate memory is ~2x the largest file plus the bounded parts list
+// (~10 MB at the 100K cap). 32 MiB keeps the worst case near 80 MB,
+// inside the 128 MB isolate with headroom. Streaming promotion (no
+// full assembly) is the documented follow-on for larger files.
+export const MAX_FINALIZE_FILE_BYTES = 32 * 1024 * 1024;
+export const MAX_ASSET_BYTES = 500 * 1024 * 1024 * 1024;
+
+// Allowed data-file suffixes for the initial matrix. Archives are refused
+// outright until bounded extraction exists; executables/scripts are refused.
+const ALLOWED_SUFFIXES = ['.safetensors', '.gguf', '.json', '.txt', '.md', '.model', '.vocab', '.merges'];
+const REFUSED_SUFFIXES = ['.bin', '.pt', '.pth', '.ckpt', '.pkl', '.pickle', '.dill', '.mar',
+  '.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.exe', '.dll', '.so', '.dylib', '.sh', '.py', '.js'];
+
+function check(code, ok, message, resolve = '') {
+  return { code, ok, message, resolve };
+}
+
+// Server-side traversal/symlink/name policy (T5). relpath must be a
+// relative posix path: no leading slash, no drive, no '..' segment, no
+// empty segment, no backslash, bounded length. Archive/symlink entries
+// cannot be expressed here at all: manifests are explicit file lists.
+export function validateRelPath(relpath) {
+  if (typeof relpath !== 'string' || !relpath || relpath.length > 512) return 'empty or overlong name';
+  if (relpath.includes('\\')) return 'backslashes refused';
+  if (relpath.startsWith('/') || /^[A-Za-z]:/.test(relpath)) return 'absolute path refused';
+  const segs = relpath.split('/');
+  if (segs.some((s) => !s || s === '.' || s === '..')) return 'empty, dot, or dot-dot segment refused';
+  if (segs.some((s) => s.length > 200)) return 'overlong segment refused';
+  return null;
+}
+
+function suffixOf(name) {
+  const i = name.toLowerCase().lastIndexOf('.');
+  return i >= 0 ? name.toLowerCase().slice(i) : '';
+}
+
+function hasAllowedSuffix(name) {
+  return ALLOWED_SUFFIXES.some((s) => name.toLowerCase().endsWith(s));
+}
+
+function hasRefusedSuffix(name) {
+  return REFUSED_SUFFIXES.some((s) => name.toLowerCase().endsWith(s));
+}
+
+// Magic-number screen over the first bytes (bounded peek). Catches
+// mislabeled executables and pickle payloads regardless of suffix.
+export function screenMagic(peek) {
+  if (!peek || !peek.length) return 'empty file';
+  const b = peek.length > 16 ? peek.slice(0, 16) : peek;
+  if (b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46) return 'ELF executable refused';
+  if (b[0] === 0x4d && b[1] === 0x5a) return 'Windows executable refused';
+  if (b[0] === 0x23 && b[1] === 0x21) return 'shebang script refused';
+  if (b[0] === 0x80 && b[1] >= 0x02 && b[1] <= 0x05) return 'pickle opcode refused: use safetensors';
+  if (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) return 'zip container refused: upload explicit files';
+  if (b[0] === 0x50 && b[1] === 0x4b && ((b[2] === 0x05 && b[3] === 0x06) || (b[2] === 0x07 && b[3] === 0x08))) return 'zip container refused: upload explicit files';
+  if (b[0] === 0x1f && b[1] === 0x8b) return 'gzip container refused: upload explicit files';
+  if (b[0] === 0x52 && b[1] === 0x61 && b[2] === 0x72 && b[3] === 0x21 && b[4] === 0x1a && b[5] === 0x07) return 'rar container refused: upload explicit files';
+  if (b[0] === 0x37 && b[1] === 0x7a && b[2] === 0xbc && b[3] === 0xaf && b[4] === 0x27 && b[5] === 0x1c) return '7z container refused: upload explicit files';
+  if (b[0] === 0xcf && b[1] === 0xfa && b[2] === 0xed && b[3] === 0xfe) return 'Mach-O executable refused';
+  if (b[0] === 0xce && b[1] === 0xfa && b[2] === 0xed && b[3] === 0xfe) return 'Mach-O executable refused';
+  if (b[0] === 0xca && b[1] === 0xfe && b[2] === 0xba && b[3] === 0xbe) return 'Mach-O executable refused';
+  if (b[0] === 0xfe && b[1] === 0xed && b[2] === 0xfa && (b[3] === 0xce || b[3] === 0xcf)) return 'Mach-O executable refused';
+  if (b[0] === 0xca && b[1] === 0xfe && b[2] === 0xba && b[3] === 0xbf) return 'Mach-O executable refused';
+  if (b[0] === 0xbe && b[1] === 0xba && b[2] === 0xfe && b[3] === 0xca) return 'Mach-O executable refused';
+  if (b[0] === 0xbf && b[1] === 0xba && b[2] === 0xfe && b[3] === 0xca) return 'Mach-O executable refused';
+  return null;
+}
+
+// Minimal safetensors header validation: u64LE header length + JSON header
+// with data offsets inside the file. Bounded: header must fit the peek.
+export function screenSafetensors(relpath, size, peek) {
+  if (!relpath.toLowerCase().endsWith('.safetensors')) return null;
+  if (!peek || peek.length < 8) return 'safetensors header truncated';
+  const view = new DataView(peek.buffer, peek.byteOffset, 8);
+  const hlen = Number(view.getBigUint64(0, true));
+  if (!Number.isSafeInteger(hlen) || hlen > MAX_HEADER_PEEK || hlen + 8 > size) return 'safetensors header length implausible';
+  if (peek.length < 8 + hlen) return 'safetensors header exceeds peek; re-read bounded';
+  let header;
+  try {
+    header = JSON.parse(new TextDecoder().decode(peek.slice(8, 8 + hlen)));
+  } catch {
+    return 'safetensors header is not JSON';
+  }
+  if (!header || typeof header !== 'object') return 'safetensors header shape invalid';
+  for (const [name, entry] of Object.entries(header)) {
+    if (name === '__metadata__') continue;
+    if (!entry || !Array.isArray(entry.data_offsets) || entry.data_offsets.length !== 2) return `tensor ${name} lacks data offsets`;
+    const [a, z] = entry.data_offsets;
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(z) || a < 0 || z < a || 8 + hlen + z > size) {
+      return `tensor ${name} offsets escape the file`;
+    }
+  }
+  return null;
+}
+
+// Shard-index consistency: every weight file the index names must be
+// present, every weight file present must be named (no silent extras, no
+// silent gaps), and the index total must match tensor payload bytes.
+export function checkShardIndex(manifestFiles, indexJson, indexRelpath = '', payloads = null) {
+  let index;
+  try {
+    index = typeof indexJson === 'string' ? JSON.parse(indexJson) : indexJson;
+  } catch {
+    return 'shard index is not JSON';
+  }
+  const map = (index && index.weight_map) || {};
+  if (!map || typeof map !== 'object' || !Object.keys(map).length) return 'shard index has no weight map';
+  // Weight values resolve against the index location (Codex-P2): bare
+  // names sit beside the index, values with a directory are asset-root
+  // paths. Manifest paths compare whole, never by basename: comparing
+  // basenames rejects valid nested layouts (`nested/model.safetensors`
+  // against a root index) and could confuse two same-named shards.
+  const indexDir = indexRelpath.includes('/') ? indexRelpath.slice(0, indexRelpath.lastIndexOf('/')) : '';
+  const resolve = (v) => {
+    const s = String(v);
+    if (s.includes('/')) return s.toLowerCase();
+    return (indexDir ? indexDir + '/' + s : s).toLowerCase();
+  };
+  const named = new Set(Object.values(map).map(resolve));
+  const present = new Set(manifestFiles.filter((f) => f.relpath.toLowerCase().endsWith('.safetensors')).map((f) => f.relpath.toLowerCase()));
+  for (const n of named) {
+    if (!present.has(n)) return `shard index names missing file ${n}`;
+  }
+  for (const f of manifestFiles) {
+    const base = f.relpath.split('/').pop();
+    if (f.relpath.toLowerCase().endsWith('.safetensors') && !named.has(f.relpath.toLowerCase())) return `weight file ${base} is unnamed by the shard index`;
+  }
+  // Index totals compare against tensor payload, never file lengths
+  // (Codex-P2): HF total_size sums tensor storage, and every serialized
+  // shard adds its JSON header, so file-length equality rejects valid
+  // uploads. Payloads arrive from the streaming screens (the same bytes
+  // the shape check validated); a missing payload means its file already
+  // failed screening, so skipping the total then can never pass a bad
+  // file. Callers without payloads get presence-only checking.
+  const total = Number(index.metadata && index.metadata.total_size);
+  if (Number.isSafeInteger(total) && payloads) {
+    let sum = 0;
+    for (const n of named) {
+      const p = payloads.get(n);
+      if (!Number.isSafeInteger(p)) { sum = null; break; }
+      sum += p;
+    }
+    if (sum !== null && sum !== total) return `shard tensor bytes ${sum} disagree with index total ${total}`;
+  }
+  return null;
+}
+
+// Tensor payload bytes from a validated safetensors header (Codex-P2):
+// the sum of tensor storage extents, which is what HF shard indexes
+// declare in metadata.total_size. Mirrors screenSafetensors' parse guards
+// exactly; returns null unless the header is fully valid.
+export function safetensorsTensorBytes(relpath, size, peek) {
+  if (!relpath.toLowerCase().endsWith('.safetensors')) return null;
+  if (!peek || peek.length < 8) return null;
+  const view = new DataView(peek.buffer, peek.byteOffset, 8);
+  const hlen = Number(view.getBigUint64(0, true));
+  if (!Number.isSafeInteger(hlen) || hlen > MAX_HEADER_PEEK || hlen + 8 > size) return null;
+  if (peek.length < 8 + hlen) return null;
+  let header;
+  try {
+    header = JSON.parse(new TextDecoder().decode(peek.slice(8, 8 + hlen)));
+  } catch {
+    return null;
+  }
+  if (!header || typeof header !== 'object') return null;
+  let total = 0;
+  for (const [name, entry] of Object.entries(header)) {
+    if (name === '__metadata__') continue;
+    if (!entry || !Array.isArray(entry.data_offsets) || entry.data_offsets.length !== 2) return null;
+    const [a, z] = entry.data_offsets;
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(z) || a < 0 || z < a || 8 + hlen + z > size) {
+      return null;
+    }
+    total += z - a;
+  }
+  return total;
+}
+
+// Full manifest validation. `peek(relpath)` returns up to MAX_HEADER_PEEK
+// leading bytes or null when the file is absent. Returns { ok, checks[] }
+// with per-check results; ok is false if any check fails.
+// Per-file structural checks shared by the batched and streaming validators
+// (Codex-sec-P2): path policy, duplicates, size shape, and suffix matrix.
+// Besides the checks it reports the flow facts the legacy order depends on:
+// whether this file proceeds to byte screening, and how many bytes count
+// toward the asset total (path/size-shape failures exclude the file, exactly
+// as the legacy loop's early continues did).
+function structuralFileChecks(f, seen) {
+  const checks = [];
+  const bad = validateRelPath(f && f.relpath);
+  if (bad) {
+    checks.push(check('PATH_POLICY', false, `Refused name ${JSON.stringify((f && f.relpath) || '')}: ${bad}.`));
+    return { checks, byteEligible: false, countedBytes: 0 };
+  }
+  if (seen.has(f.relpath)) checks.push(check('PATH_DUP', false, `Duplicate manifest entry ${f.relpath}.`));
+  seen.add(f.relpath);
+  if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) {
+    checks.push(check('SIZE_SHAPE', false, `Unusable byte count for ${f.relpath}.`));
+    return { checks, byteEligible: false, countedBytes: 0 };
+  }
+  if (f.bytes === 0) checks.push(check('SIZE_ZERO', false, `Empty file ${f.relpath}.`));
+  if (f.bytes > MAX_FILE_BYTES) checks.push(check('SIZE_FILE_CAP', false, `${f.relpath} exceeds the per-file cap.`));
+  if (hasRefusedSuffix(f.relpath)) {
+    checks.push(check('SUFFIX_REFUSED', false, `${f.relpath}: this suffix is outside the support matrix (no archives, executables, scripts, or pickle weights).`));
+    return { checks, byteEligible: false, countedBytes: f.bytes };
+  }
+  if (!hasAllowedSuffix(f.relpath)) {
+    checks.push(check('SUFFIX_UNKNOWN', false, `${f.relpath}: suffix is not in the allowed data set.`));
+    return { checks, byteEligible: false, countedBytes: f.bytes };
+  }
+  return { checks, byteEligible: true, countedBytes: f.bytes };
+}
+
+// Byte-screening eligibility (Codex-sec-P2): a file's head is screened only
+// when its path, size shape, and suffix pass - mirroring the legacy loop's
+// early continues. Duplicates do not gate screening (legacy screened them).
+// Keep the four conditions in sync with structuralFileChecks' early exits.
+export function isByteEligible(f) {
+  if (validateRelPath(f && f.relpath)) return false;
+  if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) return false;
+  if (hasRefusedSuffix(f.relpath)) return false;
+  if (!hasAllowedSuffix(f.relpath)) return false;
+  return true;
+}
+
+// Per-file byte screening (Codex-sec-P2): magic + safetensors shape over a
+// bounded head. `screened` reports whether the head passed far enough for
+// shard-index candidacy (missing bytes and refused magic disqualify, exactly
+// as the legacy loop's early continues did; a safetensors-shape failure does
+// not disqualify).
+export function validateFileBytes(f, head) {
+  if (head === null) {
+    return { checks: [check('BYTES_MISSING', false, `Manifest names ${f.relpath} but no bytes arrived.`)], screened: false };
+  }
+  const magic = screenMagic(head);
+  if (magic) {
+    return { checks: [check('MAGIC_REFUSED', false, `${f.relpath}: ${magic}.`)], screened: false };
+  }
+  const checks = [];
+  const st = screenSafetensors(f.relpath, f.bytes, head);
+  if (st) checks.push(check('SAFETENSORS_SHAPE', false, `${f.relpath}: ${st}.`));
+  const tensorBytes = st ? null : safetensorsTensorBytes(f.relpath, f.bytes, head);
+  return { checks, screened: true, tensorBytes };
+}
+
+// Manifest-level validation over metadata plus already-screened bytes
+// (Codex-sec-P2): the streaming finalizer screens each file while its bytes
+// are in hand, retains at most one shard-index head (<=1 MiB), and calls here
+// once for the verdict - instead of retaining every file for one batched
+// call. `shard` is { relpath, head } for the qualifying index file or null;
+// `byteChecks` are the streaming per-file results in manifest order. Check
+// SET matches the legacy batched loop; only the order is structural-first
+// (revalidate stringifies checks for idempotence, so the first post-upgrade
+// revalidation writes once more - self-healing, no action needed).
+// (no caller depends on order - every assertion is .some/.ok).
+export function validateManifestStructure(manifest, shard, byteChecks, opts = {}) {
+  const checks = [];
+  const files = manifest && Array.isArray(manifest.files) ? manifest.files : null;
+  if (!files) {
+    checks.push(check('MANIFEST_SHAPE', false, 'Manifest must carry a files array.'));
+    return { ok: false, checks, version: VALIDATOR_VERSION };
+  }
+  if (files.length === 0) checks.push(check('MANIFEST_EMPTY', false, 'Manifest names no files.'));
+  if (files.length > MAX_MANIFEST_FILES) checks.push(check('MANIFEST_COUNT', false, `Manifest names ${files.length} files; at most ${MAX_MANIFEST_FILES}.`));
+  const seen = new Set();
+  let total = 0;
+  for (const f of files) {
+    const st = structuralFileChecks(f, seen);
+    checks.push(...st.checks);
+    total += st.countedBytes;
+  }
+  if (total > MAX_ASSET_BYTES) checks.push(check('SIZE_ASSET_CAP', false, `Asset totals ${total} bytes; at most ${MAX_ASSET_BYTES}.`));
+  if (shard) {
+    const text = new TextDecoder().decode(shard.head.slice(0, MAX_MANIFEST_BYTES));
+    const err = checkShardIndex(files, text, shard.relpath, opts.payloads || null);
+    if (err) checks.push(check('SHARD_INDEX', false, err));
+  }
+  if (opts.adapter) {
+    const a = opts.adapter;
+    if (!a.baseAssetId || !a.baseRevision) {
+      checks.push(check('ADAPTER_BASE_UNBOUND', false, 'Adapters must declare an exact base asset id and revision.'));
+    }
+    if (!Array.isArray(a.targetModules) || !a.targetModules.length) {
+      checks.push(check('ADAPTER_MODULES_UNDECLARED', false, 'Adapters must declare target modules.'));
+    }
+    if (!a.tokenizer) checks.push(check('ADAPTER_TOKENIZER_UNDECLARED', false, 'Adapters must declare tokenizer assumptions.'));
+  }
+  checks.push(...byteChecks);
+  if (!checks.length) checks.push(check('MANIFEST_OK', true, `${files.length} files, ${total} bytes, all structural checks passed.`));
+  return { ok: checks.every((c) => c.ok), checks, version: VALIDATOR_VERSION };
+}
+
+export function validateManifest(manifest, peek = () => null, opts = {}) {
+  const files = manifest && Array.isArray(manifest.files) ? manifest.files : null;
+  // Streaming composition: screen each byte-eligible file's head while
+  // walking (retaining only the qualifying shard-index head), then run the
+  // manifest level once. Equivalent to the legacy batched loop except that
+  // SHARD_INDEX_MISSING cannot fire (it required an inconsistent peek - a
+  // head present during screening, absent on re-read - and streaming always
+  // screens heads in hand).
+  const byteChecks = [];
+  const payloads = new Map();
+  let shard = null;
+  for (const f of files || []) {
+    if (!isByteEligible(f)) continue;
+    const head = peek(f.relpath);
+    const b = validateFileBytes(f, head);
+    byteChecks.push(...b.checks);
+    if (Number.isSafeInteger(b.tensorBytes)) payloads.set(f.relpath.toLowerCase(), b.tensorBytes);
+    if (b.screened && f.relpath.toLowerCase().endsWith('.index.json')) shard = { relpath: f.relpath, head };
+  }
+  return validateManifestStructure(manifest, shard, byteChecks, { ...opts, payloads });
+}

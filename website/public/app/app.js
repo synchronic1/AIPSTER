@@ -94,7 +94,7 @@ function renderStatus(el, data) {
   const items = list.map((r) => {
     const seen = r.lastSeenAt !== null && r.lastSeenAt !== undefined;
     const age = r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs);
-    // Only heartbeat-seen rows replace the telemetry-unavailable copy with
+    // Only heartbeat-seen rows replace the heartbeat-unavailable copy with
     // reachability-only copy. usable=false gets a distinct not-ready
     // attention note and never renders as runnable/ready.
     // Present-tense reachability needs a fresh heartbeat (Muse W4
@@ -111,8 +111,8 @@ function renderStatus(el, data) {
   const note = data.demo
     ? 'DEMO DATA: simulated fixture, not a live node.'
     : anySeen
-      ? 'Heartbeat telemetry seen for some resources — reachability only, never inference acceptance. Resources never seen have no telemetry; nothing here means ready to run.'
-      : 'Declared resources only — live telemetry is unavailable, so nothing here means ready to run.';
+      ? 'Worker heartbeats seen for some resources — reachability only, never inference acceptance. Resources never seen have no heartbeats; nothing here means ready to run.'
+      : 'Declared resources only — no worker heartbeats seen, so nothing here means connected or ready to run. Heartbeats prove reachability only; capability reports (Models tab) are separate snapshots for estimation.';
   // Counts always cover every owned resource; only the listed page is capped.
   const truncated = data.itemsTruncated === true
     ? `<p class="muted">showing ${list.length} of ${s.total} — older resources omitted from the list; counts cover all resources.</p>`
@@ -183,14 +183,15 @@ async function loadOverview() {
   $('status-strip').innerHTML = '<h2>Resource status</h2><p class="muted">Checking resource status…</p>';
   refreshStatusStrip(token, gen, 0);
   try {
-    const [inv, shared, usage] = await Promise.all([api('/api/inventory?limit=50'), api('/api/shared-with-me?limit=50'), api('/api/usage?limit=1')]);
+    const [inv, shared, usage, catalog] = await Promise.all([api('/api/inventory?limit=50'), api('/api/shared-with-me?limit=50'), api('/api/usage?limit=1'), api('/api/catalog/summary')]);
     // Reachability is fresh liveness, not terminal usability (Codex P2
     // round 12): a mock worker beating usable:false is online but
     // unusable, and the status strip counts it — so must this count.
     const reachable = inv.items.filter((r) => r.state.online).length;
     el.innerHTML = `<div class="card"><h2>My resources</h2><p>${inv.total} total · ${reachable} reachable</p></div>
       <div class="card"><h2>Shared with me</h2><p>${shared.total} active grant(s)</p></div>
-      <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>`;
+      <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>
+      <div class="card"><h2>Models & adapters</h2><p>${catalog.privateAssets} private · ${catalog.activeDeployments} active deployment(s)</p><div class="actions"><button type="button" class="btn secondary" data-goto="models">Browse catalog</button></div></div>`;
     $('ov-note').innerHTML = me && me.demo
       ? '<p class="muted">DEMO DATA: simulated fixtures for exploration. Grants and live actions are disabled. Inference dispatch is disabled.</p>'
       : '<p class="muted">No demo data: only resources you register or pair appear here. Inference dispatch is disabled.</p>';
@@ -840,7 +841,398 @@ async function loadSettings() {
   } catch (e) { if (isStale(e)) return; banner(e.message); }
 }
 
-const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, federation: loadFederation, keys: loadKeys, usage: loadUsage, advice: loadAdvice, settings: loadSettings };
+// ---- Models & adapters catalog (Phase 1: read-only discovery + compat) ----
+// Browsing calls metadata endpoints only: no weight download, no inference,
+// no worker change. Model cards are untrusted content and render through
+// esc() only — markup, scripts, and embedded instructions stay inert.
+// External Hub links open in a new tab, marked, never prefetched.
+const fmtBytes = (n) => {
+  if (!Number.isSafeInteger(n) || n < 0) return 'unknown size';
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[u];
+};
+const extLink = (href, label) => `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(label)} (external)</a>`;
+const compatPill = (state) => {
+  const cls = state === 'estimated-compatible' ? 'ok' : state === 'blocked' ? 'bad' : 'warn';
+  const label = state === 'estimated-compatible' ? 'estimated compatible' : state;
+  return `<span class="pill ${cls}">${esc(label)}</span>`;
+};
+let catalogWired = false;
+
+async function catalogNodes(select, keepEmpty) {
+  const inv = await allInventory();
+  select.innerHTML = (keepEmpty ? '<option value="">no compatibility filter</option>' : '') + inv.map((r) => `<option value="${esc(r.id)}">${esc(r.name)}</option>`).join('');
+  return inv;
+}
+
+async function runCatalogSearch() {
+  const list = $('catalog-list');
+  const meta = $('catalog-meta');
+  const err = $('catalog-error');
+  err.hidden = true;
+  loading(list);
+  meta.textContent = '';
+  try {
+    const params = new URLSearchParams();
+    for (const [key, id] of [['q', 'cat-q'], ['kind', 'cat-kind'], ['task', 'cat-task'], ['format', 'cat-format'], ['quant', 'cat-quant'], ['license', 'cat-license']]) {
+      const v = $(id).value.trim();
+      if (v) params.set(key, v);
+    }
+    const nodeId = $('cat-node').value;
+    const compat = $('cat-compat').value;
+    if (compat) {
+      if (!nodeId) throw new Error('Pick a node to filter by compatibility: compatibility is per-node, never global.');
+      params.set('compat', compat);
+      params.set('nodeId', nodeId);
+    }
+    params.set('limit', '20');
+    const res = await api('/api/catalog/search?' + params.toString());
+    const total = Number.isSafeInteger(res.total) ? `${res.total} result(s)` : 'results';
+    meta.textContent = `${total}${res.fixture ? ' · DEMO DATA: fixtures, not live Hub content' : ''}${res.compatFiltered ? ' · filtered by compatibility' : ''}`;
+    if (!res.items.length) {
+      list.innerHTML = '<div class="card"><p class="muted">No models match these filters. Broaden the search or clear the compatibility filter.</p></div>';
+      return;
+    }
+    list.innerHTML = res.items.map((a) => `<div class="card"><h2>${esc(a.repo)}</h2>
+      <p class="muted">${esc(a.kind)} · ${esc(a.task)} · ${esc(a.format)}${a.quant && a.quant !== 'unknown' ? ' · ' + esc(a.quant) : ''} · ${fmtBytes(a.totalBytes)}</p>
+      <p class="muted">revision ${esc(a.revision ? a.revision.slice(0, 12) : 'unpinned')} · license: ${esc((a.license.tags || []).join(', ') || 'unstated')}${a.gated ? ' · gated access' : ''}${a.fixture ? ' · DEMO' : ''}</p>
+      <div class="actions"><button type="button" class="btn secondary" data-asset="${esc(a.repo)}">Details</button>${extLink('https://huggingface.co/' + a.repo, 'Hub page')}</div></div>`).join('');
+    // Host-level delegation (connect-card pattern): survives re-renders and
+    // stays drivable in the minimal-DOM UI harness.
+    list.onclick = (e) => {
+      const repo = e && e.target && e.target.dataset ? e.target.dataset.asset : null;
+      if (repo) showAssetDetail(repo);
+    };
+  } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; state(list, 'error', e.message); }
+}
+
+async function showAssetDetail(repo) {
+  const host = $('asset-detail');
+  loading(host);
+  if (host.scrollIntoView) host.scrollIntoView();
+  try {
+    const a = await api('/api/catalog/assets/' + encodeURIComponent(repo));
+    const demo = !!(me && me.demo);
+    const files = (a.files || []).map((f) => `<li>${esc(f.relpath)} — ${fmtBytes(f.bytes)}${f.sha256 ? '' : ' · digest pending pinned resolve'}</li>`).join('');
+    host.innerHTML = `<div class="card"><h2>${esc(a.repo)}</h2>
+      <p class="muted">${esc(a.kind)} · ${esc(a.task)} · ${esc(a.format)}${a.fixture ? ' · DEMO DATA: fixture, not a live model' : ''}</p>
+      <p>revision <code>${esc(a.revision || 'unpinned')}</code> · ${fmtBytes(a.totalBytes)} across ${(a.files || []).length} file(s)</p>
+      <p class="muted">license tags: ${esc((a.license.tags || []).join(', ') || 'unstated')} — a tag is evidence to review, not a legal conclusion.${a.gated ? ' Gated access: you must complete the grant yourself; nothing is auto-accepted.' : ''}</p>
+      <p>${extLink('https://huggingface.co/' + a.repo, 'Hub page')}</p>
+      <h3>Files (manifest — nothing is downloaded)</h3><ul>${files}</ul>
+      <h3>Model card (untrusted, rendered inert)</h3><pre class="cardtext">${esc(a.card || '(no card text)')}</pre>
+      ${demo ? '<p class="muted">Compatibility checks are disabled for the demo account.</p>' : `<form id="compat-form" class="card">
+        <h3>Check compatibility</h3>
+        <label>Node <select id="compat-node" required></select></label>
+        <label>Runtime <input id="compat-runtime" required maxlength="64" value="fixture-llama"></label>
+        <label>Context length <input id="compat-context" type="number" min="1" max="1048576" value="4096" required></label>
+        <label>Concurrency <input id="compat-concurrency" type="number" min="1" max="1024" value="1" required></label>
+        ${a.kind === 'adapter' ? '<label>Adapter repo <input id="compat-adapter" maxlength="200"></label><label>Exact base repo <input id="compat-base" maxlength="200"></label>' : ''}
+        <p id="compat-error" class="error" role="alert" hidden></p>
+        <button type="submit">Evaluate</button>
+      </form><div id="compat-out" role="status"></div>`}</div>`;
+    if (!demo) {
+      await catalogNodes($('compat-node'), false);
+      $('compat-form').addEventListener('submit', (e) => { e.preventDefault(); runCompat(a); });
+    }
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function runCompat(asset) {
+  const out = $('compat-out');
+  const err = $('compat-error');
+  err.hidden = true;
+  loading(out);
+  try {
+    const body = {
+      ...(asset.id.startsWith('priv:') ? { assetId: asset.id } : { repo: asset.repo }),
+      nodeId: $('compat-node').value,
+      runtime: $('compat-runtime').value.trim(),
+      context: Number($('compat-context').value),
+      concurrency: Number($('compat-concurrency').value),
+    };
+    const adapterEl = $('compat-adapter');
+    if (adapterEl && adapterEl.value.trim()) {
+      if (adapterEl.value.trim().startsWith('priv:')) body.adapterAssetId = adapterEl.value.trim(); else body.adapterRepo = adapterEl.value.trim();
+      if ($('compat-base').value.trim().startsWith('priv:')) body.baseAssetId = $('compat-base').value.trim(); else body.baseRepo = $('compat-base').value.trim();
+    }
+    const dec = await api('/api/catalog/compat', { method: 'POST', body: JSON.stringify(body) });
+    const rows = (items) => (items || []).map((r) => `<li><strong>${esc(r.code)}</strong> — ${esc(r.message)}${r.resolve ? ' ' + esc(r.resolve) : ''}</li>`).join('');
+    const est = dec.estimate ? `<h4>Resource budget (conservative estimate, not a load test)</h4>
+      <ul><li>weights ${fmtBytes(dec.estimate.weightsBytes)}</li><li>KV cache ${fmtBytes(dec.estimate.kvCacheBytes)}</li>
+      <li>runtime buffers ${fmtBytes(dec.estimate.runtimeBuffersBytes)}</li><li>adapter ${fmtBytes(dec.estimate.adapterBytes)}</li>
+      <li>load workspace ${fmtBytes(dec.estimate.loadWorkspaceBytes)}</li><li>safety reserve ${fmtBytes(dec.estimate.safetyReserveBytes)}</li>
+      <li><strong>total ${fmtBytes(dec.estimate.totalBytes)}</strong></li></ul>
+      <p class="muted">method: ${esc(dec.estimate.method)} · ${esc(dec.estimate.uncertainty)}</p>` : '';
+    out.innerHTML = `<div class="card"><h3 tabindex="-1" id="compat-head">Decision: ${compatPill(dec.state)}</h3>
+      <p class="muted">node ${esc(dec.nodeId)} · estimator ${esc(dec.estimator)} · capability-report age ${dec.telemetryAgeMs === null ? 'unknown' : Math.round(dec.telemetryAgeMs / 1000) + 's'} · expires ${esc(dec.expiresAt)}${dec.cached ? ' · cached' : ''}${dec.fixture ? ' · DEMO' : ''} · snapshot only, not a connected node</p>
+      ${dec.blocking && dec.blocking.length ? `<h4>Blocking</h4><ul>${rows(dec.blocking)}</ul>` : ''}
+      ${dec.unknown && dec.unknown.length ? `<h4>Unknown (missing evidence)</h4><ul>${rows(dec.unknown)}</ul>` : ''}
+      ${dec.warnings && dec.warnings.length ? `<h4>Warnings</h4><ul>${rows(dec.warnings)}</ul>` : ''}
+      ${est}
+      ${dec.state === 'estimated-compatible' ? '<p><button type="button" class="btn" data-plan="1">Plan deployment</button></p>' : '<p><button type="button" class="btn" disabled title="Deployment needs an estimated-compatible decision">Deploy (unavailable)</button></p>'}<div id="deploy-out" role="status"></div></div>`;
+    lastCompatInput = { ref: body.repo || body.assetId, nodeId: body.nodeId, runtime: body.runtime, context: body.context, concurrency: body.concurrency };
+    out.onclick = (e) => {
+      const ds = e && e.target && e.target.dataset ? e.target.dataset : {};
+      if (ds.plan) runPlan();
+      if (ds.exec) runExecute(false);
+      if (ds.execDemo) runExecute(true);
+      if (ds.depRefresh) trackRefresh(ds.depRefresh, $('deploy-track'));
+      if (ds.depCancel) trackCancel(ds.depCancel, $('deploy-track'));
+    };
+    const head = $('compat-head');
+    if (head && head.focus) head.focus();
+  } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; state(out, 'error', e.message); }
+}
+
+// ---- qualified deployments (Phase 3: plan -> execute -> track) ----
+// Plans pin exact revisions and expire in 15 minutes; execution re-checks
+// compatibility, reserves node memory, then dispatches. Each plan mints one
+// idempotency key per path (real / walkthrough) so retries and double
+// clicks replay the same job instead of duplicating it. The fixture
+// walkthrough drives the fake worker through its scripted receipts and is
+// labeled DEMO throughout; live environments refuse scripted plans.
+let lastCompatInput = null;
+let pendingPlan = null;
+const depCache = new Map();
+const DEPLOY_FINAL = ['ready', 'failed', 'cancelled'];
+const WALKTHROUGH = [{ status: 'staging' }, { status: 'verifying' }, { status: 'loading' }, { status: 'ready' }];
+const deployPill = (s) => `<span class="pill ${s === 'ready' ? 'ok' : (s === 'failed' || s === 'cancelled') ? 'bad' : 'warn'}">${esc(s)}</span>`;
+const mintIdemKey = () => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : 'key-' + Date.now().toString(36) + '-' + Math.random().toString(16).slice(2));
+
+function renderDeployment(d, events) {
+  const ev = (events || []).map((e) => `<li>${esc(e.at)} · ${esc(e.from_state || '—')} → ${esc(e.to_state)} — ${esc(e.detail || '')}</li>`).join('');
+  return `<div class="card"><h3>Deployment ${esc(d.id)}</h3>
+    ${d.scripted ? '<p class="muted">DEMO: scripted fixture-worker receipts, not live execution.</p>' : ''}
+    <p>${deployPill(d.state)} <span class="muted">${esc(d.plan.asset.id)}@${esc(String(d.plan.asset.revision).slice(0, 12))} → node ${esc(d.plan.nodeId)} · ${esc(d.plan.runtime)}</span></p>
+    ${d.error ? `<p class="error" role="alert">${esc(d.error.code || 'FAILED')}: ${esc(d.error.detail || '')}</p>` : ''}
+    <p class="muted">reservation ${esc(d.reservation ? d.reservation.state : 'none')} · ${fmtBytes(d.estimateTotalBytes)} · updated ${esc(d.updatedAt)}</p>
+    <h4>Event trail</h4><ul>${ev || '<li>No events yet.</li>'}</ul>
+    ${d.state === 'cancelling' ? '<p class="muted">Cancel requested — awaiting worker acknowledgment. Capacity stays held.</p>' : ''}
+    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) || d.state === 'cancelling' ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
+}
+
+function renderDeploymentLite(d) {
+  return `<div class="card"><h3>Deployment ${esc(d.id)}</h3>
+    ${d.scripted ? '<p class="muted">DEMO walkthrough.</p>' : ''}
+    <p>${deployPill(d.state)} <span class="muted">${esc(d.assetId)}@${esc(String(d.revision).slice(0, 12))} → node ${esc(d.nodeId)}</span></p>
+    ${d.error ? `<p class="error" role="alert">${esc(d.error.code || 'FAILED')}: ${esc(d.error.detail || '')}</p>` : ''}
+    ${d.state === 'cancelling' ? '<p class="muted">Cancel requested — awaiting worker acknowledgment. Capacity stays held.</p>' : ''}
+    <div class="actions"><button type="button" class="btn secondary" data-dep-refresh="${esc(d.id)}">Refresh status</button>${DEPLOY_FINAL.includes(d.state) || d.state === 'cancelling' ? '' : `<button type="button" class="danger" data-dep-cancel="${esc(d.id)}">Cancel</button>`}</div></div>`;
+}
+
+async function runPlan() {
+  const host = $('deploy-out');
+  if (!lastCompatInput) return;
+  loading(host);
+  pendingPlan = null;
+  try {
+    const b = lastCompatInput;
+    const res = await api('/api/catalog/plans', { method: 'POST', body: JSON.stringify({ assetRef: b.ref, nodeId: b.nodeId, runtime: b.runtime, context: b.context, concurrency: b.concurrency }) });
+    pendingPlan = { planToken: res.planToken, plan: res.plan, expiresAt: res.expiresAt, keys: {} };
+    host.innerHTML = `<div class="card"><h3>Deployment plan</h3>
+      <p class="muted">${esc(res.plan.asset.id)}@${esc(String(res.plan.asset.revision).slice(0, 12))} → node ${esc(res.plan.nodeId)} · ${esc(res.plan.runtime)} · context ${esc(res.plan.context)} · concurrency ${esc(res.plan.concurrency)}</p>
+      <p>reserved on execute: <strong>${fmtBytes(res.plan.estimateTotalBytes)}</strong> · plan expires ${esc(res.expiresAt)}</p>
+      <p class="muted">Execution re-checks compatibility and access, then reserves node memory before dispatch. Live worker dispatch is not implemented: real execution is refused honestly until a lifecycle transport qualifies.</p>
+      <p id="deploy-error" class="error" role="alert" hidden></p>
+      <div class="actions"><button type="button" class="btn" data-exec="1">Execute</button><button type="button" class="btn secondary" data-exec-demo="1">Fixture walkthrough (DEMO)</button></div>
+      <div id="deploy-track"></div></div>`;
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function runExecute(walkthrough) {
+  const err = $('deploy-error');
+  const track = $('deploy-track');
+  if (!pendingPlan || !track) return;
+  err.hidden = true;
+  loading(track);
+  try {
+    const slot = walkthrough ? 'demo' : 'real';
+    let planToken = pendingPlan.planToken;
+    if (walkthrough) {
+      const b = lastCompatInput;
+      const res = await api('/api/catalog/plans', { method: 'POST', body: JSON.stringify({ assetRef: b.ref, nodeId: b.nodeId, runtime: b.runtime, context: b.context, concurrency: b.concurrency, fixtureScript: WALKTHROUGH }) });
+      planToken = res.planToken;
+    }
+    if (!pendingPlan.keys[slot]) pendingPlan.keys[slot] = mintIdemKey();
+    const job = await api('/api/catalog/deployments', { method: 'POST', body: JSON.stringify({ idempotencyKey: pendingPlan.keys[slot], planToken }) });
+    depCache.set(job.id, { full: job, events: job.events });
+    track.innerHTML = renderDeployment(job, job.events);
+    loadDeployments();
+  } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; state(track, 'error', e.message); }
+}
+
+async function trackRefresh(id, host) {
+  if (!host) return;
+  loading(host);
+  try {
+    const s = await api('/api/catalog/deployments/' + encodeURIComponent(id));
+    depCache.set(id, { full: s, events: s.events });
+    host.innerHTML = renderDeployment(s, s.events);
+    loadDeployments();
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function trackCancel(id, host) {
+  if (!host) return;
+  loading(host);
+  try {
+    const s = await api('/api/catalog/deployments/' + encodeURIComponent(id) + '/cancel', { method: 'POST', body: JSON.stringify({}) });
+    depCache.set(id, { full: s, events: s.events });
+    host.innerHTML = renderDeployment(s, s.events);
+    loadDeployments();
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function loadDeployments() {
+  const host = $('my-deployments');
+  if (!host) return;
+  loading(host);
+  try {
+    const res = await api('/api/catalog/deployments?limit=50');
+    if (!res.items.length) {
+      host.innerHTML = '<div class="card"><p class="muted">No deployments yet. Evaluate compatibility on a model, then plan and execute.</p></div>';
+      return;
+    }
+    host.innerHTML = res.items.map((d) => {
+      const c = depCache.get(d.id);
+      return c ? renderDeployment(c.full, c.events) : renderDeploymentLite(d);
+    }).join('');
+    host.onclick = async (e) => {
+      const ds = e && e.target && e.target.dataset ? e.target.dataset : {};
+      if (ds.depRefresh) {
+        try {
+          const s = await api('/api/catalog/deployments/' + encodeURIComponent(ds.depRefresh));
+          depCache.set(ds.depRefresh, { full: s, events: s.events });
+          loadDeployments();
+        } catch (err) { if (!isStale(err)) banner(err.message); }
+      }
+      if (ds.depCancel) {
+        try {
+          const s = await api('/api/catalog/deployments/' + encodeURIComponent(ds.depCancel) + '/cancel', { method: 'POST', body: JSON.stringify({}) });
+          depCache.set(ds.depCancel, { full: s, events: s.events });
+          loadDeployments();
+        } catch (err) { if (!isStale(err)) banner(err.message); }
+      }
+    };
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+async function apiBytes(path, buf) {
+  const gen = generation;
+  let res;
+  try {
+    res = await fetch(path, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Aipster-CSRF': '1' }, body: buf });
+  } catch (e) { if (gen !== generation) throw staleError(); throw e; }
+  if (gen !== generation) throw staleError();
+  let data = null;
+  try { data = await res.json(); } catch { /* non-JSON */ }
+  if (gen !== generation) throw staleError();
+  if (!res.ok) {
+    const code = data && data.code ? ` (${data.code})` : '';
+    throw new Error((data && data.error ? data.error : `Request failed: ${res.status}`) + code);
+  }
+  return data;
+}
+
+async function loadMyAssets() {
+  const host = $('my-assets');
+  loading(host);
+  try {
+    const res = await api('/api/catalog/my-assets?limit=50');
+    if (!res.items.length) {
+      host.innerHTML = '<div class="card"><p class="muted">No private assets yet. Uploads appear here after validation.</p></div>';
+      return;
+    }
+    host.innerHTML = res.items.map((a) => `<div class="card"><h2>${esc(a.name)}</h2>
+      <p class="muted">${esc(a.kind)} · ${esc(a.task)} · ${esc(a.format)} · ${fmtBytes(a.totalBytes)} across ${a.files} file(s)</p>
+      <p><span class="pill ${a.validation === 'validated' ? 'ok' : 'bad'}">${esc(a.validation)}</span> <span class="muted">revision ${esc(String(a.revision).slice(0, 12))}</span></p>
+      <div class="actions"><button type="button" class="btn secondary" data-myasset="${esc(a.id)}">Details</button><button type="button" class="btn secondary" data-revalidate="${esc(a.id)}">Revalidate</button></div></div>`).join('');
+    host.onclick = async (e) => {
+      const ds = e && e.target && e.target.dataset ? e.target.dataset : {};
+      if (ds.myasset) showAssetDetail(ds.myasset);
+      if (ds.revalidate) {
+        const id = ds.revalidate.replace(/^priv:/, '');
+        try {
+          const r = await api(`/api/catalog/assets/${encodeURIComponent(id)}/validate`, { method: 'POST', body: JSON.stringify({}) });
+          state(host, r.ok ? 'ok' : 'warn', `Revalidation: ${r.validation}.`);
+          loadMyAssets();
+        } catch (err) { if (!isStale(err)) state(host, 'error', err.message); }
+      }
+    };
+  } catch (e) { if (isStale(e)) return; state(host, 'error', e.message); }
+}
+
+let uploadWired = false;
+
+async function runUpload() {
+  const err = $('upload-error');
+  const progress = $('upload-progress');
+  err.hidden = true;
+  progress.textContent = '';
+  try {
+    const input = $('up-files');
+    const files = Array.from((input && input.files) || []);
+    if (!files.length) throw new Error('Choose at least one file.');
+    const kind = $('up-kind').value;
+    const spec = {
+      name: $('up-name').value.trim(),
+      kind,
+      task: $('up-task').value.trim() || 'unknown',
+      format: $('up-format').value.trim() || 'unknown',
+      license: $('up-license').value.trim() || 'unstated:rights-reserved',
+      files: files.map((f) => ({ relpath: f.webkitRelativePath || f.name, bytes: f.size })),
+    };
+    if (kind === 'adapter') {
+      spec.baseAssetId = $('up-base-id').value.trim().replace(/^priv:/, '');
+      spec.baseRevision = $('up-base-rev').value.trim();
+      spec.targetModules = $('up-modules').value.split(',').map((s) => s.trim()).filter(Boolean);
+      spec.tokenizer = $('up-tokenizer').value.trim();
+    }
+    const begun = await api('/api/catalog/uploads', { method: 'POST', body: JSON.stringify(spec) });
+    const CHUNK = 8 * 1024 * 1024;
+    for (const file of files) {
+      const relpath = file.webkitRelativePath || file.name;
+      let index = 0;
+      for (let at = 0; at < file.size; at += CHUNK, index++) {
+        const part = await file.slice(at, Math.min(at + CHUNK, file.size)).arrayBuffer();
+        await apiBytes(`/api/catalog/uploads/${begun.id}/chunk?path=${encodeURIComponent(relpath)}&index=${index}`, part);
+        progress.textContent = `Uploading ${relpath}: ${Math.min(at + CHUNK, file.size)} of ${file.size} bytes`;
+      }
+    }
+    progress.textContent = 'Validating…';
+    const fin = await api(`/api/catalog/uploads/${begun.id}/finalize`, { method: 'POST', body: JSON.stringify({}) });
+    progress.textContent = `Validated: ${spec.name} (${fin.revision.slice(0, 12)}…).`;
+    loadMyAssets();
+  } catch (e) { if (isStale(e)) return; err.textContent = e.message; err.hidden = false; }
+}
+
+async function loadModels() {
+  $('demo-models-note').hidden = !(me && me.demo);
+  if (!catalogWired) {
+    catalogWired = true;
+    $('catalog-form').addEventListener('submit', (e) => { e.preventDefault(); runCatalogSearch(); });
+    const demoUpload = !!(me && me.demo);
+    $('upload-form').hidden = demoUpload;
+    if (!uploadWired && !demoUpload) {
+      uploadWired = true;
+      $('up-kind').addEventListener('change', () => { $('up-adapter-fields').hidden = $('up-kind').value !== 'adapter'; });
+      $('upload-form').addEventListener('submit', (e) => { e.preventDefault(); runUpload(); });
+    }
+    loadMyAssets();
+  }
+  try {
+    await catalogNodes($('cat-node'), true);
+  } catch (e) { if (isStale(e)) return; /* node filter degrades; search still works */ }
+  if (!$('catalog-list').innerHTML) runCatalogSearch();
+  loadDeployments();
+}
+
+const loaders = { overview: loadOverview, compute: loadCompute, shared: loadShared, sharing: () => { loadCompute(); loadGrants(); }, models: loadModels, federation: loadFederation, keys: loadKeys, usage: loadUsage, advice: loadAdvice, settings: loadSettings };
 
 // ---- fabric adviser ----
 // Advisory text about owned resources. The panel renders the server
@@ -1056,6 +1448,17 @@ function resetState() {
   $('whoami').textContent = '';
   $('settings-email').textContent = ''; $('settings-via').textContent = '…';
   for (const id of ['res-name', 'res-origin', 'res-cpu', 'res-gpu', 'res-caps', 'grant-user', 'key-name', 'key-expires', 'settings-name', 'demo-username', 'demo-password']) $(id).value = '';
+  for (const id of ['cat-q', 'cat-task', 'cat-format', 'cat-quant', 'cat-license']) { const el = $(id); if (el) el.value = ''; }
+  for (const id of ['cat-kind', 'cat-node', 'cat-compat']) { const el = $(id); if (el) el.selectedIndex = 0; }
+  for (const id of ['catalog-list', 'asset-detail', 'my-deployments', 'compat-out', 'deploy-out', 'deploy-track']) { const el = $(id); if (el) el.innerHTML = ''; }
+  for (const id of ['catalog-meta', 'catalog-error', 'upload-progress', 'upload-error', 'deploy-error']) { const el = $(id); if (el) el.textContent = ''; }
+  pendingPlan = null;
+  lastCompatInput = null;
+  depCache.clear();
+  for (const id of ['up-name', 'up-task', 'up-format', 'up-license', 'up-base-id', 'up-base-rev', 'up-modules', 'up-tokenizer']) { const el = $(id); if (el) el.value = ''; }
+  for (const id of ['my-assets']) { const el = $(id); if (el) el.innerHTML = ''; }
+  catalogWired = false;
+  uploadWired = false;
   for (const id of ['fab-node-label', 'fab-node-ws', 'fab-inv-node', 'fab-inv-ws', 'fab-inv-purpose', 'fab-accept-token', 'fab-accept-key', 'fab-prev-res', 'fab-prev-consumers', 'fab-prev-models', 'fab-deny-res', 'fab-deny-action', 'fab-authz-res', 'fab-authz-model', 'fab-authz-consumer']) $(id).value = '';
   $('grant-jobs').value = '50'; $('grant-tokens').value = '50000'; $('key-scope').value = 'read';
   $('fab-prev-tokens').value = '100000'; $('fab-prev-reqs').value = '1000';
@@ -1076,6 +1479,15 @@ document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('c
   document.querySelectorAll('[role="tabpanel"]').forEach((p) => { p.hidden = p.id !== 'tab-' + btn.dataset.tab; });
   loaders[btn.dataset.tab]();
 }));
+
+// Cross-card navigation (e.g. the Overview catalog card): delegates to the
+// real tab buttons so generation fencing and loaders stay identical.
+if (document.addEventListener) document.addEventListener('click', (e) => {
+  const go = e.target && e.target.closest ? e.target.closest('[data-goto]') : null;
+  if (!go) return;
+  const tab = document.querySelector(`[data-tab="${go.dataset.goto}"]`);
+  if (tab) tab.click();
+});
 
 $('github-login').addEventListener('click', async () => {
   const err = $('login-error'); err.hidden = true;

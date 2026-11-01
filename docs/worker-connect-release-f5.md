@@ -7,8 +7,8 @@ worker PR so the merge/dispatch owner sees the ordering constraints.
 
 - PR: synchronic1/AIPSTER#50 `muse/model-catalog` → `main`, state OPEN.
 - Head: `3f253b39b8b6d4f7f26d49bea72046c0e322871d`.
-- Migrations: `website/migrations/0018_model_catalog.sql`,
-  `website/migrations/0019_model_catalog_reservations.sql`.
+- Migrations: `website/migrations/0022_model_catalog.sql`,
+  `website/migrations/0023_model_catalog_reservations.sql`.
 - Code: `website/src/lib/catalog/*`, plus `website/src/lib/schema.js` and
   `website/src/worker.js` (shared health-check/schema surface).
 - `main` migrations top out at `0017_dgm_preview.sql` (DGM slice).

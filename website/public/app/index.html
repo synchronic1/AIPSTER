@@ -39,6 +39,7 @@
       <button role="tab" data-tab="compute" aria-selected="false">My Compute</button>
       <button role="tab" data-tab="shared" aria-selected="false">Shared With Me</button>
       <button role="tab" data-tab="sharing" aria-selected="false">Sharing</button>
+      <button role="tab" data-tab="models" aria-selected="false">Models</button>
       <button role="tab" data-tab="federation" aria-selected="false">Federation</button>
       <button role="tab" data-tab="keys" aria-selected="false">API Keys</button>
       <button role="tab" data-tab="usage" aria-selected="false">Usage</button>
@@ -81,6 +82,52 @@
         <button type="submit">Create grant</button>
       </form>
       <h2>Outgoing grants</h2><div id="grant-list" class="grid"></div>
+    </section>
+    <section id="tab-models" role="tabpanel" hidden>
+      <h1>Models &amp; adapters</h1>
+      <p class="muted">Discovery and compatibility for Hugging Face models, LoRA adapters, and private assets. Browsing never downloads weights or changes a worker.</p>
+      <p id="demo-models-note" class="muted" hidden>The demo account browses fixtures only; compatibility checks, uploads, and deployment are disabled.</p>
+      <form id="catalog-form" class="card">
+        <h2>Browse catalog</h2>
+        <label>Search <input id="cat-q" maxlength="128" placeholder="e.g. instruct"></label>
+        <label>Kind <select id="cat-kind"><option value="">model or adapter</option><option value="model">model</option><option value="adapter">adapter</option></select></label>
+        <label>Task <input id="cat-task" maxlength="64" placeholder="e.g. text-generation"></label>
+        <label>Format <input id="cat-format" maxlength="32" placeholder="e.g. gguf"></label>
+        <label>Quantization <input id="cat-quant" maxlength="32" placeholder="e.g. Q4_K_M"></label>
+        <label>License tag <input id="cat-license" maxlength="64" placeholder="e.g. apache-2.0"></label>
+        <label>Compatibility on node <select id="cat-node"><option value="">no compatibility filter</option></select></label>
+        <label>Show <select id="cat-compat"><option value="">all states</option><option value="compatible">compatible only</option><option value="blocked">blocked only</option><option value="unknown">unknown only</option></select></label>
+        <p id="catalog-error" class="error" role="alert" hidden></p>
+        <button type="submit">Search</button>
+      </form>
+      <div id="catalog-meta" class="muted" role="status"></div>
+      <div id="catalog-list" class="grid"></div>
+      <div id="asset-detail"></div>
+      <h2>My assets</h2>
+      <p class="muted">Private uploads, visible only to you. Bytes stay quarantined until validation passes.</p>
+      <div id="my-assets" class="grid"></div>
+      <form id="upload-form" class="card">
+        <h2>Upload private asset</h2>
+        <p class="muted">Explicit files only (no archives). Refused: executables, scripts, pickle weights, traversal names. Scaffold cap: 128 MiB per asset.</p>
+        <label>Name <input id="up-name" maxlength="80" required></label>
+        <label>Kind <select id="up-kind"><option value="model">model</option><option value="adapter">adapter</option></select></label>
+        <label>Task <input id="up-task" maxlength="64" placeholder="e.g. text-generation"></label>
+        <label>Format <input id="up-format" maxlength="32" placeholder="e.g. gguf"></label>
+        <label>License <input id="up-license" maxlength="200" placeholder="e.g. apache-2.0"></label>
+        <div id="up-adapter-fields" hidden>
+          <label>Exact base asset id <input id="up-base-id" maxlength="64" placeholder="priv:…"></label>
+          <label>Exact base revision <input id="up-base-rev" maxlength="64"></label>
+          <label>Target modules (comma-separated) <input id="up-modules" maxlength="500" placeholder="q_proj, v_proj"></label>
+          <label>Tokenizer <input id="up-tokenizer" maxlength="200"></label>
+        </div>
+        <label>Files <input id="up-files" type="file" multiple required></label>
+        <p id="upload-error" class="error" role="alert" hidden></p>
+        <div id="upload-progress" class="muted" role="status"></div>
+        <button type="submit">Upload and validate</button>
+      </form>
+      <h2>Deployments</h2>
+      <p class="muted">Qualified deployments only: a plan pins exact revisions, execution re-checks compatibility and reserves node memory before dispatch. Live worker dispatch is not implemented; the fixture worker drives scripted receipts in fixture environments.</p>
+      <div id="my-deployments" class="grid"></div>
     </section>
     <section id="tab-federation" role="tabpanel" hidden>
       <h1>Federation</h1>
