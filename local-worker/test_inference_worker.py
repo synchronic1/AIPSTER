@@ -35,6 +35,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
@@ -489,6 +490,44 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertGreaterEqual(sleeps[0], 0.005)
         self.assertGreaterEqual(sleeps[1], sleeps[0], "idle waits grow instead of hot-looping")
         self.assertGreaterEqual(self.api.next_hits, 3)
+
+    def test_long_empty_poll_run_neither_overflows_nor_outgrows_the_cap(self):
+        # Finding 4437293876: idle grew without bound and 2 ** idle was
+        # evaluated before min() could cap the delay. At idle == 1024 the
+        # float multiply raised OverflowError, so a healthy worker that saw
+        # only empty polls exited instead of continuing to serve work.
+        polls = 1100
+        sleeps = []
+        with mock.patch.object(inference_worker, "fetch_next",
+                               lambda *a, **k: (None, None)):
+            code, _, err = self.run_quiet(
+                self.runner(sleep=sleeps.append, poll_interval=2.0,
+                            max_idle_sec=30.0),
+                max_cycles=polls)
+        self.assertEqual(code, pairing.EXIT_OK, err)
+        self.assertEqual(len(sleeps), polls)
+        # Growth schedule and cap are unchanged ...
+        self.assertEqual(sleeps[:6], [2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+        # ... and every later poll sits exactly at the cap.
+        self.assertEqual(set(sleeps[4:]), {30.0})
+
+    def test_idle_backoff_counter_stops_where_the_delay_reaches_the_cap(self):
+        # The counter itself must stay bounded, not only the delay; otherwise
+        # idle keeps growing for the lifetime of the worker.
+        runner = self.runner(poll_interval=2.0, max_idle_sec=30.0)
+        cap = runner.max_idle_exponent
+        self.assertGreaterEqual(cap, 0)
+        self.assertLessEqual(cap, 1023, "the exponent must stay float-safe")
+        idle = 0
+        delays = []
+        for _ in range(50000):
+            delays.append(runner._idle_delay(idle))
+            idle = min(idle + 1, cap)
+        self.assertEqual(delays[:6], [2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+        self.assertEqual(set(delays[4:]), {30.0})
+        self.assertEqual(idle, cap)
+        # Even a direct probe far past the cap never computes 2 ** idle.
+        self.assertEqual(runner._idle_delay(10 ** 6), 30.0)
 
     def test_retry_after_on_204_is_honored(self):
         sleeps = []
