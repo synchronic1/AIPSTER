@@ -314,7 +314,7 @@ function workerCommands(os) {
 function workerPairingCommands(os) {
   const meta = OS_META[os] || OS_META.windows;
   const py = meta.posix ? meta.venvBin + '/python' : meta.venvBin + '\\python.exe';
-  return [py + ' pairing.py pair', py + ' pairing.py heartbeat-loop --config configs/mock.toml', py + ' pairing.py unpair'];
+  return [py + ' pairing.py pair', py + ' pairing.py heartbeat-loop --config configs/mock.toml', py + ' pairing.py unpair', py + ' pairing.py status'];
 }
 
 // Complete, version-pinned setup packet for the user's own local agent,
@@ -334,6 +334,7 @@ function agentSetupPacket(os, setup) {
   const tested = os === 'windows'
     ? 'Windows x64 is the only tested platform (mock check only).'
     : 'Only Windows x64 is tested; macOS and Linux steps are untested adaptation, so verify each step before continuing.';
+  const dataDir = meta.posix ? '~/.local/share/aipster-worker/pairing.json' : '%LOCALAPPDATA%\\AIPSTER-Worker\\pairing.json';
   const account = String(setup.account ?? '').replace(/[\r\n\t]+/g, ' ').slice(0, 120);
   const expiresAt = String(setup.expiresAt ?? '').replace(/[\r\n\t]+/g, ' ');
   return ['AIPSTER agent setup packet v2.',
@@ -400,10 +401,12 @@ function agentSetupPacket(os, setup) {
     '  engine or model is installed by these steps.',
     '',
     'Step 6 - link this computer to my account (use the code above exactly once):',
-    '- If this machine is already paired (a pairing.json exists in local-worker), STOP:',
-    '  do not consume the code, rotate keys, unpair, or start a second sender. Ask me',
-    '  whether this is a repair or an account change before doing anything.',
-    '- Otherwise, in the local-worker directory, run: ' + pairing[0],
+    '- First check whether this machine is already paired: in the local-worker directory, run: ' + pairing[3],
+    '- If it reports "status: paired ...", STOP: do not consume the code, rotate keys, unpair, or start a second',
+    '  sender. Ask me whether this is a repair or an account change before doing anything.',
+    '- Pairing state lives in the worker data directory (' + dataDir + '; AIPSTER_WORKER_DATA overrides it),',
+    '  never in the local-worker checkout. Never open, copy, or paste the private files there.',
+    '- Otherwise ("status: not paired"), in the local-worker directory, run: ' + pairing[0],
     '- Supply the code through the private no-echo prompt that command shows. Never pass',
     '  the code as a command-line argument, shell variable, or file content, and never',
     '  print, log, or commit it. If you cannot type into that private prompt, stop and',
@@ -437,6 +440,13 @@ function clearPairingCode() {
 function clearSetupCode() {
   if (!connect || !connect.setup) return;
   Object.assign(connect.setup, { phase: 'idle', code: '', expiresAt: '', packet: '', packetOs: '', error: '', accountId: '', op: (connect.setup.op || 0) + 1 });
+  // The clipboard-failure path stages the code-bearing packet in the
+  // card-level fallback buffers; navigation must remove the displayed
+  // credential and its setup presentation state, not just the setup record.
+  connect.fallback = '';
+  connect.fallbackRedacted = '';
+  connect.saveFailed = false;
+  if (/^(generating|copying|setup-)/.test(connect.phase || '')) connect.phase = 'idle';
 }
 const accountName = () => (me && (me.name || me.username || me.email)) || 'signed-in account';
 

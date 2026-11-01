@@ -347,3 +347,38 @@ test('retry failure rebuilds a lost redaction; download never carries the code',
   assert.doesNotMatch(text, new RegExp(FAKE_CODE), 'rebuilt redaction carries no code');
   assert.match(text, /PAIRING CODE: \[code redacted/, 'redaction marker rebuilt in place');
 });
+
+test('packet preflight checks pairing state before consuming the code', async () => {
+  const mint = async () => mintResponse(fakeMintBody());
+  for (const [os, dataDir] of [['windows', /%LOCALAPPDATA%\\AIPSTER-Worker/], ['linux', /\.local\/share\/aipster-worker/]]) {
+    const captured = [];
+    const ui = fixture({ platform: 'Win32', clipboard: { writeText: async (text) => captured.push(text) } }, { mint });
+    await ui.pick(os);
+    await ui.press('gen-setup');
+    const packet = captured[0];
+    assert.match(packet, /pairing\.py status/, `${os}: secret-free status check`);
+    assert.match(packet, dataDir, `${os}: effective data directory named`);
+    assert.match(packet, /AIPSTER_WORKER_DATA/, `${os}: override named`);
+    assert.match(packet, /status: paired/, `${os}: STOP rule keys on the status report`);
+    assert.doesNotMatch(packet, /pairing\.json exists in local-worker/, `${os}: no wrong-directory check`);
+  }
+});
+
+test('leaving My Compute clears the staged fallback and its display', async () => {
+  const ui = fixture({ platform: 'Win32', get clipboard() { throw new Error('denied'); } },
+    { mint: async () => mintResponse(fakeMintBody()) });
+  await ui.pick('windows');
+  await ui.press('gen-setup');
+  assert.match(ui.card.innerHTML, /textarea/, 'fallback staged before navigation');
+  assert.match(ui.card.innerHTML, new RegExp(FAKE_CODE), 'code displayed before navigation');
+  // The tab-switch handler sequence: clear both flows, then repaint.
+  ui.run('clearPairingCode(); clearSetupCode(); paintConnectCard()');
+  assert.equal(ui.run('connect.fallback'), '', 'fallback buffer cleared');
+  assert.equal(ui.run('connect.fallbackRedacted'), '', 'redacted buffer cleared');
+  assert.equal(ui.run('connect.phase'), 'idle', 'setup presentation phase reset');
+  assert.doesNotMatch(ui.card.innerHTML, /textarea/, 'no code-bearing field repainted');
+  assert.doesNotMatch(ui.card.innerHTML, new RegExp(FAKE_CODE), 'code gone from the hidden panel');
+  ui.run(`connect.phase = 'load-error'`);
+  ui.run('clearSetupCode()');
+  assert.equal(ui.run('connect.phase'), 'load-error', 'unrelated card phases preserved');
+});
