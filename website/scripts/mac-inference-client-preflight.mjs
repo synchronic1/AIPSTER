@@ -182,7 +182,7 @@ check('deployed-unknown', 'Deployed state is unknown (no probe performed)', () =
 check('gpu-path-hold', 'GPU route is unselectable: exact live HOLD', () => ({
   status: 'hold',
   text: 'contract has no device selector (submit placement is FORGED_CLIENT_AUTHORITY; no --gpu CLI) and both sides fence device=cpu: RTX 3090 execution cannot be requested, so live qualification is HOLD pending an explicit reviewed GPU authority/capability decision by the backend owner',
-  ref: 'dispatch-coordinator.mjs:47-51,89; inference_worker.py:368; dispatch-store.mjs:988',
+  ref: 'dispatch-coordinator.mjs:49-51,89; inference_worker.py:368; dispatch-store.mjs:988',
 }));
 
 const fails = checks.filter((c) => c.status === 'fail');
