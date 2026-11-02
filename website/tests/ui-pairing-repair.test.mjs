@@ -87,6 +87,46 @@ test('UI repair: newest inventory failure stays visible after older successful s
   }
 });
 
+// Regression for the reported contradiction: paired rows with a fresh
+// heartbeat rendered the pairing-time note ("awaiting first heartbeat") next to
+// a link that said "reachable — heartbeat seen". The note is written once at
+// pairing and never refreshed, so the card must derive the verification text
+// from row facts: keep the pair date, state the heartbeat honestly (fresh vs
+// last seen), claim reachability only, and leave pre-beat / offline / other
+// notes untouched.
+const PAIR_NOTE = 'Paired 2026-11-01T23:49:03.000Z; awaiting first heartbeat.';
+const BEAT_AT = '2026-11-01T23:50:12.000Z';
+const cardRow = (id, name, extra) => ({
+  ...pairedResource, id, name, verification:{note:PAIR_NOTE},
+  state:{configured:true,authenticated:true,online:false,usable:false,status:'unverified'},
+  heartbeatAt:null, ...extra,
+});
+
+test('INDEPENDENT UI: a fresh heartbeat retires the stale "awaiting first heartbeat" clause without claiming readiness', async () => {
+  const t = await ui({holdInventory:true});
+  await t.press('pair-done');
+  const beaten = cardRow('synthetic-beaten','BEATEN', {state:{configured:true,authenticated:true,online:true,usable:false,status:'unverified'},heartbeatAt:BEAT_AT});
+  const never = cardRow('synthetic-never','NEVER-BEATEN', {});
+  const stale = cardRow('synthetic-stale','STALE', {heartbeatAt:BEAT_AT});
+  const declared = cardRow('synthetic-declared','DECLARED', {state:{configured:true,authenticated:true,online:true,usable:false,status:'unverified'},heartbeatAt:BEAT_AT,verification:{note:'Declared by owner; not verified.'}});
+  t.inventory.at(-1)({items:[beaten,never,stale,declared],total:4}); await t.flush();
+  const html = t.el('compute-list').innerHTML;
+  assert.equal((html.match(/Paired 2026-11-01T23:49:03\.000Z/g) || []).length, 3, 'every paired row keeps its actual pair date');
+  assert.equal((html.match(/awaiting first heartbeat/g) || []).length, 2, 'only the never-beaten row still says it, in its note and its link');
+  assert.ok(!/inference (?:ready|verified|tested)/i.test(html), 'the card never claims inference readiness or a test that did not run');
+  assert.ok(!/usable: yes/.test(html), 'usable stays false in the fixture');
+
+  const verification = (row) => {
+    t.context.__row = row;
+    const card = vm.runInContext('resourceCard(__row)', t.context);
+    return /verification: ([^<]*)</.exec(card)[1];
+  };
+  assert.equal(verification(beaten), 'Paired 2026-11-01T23:49:03.000Z; heartbeat seen 2026-11-01T23:50:12.000Z; reachability only, never inference-ready.');
+  assert.equal(verification(never), PAIR_NOTE, 'a row with no heartbeat keeps the server note verbatim');
+  assert.equal(verification(stale), 'Paired 2026-11-01T23:49:03.000Z; last heartbeat 2026-11-01T23:50:12.000Z (not fresh); reachability only, never inference-ready.');
+  assert.equal(verification(declared), 'Declared by owner; not verified.', 'an unrelated server note is rendered verbatim, unmodified');
+});
+
 test('INDEPENDENT UI: target change discards a late pairing-code success', async () => {
   const t = await ui({deferred:true});
   await t.press('pair'); await t.choose('linux');

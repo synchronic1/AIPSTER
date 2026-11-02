@@ -155,6 +155,28 @@ async function refreshStatusStrip(token, gen, failures) {
   }
 }
 
+// The server writes the verification note once, at pairing time
+// ("Paired <date>; awaiting first heartbeat."), and a heartbeat updates only
+// heartbeat_at/online/usable — never verification_json. Rendering that note
+// verbatim under a row that has since beaten prints two contradictory claims
+// ("reachable — heartbeat seen" next to "awaiting first heartbeat"). Derive the
+// text from the row's own facts instead: keep the pair date, replace only the
+// contradicted clause, and phrase a heartbeat as reachability only — never as
+// inference readiness. Rows with no heartbeat yet, or not paired at all, keep
+// the server note unchanged, so genuine pre-beat and offline states still read
+// exactly as the server reported them.
+function verificationText(r) {
+  const note = String((r.verification && r.verification.note) || 'unknown');
+  const s = r.state || {};
+  if (!s.authenticated || !r.heartbeatAt) return note;
+  const clause = /awaiting (?:the )?first heartbeat\.?/i;
+  if (!clause.test(note)) return note;
+  const beat = s.online
+    ? 'heartbeat seen ' + r.heartbeatAt
+    : 'last heartbeat ' + r.heartbeatAt + ' (not fresh)';
+  return note.replace(clause, beat + '; reachability only, never inference-ready.');
+}
+
 function resourceCard(r) {
   const s = r.state || {};
   // Pairing/link state from row fields only. The browser cannot observe an
@@ -172,7 +194,7 @@ function resourceCard(r) {
     <p class="muted">status: ${esc(s.status)} · heartbeat: ${esc(r.heartbeatAt || 'unknown')} · scope: ${esc(r.scope)}</p>
     <p class="muted">capabilities: ${esc((r.capabilities || []).join(', ') || 'none recorded')}</p>
     ${r.credits ? `<p>credits: ${esc(r.credits.label)} ${esc(r.credits.amount)} ${esc(r.credits.currency || '')} <span class="muted">(informational only)</span></p>` : '<p class="muted">credits: unknown / none recorded</p>'}
-    <p class="muted">verification: ${esc(r.verification && r.verification.note || 'unknown')}</p>
+    <p class="muted">verification: ${esc(verificationText(r))}</p>
     <p class="muted">link: ${esc(link)}</p></div>`;
 }
 
@@ -215,6 +237,15 @@ async function loadOverview() {
 // progress stage derives from the tab's inventory snapshot (setup /
 // pairing / reachable); it never claims an unverified state.
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
+// The deterministic onboarding entry point (local-worker/setup_worker.py and
+// its setup-worker wrappers) ships in a reviewed commit after the worker pin.
+// Keep this null until that commit exists, is reviewed, and is included in the
+// combined branch: the copied packet must never point a live copy at an
+// unpublished script. Flipping this one constant is the only packet change
+// needed when the reviewed SHA lands, and every command below then runs at it.
+const WORKER_SETUP_COMMIT = null;
+const workerPin = () => WORKER_SETUP_COMMIT || WORKER_COMMIT;
+const setupWorkerPinned = () => /^[0-9a-f]{40}$/.test(String(WORKER_SETUP_COMMIT || ''));
 const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
 const DOCS_TREE = 'https://github.com/synchronic1/AIPSTER/blob/' + DOCS_COMMIT + '/local-worker/';
 const WORKER_LINKS = {
@@ -302,8 +333,8 @@ function workerCommands(os) {
     'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
     'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
-    'git fetch origin ' + WORKER_COMMIT,
-    'git checkout --detach ' + WORKER_COMMIT,
+    'git fetch origin ' + workerPin(),
+    'git checkout --detach ' + workerPin(),
     'cd local-worker',
     'uv run --no-project --python 3.12.14 python install.py',
     py + ' test_installation.py',
@@ -318,6 +349,25 @@ function workerPairingCommands(os) {
   return [py + ' pairing.py pair', py + ' pairing.py heartbeat-loop --config configs/mock.toml', py + ' pairing.py unpair', py + ' pairing.py status'];
 }
 
+// One-command entry point for the packet path. The packet itself is supplied on
+// the command's stdin, so the code never enters argv, an environment variable,
+// a separate prompt or a second terminal; the wrapper also enforces the pinned
+// uv version before running the orchestrator.
+function setupWorkerCommands(os) {
+  const meta = OS_META[os] || OS_META.windows;
+  const wrapper = meta.posix ? 'sh setup-worker.sh' : '.\\setup-worker.ps1';
+  // The entry point asks the caller to acknowledge the untested macOS/Linux
+  // adaptation explicitly. The picked OS plus this packet's warning is that
+  // acknowledgment, so the copied command carries the flag instead of adding
+  // another manual step. It is a product acknowledgment, not a permission.
+  const unqualified = meta.posix ? ' --allow-unqualified-platform' : '';
+  return {
+    run: wrapper + ' run --packet-stdin' + unqualified,
+    status: wrapper + ' status',
+    retry: wrapper + ' run --packet-stdin --retry-pair' + unqualified
+  };
+}
+
 // Complete, version-pinned setup packet for the user's own local agent,
 // carrying the freshly minted code the deliberate generate action produced.
 // The code sits in a delimited data field, never interpolated into a shell
@@ -327,6 +377,8 @@ function agentSetupPacket(os, setup) {
   const meta = OS_META[os] || OS_META.windows;
   const lines = workerCommands(os);
   const pairing = workerPairingCommands(os);
+  const guided = setupWorkerPinned();
+  const entry = setupWorkerCommands(os);
   const fetch = lines.slice(0, 6).map((l) => '  ' + l).join('\n');
   const packagedPair = installerUsable(INSTALLERS[os])
     ? ['- Packaged installs instead: pair from the tray menu (Pair this computer) or with `aipster-worker pair`;',
@@ -338,46 +390,58 @@ function agentSetupPacket(os, setup) {
   const dataDir = meta.posix ? '~/.local/share/aipster-worker/pairing.json' : '%LOCALAPPDATA%\\AIPSTER-Worker\\pairing.json';
   const account = String(setup.account ?? '').replace(/[\r\n\t]+/g, ' ').slice(0, 120);
   const expiresAt = String(setup.expiresAt ?? '').replace(/[\r\n\t]+/g, ' ');
-  return ['AIPSTER agent setup packet v2.',
-    'Set up the AIPSTER local worker on THIS computer (assisted install).',
+  // Two shapes of the same reviewed contract. Guided (the pin above is set)
+  // hands the whole packet to the deterministic entry point on stdin: one
+  // command installs, pairs, starts and verifies, and resume/status are its own
+  // read-only commands. Until that pin exists the packet keeps the reviewed
+  // manual steps, so a live copy never points at unpublished code.
+  const steps = guided ? [
+    'Step 3 - run the reviewed setup entry point with this packet as its private input:',
+    '- Run, in the local-worker directory:',
+    '  ' + entry.run,
+    '- Supply THIS entire packet as that command\'s standard input, using your tool\'s stdin',
+    '  or pipe support. Do not retype the pairing code into the command line, an argument,',
+    '  an environment variable, a file, or a separate prompt; never print the packet or the',
+    '  code, and do not keep the packet after the command finishes.',
+    '- This one command prepares its own private pinned toolchain (uv, and the pinned Python',
+    '  through it), installs the reviewed worker into an isolated .venv, pairs this computer',
+    '  with the code it reads from the packet, starts one worker and one sender, and verifies',
+    '  loopback health and identity. It reuses a healthy worker and refuses to start a second',
+    '  worker or sender.',
+    '- Do not create a worker token yourself, run pairing.py or serve directly, open a second',
+    '  terminal, or ask me to handle a token or code. The entry point keeps the worker token',
+    '  in owner-only storage and passes it only to its child process.',
     '',
-    'READ FIRST - what this does and does NOT do:',
-    '- Install the local Dendrite worker (ganglion-dendrite 0.1.0) from the reviewed',
-    '  AIPSTER source revision below, in an isolated folder on this machine.',
-    '- Installing does NOT share this computer and does NOT enable inference. The',
-    '  worker does not contact AIPSTER until the pair step below runs: until then',
-    '  it holds no AIPSTER credential. AIPSTER dispatch stays disabled.',
-    '- Inspect this machine first, then explain every change BEFORE making it and',
-    '  wait for my approval. Do not change system Python, install global packages,',
-    '  add services or startup tasks, or expose anything to a network.',
+    'Step 4 - resume and status (only if it stops):',
+    '- Run: ' + entry.status,
+    '  It is read-only. Report its lines exactly as printed.',
+    '- If pairing was interrupted or its outcome is uncertain, run status first. Only if it',
+    '  shows the attempt did not complete, rerun:',
+    '  ' + entry.retry,
+    '  with this same packet. Never mint, ask for, or consume a second code, and never re-pair',
+    '  a computer that status reports as already paired.',
+    '- If the code above has expired, stop and ask me for a fresh packet.',
     '',
-    'TEMPORARY PAIRING CODE - single use, expires ' + expiresAt + ':',
-    '- This code registers THIS computer to my account (' + account + '). It is short-lived',
-    '  and single-use; it is NOT a password, API key, or heartbeat key. Do not store',
-    '  it in a file, log, URL, or chat history beyond this task.',
-    '  PAIRING CODE: ' + setup.code,
+    'Step 5 - report states truthfully:',
+    '- installed: the pinned runtime and dependencies were verified.',
+    '- paired: AIPSTER accepted the claim and this computer persisted its identity.',
+    '- reachable: a fresh heartbeat was observed. That is reachability, not inference.',
+    '- inference: NOT tested by this setup. The default verification never runs inference and',
+    '  no engine or model is installed. Report the entry point\'s own wording; never call the',
+    '  computer inference-ready.',
+    ...packagedPair,
     '',
-    'Pinned source - do not substitute another revision:',
-    '- Repository: https://github.com/synchronic1/AIPSTER',
-    '- Commit: ' + WORKER_COMMIT + ' (reviewed: local token required, Host/Origin checked, API edge-compatible sender)',
-    '- Worker directory: local-worker/',
-    '- Standalone worker background and troubleshooting: ' + WORKER_LINKS.quickstart,
-    '- Use the pinned commands below for pairing; do not substitute an older checkout from background documentation.',
-    '',
-    'Step 1 - inspect this machine (report, change nothing):',
-    '- OS and CPU architecture; Git version; uv 0.12.12 exactly (must match); Python',
-    '  3.12.14 availability (install with "uv python install 3.12.14" if missing);',
-    '  about 1 GiB free disk space and memory for tooling.',
-    '- Confirm CPU architecture: these steps cover x64 only. On ARM64 or any other',
-    '  architecture, stop and explain that no qualified instructions exist; do not',
-    '  adapt them silently.',
-    '- ' + tested,
-    '',
-    'Step 2 - fetch worker files only (in ' + meta.shell + '):',
-    fetch,
-    '- The checkout contains the worker and the root LICENSE only; the license is',
-    '  required by local-worker/LICENSING.md. Do not fetch the rest of the repository.',
-    '',
+    'Step 6 - disconnect and uninstall (I choose when to do this):',
+    '- Stop the worker and sender this setup started (end those processes or restart the',
+    '  computer). In AIPSTER Keys I revoke this resource\'s heartbeat key.',
+    '- To forget local pairing I run: ' + pairing[2],
+    '  Local unpair does not revoke the server key. Keep it private until revoked.',
+    '- Remove only local-worker/.venv and .state if present. Do not delete other',
+    '  models, engines or files. There is no automatic update; reinstall only',
+    '  from another reviewed pin AIPSTER publishes. Dispatch stays disabled.',
+    'Finish by reporting installed revision, status lines and stop steps;',
+    'never report tokens, pairing codes or private key-file contents.'
+  ] : [
     'Step 3 - install into an isolated environment:',
     '- Run: ' + lines[6],
     '  (verifies vendored hashes, refuses an existing .venv, installs hash-locked',
@@ -430,6 +494,60 @@ function agentSetupPacket(os, setup) {
     '  from another reviewed pin AIPSTER publishes. Dispatch stays disabled.',
     'Finish by reporting installed revision, inspect/test results and stop steps;',
     'never report tokens, pairing codes or private key-file contents.'
+  ];
+  return ['AIPSTER agent setup packet v2.',
+    'Set up the AIPSTER local worker on THIS computer (assisted install).',
+    '',
+    'READ FIRST - what this does and does NOT do:',
+    '- Install the local Dendrite worker (ganglion-dendrite 0.1.0) from the reviewed',
+    '  AIPSTER source revision below, in an isolated folder on this machine.',
+    '- Installing does NOT share this computer and does NOT enable inference. The',
+    '  worker does not contact AIPSTER until the pair step below runs: until then',
+    '  it holds no AIPSTER credential. AIPSTER dispatch stays disabled.',
+    '- Inspect this machine first, then explain every change BEFORE making it and',
+    '  wait for my approval. Do not change system Python, install global packages,',
+    '  add services or startup tasks, or expose anything to a network.',
+    '',
+    'TEMPORARY PAIRING CODE - single use, expires ' + expiresAt + ':',
+    '- This code registers THIS computer to my account (' + account + '). It is short-lived',
+    '  and single-use; it is NOT a password, API key, or heartbeat key. Do not store',
+    '  it in a file, log, URL, or chat history beyond this task.',
+    '  PAIRING CODE: ' + setup.code,
+    '',
+    'Pinned source - do not substitute another revision:',
+    '- Repository: https://github.com/synchronic1/AIPSTER',
+    '- Commit: ' + workerPin() + ' (reviewed: local token required, Host/Origin checked, API edge-compatible sender)',
+    '- Worker directory: local-worker/',
+    '- Standalone worker background and troubleshooting: ' + WORKER_LINKS.quickstart,
+    guided
+      ? '- Use only the pinned command below; do not substitute an older checkout from background documentation.'
+      : '- Use the pinned commands below for pairing; do not substitute an older checkout from background documentation.',
+    '',
+    'Step 1 - inspect this machine (report, change nothing):',
+    ...(guided ? [
+      '- OS and CPU architecture; Git version; about 1 GiB free disk space and memory for tooling.',
+      '- uv: do NOT install, upgrade or configure it. The setup wrapper prepares its own private,',
+      '  digest-verified uv under an owner-only cache and never uses or changes a global uv. If it',
+      '  cannot do that safely on this platform, it stops and reports the exact missing',
+      '  prerequisite; report that verbatim instead of installing anything to work around it.',
+      '- Python: do NOT install or upgrade it. The wrapper obtains the pinned interpreter',
+      '  privately through that uv; a system or global Python is never modified.'
+    ] : [
+      '- OS and CPU architecture; Git version; uv 0.12.12 exactly (must match); Python',
+      '  3.12.14 availability (install with "uv python install 3.12.14" if missing);',
+      '  about 1 GiB free disk space and memory for tooling.'
+    ]),
+    '- Confirm CPU architecture: these steps cover x64 only. On ARM64 or any other',
+    '  architecture, stop and explain that no qualified instructions exist; do not',
+    '  adapt them silently.',
+    '- ' + tested,
+    '',
+    'Step 2 - fetch worker files only (in ' + meta.shell + '):',
+    fetch,
+    '- The checkout contains the worker and the root LICENSE only; the license is',
+    '  required by local-worker/LICENSING.md. Do not fetch the rest of the repository.',
+    '',
+    ...steps
   ].join('\n');
 }
 

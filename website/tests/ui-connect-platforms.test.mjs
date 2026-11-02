@@ -417,3 +417,75 @@ test('generate waits out an in-flight retry instead of racing its clipboard writ
   assert.equal(ui.clipboard.length, 1, 'retry write landed once');
   assert.match(textOf(ui.card.innerHTML), /Setup prompt copied/, 'retry success reported');
 });
+
+// The deterministic entry point is staged behind WORKER_SETUP_COMMIT. The
+// shipped packet must keep the reviewed manual steps while that script is
+// unpublished; setting the pin is the only change that swaps in the one-command
+// flow, and no manual token, serve or second-terminal choreography survives it.
+const SETUP_PIN = '0123456789abcdef0123456789abcdef01234567';
+const setupMint = { id: 'p_pinned01', code: FAKE_CODE, expiresAt: FAKE_EXPIRY, account: 'Synthetic Owner' };
+
+function pinnedComponent() {
+  const src = component.replace('const WORKER_SETUP_COMMIT = null;',
+    'const WORKER_SETUP_COMMIT = ' + JSON.stringify(SETUP_PIN) + ';');
+  assert.notEqual(src, component, 'fixture substitutes the staged pin');
+  const context = vm.createContext({ navigator: { platform: 'MacIntel', userAgent: 'Mac' } });
+  new vm.Script(src).runInContext(context);
+  return context;
+}
+
+test('shipped packet keeps the reviewed manual steps while the entry point is unpublished', () => {
+  const ui = fixture({ platform: 'Win32' });
+  const packet = ui.context.agentSetupPacket('windows', setupMint);
+  assert.ok(packet.includes('PAIRING CODE: ' + FAKE_CODE), 'code stays in its delimited field');
+  assert.ok(packet.includes('3fa309cb08461ea046ee23e801404911c1f3bcc2'), 'reviewed worker pin kept');
+  assert.doesNotMatch(packet, /setup-worker|setup_worker/, 'never points at an unpublished script');
+  assert.ok(packet.includes('uv run --no-project --python 3.12.14 python install.py'), 'reviewed install step kept');
+  assert.ok(packet.includes('uv 0.12.12 exactly (must match)'), 'legacy path still states the reviewed uv prerequisite');
+  assert.ok(packet.includes('uv python install 3.12.14'), 'legacy path still offers the reviewed Python install hint');
+});
+
+test('pinned entry point packet runs one deterministic command with the packet on stdin', () => {
+  const context = pinnedComponent();
+  const packets = {
+    windows: context.agentSetupPacket('windows', setupMint),
+    macos: context.agentSetupPacket('macos', setupMint),
+    linux: context.agentSetupPacket('linux', setupMint)
+  };
+  const commands = {
+    windows: ['.\\setup-worker.ps1 run --packet-stdin',
+      '.\\setup-worker.ps1 run --packet-stdin --retry-pair'],
+    macos: ['sh setup-worker.sh run --packet-stdin --allow-unqualified-platform',
+      'sh setup-worker.sh run --packet-stdin --retry-pair --allow-unqualified-platform'],
+    linux: ['sh setup-worker.sh run --packet-stdin --allow-unqualified-platform',
+      'sh setup-worker.sh run --packet-stdin --retry-pair --allow-unqualified-platform']
+  };
+  for (const os of ['windows', 'macos', 'linux']) {
+    const packet = packets[os];
+    const [run, retry] = commands[os];
+    assert.ok(packet.includes(SETUP_PIN), os + ': pinned setup commit');
+    assert.ok(packet.includes(run), os + ': one deterministic entry command');
+    assert.ok(packet.includes(retry), os + ': retry command documented');
+    assert.match(packet, /setup-worker\.(sh|ps1) status/, os + ': read-only status documented');
+    assert.ok(packet.includes('PAIRING CODE: ' + FAKE_CODE), os + ': code stays in its delimited field');
+    assert.ok(!new RegExp('--code\\s+' + FAKE_CODE).test(packet), os + ': code never in argv');
+    for (const gone of ['DENDRITE_API_TOKEN', 'pairing.py pair', 'heartbeat-loop',
+      'In a second terminal', 'private no-echo prompt', 'secrets.token_urlsafe', 'serve --config']) {
+      assert.ok(!packet.includes(gone), os + ': manual choreography removed (' + gone + ')');
+    }
+    for (const state of ['installed:', 'paired:', 'reachable:', 'inference: NOT tested']) {
+      assert.ok(packet.includes(state), os + ': truthful state named (' + state + ')');
+    }
+    assert.match(packet, /standard input/, os + ': private stdin stated');
+    assert.match(packet, /private,?\s+digest-verified uv/, os + ': private pinned toolchain stated');
+    assert.ok(packet.includes('never uses or changes a global uv'), os + ': global uv left alone');
+    assert.ok(!/uv python install/.test(packet), os + ': no manual Python install choreography');
+    assert.ok(!/uv 0\.12\.12 exactly/.test(packet), os + ': no manual uv prerequisite for the wrapper');
+    assert.ok(packet.includes(FAKE_EXPIRY) && packet.includes('Synthetic Owner'), os + ': expiry and account kept');
+    assert.ok(!packet.includes('setup_worker.py'), os + ': packet calls the wrapper, not a raw script path');
+  }
+  const redacted = context.agentSetupPacket('macos',
+    { ...setupMint, code: vm.runInContext('REDACTED_CODE', context) });
+  assert.ok(!redacted.includes(FAKE_CODE), 'redacted packet never carries the code');
+  assert.match(redacted, /PAIRING CODE: \[code redacted/);
+});
