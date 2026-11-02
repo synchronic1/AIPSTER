@@ -90,8 +90,9 @@ How `run` composes the phases, exactly:
    runs.
 2. `install`. A non-zero install returns its code and nothing else runs.
 3. The packet/code is read late; an unreadable or malformed source returns 2
-   and pairing is never attempted (an empty source yields no code, which
-   `pair` reports as 4).
+   and pairing is never attempted. An empty `--code-stdin` or `--code-fd`
+   yields no code, which `pair` reports as 4; an empty `--packet-stdin` raises
+   `NO_PAIRING_CODE` and returns 2.
 4. `pair` runs **before** `start`, always — it is not conditional on `start`.
 5. `start` is attempted **even when `pair` failed** (the daemon does not need
    pairing; the sender is skipped when unpaired).
@@ -114,6 +115,7 @@ How `run` composes the phases, exactly:
 | `start`: not paired (sender skipped), sender lock already held, another sender owns the data dir (sender exit 6), sender started or heartbeat observed | 0 | complete | Reaching 0 here means the connection target met; it does not mean usable or inference-qualified. |
 | `verify`: daemon not healthy, node check failed with any status other than 401/403, inference exercise failed, heartbeat stale/failed/awaiting/unreadable | 5 | incomplete | Retry later; nothing was deleted. |
 | `verify`: config/node section invalid, private daemon token missing, node identity rejected (401/403) | 3 | blocked | Run `start` with the right data dir, or repair pairing; a revoked credential surfaces as 401/403 here, never as 4. |
+| `verify`: worker is not paired (a daemon token exists but the pairing manifest is missing) | 4 | blocked | Pair again; `start` creates the daemon token before pairing, so this is reachable right after an unpaired `start`. |
 | `verify`: facts disagree (e.g. `usable=false`) | 0 | complete | Connection target met; usability and inference are separate facts. |
 | any: another setup process holds the lock | 75 | blocked | Wait for it; nothing was mutated. |
 | any: Ctrl-C / interrupt | 130 | cancelled | The checkpoint is preserved and nothing is deleted. |
@@ -121,10 +123,7 @@ How `run` composes the phases, exactly:
 | `status` | 0, or 2 when the pairing status helper fails | complete / failed | Read-only; never mutates, never consumes a code. |
 
 Reserved: exit `6` is the sender's own "already running" code. `start` maps
-it to exit `0` (complete) rather than surfacing an error. `verify` has no
-reachable pair-required path today: the only `EXIT_PAIRING` branch there
-requires a present pairing manifest and a `not-paired` heartbeat at the same
-time, which cannot both hold.
+it to exit `0` (complete) rather than surfacing an error.
 
 `--json` never changes an exit code; the document's `outcome` and `exit_code`
 always agree with the table above.
