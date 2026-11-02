@@ -84,24 +84,36 @@ Create the fixture packet with
 
 ### Phase-to-exit-code table
 
-`run` stops at the first phase that does not succeed and returns that
-phase's code; `pair` is attempted even when `start` fails, and `verify` only
-runs after a successful `start`.
+How `run` composes the phases, exactly:
+
+1. Target guard, then `check`. A blocked check returns 3 and nothing else
+   runs.
+2. `install`. A non-zero install returns its code and nothing else runs.
+3. The packet/code is read late; an unreadable or malformed source returns 2
+   and pairing is never attempted (an empty source yields no code, which
+   `pair` reports as 4).
+4. `pair` runs **before** `start`, always — it is not conditional on `start`.
+5. `start` is attempted **even when `pair` failed** (the daemon does not need
+   pairing; the sender is skipped when unpaired).
+6. `verify` runs only when `start` returned 0.
+7. The returned code is: `start`'s code if `start` failed; otherwise `pair`'s
+   code if `pair` failed; otherwise `verify`'s code. So `pair` = 5 followed by
+   `start` = 3 returns **3**, not 5.
 
 | Phase / situation | Exit | Outcome | Meaning and next action |
 |---|---|---|---|
 | any: bad flags, unresolvable packet/code source, invalid code syntax, target mismatch or target change | 2 | failed | Fix the invocation. No mutation; `reason.code` names the fault. |
 | `check`: platform other than Windows x64 without `--allow-unqualified-platform`, Python < 3.9, `uv` not 0.12.12, < 1 GiB disk, bad loopback config, missing checkout files | 3 | blocked | Fix the prerequisite; the wrapper can bootstrap the pinned `uv`. |
 | `install`: partial `.venv`, installer failure, missing checkout files | 3 | blocked | Remove only `local-worker/.venv` and rerun; a partial tree is never deleted. |
-| `pair`: private store unreadable, previous attempt uncertain, no code supplied, claim rejected, local store missing after success | 4 | blocked | Repair the store or obtain a new code. Uncertain: check AIPSTER status/dashboard first, then `--retry-pair` only if still unpaired. |
+| `pair`: cannot establish private storage (directory/ACL failure) | 3 | blocked | Fix the data-dir permissions/ownership; nothing was claimed. |
+| `pair`: store unreadable, previous attempt uncertain, no code supplied, claim rejected, local store missing after success | 4 | blocked | Repair the store or obtain a new code. Uncertain: check AIPSTER status/dashboard first, then `--retry-pair` only if still unpaired. |
 | `pair`: network failure, or an exception after the claim was dispatched | 5 | incomplete | The code may be consumed. Check status/dashboard before any retry. |
-| `start`: daemon cannot spawn/become healthy, port conflict, sender spawn failure, sender exited | 3 | blocked | Read the log tail printed to stderr; the unhealthy daemon is stopped through the ownership ledger. |
+| `start`: worker not installed, check blocked, port held by an unresponsive service, healthy service this data dir cannot prove or whose token it rejects, daemon could not spawn, daemon healthy but rejected the setup token, sender could not spawn | 3 | blocked | Read the log tail printed to stderr; an unhealthy daemon that did start is stopped through the ownership ledger. |
+| `start`: daemon exited, never became healthy, health ok but the node check failed, something answers that is not this worker, sender exited with any code other than 4 or 6 | 5 | incomplete | Retry `start`; the checkpoint is preserved and nothing is deleted. |
 | `start`: sender key revoked/expired (sender exit 4) | 4 | blocked | Pair again; install is preserved. |
-| `start`: sender exited without a heartbeat | 5 | incomplete | Retry `start`; the checkpoint is preserved. |
-| `start`: another sender already owns the data dir (sender exit 6) | 0 | complete | Not an error: one sender per data dir. |
-| `verify`: health unreachable or heartbeat stale/missing | 5 | incomplete | Retry later; nothing was deleted. |
-| `verify`: node identity rejected (401/403) | 3 | blocked | Credentials are not accepted; repair pairing. |
-| `verify`: pairing revoked/expired | 4 | blocked | Pair again. |
+| `start`: not paired (sender skipped), sender lock already held, another sender owns the data dir (sender exit 6), sender started or heartbeat observed | 0 | complete | Reaching 0 here means the connection target met; it does not mean usable or inference-qualified. |
+| `verify`: daemon not healthy, node check failed with any status other than 401/403, inference exercise failed, heartbeat stale/failed/awaiting/unreadable | 5 | incomplete | Retry later; nothing was deleted. |
+| `verify`: config/node section invalid, private daemon token missing, node identity rejected (401/403) | 3 | blocked | Run `start` with the right data dir, or repair pairing; a revoked credential surfaces as 401/403 here, never as 4. |
 | `verify`: facts disagree (e.g. `usable=false`) | 0 | complete | Connection target met; usability and inference are separate facts. |
 | any: another setup process holds the lock | 75 | blocked | Wait for it; nothing was mutated. |
 | any: Ctrl-C / interrupt | 130 | cancelled | The checkpoint is preserved and nothing is deleted. |
@@ -109,7 +121,10 @@ runs after a successful `start`.
 | `status` | 0, or 2 when the pairing status helper fails | complete / failed | Read-only; never mutates, never consumes a code. |
 
 Reserved: exit `6` is the sender's own "already running" code. `start` maps
-it to exit `0` (complete) rather than surfacing an error.
+it to exit `0` (complete) rather than surfacing an error. `verify` has no
+reachable pair-required path today: the only `EXIT_PAIRING` branch there
+requires a present pairing manifest and a `not-paired` heartbeat at the same
+time, which cannot both hold.
 
 `--json` never changes an exit code; the document's `outcome` and `exit_code`
 always agree with the table above.
