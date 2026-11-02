@@ -108,23 +108,31 @@ test('INDEPENDENT UI: a fresh heartbeat retires the stale "awaiting first heartb
   const beaten = cardRow('synthetic-beaten','BEATEN', {state:{configured:true,authenticated:true,online:true,usable:false,status:'unverified'},heartbeatAt:BEAT_AT});
   const never = cardRow('synthetic-never','NEVER-BEATEN', {});
   const stale = cardRow('synthetic-stale','STALE', {heartbeatAt:BEAT_AT});
+  const inconsistent = cardRow('synthetic-inconsistent','INCONSISTENT', {state:{configured:true,authenticated:true,online:true,usable:false,status:'unverified'},heartbeatAt:null});
   const declared = cardRow('synthetic-declared','DECLARED', {state:{configured:true,authenticated:true,online:true,usable:false,status:'unverified'},heartbeatAt:BEAT_AT,verification:{note:'Declared by owner; not verified.'}});
-  t.inventory.at(-1)({items:[beaten,never,stale,declared],total:4}); await t.flush();
+  t.inventory.at(-1)({items:[beaten,never,stale,inconsistent,declared],total:5}); await t.flush();
   const html = t.el('compute-list').innerHTML;
-  assert.equal((html.match(/Paired 2026-11-01T23:49:03\.000Z/g) || []).length, 3, 'every paired row keeps its actual pair date');
+  assert.equal((html.match(/Paired 2026-11-01T23:49:03\.000Z/g) || []).length, 4, 'every paired row keeps its actual pair date');
   assert.equal((html.match(/awaiting first heartbeat/g) || []).length, 2, 'only the never-beaten row still says it, in its note and its link');
   assert.ok(!/inference (?:ready|verified|tested)/i.test(html), 'the card never claims inference readiness or a test that did not run');
   assert.ok(!/usable: yes/.test(html), 'usable stays false in the fixture');
 
-  const verification = (row) => {
+  const card = (row) => {
     t.context.__row = row;
-    const card = vm.runInContext('resourceCard(__row)', t.context);
-    return /verification: ([^<]*)</.exec(card)[1];
+    return vm.runInContext('resourceCard(__row)', t.context);
   };
-  assert.equal(verification(beaten), 'Paired 2026-11-01T23:49:03.000Z; heartbeat seen 2026-11-01T23:50:12.000Z; reachability only, never inference-ready.');
+  const verification = (row) => /verification: ([^<]*)</.exec(card(row))[1];
+  assert.equal(verification(beaten), 'Paired 2026-11-01T23:49:03.000Z; heartbeat seen 2026-11-01T23:50:12.000Z; reachability only, not inference-ready.');
   assert.equal(verification(never), PAIR_NOTE, 'a row with no heartbeat keeps the server note verbatim');
-  assert.equal(verification(stale), 'Paired 2026-11-01T23:49:03.000Z; last heartbeat 2026-11-01T23:50:12.000Z (not fresh); reachability only, never inference-ready.');
+  assert.equal(verification(stale), 'Paired 2026-11-01T23:49:03.000Z; last heartbeat 2026-11-01T23:50:12.000Z (not fresh); reachability only, not inference-ready.');
   assert.equal(verification(declared), 'Declared by owner; not verified.', 'an unrelated server note is rendered verbatim, unmodified');
+  // Out-of-order/cached snapshot: the online flag contradicts the creation note but
+  // carries no beat time, so the card states the uncertainty instead of either claim.
+  assert.equal(verification(inconsistent), 'Paired 2026-11-01T23:49:03.000Z; online reported without a heartbeat timestamp; freshness unknown; reachability only, not inference-ready.');
+  const inconsistentCard = card(inconsistent);
+  assert.ok(!inconsistentCard.includes('awaiting first heartbeat'), 'online:true cannot coexist with awaiting-first-heartbeat copy');
+  assert.match(inconsistentCard, /heartbeat time unknown/);
+  assert.match(inconsistentCard, /never ready to run/);
 });
 
 test('INDEPENDENT UI: target change discards a late pairing-code success', async () => {

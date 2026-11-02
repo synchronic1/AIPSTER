@@ -168,13 +168,18 @@ async function refreshStatusStrip(token, gen, failures) {
 function verificationText(r) {
   const note = String((r.verification && r.verification.note) || 'unknown');
   const s = r.state || {};
-  if (!s.authenticated || !r.heartbeatAt) return note;
+  if (!s.authenticated) return note;
   const clause = /awaiting (?:the )?first heartbeat\.?/i;
   if (!clause.test(note)) return note;
-  const beat = s.online
-    ? 'heartbeat seen ' + r.heartbeatAt
-    : 'last heartbeat ' + r.heartbeatAt + ' (not fresh)';
-  return note.replace(clause, beat + '; reachability only, never inference-ready.');
+  // An online flag with no timestamp is an inconsistent (cached or out-of-order)
+  // snapshot: it contradicts "no heartbeat yet" but cannot state a beat time.
+  const beat = !r.heartbeatAt
+    ? (s.online ? 'online reported without a heartbeat timestamp; freshness unknown' : null)
+    : s.online
+      ? 'heartbeat seen ' + r.heartbeatAt
+      : 'last heartbeat ' + r.heartbeatAt + ' (not fresh)';
+  if (!beat) return note;
+  return note.replace(clause, beat + '; reachability only, not inference-ready.');
 }
 
 function resourceCard(r) {
@@ -184,9 +189,12 @@ function resourceCard(r) {
   // row proves: needs-link (manual, never paired), linked (paired, never
   // beaten), reachable (fresh heartbeat, still not inference-ready), stale.
   const link = !s.authenticated ? 'needs-link — pair this worker to link it'
-    : !r.heartbeatAt ? 'linked — awaiting first heartbeat'
-    : s.online ? 'reachable — heartbeat seen (reachability only, never ready to run)'
-    : 'stale — last beat ' + (r.heartbeatAt || 'unknown') + '; start the worker sender or check its key';
+    : !r.heartbeatAt
+      ? s.online
+        ? 'linked — online reported, heartbeat time unknown (reachability only, never ready to run)'
+        : 'linked — awaiting first heartbeat'
+      : s.online ? 'reachable — heartbeat seen (reachability only, never ready to run)'
+      : 'stale — last beat ' + (r.heartbeatAt || 'unknown') + '; start the worker sender or check its key';
   return `<div class="card"><h2>${esc(r.name)}</h2>
     <p class="muted">${esc(r.id)} · ${esc(r.kind)} · origin: ${esc(r.origin)} · owner: ${esc(r.owner && r.owner.name)}</p>
     <p>${esc(r.compute.cpu)} · ${esc(r.compute.gpu)}</p>
