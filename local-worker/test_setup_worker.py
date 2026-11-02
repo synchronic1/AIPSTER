@@ -171,6 +171,7 @@ class FakeProcessOps:
         self.probes = {}
         self.flip_all = False
         self.gone = False
+        self.unreadable_after_claim = False
 
     def _identity(self, pid, start=None):
         return SimpleNamespace(start_time=start or ("start-%d" % pid),
@@ -181,6 +182,8 @@ class FakeProcessOps:
         if self.gone:
             return None
         self.probes[pid] = self.probes.get(pid, 0) + 1
+        if self.unreadable_after_claim and self.probes[pid] > 1:
+            raise ownership.OwnershipError("cannot observe synthetic process")
         if self.flip_all and self.probes[pid] > 1:
             return self._identity(pid, start="reused-%d" % pid)
         return self.alive.setdefault(pid, self._identity(pid))
@@ -196,9 +199,12 @@ class FakeProcessOps:
         return True
 
 
+_DEFAULT_PROCESS_OPS = object()
+
+
 def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=None,
                http=None, pairer=None, token=FAKE_TOKEN, token_provider=None,
-               file_ops=None, process_ops=None,
+               file_ops=None, process_ops=_DEFAULT_PROCESS_OPS,
                allow=True,
                platform_name="posix", machine="arm64", retry_pair=False,
                verify_inference=False, sender_lock=False, port_open=False,
@@ -211,12 +217,14 @@ def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=N
     spawner = spawner or FakeSpawner()
     http = http or FakeHttp()
     out, err = [], []
+    if process_ops is _DEFAULT_PROCESS_OPS:
+        process_ops = FakeProcessOps()  # injected spawner: never touch real PIDs
     session = sw.Setup(
         root=root, data_dir=data, config=config, api_base="http://127.0.0.1:9",
         allow_unqualified=allow, retry_pair=retry_pair, verify_inference=verify_inference,
         runner=runner, spawner=spawner, http=http, pairer=pairer,
         token_provider=token_provider or (lambda create=True: token),
-        file_ops=file_ops, process_ops=process_ops or FakeProcessOps(),
+        file_ops=file_ops, process_ops=process_ops,
         sender_lock_probe=lambda _data: sender_lock,
         which=(lambda _name: "/fixture/uv") if uv_present else (lambda _name: None),
         port_open=lambda _host, _port: port_open,
@@ -682,6 +690,76 @@ class StartTests(unittest.TestCase):
                     "start_time": "expected", "executable": "/synthetic/dendrite",
                     "owner": "501"})
         self.assertEqual(calls, [], "identity mismatch must not send even signal 0")
+
+    def test_injected_spawner_gets_no_real_process_authority(self):
+        handle = FakeHandle()
+        spawner = FakeSpawner([handle])
+        http = FakeHttp(health=(None, {}, "refused"))
+        session, _runner, spawner, _http, _out, _err = make_setup(
+            self.tmp.name, root=self.root, http=http, spawner=spawner,
+            process_ops=None, start_timeout=0.0)
+        self.assertIsNone(session.process_ops,
+                          "an injected spawner must not imply host signal authority")
+        calls = []
+        with patch.object(sw.os, "kill", lambda *args: calls.append(args)):
+            self.assertEqual(session.start(), sw.EXIT_NETWORK)
+        self.assertEqual(calls, [], "a synthetic PID was probed on the real host")
+        self.assertTrue(handle.terminated,
+                        "the owned child handle is still stopped")
+
+    def test_default_spawner_gets_the_real_process_adapter(self):
+        root = Path(self.root)
+        session = sw.Setup(
+            root=root, data_dir=Path(self.tmp.name) / "data",
+            config=root / "configs" / "mock.toml", api_base="http://127.0.0.1:9",
+            allow_unqualified=True, platform_name="posix", machine="arm64",
+            out=lambda _line: None, err=lambda _line: None)
+        self.assertIsInstance(session.process_ops, sw.OsProcessOps)
+
+    def test_probe_raises_when_ps_cannot_be_observed(self):
+        ops = sw.OsProcessOps()
+        with patch.object(sw.os, "kill", lambda *args: None):
+            with patch.object(sw.subprocess, "run", side_effect=OSError("ps missing")):
+                with self.assertRaises(ownership.OwnershipError):
+                    ops.probe(4321)
+
+    def test_probe_raises_on_an_unparsable_ps_result(self):
+        ops = sw.OsProcessOps()
+        result = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(sw.os, "kill", lambda *args: None):
+            with patch.object(sw.subprocess, "run", lambda *a, **k: result):
+                with self.assertRaises(ownership.OwnershipError):
+                    ops.probe(4321)
+
+    def test_probe_treats_ps_no_such_process_as_proven_absent(self):
+        ops = sw.OsProcessOps()
+        result = SimpleNamespace(returncode=1, stdout="",
+                                  stderr="ps: 4321: No such process\n")
+        with patch.object(sw.os, "kill", lambda *args: None):
+            with patch.object(sw.subprocess, "run", lambda *a, **k: result):
+                self.assertIsNone(ops.probe(4321))
+
+    def test_linux_probe_raises_when_proc_identity_is_unreadable(self):
+        with patch.object(sw.os, "kill", lambda *args: None), \
+                patch.object(sw.sys, "platform", "linux"), \
+                patch.object(sw.Path, "read_text", side_effect=PermissionError("denied")):
+            with self.assertRaises(ownership.OwnershipError):
+                sw.OsProcessOps().probe(4321)
+
+    def test_unobservable_identity_during_rollback_is_a_residual_not_a_stop(self):
+        handle = FakeHandle()
+        spawner = FakeSpawner([handle])
+        http = FakeHttp(health=(None, {}, "refused"))
+        ops = FakeProcessOps()
+        ops.unreadable_after_claim = True
+        session, _runner, spawner, _http, out, err = make_setup(
+            self.tmp.name, root=self.root, http=http, spawner=spawner,
+            process_ops=ops, start_timeout=0.0)
+        self.assertEqual(session.start(), sw.EXIT_NETWORK)
+        self.assertEqual(ops.stopped, [], "an unobservable PID must not be signalled")
+        self.assertFalse(handle.terminated)
+        self.assertIn("residuals=1", "\n".join(out))
+        self.assertIn("category=error", "\n".join(out))
 
     def test_sender_argv_quotes_spaces_and_is_not_shell_text(self):
         self.api = ApiFixture(self)

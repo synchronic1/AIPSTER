@@ -490,12 +490,16 @@ class ProcessIdentity:
 class OsProcessOps:
     """Production ProcessOps for ownership rollback (POSIX).
 
-    ``probe`` reads (start_time, executable, owner) without signalling; it
-    returns None when the PID is gone and raises on an unsupported platform so
-    rollback fails safe rather than assuming a process exited. ``stop_owned``
-    re-probes, refuses on any mismatch, and sends SIGTERM then a bounded
-    SIGKILL to that single PID only. It never signals a process group. Windows
-    process identity is unsupported here; callers get a fail-safe residual.
+    ``probe`` reads (start_time, executable, owner) without signalling and
+    returns None only when the process is **proven absent**. An identity that
+    cannot be observed (unsupported platform, unreadable ``/proc``, ``ps``
+    missing/timed out/unparsable) raises ``OwnershipError`` so rollback keeps
+    a retryable residual instead of reporting a running daemon as stopped.
+
+    ``stop_owned`` re-probes, refuses on any mismatch, and sends SIGTERM then a
+    bounded SIGKILL to that single PID only. It never signals a process group.
+    Windows process identity is unsupported here; callers get a fail-safe
+    residual.
     """
 
     def __init__(self, timeout: float = 5.0, interval: float = 0.1):
@@ -510,15 +514,16 @@ class OsProcessOps:
         if self._unsupported():
             raise ownership.OwnershipError("process identity is unsupported on this platform")
         if not isinstance(pid, int) or pid <= 0:
-            return None
+            return None  # not a process ID at all: nothing can exist to stop
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return None
+            return None  # proven absent
         except PermissionError:
-            pass  # exists, owned by another user; identity comparison will refuse
-        except OSError:
-            return None
+            pass  # exists under another owner; the identity read below must prove it
+        except OSError as exc:
+            raise ownership.OwnershipError(
+                "cannot observe process %d: %s" % (pid, type(exc).__name__)) from exc
         if sys.platform.startswith("linux"):
             return self._probe_linux(pid)
         return self._probe_ps(pid)
@@ -527,25 +532,41 @@ class OsProcessOps:
     def _probe_linux(pid: int) -> Optional[ProcessIdentity]:
         try:
             raw = Path("/proc/%d/stat" % pid).read_text(encoding="utf-8", errors="replace")
-            fields = raw[raw.rfind(")") + 2:].split()
-            start_time = fields[19]  # field 22 overall, after state..starttime
+        except FileNotFoundError:
+            return None  # exited between the existence check and this read
+        except OSError as exc:
+            raise ownership.OwnershipError(
+                "cannot observe /proc identity: " + type(exc).__name__) from exc
+        fields = raw[raw.rfind(")") + 2:].split()
+        if len(fields) < 20:
+            raise ownership.OwnershipError("cannot parse /proc/%d/stat" % pid)
+        try:
             executable = os.readlink("/proc/%d/exe" % pid)
             owner = str(os.stat("/proc/%d" % pid).st_uid)
-        except (OSError, IndexError, ValueError):
-            return None
-        return ProcessIdentity(start_time, executable, owner)
+        except FileNotFoundError:
+            return None  # exited during the read
+        except OSError as exc:
+            raise ownership.OwnershipError(
+                "cannot observe /proc identity: " + type(exc).__name__) from exc
+        return ProcessIdentity(fields[19], executable, owner)  # field 22 overall
 
     def _probe_ps(self, pid: int) -> Optional[ProcessIdentity]:
         try:
             result = subprocess.run(
                 ["ps", "-o", "lstart=", "-o", "uid=", "-o", "comm=", "-p", str(pid)],
                 capture_output=True, text=True, timeout=5.0, check=False)
-        except (OSError, subprocess.SubprocessError):
-            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ownership.OwnershipError(
+                "cannot observe process identity: " + type(exc).__name__) from exc
         line = (result.stdout or "").strip()
+        if not line:
+            if result.returncode != 0 and "no such process" in (result.stderr or "").lower():
+                return None  # ps itself reports the PID is gone
+            raise ownership.OwnershipError(
+                "ps returned no identity for pid %d (rc=%s)" % (pid, result.returncode))
         parts = line.split(None, 6)
         if result.returncode != 0 or len(parts) < 7:
-            return None
+            raise ownership.OwnershipError("cannot parse ps identity for pid %d" % pid)
         return ProcessIdentity(" ".join(parts[:5]), parts[6], parts[5])
 
     @staticmethod
@@ -663,7 +684,17 @@ class Setup:
         self.which = which or shutil.which
         self.port_open = port_open or self._default_port_open
         self.file_ops = file_ops or ownership.OsFileOps()
-        self.process_ops = process_ops or OsProcessOps()
+        # Real signal authority is granted only to the spawner this process
+        # owns end to end. An injected spawner may return synthetic handles
+        # with PIDs that belong to unrelated host processes, so the default is
+        # no adapter at all: the rollback then stops the live Popen handle this
+        # process created instead of probing an arbitrary PID.
+        if process_ops is not None:
+            self.process_ops = process_ops
+        elif spawner is None:
+            self.process_ops = OsProcessOps()
+        else:
+            self.process_ops = None
         self.platform_name = platform_name if platform_name is not None else os.name
         self.machine = machine if machine is not None else platform.machine()
         self.hostname = hostname or socket.gethostname
@@ -714,27 +745,31 @@ class Setup:
         The live handle already proves this process created the child. The
         Muse ledger adds an independent birth identity and revalidates it at
         the stop boundary. An identity mismatch is never signalled and stays a
-        reported residual; only a PID that cannot be probed at claim time
-        (normally because it already exited, or a synthetic handle) falls back
-        to the direct child handle.
+        reported residual.
+
+        Without a process adapter (the default whenever a spawner is injected)
+        there is no authority to look at host PIDs at all, so the engine stops
+        only the live Popen handle it created. A PID that cannot be probed at
+        claim time (normally because it already exited) takes the same path.
         """
         pid = getattr(handle, "pid", None)
-        ledger = self._ownership_ledger()
-        claim_error: Optional[BaseException] = None
-        if isinstance(pid, int) and pid > 0:
+        if self.process_ops is not None and isinstance(pid, int) and pid > 0:
+            ledger = self._ownership_ledger()
+            claim_error: Optional[BaseException] = None
             try:
                 ownership.claim_new_process(ledger, pid, self.process_ops)
             except ownership.Refusal as exc:
                 claim_error = exc
             except Exception as exc:  # noqa: BLE001 - fail safe, report as handled
                 claim_error = exc
-        if claim_error is None and pid in ledger.processes:
-            report = ownership.rollback(ledger, self.file_ops, self.process_ops)
-            if not report.complete:
-                report = ownership.rollback(ledger, self.file_ops, self.process_ops,
-                                            prior=report)
-            self.out("rollback: " + ownership.redacted_diagnostics(report).replace("\n", "; "))
-            return report
+            if claim_error is None and pid in ledger.processes:
+                report = ownership.rollback(ledger, self.file_ops, self.process_ops)
+                if not report.complete:
+                    report = ownership.rollback(ledger, self.file_ops, self.process_ops,
+                                                prior=report)
+                self.out("rollback: "
+                         + ownership.redacted_diagnostics(report).replace("\n", "; "))
+                return report
         # No identity was recorded before the stop. The direct child handle is
         # the only object this process may still stop (never a PID read from a
         # checkpoint). If it already exited, terminate() is a no-op.

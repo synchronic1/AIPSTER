@@ -203,12 +203,25 @@ Wired today — one path only, a daemon that never becomes healthy after
    `redacted_diagnostics(report)` — counts and refusal categories, never a
    path, PID, or token.
 
-The orchestrator supplies the missing `stop_owned` adapter as `OsProcessOps`:
+The orchestrator supplies the missing `stop_owned` adapter as `OsProcessOps`,
+and grants it real signal authority only when the engine owns the spawner:
 
+* The default adapter is installed **only with the default spawner**. With an
+  injected spawner the adapter is `None` unless the caller passes one
+  explicitly, because a synthetic handle's PID may belong to an unrelated host
+  process; passing `process_ops=` is an explicit grant. With no adapter the
+  daemon-failure path stops the live `Popen` handle the engine created and
+  never looks at the host PID table.
 * `probe(pid)` does an `os.kill(pid, 0)` existence precheck first, so a
-  nonexistent or already-reaped PID costs no subprocess. On Linux it reads
-  `/proc/<pid>/stat` for the start time, `/proc/<pid>/exe` and the directory
-  owner; on macOS it runs `ps -o lstart= -o uid= -o comm= -p <pid>`.
+  nonexistent or already-reaped PID costs no subprocess. It returns `None`
+  **only when the process is proven absent** (`ProcessLookupError`, `/proc`
+  gone, or `ps` reporting "no such process"). An identity that cannot be
+  observed — unsupported platform, unreadable `/proc`, `ps` missing, timed
+  out, or unparsable — raises `OwnershipError`, so rollback records a
+  retryable `error` residual instead of reporting a running daemon as stopped.
+  On Linux identity is the start time from `/proc/<pid>/stat` plus
+  `/proc/<pid>/exe` and the directory owner; on macOS it is
+  `ps -o lstart= -o uid= -o comm= -p <pid>`.
 * `stop_owned(pid, expected)` re-verifies the full identity tuple
   `(start_time, executable, owner)` before signalling. A mismatch raises
   `Refusal("PID reused (birth identity mismatch)", "reuse")` and **sends no
@@ -218,11 +231,12 @@ The orchestrator supplies the missing `stop_owned` adapter as `OsProcessOps`:
 
 Fail-safe behaviour, unchanged from before:
 
-* If the child cannot be probed (nonexistent, permission denied, or a
-  synthetic handle with no real PID) or the ledger refuses the claim, the
-  engine falls back to the live `Popen` handle it owns by construction:
-  `terminate()` then a bounded `wait()`. No unowned PID is ever signalled.
-* A reused/mismatched PID is reported as a residual and left alone.
+* If the ledger refuses the claim (normally because the child already exited,
+  or a synthetic handle has no real PID), the engine falls back to the live
+  `Popen` handle it owns by construction: `terminate()` then a bounded
+  `wait()`. No unowned PID is ever signalled.
+* A reused/mismatched PID or an unobservable identity is reported as a
+  residual and left alone.
 * Cancellation, Ctrl-C, and every other failure path still delete nothing and
   leave the checkpoint. No file claim (`claim_new_file` / `claim_new_dir`) is
   wired yet, so an install, `.venv`, or private store is never removed by
@@ -230,9 +244,11 @@ Fail-safe behaviour, unchanged from before:
 
 Gaps in this integration (routed to Muse `a2a`, not patched here): the
 fallback path is outside the ledger, so its outcome is not counted in the
-rollback diagnostics; and `ps lstart` text is locale- and platform-formatted,
-which is fine for same-session comparison but is not a stable cross-tool
-identity format.
+rollback diagnostics; `ps lstart` text is locale- and platform-formatted and
+has one-second resolution, which is fine for same-session comparison but is
+not a stable cross-tool identity format; and the fallback `Popen.terminate()`
+targets the child's process group (the session the engine itself created), so
+"single PID only" holds for `OsProcessOps`, not for that handle.
 
 ## Setup state
 
@@ -381,9 +397,12 @@ Hook shapes actually used by the implementation:
   caller's asserted fingerprint (`None` disables the assertion).
 * `clock()` / `sleep(seconds)` make bounded waits deterministic.
 * `file_ops` / `process_ops` are the Muse ownership adapters passed to
-  `rollback`. Defaults are `ownership.OsFileOps()` and the engine's
-  `OsProcessOps`. A fake `process_ops` needs `probe(pid) -> identity | None`
-  and `stop_owned(pid, expected) -> bool`; the author tests pass the real
+  `rollback`. `file_ops` defaults to `ownership.OsFileOps()`. `process_ops`
+  defaults to the engine's `OsProcessOps` **only when the spawner is also the
+  default**; with an injected spawner it defaults to `None`, so the daemon stop
+  uses the injected handle and no host PID is probed. A fake needs
+  `probe(pid) -> identity | None` (raise on "cannot observe") and
+  `stop_owned(pid, expected) -> bool`; the author tests pass the real
   `OsFileOps` over temp roots with a fake `process_ops`, so no real process is
   signalled. The fixture driver does the same.
 
