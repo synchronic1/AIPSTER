@@ -14,7 +14,7 @@ const component = client.slice(client.indexOf('const WORKER_COMMIT ='), client.i
 
 const FAKE_CODE = 'pair-SYNTHETIC-SETUP-001';
 // Reviewed writer revision that ships the deterministic setup entry point.
-const SETUP_COMMIT = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
+const SETUP_COMMIT = '99f3a2fb3f23b128312b09857ca81a1f842fb842';
 const FAKE_ID = 'p_synthetic001';
 const FAKE_EXPIRY = '2100-01-01T00:00:00.000Z';
 const fakeMintBody = (over = {}) => ({ id: FAKE_ID, code: FAKE_CODE, expiresAt: FAKE_EXPIRY, ...over });
@@ -427,7 +427,7 @@ test('generate waits out an in-flight retry instead of racing its clipboard writ
 // shipped packet must run it; clearing the pin must fall back to the reviewed
 // manual steps, so no manual token, serve or second-terminal choreography
 // survives a live pin and an accidental null never points at unpublished code.
-const SETUP_PIN = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
+const SETUP_PIN = '99f3a2fb3f23b128312b09857ca81a1f842fb842';
 const setupMint = { id: 'p_pinned01', code: FAKE_CODE, expiresAt: FAKE_EXPIRY, account: 'Synthetic Owner' };
 
 function shippedComponent() {

@@ -22,7 +22,7 @@ const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 // Reviewed writer revision that first ships the deterministic setup entry point;
 // the guided packet checks out this pin, while Advanced keeps the worker pin above.
-const SETUP_COMMIT = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
+const SETUP_COMMIT = '99f3a2fb3f23b128312b09857ca81a1f842fb842';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;

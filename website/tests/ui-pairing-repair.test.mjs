@@ -186,7 +186,7 @@ test('UI repair: pairing checkout uses the published reviewed source pin and qua
   assert.match(commands,/sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
   assert.ok(!commands.includes('git clone https://'), 'no full checkout replaces the qualified sparse flow');
   const packet = t.context.agentSetupPacket('windows', { id: 'p_direct01', code: 'SYNTHETIC-DIRECT-CODE', expiresAt: '2100-01-01T00:00:00Z', account: 'Direct Owner' });
-  assert.equal(/git checkout --detach ([a-f0-9]{40})/.exec(packet)[1], '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed',
+  assert.equal(/git checkout --detach ([a-f0-9]{40})/.exec(packet)[1], '99f3a2fb3f23b128312b09857ca81a1f842fb842',
     'the guided packet checks out the reviewed commit that ships the setup entry point');
   assert.match(packet, /sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
   assert.match(packet, /Use only the pinned command below; do not substitute an older checkout/);

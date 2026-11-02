@@ -251,7 +251,7 @@ const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 // one wrapper command at this revision; the manual steps below remain only as
 // a fallback branch if this pin is ever cleared (for example after a bad
 // withdrawal), so a live copy never points at unpublished or unreviewed code.
-const WORKER_SETUP_COMMIT = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
+const WORKER_SETUP_COMMIT = '99f3a2fb3f23b128312b09857ca81a1f842fb842';
 const workerPin = () => WORKER_SETUP_COMMIT || WORKER_COMMIT;
 const setupWorkerPinned = () => /^[0-9a-f]{40}$/.test(String(WORKER_SETUP_COMMIT || ''));
 const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
