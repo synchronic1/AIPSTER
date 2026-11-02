@@ -443,6 +443,8 @@ test('shipped packet keeps the reviewed manual steps while the entry point is un
   assert.ok(packet.includes('uv run --no-project --python 3.12.14 python install.py'), 'reviewed install step kept');
   assert.ok(packet.includes('uv 0.12.12 exactly (must match)'), 'legacy path still states the reviewed uv prerequisite');
   assert.ok(packet.includes('uv python install 3.12.14'), 'legacy path still offers the reviewed Python install hint');
+  assert.match(packet, /ask me which machine this packet is for/, 'target-machine ambiguity resolved before mutation');
+  assert.match(packet, /run every command below on that machine only/, 'commands confined to the chosen machine');
 });
 
 test('pinned entry point packet runs one deterministic command with the packet on stdin', () => {
@@ -477,7 +479,14 @@ test('pinned entry point packet runs one deterministic command with the packet o
       assert.ok(packet.includes(state), os + ': truthful state named (' + state + ')');
     }
     assert.match(packet, /standard input/, os + ': private stdin stated');
-    assert.match(packet, /private,?\s+digest-verified uv/, os + ': private pinned toolchain stated');
+    assert.match(packet, /ask me which machine this packet is for/, os + ': ambiguous target stops before mutation');
+    assert.match(packet, /If you cannot supply standard input privately, stop/, os + ': missing capability pauses with one action');
+    assert.match(packet, /outcome is unknown until you run status/, os + ': lost pairing response is reconciled, not replayed');
+    assert.match(packet, /complete even though inference is unavailable/, os + ': connection completes while usable stays false');
+    assert.match(packet, /"mock only"/, os + ': mock evidence is labelled');
+    assert.match(packet, /installs no autostart/, os + ': no silent persistence claimed or added');
+    assert.match(packet, /private,?\s*digest-verified/, os + ': private pinned toolchain stated');
+    assert.match(packet, /host Python 3\.9\+/, os + ': bootstrap host prerequisite stated truthfully');
     assert.ok(packet.includes('never uses or changes a global uv'), os + ': global uv left alone');
     assert.ok(!/uv python install/.test(packet), os + ': no manual Python install choreography');
     assert.ok(!/uv 0\.12\.12 exactly/.test(packet), os + ': no manual uv prerequisite for the wrapper');
