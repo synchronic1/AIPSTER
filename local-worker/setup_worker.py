@@ -1234,7 +1234,8 @@ class Setup:
         self.out("verify: fact paired=%s (private pairing store)" % ("yes" if paired else "no"))
         self.out("verify: fact reachable=%s (fresh authenticated heartbeat at %s)"
                  % ("yes" if fresh else "no", heartbeat.get("heartbeatAt") or "none"))
-        self.out("verify: fact usable=%s (heartbeat usable flag; not proof of inference)" % usable)
+        self.out("verify: fact usable=%s (last heartbeat flag; not authoritative controller readiness)"
+                 % usable)
         self.out("verify: fact inference-qualified=%s" % qualified)
 
     def _log_tail(self, path: Path, extra: Sequence[str]) -> str:
