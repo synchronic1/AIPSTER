@@ -164,7 +164,8 @@ def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=N
                http=None, pairer=None, token=FAKE_TOKEN, allow=True,
                platform_name="posix", machine="arm64", retry_pair=False,
                verify_inference=False, sender_lock=False, port_open=False,
-               start_timeout=0.0, heartbeat_wait=0.0, uv_present=True):
+               start_timeout=0.0, heartbeat_wait=0.0, uv_present=True,
+               hostname=None, expect_target=None):
     root = Path(root or make_root(tmp))
     data = Path(data or (Path(tmp) / "data dir"))
     config = Path(config or (root / "configs" / "mock.toml"))
@@ -181,6 +182,8 @@ def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=N
         which=(lambda _name: "/fixture/uv") if uv_present else (lambda _name: None),
         port_open=lambda _host, _port: port_open,
         platform_name=platform_name, machine=machine,
+        hostname=hostname or (lambda: "fixture-host"),
+        expect_target=expect_target,
         clock=clock_sequence(), sleep=lambda _seconds: None,
         out=out.append, err=err.append,
         start_timeout=start_timeout, heartbeat_wait=heartbeat_wait)
@@ -1087,6 +1090,222 @@ class RunResumeTests(unittest.TestCase):
         self.assertEqual(len(sender_starts), 1)
         self.assertEqual(retried.state["phases"]["verify"]["state"], "passed")
         self.assertNotIn(FAKE_SECRET, retried.state_path.read_text(encoding="utf-8"))
+
+
+class TargetBindingTests(unittest.TestCase):
+    """ONB 04: never mutate a machine that is not the selected target."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = make_root(self.tmp.name)
+        make_venv(self.root)
+        self.data = Path(self.tmp.name) / "data dir"
+
+    def session(self, host="machine-a", expect=None, **kw):
+        return make_setup(self.tmp.name, root=self.root, data=self.data,
+                          hostname=lambda: host, expect_target=expect, **kw)
+
+    def test_expect_target_mismatch_blocks_before_any_mutation(self):
+        session, _runner, _spawner, _http, _out, err = self.session(
+            host="machine-b", expect="0123456789abcdef")
+        self.assertEqual(session.install(), sw.EXIT_USAGE)
+        self.assertIn("TARGET_MISMATCH", "\n".join(err))
+        self.assertFalse(session.state_path.exists(), "a refused target must not write a checkpoint")
+
+    def test_fingerprint_is_stable_and_distinguishes_machines(self):
+        one, *_ = self.session(host="machine-a")
+        two, *_ = self.session(host="machine-b")
+        self.assertEqual(len(one.target_identity()["fingerprint"]), 16)
+        self.assertEqual(one.target_identity(), one.target_identity())
+        self.assertNotEqual(one.target_identity()["fingerprint"],
+                            two.target_identity()["fingerprint"])
+
+    def test_checkpoint_target_change_blocks_pairing_without_consuming_a_code(self):
+        first, *_ = self.session(host="machine-a")
+        self.assertEqual(first.check()["blocked"], [])
+        first._guard_target()
+        recorded = json.loads(self.data.joinpath("setup-state.json").read_text())["target"]["fingerprint"]
+
+        moved, _runner, _spawner, _http, _out, err = self.session(host="machine-b")
+        self.assertEqual(moved.pair(FAKE_CODE), sw.EXIT_USAGE)
+        self.assertIn("TARGET_CHANGED", "\n".join(err))
+        self.assertIn(recorded, "\n".join(err))
+        self.assertFalse(pairing.pairing_files(self.data)["meta"].exists())
+
+    def test_explicit_expect_target_resolves_a_new_machine(self):
+        first, *_ = self.session(host="machine-a")
+        first._guard_target()
+        moved, _runner, _spawner, _http, _out, _err = self.session(host="machine-b")
+        fingerprint = moved.target_identity()["fingerprint"]
+        confirmed, *_ = self.session(host="machine-b", expect=fingerprint)
+        self.assertEqual(confirmed._block_on_target("install"), None)
+        self.assertEqual(json.loads(self.data.joinpath("setup-state.json").read_text())
+                         ["target"]["fingerprint"], fingerprint)
+
+    def test_check_reports_a_selected_machine_mismatch_without_writing(self):
+        session, *_ = self.session(host="machine-b", expect="0123456789abcdef")
+        report = session.check()
+        self.assertIn("TARGET_MISMATCH", [item["code"] for item in report["blocked"]])
+        self.assertFalse(session.state_path.exists())
+
+
+class HeartbeatFreshnessTests(unittest.TestCase):
+    """ONB 29 (engine side): stale or foreign-generation beats are not reachable."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = make_root(self.tmp.name)
+        make_venv(self.root)
+        self.api = ApiFixture(self)
+        self.data = Path(self.tmp.name) / "paired data"
+        self.assertEqual(pair_real(self.tmp.name, self.api.base, data=self.data)[0], 0)
+
+    def session(self):
+        http = FakeHttp(health=(200, {"status": "ok"}, ""), node=(200, node_body(), ""))
+        return make_setup(self.tmp.name, root=self.root, data=self.data, http=http)
+
+    def write_status(self, **fields):
+        meta = pairing.load_pairing(self.data)
+        record = {"ok": True, "usable": False, "heartbeatAt": "2026-11-01T00:00:00.000Z"}
+        record.update(fields)
+        pairing.write_status(self.data, record, meta)
+
+    def test_fresh_status_is_reachable(self):
+        self.write_status(at=time.time())
+        session, *_ = self.session()
+        self.assertEqual(session._heartbeat()["state"], "fresh")
+
+    def test_stale_status_is_not_reachable(self):
+        self.write_status(at=time.time() - pairing.STATUS_STALE_SEC - 1)
+        session, *_ = self.session()
+        self.assertEqual(session._heartbeat()["state"], "stale")
+
+    def test_status_from_a_previous_pairing_generation_is_ignored(self):
+        """A heartbeat copied from another pairing must not clear 'awaiting'."""
+        other = Path(self.tmp.name) / "other data"
+        self.api.state.claim_body = {
+            "resourceId": "r_other_fixture",
+            "heartbeatKey": "synthetic-other-heartbeat-key-0123456789",
+            "heartbeatUrl": "/api/resources/r_other_fixture/heartbeat"}
+        self.assertEqual(pair_real(self.tmp.name, self.api.base, code=FAKE_CODE2,
+                                   data=other)[0], 0)
+        other_meta = pairing.load_pairing(other)
+        pairing.write_status(self.data, {"at": time.time(), "ok": True, "usable": True,
+                                         "heartbeatAt": "2026-11-01T00:00:00.000Z"},
+                             other_meta)
+        session, *_ = self.session()
+        self.assertEqual(session._heartbeat()["state"], "awaiting-current-generation")
+
+    def test_stale_usable_true_never_reports_usable(self):
+        self.write_status(at=time.time() - pairing.STATUS_STALE_SEC - 1, usable=True)
+        session, _runner, _spawner, _http, out, _err = self.session()
+        self.assertEqual(session.verify(), sw.EXIT_NETWORK)
+        text = "\n".join(out)
+        self.assertIn("fact usable=unknown", text)
+        self.assertIn("fact reachable=no", text)
+        self.assertNotIn("usable=true", text)
+
+
+class VerifyFactTests(unittest.TestCase):
+    """ONB 09: list the five readiness facts separately and never overclaim."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = make_root(self.tmp.name)
+        make_venv(self.root)
+        self.api = ApiFixture(self)
+        self.data = Path(self.tmp.name) / "paired data"
+        self.assertEqual(pair_real(self.tmp.name, self.api.base, data=self.data)[0], 0)
+
+    def session(self, **kw):
+        http = kw.pop("http", FakeHttp(health=(200, {"status": "ok"}, ""),
+                                       node=(200, node_body(), "")))
+        return make_setup(self.tmp.name, root=self.root, data=self.data, http=http, **kw)
+
+    def test_connected_with_usable_false_is_setup_complete_not_inference_ready(self):
+        write_fresh_beat(self.data, usable=False)
+        session, _runner, _spawner, http, out, _err = self.session()
+        self.assertEqual(session.verify(), sw.EXIT_OK)
+        self.assertEqual(http.count("/v1/execute"), 0)
+        text = "\n".join(out)
+        for fact in ("installed=yes", "paired=yes", "reachable=yes",
+                     "usable=false", "inference-qualified=no"):
+            self.assertIn("fact " + fact, text)
+        self.assertIn("target=connection", text)
+        self.assertNotIn("ready for inference", text.lower())
+
+    def test_mock_inference_is_labelled_mock_only_and_never_qualified(self):
+        write_fresh_beat(self.data)
+        http = FakeHttp(health=(200, {"status": "ok"}, ""),
+                        node=(200, node_body(), ""),
+                        execute=(200, {"simulated": True}, ""))
+        session, _runner, _spawner, http, out, _err = self.session(
+            http=http, verify_inference=True)
+        self.assertEqual(session.verify(), sw.EXIT_OK)
+        text = "\n".join(out)
+        self.assertIn("inference=mock-simulated", text)
+        self.assertIn("mock only", text)
+        self.assertIn("inference-qualified=no", text)
+
+    def test_unpaired_verify_still_lists_every_fact(self):
+        data = Path(self.tmp.name) / "unpaired data"
+        http = FakeHttp(health=(200, {"status": "ok"}, ""), node=(200, node_body(), ""))
+        session, _runner, _spawner, _http, out, _err = make_setup(
+            self.tmp.name, root=self.root, data=data, http=http)
+        self.assertEqual(session.verify(), sw.EXIT_PAIRING)
+        text = "\n".join(out)
+        for fact in ("installed=yes", "paired=no", "reachable=no",
+                     "usable=unknown", "inference-qualified=no"):
+            self.assertIn("fact " + fact, text)
+
+
+class ContinuityTests(unittest.TestCase):
+    """ONB 08: the worker outlives the launcher, without enabling autostart."""
+
+    def test_successful_daemon_is_not_terminated_or_waited_by_the_launcher(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = make_root(tmp.name)
+        make_venv(root)
+        api = ApiFixture(self)
+        data = Path(tmp.name) / "paired data"
+        self.assertEqual(pair_real(tmp.name, api.base, data=data)[0], 0)
+        handle = FakeHandle()
+        spawner = FakeSpawner([handle, FakeHandle()])
+        http = FakeHttp(health=(200, {"status": "ok"}, ""), node=(200, node_body(), ""))
+        session, _runner, _spawner, _http, _out, _err = make_setup(
+            tmp.name, root=root, data=data, spawner=spawner, http=http)
+        session.api_base = api.base
+        self.assertEqual(session.start(), sw.EXIT_OK)
+        self.assertFalse(handle.terminated, "a healthy worker must survive launcher exit")
+        self.assertFalse(handle.waited, "the launcher must not reap a surviving worker")
+
+    def test_default_spawner_detaches_the_child_from_the_launcher_session(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = Path(tmp.name) / "logs" / "daemon.log"
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                captured.update(kwargs)
+                self.pid = 999001
+
+        with patch.object(sw.subprocess, "Popen", FakePopen):
+            handle = sw._default_spawner(["/fixture/dendrite", "serve"], cwd=Path(tmp.name),
+                                         env={"PATH": ""}, log_path=log)
+        self.assertEqual(handle.pid, 999001)
+        self.assertEqual(captured.get("stdin"), sw.subprocess.DEVNULL)
+        self.assertTrue(captured.get("close_fds"))
+        if os.name != "nt":
+            self.assertIs(captured.get("start_new_session"), True,
+                          "closing the terminal or agent session must not signal the worker")
+        else:
+            self.assertIn("creationflags", captured)
+        self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

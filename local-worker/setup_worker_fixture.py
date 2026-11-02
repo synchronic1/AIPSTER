@@ -197,7 +197,8 @@ def make_venv(root: Path) -> None:
 
 def make_session(tmp: Path, root: Path, data: Path, base: str, *,
                  retry_pair: bool = False, verify_inference: bool = False,
-                 sender_lock: bool = False, http: Optional[FakeHttp] = None):
+                 sender_lock: bool = False, http: Optional[FakeHttp] = None,
+                 hostname: str = "fixture-host", expect_target: Optional[str] = None):
     out: List[str] = []
     err: List[str] = []
     runner = FakeRunner(root)
@@ -212,6 +213,7 @@ def make_session(tmp: Path, root: Path, data: Path, base: str, *,
         which=lambda _name: "/synthetic/uv",
         port_open=lambda _host, _port: False,
         platform_name="posix", machine="arm64",
+        hostname=lambda: hostname, expect_target=expect_target,
         clock=(lambda: time.monotonic()), sleep=lambda _seconds: None,
         out=out.append, err=err.append, start_timeout=0.0, heartbeat_wait=0.0)
     return session, runner, spawner, http, out, err
@@ -376,11 +378,58 @@ def scenario_verify_honesty(tmp: Path, base: str) -> Dict[str, Any]:
                       "execute_requests": 0, "inference": "not-exercised"}}
 
 
+def scenario_target_mismatch(tmp: Path, base: str) -> Dict[str, Any]:
+    """ONB 04: an assistant must not mutate a machine it was not asked to pair."""
+    root = make_fixture_root(tmp)
+    data = tmp / "target data"
+    session, runner, spawner, _http, out, err = make_session(
+        tmp, root, data, base, hostname="assistant-sandbox", expect_target="0" * 16)
+    rc = session.run(FAKE_CODE)
+    checks: List[Dict[str, Any]] = []
+    text = "\n".join(out + err)
+    check(rc == sw.EXIT_USAGE, "mismatched target exits 2", checks)
+    check("TARGET_MISMATCH" in text, "the refused target is named", checks)
+    check(runner.install_calls == [], "install.py never ran", checks)
+    check(spawner.calls == [], "no daemon or sender spawned", checks)
+    check(not session.state_path.exists(), "no checkpoint written for a refused machine", checks)
+    check(not (data / "pairing.json").exists(), "no pairing store written", checks)
+    return {"checks": checks, "transcript": out + err,
+            "facts": {"exit": rc, "install_calls": 0, "spawns": 0,
+                      "mutation_before_refusal": False}}
+
+def scenario_stale_heartbeat(tmp: Path, base: str) -> Dict[str, Any]:
+    """ONB 29 (engine side): a copied or stale beat never becomes reachable."""
+    root, data = paired_setup(tmp, base)
+    http = FakeHttp()
+    http.health_responses = (200, {"status": "ok"}, "")
+    meta = pairing.load_pairing(data)
+    pairing.write_status(data, {"at": time.time() - pairing.STATUS_STALE_SEC - 5,
+                                "ok": True, "usable": True,
+                                "heartbeatAt": "2026-11-01T00:00:00.000Z"}, meta)
+    session, _runner, _spawner, http, out, err = make_session(
+        tmp, root, data, base, http=http)
+    rc = session.verify()
+    checks: List[Dict[str, Any]] = []
+    text = "\n".join(out + err)
+    check(rc == sw.EXIT_NETWORK, "stale heartbeat is not a pass", checks)
+    check("heartbeat=stale" in text, "staleness reported explicitly", checks)
+    check("fact usable=unknown" in text, "stale usable=true is not reported as usable", checks)
+    check("fact reachable=no" in text, "stale beat is not reachable", checks)
+    check("usable=true" not in text, "no stale usable claim leaks into output", checks)
+    check(http.count("/v1/execute") == 0, "no inference request", checks)
+    assert_absent(text)
+    return {"checks": checks, "transcript": out + err,
+            "facts": {"exit": rc, "stale_after_sec": pairing.STATUS_STALE_SEC,
+                      "execute_requests": 0}}
+
+
 SCENARIOS = {
     "happy": scenario_happy,
     "resume": scenario_resume,
     "duplicate-sender": scenario_duplicate_sender,
     "verify-honesty": scenario_verify_honesty,
+    "target-mismatch": scenario_target_mismatch,
+    "stale-heartbeat": scenario_stale_heartbeat,
 }
 
 

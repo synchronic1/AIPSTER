@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import hashlib
 import io
 import json
 import os
@@ -444,6 +445,8 @@ class Setup:
                  port_open: Optional[Callable[[str, int], bool]] = None,
                  platform_name: Optional[str] = None,
                  machine: Optional[str] = None,
+                 hostname: Optional[Callable[[], str]] = None,
+                 expect_target: Optional[str] = None,
                  sleep: Optional[Callable[[float], None]] = None,
                  clock: Optional[Callable[[], float]] = None,
                  out: Optional[Callable[[str], None]] = None,
@@ -471,6 +474,8 @@ class Setup:
         self.port_open = port_open or self._default_port_open
         self.platform_name = platform_name if platform_name is not None else os.name
         self.machine = machine if machine is not None else platform.machine()
+        self.hostname = hostname or socket.gethostname
+        self.expect_target = (expect_target or "").strip().lower() or None
         self.sleep = sleep or time.sleep
         self.clock = clock or time.monotonic
         self.out = out or (lambda line: print(line, flush=True))
@@ -649,6 +654,61 @@ class Setup:
     def _origin(self) -> str:
         return self._node_section()["origin"]
 
+    # -- target identity -----------------------------------------------------
+    def target_identity(self) -> Dict[str, str]:
+        """Identify the machine this process is actually running on.
+
+        An assistant may run setup inside its own sandbox or on a different
+        host than the machine the user chose. The fingerprint is recorded in
+        the checkpoint before the first mutation and compared on every later
+        run; it is not derived from the checkout path, which may legitimately
+        move between runs.
+        """
+        try:
+            host = str(self.hostname() or "").strip().lower()
+        except OSError:
+            host = ""
+        material = "|".join((host, self.platform_name, str(self.machine).lower()))
+        fingerprint = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+        return {"host": host, "platform": self.platform_name,
+                "machine": str(self.machine).lower(), "fingerprint": fingerprint}
+
+    def _guard_target(self) -> Dict[str, str]:
+        """Refuse to mutate a machine that is not the selected/recorded one."""
+        identity = self.target_identity()
+        actual = identity["fingerprint"]
+        if self.expect_target and self.expect_target != actual:
+            raise SetupError(
+                "TARGET_MISMATCH",
+                "this is not the selected machine: expected target %s, current machine is %s (%s/%s)"
+                % (self.expect_target, actual, self.platform_name, identity["machine"]),
+                EXIT_USAGE)
+        recorded = self.state.get("target")
+        if isinstance(recorded, dict):
+            previous = str(recorded.get("fingerprint") or "")
+            if previous and previous != actual and self.expect_target != actual:
+                raise SetupError(
+                    "TARGET_CHANGED",
+                    "this data dir was prepared for target %s but setup is running on %s; "
+                    "run on the original machine, or confirm the new target with --expect-target %s"
+                    % (previous, actual, actual),
+                    EXIT_USAGE)
+        if not isinstance(recorded, dict) or recorded.get("fingerprint") != actual:
+            self.state["target"] = identity
+            self._save_state()
+        return identity
+
+    def _block_on_target(self, phase: str) -> Optional[int]:
+        try:
+            self._guard_target()
+        except SetupError as exc:
+            # A refused target is a pre-mutation stop: report it, but leave the
+            # checkpoint untouched rather than recording state for a machine
+            # this data dir was not prepared for.
+            self.err("%s: BLOCKED [%s] %s" % (phase, exc.code, redact(exc)))
+            return exc.exit_code
+        return None
+
     # -- check ---------------------------------------------------------------
     def check(self, *, for_verify: bool = False) -> Dict[str, Any]:
         report: Dict[str, Any] = {"blocked": [], "checks": [],
@@ -666,9 +726,27 @@ class Setup:
             if not self.allow_unqualified:
                 report["blocked"].append({"code": "UNQUALIFIED_PLATFORM", "detail": detail})
 
+        identity = self.target_identity()
+        report["target"] = identity
+        report["expect_target"] = self.expect_target
+        report["checks"].append(("target", "PASSED", "machine %s (%s/%s)"
+                                 % (identity["fingerprint"], self.platform_name,
+                                    identity["machine"])))
+        recorded = self.state.get("target")
+        if self.expect_target and self.expect_target != identity["fingerprint"]:
+            detail = ("this is not the selected machine: expected %s, current %s"
+                      % (self.expect_target, identity["fingerprint"]))
+            report["checks"].append(("target", "BLOCKED", detail))
+            report["blocked"].append({"code": "TARGET_MISMATCH", "detail": detail})
+        elif isinstance(recorded, dict) and recorded.get("fingerprint") not in (
+                None, "", identity["fingerprint"]) and self.expect_target != identity["fingerprint"]:
+            detail = ("this data dir was prepared for target %s; confirm this machine with "
+                      "--expect-target %s" % (recorded.get("fingerprint"), identity["fingerprint"]))
+            report["checks"].append(("target", "BLOCKED", detail))
+            report["blocked"].append({"code": "TARGET_CHANGED", "detail": detail})
+
         install = self._install_state()
-        report.update(installed=install["installed"], partial=install["partial"],
-                      venv_python=str(install["python"]), dendrite=str(install["dendrite"]))
+        report.update(installed=install["installed"], partial=install["partial"],                      venv_python=str(install["python"]), dendrite=str(install["dendrite"]))
         if install["installed"]:
             report["checks"].append(("install", "PASSED", "existing .venv and dendrite found"))
         elif install["partial"]:
@@ -737,6 +815,9 @@ class Setup:
 
     # -- install -------------------------------------------------------------
     def install(self, report: Optional[Dict[str, Any]] = None) -> int:
+        blocked = self._block_on_target("install")
+        if blocked is not None:
+            return blocked
         report = report or self.check()
         if report["blocked"]:
             for item in report["blocked"]:
@@ -811,6 +892,9 @@ class Setup:
             return None, redact(exc)
 
     def pair(self, code: Optional[str]) -> int:
+        blocked = self._block_on_target("pair")
+        if blocked is not None:
+            return blocked
         pairing = self._pairing()
         try:
             pairing.private_dir(self.data_dir)
@@ -949,6 +1033,9 @@ class Setup:
             self.sleep(self.poll_interval)
 
     def start(self, report: Optional[Dict[str, Any]] = None) -> int:
+        blocked = self._block_on_target("start")
+        if blocked is not None:
+            return blocked
         report = report or self.check()
         if report["blocked"]:
             self._record("start", "blocked", "check is blocked")
@@ -1123,6 +1210,33 @@ class Setup:
         except (OSError, ValueError, TypeError):
             return {"state": "unreadable"}
 
+    def _emit_facts(self, heartbeat: Dict[str, Any], inference_state: str) -> None:
+        """List the readiness facts separately, each with its evidence source.
+
+        The declared target is connection. A mock heartbeat with usable=false
+        completes that target; it never becomes usability or qualification.
+        """
+        install = self._install_state()
+        paired = heartbeat.get("state") != "not-paired"
+        fresh = heartbeat.get("state") == "fresh"
+        usable = "yes" if fresh and heartbeat.get("usable") is True else (
+            "false" if fresh else "unknown")
+        if inference_state == "mock-simulated":
+            qualified = "no (mock only; simulated output is not a qualification)"
+        elif inference_state in ("real-inference-exercised", "unknown"):
+            qualified = "no (one execute request is not qualification evidence)"
+        else:
+            qualified = "no (not exercised)"
+        self.out("verify: target=connection (usability and inference are separate facts)")
+        self.out("verify: fact installed=%s (local .venv and dendrite)"
+                 % ("yes" if install["installed"] else
+                    ("partial" if install["partial"] else "no")))
+        self.out("verify: fact paired=%s (private pairing store)" % ("yes" if paired else "no"))
+        self.out("verify: fact reachable=%s (fresh authenticated heartbeat at %s)"
+                 % ("yes" if fresh else "no", heartbeat.get("heartbeatAt") or "none"))
+        self.out("verify: fact usable=%s (heartbeat usable flag; not proof of inference)" % usable)
+        self.out("verify: fact inference-qualified=%s" % qualified)
+
     def _log_tail(self, path: Path, extra: Sequence[str]) -> str:
         try:
             data = path.read_bytes()[-4096:]
@@ -1179,7 +1293,7 @@ class Setup:
             response = result["body"]
             if response.get("simulated") is True:
                 inference_state = "mock-simulated"
-                inference_detail = "worker returned simulated output (not real inference)"
+                inference_detail = "mock only: worker returned simulated output (not real inference)"
             elif response.get("simulated") is False:
                 inference_state = "real-inference-exercised"
                 inference_detail = "worker returned non-simulated output; this exercised the configured engine"
@@ -1192,6 +1306,7 @@ class Setup:
                      "use --verify-inference only when you intend to run the configured engine)")
 
         heartbeat = self._heartbeat()
+        self._emit_facts(heartbeat, inference_state)
         if heartbeat.get("state") == "not-paired":
             self._record("verify", "blocked", "worker is not paired", inference=inference_state)
             self._save_state()
@@ -1244,6 +1359,9 @@ class Setup:
 
     # -- run -----------------------------------------------------------------
     def run(self, code: Optional[str]) -> int:
+        blocked = self._block_on_target("check")
+        if blocked is not None:
+            return blocked
         report = self.check()
         self.print_check(report)
         if report["blocked"]:
@@ -1303,6 +1421,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="allow a new code after an interrupted/uncertain pairing attempt")
     parser.add_argument("--allow-unqualified-platform", action="store_true",
                         help="explicitly allow the untested macOS/Linux adaptation")
+    parser.add_argument("--expect-target", default=None, metavar="FINGERPRINT",
+                        help="assert the machine the user selected; blocks mutation on mismatch")
     parser.add_argument("--verify-inference", action="store_true",
                         help="send one execute request; default verification never runs inference")
     parser.add_argument("--install-timeout", type=float, default=900.0)
@@ -1347,6 +1467,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     session = Setup(root=ROOT, data_dir=data_dir, config=config, api_base=api_base,
                     name=args.name, allow_unqualified=args.allow_unqualified_platform,
                     retry_pair=args.retry_pair, verify_inference=args.verify_inference,
+                    expect_target=args.expect_target,
                     install_timeout=args.install_timeout, start_timeout=args.start_timeout,
                     heartbeat_wait=args.heartbeat_wait)
     mutating = args.command in ("run", "install", "pair", "start")

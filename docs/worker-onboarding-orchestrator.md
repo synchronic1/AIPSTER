@@ -43,6 +43,21 @@ python3 setup_worker.py run --packet-stdin \
 Other commands: `check`, `install`, `pair`, `start`, `verify`, `status`.
 `run` is `check -> install -> pair -> start -> verify`.
 
+## Target machine (ONB 04)
+
+An assistant can run a command in its own sandbox or on another host. Before
+the first mutation, `install`, `pair`, `start`, and `run` compute a machine
+fingerprint from hostname + platform + architecture (never the checkout path)
+and record it as `target` in the private checkpoint. Later runs on a different
+machine stop with `TARGET_CHANGED` before touching pairing, install, or the
+worker.
+
+`--expect-target FINGERPRINT` asserts the machine the user selected. A mismatch
+exits 2 with `TARGET_MISMATCH`, writes no checkpoint, runs no installer, and
+spawns nothing. `check` prints the fingerprint but does not mutate, so an agent
+can compare it with the machine the user chose before running `run`.
+
+
 ## Phases and resumability
 
 | Phase | What it does | Re-entry behavior |
@@ -53,9 +68,45 @@ Other commands: `check`, `install`, `pair`, `start`, `verify`, `status`.
 | `start` | one daemon, one sender; verifies an existing instance first | a healthy matching daemon is reused; the sender's own lock prevents duplicates |
 | `verify` | health, node identity, heartbeat freshness, optional explicit inference | reports each fact separately; no inference by default |
 
+`verify` prints the declared target and the five readiness facts separately on
+every outcome, including failure:
+
+```
+verify: target=connection (usability and inference are separate facts)
+verify: fact installed=yes (local .venv and dendrite)
+verify: fact paired=yes (private pairing store)
+verify: fact reachable=yes (fresh authenticated heartbeat at ...)
+verify: fact usable=false (heartbeat usable flag; not proof of inference)
+verify: fact inference-qualified=no (not exercised)
+```
+
+A connection target can therefore complete with `usable=false` and
+`inference-qualified=no`. Simulated output is labelled `mock only`. A single
+`--verify-inference` execute request is reported as exercised but never as
+qualification.
+
+
 If pairing was interrupted or its outcome is unknown, the next `run` stops with
 exit 4 and asks the operator to check AIPSTER status/dashboard. Only an explicit
 `--retry-pair` allows a new code. This avoids burning a single-use code blindly.
+
+Reconciliation limit: the reviewed client (`local-worker/pairing.py`) exposes
+only `POST /api/pairing/claim` and `POST /api/resources/{id}/heartbeat`; there
+is no supported read or lookup endpoint, so this orchestrator cannot query
+authoritative state itself and does not invent one. The authoritative check is
+the operator's existing dashboard/status view, after which `--retry-pair`
+resumes. Automating that lookup is a controller decision, not an onboarding
+implementation decision.
+
+## Owned-resource rollback (ONB 24)
+
+Rollback is **not implemented in this candidate**. Cancellation leaves the
+private checkpoint in place and reports residual processes; it never deletes
+`.venv`, pairing, or logs automatically. A separate Muse component
+(`setup_ownership.py`) owns ownership records, PID-reuse checks, path and
+symlink safety; this orchestrator integrates that API once it lands. Until
+then, treat cleanup as manual and reversible-step-only.
+
 
 State is a private, non-secret `setup-state.json` under the worker data dir:
 
@@ -171,6 +222,7 @@ Setup(
     runner=callable, spawner=callable, http=object, pairer=callable,
     token_provider=callable, sender_lock_probe=callable, which=callable,
     port_open=callable, platform_name=str, machine=str,
+    hostname=callable, expect_target=str,
     sleep=callable, clock=callable, out=callable, err=callable,
     install_timeout=900.0, start_timeout=20.0, heartbeat_wait=15.0,
     poll_interval=0.25,
@@ -189,6 +241,8 @@ Hook shapes actually used by the implementation:
   Optional[str]`; `sender_lock_probe(data_dir) -> bool`; `which(name) -> path`;
   `port_open(host, port) -> bool`.
 * `out(line)` / `err(line)` capture user-facing diagnostics.
+* `hostname() -> str` feeds the target fingerprint; `expect_target` is the
+  caller's asserted fingerprint (`None` disables the assertion).
 * `clock()` / `sleep(seconds)` make bounded waits deterministic.
 
 Public methods: `check()`, `install(report=None)`, `pair(code)`, `start(report=None)`,
@@ -206,7 +260,8 @@ python3 setup_worker_fixture.py                 # all scenarios, JSON to stdout
 python3 setup_worker_fixture.py --scenario resume --json-out /tmp/report.json
 ```
 
-Scenarios: `happy`, `resume`, `duplicate-sender`, `verify-honesty`. The driver
+Scenarios: `happy`, `resume`, `duplicate-sender`, `verify-honesty`,
+`target-mismatch`, `stale-heartbeat`. The driver
 uses the real `Setup` methods and real `pairing.cmd_pair` against a loopback
 fake claim API, with fake runner/spawner/HTTP. Every report is JSON with
 `live_network=false`, `live_credentials=false`, `live_services=false`,
@@ -214,9 +269,22 @@ fake claim API, with fake runner/spawner/HTTP. Every report is JSON with
 a genuine Codex or Muse harness session: the harness runs the command, not a
 simulated provider call, and no live credential or service is touched.
 
-Expected current result: all four scenarios pass. Labels distinguish
+Expected current result: all six scenarios pass. Labels distinguish
 `mock-simulated` from real inference; the default verify path prints
-`inference=NOT EXERCISED`.
+`inference=NOT EXERCISED`. `target-mismatch` proves a wrong-machine run writes
+no checkpoint, runs no installer, and spawns nothing; `stale-heartbeat` proves
+a stale `usable=true` beat is reported as `fact usable=unknown` and never
+`reachable`.
+
+## Worker continuity (ONB 08)
+
+The daemon and sender are spawned with `stdin=DEVNULL`, output to owner-only
+logs, `close_fds=True`, and `start_new_session=True` on POSIX
+(`CREATE_NO_WINDOW` on Windows). Closing the initiating terminal or agent
+session therefore does not signal the worker, and the launcher never waits on
+or terminates a healthy daemon it started. Nothing enables autostart; a reboot
+still requires an explicit launch.
+
 
 ## Compatibility and manual approvals
 
