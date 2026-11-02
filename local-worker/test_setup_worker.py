@@ -162,7 +162,8 @@ def clock_sequence(step=1.0):
 
 
 def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=None,
-               http=None, pairer=None, token=FAKE_TOKEN, allow=True,
+               http=None, pairer=None, token=FAKE_TOKEN, token_provider=None,
+               allow=True,
                platform_name="posix", machine="arm64", retry_pair=False,
                verify_inference=False, sender_lock=False, port_open=False,
                start_timeout=0.0, heartbeat_wait=0.0, uv_present=True,
@@ -178,7 +179,7 @@ def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=N
         root=root, data_dir=data, config=config, api_base="http://127.0.0.1:9",
         allow_unqualified=allow, retry_pair=retry_pair, verify_inference=verify_inference,
         runner=runner, spawner=spawner, http=http, pairer=pairer,
-        token_provider=lambda create=True: token,
+        token_provider=token_provider or (lambda create=True: token),
         sender_lock_probe=lambda _data: sender_lock,
         which=(lambda _name: "/fixture/uv") if uv_present else (lambda _name: None),
         port_open=lambda _host, _port: port_open,
@@ -811,6 +812,46 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("Traceback (most recent call last):", text)
         self.assertIn("RuntimeError", text)
 
+    def test_internal_handler_reports_type_and_phase_for_an_unregistered_value(self):
+        """A value that raised before registration cannot be redacted by value."""
+        unregistered = "synthetic-unregistered-token-0123456789abcdef"
+
+        def failing_provider(_create=True):
+            raise RuntimeError("token helper failed for " + unregistered)
+
+        session, *_ = make_setup(self.tmp.name, root=self.root,
+                                 token_provider=failing_provider)
+        with patch.object(sw, "Setup", lambda **_kwargs: session):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = sw.main(["start", "--data-dir", str(self.data)])
+        text = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(code, sw.EXIT_USAGE)
+        self.assertNotIn(unregistered, text)
+        self.assertIn("RuntimeError", text)
+        self.assertIn("during start", text)
+        self.assertNotIn("token helper failed", text,
+                         "the exception message must never be printed")
+
+    def test_debug_internal_failure_suppresses_the_unregistered_message(self):
+        unregistered = "synthetic-unregistered-token-0123456789abcdef"
+
+        def failing_provider(_create=True):
+            raise RuntimeError("token helper failed for " + unregistered)
+
+        session, *_ = make_setup(self.tmp.name, root=self.root,
+                                 token_provider=failing_provider)
+        with patch.object(sw, "Setup", lambda **_kwargs: session):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = sw.main(["start", "--debug", "--data-dir", str(self.data)])
+        text = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(code, sw.EXIT_USAGE)
+        self.assertIn("Traceback (most recent call last):", text)
+        self.assertIn("RuntimeError: [message suppressed]", text)
+        self.assertNotIn(unregistered, text)
+        self.assertNotIn("token helper failed", text)
+
     def test_sender_log_tail_redacts_inherited_heartbeat_key(self):
         api = ApiFixture(self)
         data = Path(self.tmp.name) / "paired log data"
@@ -1417,6 +1458,42 @@ class StructuredStatusTests(unittest.TestCase):
         for secret in (FAKE_SECRET, FAKE_TOKEN, FAKE_CODE):
             self.assertNotIn(secret, text)
         self.assertNotIn(str(self.data), text)
+
+    def test_document_carries_the_same_reason_shape_as_the_standalone_document(self):
+        session, *_ = self.session()
+        session.last_blocked = [{"code": "STATE_UNREADABLE",
+                                 "detail": "setup checkpoint is not valid JSON"}]
+        document = session.status_document("status", sw.EXIT_PREREQ)
+        standalone = sw.standalone_status_document(
+            "status", sw.EXIT_PREREQ,
+            {"code": "STATE_UNREADABLE", "detail": "setup checkpoint is not valid JSON"})
+        self.assertEqual(sorted(document), sorted(standalone))
+        self.assertEqual(document["reason"]["code"], "STATE_UNREADABLE")
+        self.assertEqual(document["reason"]["detail"], standalone["reason"]["detail"])
+
+    def test_pending_pair_intent_surfaces_with_the_retry_action(self):
+        session, *_ = self.session()
+        session.last_blocked = []
+        session.state["phases"]["pair"] = {
+            "state": "uncertain", "at": "2026-11-01T00:00:00Z",
+            "detail": "network failure during the pairing claim"}
+        document = session.status_document("status", sw.EXIT_PAIRING)
+        text = json.dumps(document, sort_keys=True)
+        self.assertEqual(document["outcome"], "blocked")
+        self.assertEqual(document["reason"]["code"], "uncertain")
+        self.assertIn("retry-pair", document["next_action"])
+        self.assertIn("uncertain", text,
+                      "the structured status must not hide the pending pairing")
+        self.assertIn("network failure during the pairing claim",
+                      document["reason"]["detail"])
+
+    def test_complete_document_has_no_reason(self):
+        write_fresh_beat(self.data, usable=False)
+        session, *_ = self.session()
+        rc = session.verify()
+        document = session.status_document("verify", rc)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(document["reason"])
 
     def test_cli_status_json_is_a_single_parseable_document(self):
         stdout, stderr = io.StringIO(), io.StringIO()

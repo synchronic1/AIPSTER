@@ -130,14 +130,20 @@ def redact(text: Any, extra: Sequence[str] = ()) -> str:
 
 
 def sanitized_traceback(exc: BaseException) -> str:
-    """Format a traceback without source text or an unredacted exception string."""
+    """Format a traceback with frames and the exception type only.
+
+    The exception message is deliberately suppressed: a value that raised
+    before it could be registered (for example a token helper that fails while
+    formatting its own error) is otherwise unredactable. Frames and the type
+    are enough to locate the failure without echoing arbitrary text.
+    """
     import traceback  # noqa: PLC0415 - only needed on the debug/error path
 
     lines = ["Traceback (most recent call last):"]
     for frame in traceback.extract_tb(exc.__traceback__):
         lines.append('  File "%s", line %d, in %s'
                      % (redact(frame.filename), frame.lineno, redact(frame.name)))
-    lines.append("%s: %s" % (type(exc).__name__, redact(exc)))
+    lines.append("%s: [message suppressed]" % type(exc).__name__)
     return redact("\n".join(lines))
 
 
@@ -174,6 +180,10 @@ _NEXT_ACTIONS = {
     "uncertain": "check AIPSTER status/dashboard, then pass --retry-pair",
     "repair-required": "pair again; the sender key was revoked or expired",
 }
+
+
+_BLOCKING_STATES = frozenset(("blocked", "failed", "uncertain", "in_progress",
+                              "partial", "repair-required"))
 
 
 def next_action_for(code: str, outcome: str) -> Optional[str]:
@@ -1419,6 +1429,28 @@ class Setup:
         self.out("verify: fact inference-qualified=%s" % facts["inference_qualified"]["value"])
 
     # -- structured status (ONB 10) ------------------------------------------
+    def _pending_reason(self, phase: str) -> Optional[Dict[str, Any]]:
+        """The blocked/uncertain phase that needs the one recovery action.
+
+        The requested phase wins when it is itself blocked. Otherwise the most
+        recent record with an explicit next action is used, so a pending
+        pairing is surfaced by the `status` command instead of the generic
+        default. No record means there is nothing to report.
+        """
+        phases = self.state.get("phases") or {}
+
+        def interesting(record: Any) -> bool:
+            return isinstance(record, dict) and record.get("state") in _BLOCKING_STATES
+
+        if interesting(phases.get(phase)):
+            return phases[phase]
+        candidates = [(str(record.get("at") or ""), name, record)
+                      for name, record in phases.items()
+                      if name != phase and interesting(record)]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
     def status_document(self, command: str, exit_code: int) -> Dict[str, Any]:
         """One versioned machine-readable result; agrees with the exit code."""
         outcome = _OUTCOME_BY_EXIT.get(exit_code, "failed")
@@ -1426,11 +1458,15 @@ class Setup:
                  "pair": "pair", "start": "start", "verify": "verify",
                  "status": "status"}.get(command, command)
         record = self.state.get("phases", {}).get(phase) or {}
-        reason = None
+        reason: Optional[Dict[str, str]] = None
         if exit_code != EXIT_OK:
             blocked = self.last_blocked[0] if self.last_blocked else None
-            reason = {"code": blocked["code"] if blocked else record.get("state", "UNKNOWN"),
-                      "detail": redact(blocked["detail"] if blocked else record.get("detail", ""))}
+            if blocked:
+                code, detail = blocked.get("code", "UNKNOWN"), blocked.get("detail", "")
+            else:
+                source = self._pending_reason(phase) or record
+                code, detail = source.get("state", "UNKNOWN"), source.get("detail", "")
+            reason = {"code": str(code), "detail": redact(detail)}
         facts = self.last_facts or self._facts_document(
             self.last_heartbeat or self._heartbeat(), "not-exercised")
         document = {
@@ -1442,6 +1478,7 @@ class Setup:
             "exit_code": int(exit_code),
             "retryable": outcome in ("blocked", "incomplete"),
             "next_action": next_action_for((reason or {}).get("code") or "", outcome),
+            "reason": reason,
             "facts": facts,
             "observed_at": utc_now(),
         }
@@ -1784,13 +1821,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("setup: interrupted; rerun to resume", file=sys.stderr)
         rc = EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - never leak a code/token in a traceback path
-        failure = {"code": "INTERNAL", "detail": redact(exc)}
+        # Report the phase and exception type only. The message may carry a
+        # value this process never handled (and so cannot redact), for example
+        # a token helper that fails before returning the token.
+        detail = "%s during %s; message suppressed" % (type(exc).__name__, args.command)
+        failure = {"code": "INTERNAL", "detail": detail}
         if not args.json:
             if args.debug:
-                # A raw traceback carries str(exc), which may contain a credential.
-                # Show frames and the exception type only; values go through redact().
+                # Frames and the exception type only; the message is never shown.
                 print(sanitized_traceback(exc), file=sys.stderr)
-            print("setup: FAILED [INTERNAL] " + redact(exc), file=sys.stderr)
+            print("setup: FAILED [INTERNAL] " + detail, file=sys.stderr)
         rc = EXIT_USAGE
     finally:
         lock.release()

@@ -152,6 +152,7 @@ code:
   "exit_code": 0,
   "retryable": false,
   "next_action": null,
+  "reason": null,
   "facts": {
     "installed": {"value": "yes", "source": "local .venv and dendrite"},
     "paired": {"value": "yes", "source": "private pairing store"},
@@ -168,6 +169,14 @@ blocked or incomplete result is `retryable`; a complete connection result has
 `next_action: null` even when inference is unavailable. `usable.authoritative`
 is always `false` until a controller readiness read exists. No token, code,
 heartbeat key, or private path appears in the document.
+
+`reason` is always present and has the same `{code, detail}` shape as the
+pre-session document, so a client sees one schema with one shape. On failure it
+uses the in-process block if one was recorded; otherwise it surfaces the
+requested phase's blocking record, or the most recent blocked/uncertain phase.
+A pending `pair` intent therefore reports `reason.code = "uncertain"` and the
+`--retry-pair` recovery action from the `status` command instead of the generic
+default. `detail` is redacted; a complete result has `reason: null`.
 
 ## Owned-resource rollback (ONB 24)
 
@@ -204,8 +213,9 @@ State is a private, non-secret `setup-state.json` under the worker data dir:
 ```
 
 No code, token, or heartbeat key is written to state, output, argv, or logs by
-the orchestrator. A corrupt state file is reported and replaced with a fresh
-non-secret record; it never blocks a safe retry.
+the orchestrator. A corrupt or foreign state file is **not** replaced: it is
+reported as a blocked diagnostic, left unchanged, and never treated as a safe
+retry (see Checkpoint integrity).
 
 ## Private pairing code and token
 
@@ -231,6 +241,13 @@ and passed only in the daemon child environment. It is never printed.
 values plus `aip_live_*`/`aip_test_*` and `Bearer ...` shapes. `--debug` prints
 a sanitized traceback: frame file/line/function and the exception type, never
 the raw traceback or unredacted exception text.
+
+An exception that escapes a phase is reported by **phase and exception type**
+(`INTERNAL … RuntimeError during start; message suppressed`), never by its
+message: a helper can fail while formatting a value this process never handled
+and therefore cannot register or redact. The `--debug` traceback likewise ends
+with `<Type>: [message suppressed]`. A client that needs the code should read
+`reason.code`, not prose.
 
 Daemon and sender stdout/stderr go to owner-only files under `data/logs`, and
 the orchestrator displays only a bounded tail with known values redacted.
