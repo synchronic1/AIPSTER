@@ -13,6 +13,8 @@ const client = await readFile(new URL('../public/app/app.js', import.meta.url), 
 const component = client.slice(client.indexOf('const WORKER_COMMIT ='), client.indexOf('async function loadCompute()'));
 
 const FAKE_CODE = 'pair-SYNTHETIC-SETUP-001';
+// Reviewed writer revision that ships the deterministic setup entry point.
+const SETUP_COMMIT = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
 const FAKE_ID = 'p_synthetic001';
 const FAKE_EXPIRY = '2100-01-01T00:00:00.000Z';
 const fakeMintBody = (over = {}) => ({ id: FAKE_ID, code: FAKE_CODE, expiresAt: FAKE_EXPIRY, ...over });
@@ -143,21 +145,22 @@ test('packet carries the synthetic code in a delimited field with the selected s
     assert.match(packet, new RegExp(`PAIRING CODE: ${FAKE_CODE}`), `${os}: delimited code field`);
     assert.ok(!new RegExp(`--code\\s+${FAKE_CODE}`).test(packet), `${os}: code never interpolated into a command`);
     assert.match(packet, new RegExp(FAKE_EXPIRY), `${os}: expiry in packet`);
-    assert.match(packet, /3fa309cb08461ea046ee23e801404911c1f3bcc2/, `${os}: worker pin`);
+    assert.match(packet, new RegExp(SETUP_COMMIT), `${os}: pinned setup commit`);
     assert.match(packet, new RegExp(shell.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `${os}: shell label`);
     if (posix) {
-      assert.match(packet, /\.venv\/bin\/python/, `${os}: posix interpreter`);
+      assert.match(packet, /\.venv\/bin\/python pairing\.py unpair/, `${os}: posix interpreter`);
       assert.doesNotMatch(packet, /Scripts|\\\.venv\\|\$env:/, `${os}: no PowerShell paths`);
+      assert.match(packet, /sh setup-worker\.sh run --packet-stdin/, `${os}: posix entry point`);
     } else {
-      assert.match(packet, /\.venv\\Scripts\\python\.exe/, `${os}: windows interpreter`);
+      assert.match(packet, /\.venv\\Scripts\\python\.exe pairing\.py unpair/, `${os}: windows interpreter`);
       assert.doesNotMatch(packet, /\.venv\/bin/, `${os}: no posix paths`);
+      assert.match(packet, /\.\\setup-worker\.ps1 run --packet-stdin/, `${os}: windows entry point`);
     }
-    // The worker-local token assignment is the documented local pattern (a fresh
-    // random value, never an AIPSTER key); scrub only that known-safe line.
-    const scrubbed = packet.replaceAll('DENDRITE_API_TOKEN=', 'LOCAL_TOKEN_ASSIGN=');
-    assert.ok(!SECRET_SHAPED.test(scrubbed), `${os}: no long-lived credential shapes`);
+    // The deterministic entry point owns the token: no user-handled credential path.
+    assert.doesNotMatch(packet, /DENDRITE_API_TOKEN|heartbeat-loop|no-echo/, `${os}: no credential choreography`);
+    assert.ok(!SECRET_SHAPED.test(packet), `${os}: no long-lived credential shapes`);
     assert.match(packet, /x64 only|ARM64/, `${os}: architecture stop rule`);
-    assert.match(packet, /usable=false/, `${os}: mock honesty`);
+    assert.match(packet, /NOT tested by this setup/, `${os}: mock honesty`);
   }
 });
 
@@ -350,17 +353,19 @@ test('retry failure rebuilds a lost redaction; download never carries the code',
 
 test('packet preflight checks pairing state before consuming the code', async () => {
   const mint = async () => mintResponse(fakeMintBody());
-  for (const [os, dataDir] of [['windows', /%LOCALAPPDATA%\\AIPSTER-Worker/], ['linux', /\.local\/share\/aipster-worker/]]) {
+  for (const [os, status] of [['windows', /\.\\setup-worker\.ps1 status/], ['linux', /sh setup-worker\.sh status/]]) {
     const captured = [];
     const ui = fixture({ platform: 'Win32', clipboard: { writeText: async (text) => captured.push(text) } }, { mint });
     await ui.pick(os);
     await ui.press('gen-setup');
     const packet = captured[0];
-    assert.match(packet, /pairing\.py status/, `${os}: secret-free status check`);
-    assert.match(packet, dataDir, `${os}: effective data directory named`);
-    assert.match(packet, /AIPSTER_WORKER_DATA/, `${os}: override named`);
-    assert.match(packet, /status: paired/, `${os}: STOP rule keys on the status report`);
-    assert.doesNotMatch(packet, /pairing\.json exists in local-worker/, `${os}: no wrong-directory check`);
+    assert.match(packet, status, `${os}: secret-free status check`);
+    assert.match(packet, /It is read-only\./, `${os}: status is the read-only reconciliation`);
+    assert.match(packet, /Report its lines exactly as printed\./, `${os}: status lines are reported verbatim`);
+    assert.match(packet, /outcome is unknown until you run status/, `${os}: a lost response is not a failure`);
+    assert.match(packet, /Never mint, ask for, or consume a second code/, `${os}: the code is consumed once`);
+    assert.match(packet, /never re-pair\s+a computer that status reports as already paired/, `${os}: already-paired STOP rule keys on the status report`);
+    assert.doesNotMatch(packet, /AIPSTER_WORKER_DATA|pairing\.json exists in local-worker/, `${os}: no invented data-directory check`);
   }
 });
 
@@ -418,37 +423,45 @@ test('generate waits out an in-flight retry instead of racing its clipboard writ
   assert.match(textOf(ui.card.innerHTML), /Setup prompt copied/, 'retry success reported');
 });
 
-// The deterministic entry point is staged behind WORKER_SETUP_COMMIT. The
-// shipped packet must keep the reviewed manual steps while that script is
-// unpublished; setting the pin is the only change that swaps in the one-command
-// flow, and no manual token, serve or second-terminal choreography survives it.
-const SETUP_PIN = '0123456789abcdef0123456789abcdef01234567';
+// The deterministic entry point is pinned to the reviewed writer commit. The
+// shipped packet must run it; clearing the pin must fall back to the reviewed
+// manual steps, so no manual token, serve or second-terminal choreography
+// survives a live pin and an accidental null never points at unpublished code.
+const SETUP_PIN = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
 const setupMint = { id: 'p_pinned01', code: FAKE_CODE, expiresAt: FAKE_EXPIRY, account: 'Synthetic Owner' };
 
-function pinnedComponent() {
-  const src = component.replace('const WORKER_SETUP_COMMIT = null;',
-    'const WORKER_SETUP_COMMIT = ' + JSON.stringify(SETUP_PIN) + ';');
-  assert.notEqual(src, component, 'fixture substitutes the staged pin');
+function shippedComponent() {
+  assert.ok(component.includes("const WORKER_SETUP_COMMIT = '" + SETUP_PIN + "';"),
+    'client carries the reviewed setup pin');
+  const context = vm.createContext({ navigator: { platform: 'MacIntel', userAgent: 'Mac' } });
+  new vm.Script(component).runInContext(context);
+  return context;
+}
+
+function legacyComponent() {
+  const src = component.replace("const WORKER_SETUP_COMMIT = '" + SETUP_PIN + "';",
+    'const WORKER_SETUP_COMMIT = null;');
+  assert.notEqual(src, component, 'fixture clears the shipped pin');
   const context = vm.createContext({ navigator: { platform: 'MacIntel', userAgent: 'Mac' } });
   new vm.Script(src).runInContext(context);
   return context;
 }
 
-test('shipped packet keeps the reviewed manual steps while the entry point is unpublished', () => {
-  const ui = fixture({ platform: 'Win32' });
-  const packet = ui.context.agentSetupPacket('windows', setupMint);
+test('clearing the reviewed pin falls back to the reviewed manual steps', () => {
+  const context = legacyComponent();
+  const packet = context.agentSetupPacket('windows', setupMint);
   assert.ok(packet.includes('PAIRING CODE: ' + FAKE_CODE), 'code stays in its delimited field');
   assert.ok(packet.includes('3fa309cb08461ea046ee23e801404911c1f3bcc2'), 'reviewed worker pin kept');
   assert.doesNotMatch(packet, /setup-worker|setup_worker/, 'never points at an unpublished script');
   assert.ok(packet.includes('uv run --no-project --python 3.12.14 python install.py'), 'reviewed install step kept');
-  assert.ok(packet.includes('uv 0.12.12 exactly (must match)'), 'legacy path still states the reviewed uv prerequisite');
-  assert.ok(packet.includes('uv python install 3.12.14'), 'legacy path still offers the reviewed Python install hint');
+  assert.ok(packet.includes('uv 0.12.12 exactly (must match)'), 'fallback still states the reviewed uv prerequisite');
+  assert.ok(packet.includes('uv python install 3.12.14'), 'fallback still offers the reviewed Python install hint');
   assert.match(packet, /ask me which machine this packet is for/, 'target-machine ambiguity resolved before mutation');
   assert.match(packet, /run every command below on that machine only/, 'commands confined to the chosen machine');
 });
 
-test('pinned entry point packet runs one deterministic command with the packet on stdin', () => {
-  const context = pinnedComponent();
+test('shipped packet runs one deterministic command at the reviewed pin with the packet on stdin', () => {
+  const context = shippedComponent();
   const packets = {
     windows: context.agentSetupPacket('windows', setupMint),
     macos: context.agentSetupPacket('macos', setupMint),

@@ -182,10 +182,14 @@ test('UI repair: pairing checkout uses the published reviewed source pin and qua
   const t = await ui();
   const commands = t.context.workerCommands('windows').join('\n');
   const pin = /git checkout --detach ([a-f0-9]{40})/.exec(commands)[1];
-  assert.equal(pin,'3fa309cb08461ea046ee23e801404911c1f3bcc2');
+  assert.equal(pin,'3fa309cb08461ea046ee23e801404911c1f3bcc2', 'Advanced keeps the reviewed worker pin that carries installer provenance');
   assert.match(commands,/sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
   assert.ok(!commands.includes('git clone https://'), 'no full checkout replaces the qualified sparse flow');
-  assert.match(t.context.agentSetupPacket('windows', { id: 'p_direct01', code: 'SYNTHETIC-DIRECT-CODE', expiresAt: '2100-01-01T00:00:00Z', account: 'Direct Owner' }), /Use the pinned commands below for pairing/);
+  const packet = t.context.agentSetupPacket('windows', { id: 'p_direct01', code: 'SYNTHETIC-DIRECT-CODE', expiresAt: '2100-01-01T00:00:00Z', account: 'Direct Owner' });
+  assert.equal(/git checkout --detach ([a-f0-9]{40})/.exec(packet)[1], '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed',
+    'the guided packet checks out the reviewed commit that ships the setup entry point');
+  assert.match(packet, /sparse-checkout set --no-cone \/local-worker\/ \/LICENSE/);
+  assert.match(packet, /Use only the pinned command below; do not substitute an older checkout/);
 });
 
 test('UI repair: dismiss and navigation erase shown codes and invalidate pending mint work', async () => {
@@ -224,8 +228,10 @@ test('INDEPENDENT UI: double Pair click while minting starts one mint', async ()
 test('INDEPENDENT UI: source instructions start a sender and distinguish paired credential revocation', async () => {
   const t = await ui();
   const instructions = t.context.agentSetupPacket('windows', { id: 'p_direct02', code: 'SYNTHETIC-DIRECT-CODE', expiresAt: '2100-01-01T00:00:00Z', account: 'Direct Owner' });
-  assert.match(instructions,/heartbeat-loop/, 'pair stores credentials and returns; source daemon does not start the sender');
+  assert.match(instructions,/starts one worker and one sender/, 'the entry point starts the sender, not a bare credential store');
+  assert.match(instructions,/keep their own process lifetime/, 'sender lifetime after the command exits is reported, not assumed');
   assert.ok(!/worker sends reachability heartbeats on its own/.test(instructions));
+  assert.match(instructions,/Local unpair does not revoke the server key/, 'local unpair is distinguished from server revocation');
   assert.ok(!t.el('connect-card').innerHTML.includes('there is nothing to revoke here'), 'paired heartbeat keys remain live until explicitly revoked');
 });
 

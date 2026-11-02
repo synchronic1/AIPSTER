@@ -20,6 +20,9 @@ import { checkPublic } from '../scripts/check.mjs';
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 // Reviewed pairing client retaining the #17 local-token and Host/Origin guards.
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
+// Reviewed writer revision that first ships the deterministic setup entry point;
+// the guided packet checks out this pin, while Advanced keeps the worker pin above.
+const SETUP_COMMIT = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
 // Immutable docs revision; kept independent so docs can be corrected without moving the code pin.
 const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
 const TREE = `https://github.com/synchronic1/AIPSTER/blob/${DOCS_COMMIT}/local-worker/`;
@@ -240,7 +243,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   await win.clickTab('compute');
   assert.ok(textOf(win.el('connect-card').innerHTML).includes('Detected: Windows. Change it if that is wrong.'));
   await win.press('gen-setup');
-  assert.match(win.captured[0], /\.venv\\Scripts\\python\.exe test_installation\.py/);
+  assert.ok(win.captured[0].includes('.\\setup-worker.ps1 run --packet-stdin'), 'Windows packet runs the reviewed entry point');
   assert.ok(win.captured[0].includes('Windows x64 is the only tested platform'));
   assert.ok(win.captured[0].includes(`PAIRING CODE: ${FAKE_SETUP_CODE}`), 'one action delivers the code-bearing packet');
 
@@ -253,7 +256,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   const macActions = nodesOf(macHtml).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean);
   assert.deepEqual(macActions, ['gen-setup', 'pair'], 'prompt available on macOS; manual repair stays platform-independent');
   await mac.press('gen-setup');
-  assert.ok(mac.captured[0].includes('.venv/bin/python test_installation.py'), 'macOS packet uses POSIX paths');
+  assert.ok(mac.captured[0].includes('sh setup-worker.sh run --packet-stdin'), 'macOS packet uses POSIX paths');
   assert.ok(!mac.captured[0].includes('.venv\\Scripts') && !mac.captured[0].includes('$env:'), 'no PowerShell paths in the macOS packet');
 
   // Manual correction overrides detection everywhere (status, Advanced).
@@ -266,7 +269,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
   assert.ok(linuxPre.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'));
   await mac.press('gen-setup');
   assert.equal(mac.captured.length, 2, 'Linux prompt copies too');
-  assert.ok(mac.captured[1].includes('.venv/bin/python test_installation.py'));
+  assert.ok(mac.captured[1].includes('sh setup-worker.sh run --packet-stdin --allow-unqualified-platform'), 'Linux packet keeps the POSIX entry point and its unqualified acknowledgment');
   await mac.chooseOs('windows');
   assert.deepEqual(nodesOf(mac.el('connect-card').innerHTML).filter((n) => n.tagName === 'button').map((b) => attr(b, 'data-action')).filter(Boolean), ['gen-setup', 'pair'], 'prompt stays on the qualified platform');
 
@@ -308,7 +311,7 @@ test('OS is suggested but correctable; wrong OS changes instructions honestly', 
     const packet = ui.captured[0] || nodesOf(ui.el('connect-card').innerHTML)
       .find((n) => n.tagName === 'textarea')?.childNodes.map((c) => c.value || '').join('');
     assert.ok(packet, `${name}: selected Windows target produces a packet or selectable fallback`);
-    assert.ok(packet.includes('AIPSTER agent setup packet v2.') && packet.includes(WORKER_COMMIT), `${name}: packet uses the pinned worker`);
+    assert.ok(packet.includes('AIPSTER agent setup packet v2.') && packet.includes(SETUP_COMMIT), `${name}: packet uses the pinned setup entry point`);
     assert.ok(packet.includes(`PAIRING CODE: ${FAKE_SETUP_CODE}`), `${name}: packet carries the minted code`);
     assert.ok(packet.includes('git sparse-checkout set --no-cone /local-worker/ /LICENSE'), `${name}: packet keeps the worker-only checkout`);
     assert.equal(ui.captured.length, ui.hasNavigator ? 1 : 0, `${name}: no clipboard write when navigator is unavailable`);
@@ -373,22 +376,29 @@ test('one action mints and copies the code-bearing setup packet once', async () 
   assert.equal(ui.captured.length, 1, 'one clipboard write per click');
   const packet = ui.captured[0];
   const flat = packet.replace(/\s+/g, ' ');
-  for (const phrase of ['AIPSTER agent setup packet v2.', 'THIS computer', WORKER_COMMIT, 'ganglion-dendrite 0.1.0',
-    'uv 0.12.12', '3.12.14', 'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
-    'the root LICENSE only', 'required by local-worker/LICENSING.md', 'install.py', 'test_installation.py',
-    'DENDRITE_API_TOKEN', 'worker-LOCAL token', 'NOT an AIPSTER key',
+  for (const phrase of ['AIPSTER agent setup packet v2.', 'THIS computer', SETUP_COMMIT, 'ganglion-dendrite 0.1.0',
+    'uv 0.12.12', '3.12.14', 'do NOT install, upgrade or configure it', 'host Python 3.9+',
+    'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
+    'the root LICENSE only', 'required by local-worker/LICENSING.md', 'isolated .venv',
+    'pairs this computer with the code it reads from the packet', 'owner-only storage',
+    'Do not create a worker token yourself',
     'these steps cover x64 only', 'no qualified instructions exist',
+    'STOP and ask me which machine',
     'does NOT share this computer', 'does NOT enable inference',
     'does not contact AIPSTER until the pair step below runs', 'holds no AIPSTER credential',
     `PAIRING CODE: ${FAKE_SETUP_CODE}`, 'single use, expires', 'NOT a password, API key, or heartbeat key',
-    'already paired', 'do not consume the code', 'private no-echo prompt', 'Never pass',
-    'command-line argument', 'cannot type into that private prompt',
-    'Pairing registers the resource',
-    'pairing.py heartbeat-loop --config configs/mock.toml', 'pairing.py unpair',
-    'a heartbeat proves reachability only, never inference readiness', 'A running worker is NOT proof of inference readiness',
+    'already paired', 'consume a second code', 'standard input', 'Do not retype the pairing code',
+    'an environment variable', 'cannot supply standard input privately',
+    'registers THIS computer to my account',
+    'starts one worker and one sender', '.\\setup-worker.ps1 status', '--retry-pair', 'It is read-only.',
+    'That is reachability, not inference.', 'never call the computer inference-ready.',
+    'complete even though inference is unavailable', '"mock only"', 'installs no autostart',
+    'pairing.py unpair',
     'Remove only local-worker/.venv', 'There is no automatic update']) {
     assert.ok(flat.includes(phrase), `missing: ${phrase}`);
   }
+  assert.ok(!flat.includes('heartbeat-loop') && !flat.includes('no-echo'),
+    'the packet never hands the user credential choreography');
   assert.ok(!flat.includes('tray menu') && !flat.includes('aipster-worker pair'), 'no packaged pairing copy while no installer is usable');
   assert.ok(!new RegExp(`--code\\s+${FAKE_SETUP_CODE}`).test(packet), 'code never interpolated into a command');
   assert.ok(!SECRET_SHAPED.test(packet), 'no long-lived credential shapes in the packet');
@@ -415,7 +425,7 @@ test('denied copy keeps the packet in memory; retry reuses it without reminting'
   assert.equal(areas.length, 1, 'one selectable fallback');
   assert.ok(areas[0].attrs.some((x) => x.name === 'readonly'), 'fallback is read-only');
   const fallback = areas[0].childNodes.map((c) => c.value || '').join('');
-  assert.ok(fallback.includes(WORKER_COMMIT) && fallback.includes('THIS computer'), 'fallback carries the complete packet');
+  assert.ok(fallback.includes(SETUP_COMMIT) && fallback.includes('THIS computer'), 'fallback carries the complete packet');
   assert.ok(fallback.includes(FAKE_SETUP_CODE), 'fallback carries the minted code');
   assert.ok(text.includes('Download redacted template'), 'redacted download offered');
   const saveBtns = nodesOf(html).filter((n) => n.tagName === 'button' && attr(n, 'data-action') === 'save-instructions');
@@ -642,8 +652,8 @@ test('standalone README is background; authoritative pairing commands preserve t
   assert.match(block[1], /git checkout --detach [a-f0-9]{40}/);
   const ui = await makeUi({ platform: 'Win32', clipboard: 'ok', mintStub: fakeSetupMint() });
   await ui.clickTab('compute'); await ui.press('gen-setup');
-  assert.ok(ui.captured[0].includes(`git fetch origin ${WORKER_COMMIT}`));
-  assert.ok(ui.captured[0].includes(`git checkout --detach ${WORKER_COMMIT}`));
+  assert.ok(ui.captured[0].includes(`git fetch origin ${SETUP_COMMIT}`));
+  assert.ok(ui.captured[0].includes(`git checkout --detach ${SETUP_COMMIT}`));
   assert.ok(ui.captured[0].includes('do not substitute an older checkout'));
   assert.match(readme, /sparse checkout contains the worker and the root `LICENSE` only/);
   assert.match(readme, /required by \[the licensing record\]\(LICENSING\.md\)/);

@@ -246,12 +246,12 @@ async function loadOverview() {
 // pairing / reachable); it never claims an unverified state.
 const WORKER_COMMIT = '3fa309cb08461ea046ee23e801404911c1f3bcc2';
 // The deterministic onboarding entry point (local-worker/setup_worker.py and
-// its setup-worker wrappers) ships in a reviewed commit after the worker pin.
-// Keep this null until that commit exists, is reviewed, and is included in the
-// combined branch: the copied packet must never point a live copy at an
-// unpublished script. Flipping this one constant is the only packet change
-// needed when the reviewed SHA lands, and every command below then runs at it.
-const WORKER_SETUP_COMMIT = null;
+// its setup-worker wrappers) is pinned to the reviewed writer commit that
+// first ships them, QA-accepted at the engine level. The copied packet runs
+// one wrapper command at this revision; the manual steps below remain only as
+// a fallback branch if this pin is ever cleared (for example after a bad
+// withdrawal), so a live copy never points at unpublished or unreviewed code.
+const WORKER_SETUP_COMMIT = '8e76d3146143fbe478fd2d08eb4af8c402a5d0ed';
 const workerPin = () => WORKER_SETUP_COMMIT || WORKER_COMMIT;
 const setupWorkerPinned = () => /^[0-9a-f]{40}$/.test(String(WORKER_SETUP_COMMIT || ''));
 const DOCS_COMMIT = '47d8f3c779a641d06a71fcf29bdd692b828a7781';
@@ -328,9 +328,11 @@ const OS_FAMILY = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
 const MOBILE_NOTE = 'You seem to be on a phone or tablet. Open AIPSTER on the computer you want to connect — the steps below install on the computer in front of you.';
 const needsTargetSelection = (card) => !card.picked && (!card.detected || card.detected === 'mobile');
 
-// Pinned worker commands per OS: worker-only sparse checkout at WORKER_COMMIT,
-// isolated install, self-test, fresh worker-local token, mock serve.
-function workerCommands(os) {
+// Pinned worker commands per OS: worker-only sparse checkout, isolated install,
+// self-test, fresh worker-local token, mock serve. The Advanced manual path keeps
+// the reviewed worker revision; the setup packet passes the setup pin so its
+// checkout also contains the wrappers it invokes.
+function workerCommands(os, pin = WORKER_COMMIT) {
   const meta = OS_META[os] || OS_META.windows;
   const py = meta.posix ? meta.venvBin + '/python' : meta.venvBin + '\\python.exe';
   const exe = meta.posix ? meta.venvBin + '/dendrite' : meta.venvBin + '\\dendrite.exe';
@@ -341,8 +343,8 @@ function workerCommands(os) {
     'git clone --filter=blob:none --no-checkout https://github.com/synchronic1/AIPSTER.git',
     'cd AIPSTER',
     'git sparse-checkout set --no-cone /local-worker/ /LICENSE',
-    'git fetch origin ' + workerPin(),
-    'git checkout --detach ' + workerPin(),
+    'git fetch origin ' + pin,
+    'git checkout --detach ' + pin,
     'cd local-worker',
     'uv run --no-project --python 3.12.14 python install.py',
     py + ' test_installation.py',
@@ -383,7 +385,7 @@ function setupWorkerCommands(os) {
 // itself stays byte-exact (validated, never mutated) so the claim succeeds.
 function agentSetupPacket(os, setup) {
   const meta = OS_META[os] || OS_META.windows;
-  const lines = workerCommands(os);
+  const lines = workerCommands(os, workerPin());
   const pairing = workerPairingCommands(os);
   const guided = setupWorkerPinned();
   const entry = setupWorkerCommands(os);
