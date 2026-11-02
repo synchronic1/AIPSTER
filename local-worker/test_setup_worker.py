@@ -25,9 +25,10 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import pairing
-import setup_ownership as ownership
 import setup_worker as sw
 import setup_worker_fixture as fixture
+
+ownership = sw.ownership  # the vendored copy the engine actually bound
 
 FAKE_CODE = "pair-01234567-89AB-CDEF-GHJKMNPQ"
 FAKE_CODE2 = "pair-aaaaaaaa-bbbb-cccc-ddddeeee"
@@ -1871,6 +1872,27 @@ class FixturePacketInputTests(unittest.TestCase):
         self.assertEqual(report["engine"]["code_read_events"], ["code-read-after-install"])
         self.assertEqual(len(state.claims), 1, "exactly one loopback claim")
         self.assertEqual(state.claims[0].get("code"), fixture.FAKE_CODE)
+
+
+class VendoredOwnershipAttestationTests(unittest.TestCase):
+    """The engine must run this tree's reviewed copy, not a shadowing module."""
+
+    def test_the_engine_binds_this_trees_copy(self):
+        self.assertEqual(Path(sw.ownership.__file__).resolve(),
+                         Path(sw.ROOT) / "setup_ownership.py")
+
+    def test_a_shadowing_module_is_never_used(self):
+        fake = SimpleNamespace(__file__="/elsewhere/local-worker/setup_ownership.py",
+                               Refusal=object)
+        with patch.dict(sys.modules, {"setup_ownership": fake}):
+            module = sw._load_vendored_ownership()
+        self.assertIsNot(module, fake)
+        self.assertEqual(Path(module.__file__).resolve(),
+                         Path(sw.ROOT) / "setup_ownership.py")
+
+    def test_a_foreign_ownership_path_is_refused(self):
+        with self.assertRaises(ImportError):
+            sw._require_vendored_ownership("/elsewhere/local-worker/setup_ownership.py")
 
 
 if __name__ == "__main__":

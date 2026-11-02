@@ -43,6 +43,77 @@ python3 setup_worker.py run --packet-stdin \
 Other commands: `check`, `install`, `pair`, `start`, `verify`, `status`.
 `run` is `check -> install -> pair -> start -> verify`.
 
+## Interface agreement: what an agent runs (ONB 02 / ONB 10)
+
+Two distinct invocations, both stdin-redirected from a private file. Nothing
+is passed as an argument that could appear in shell history or `ps`.
+
+**Real onboarding** (mutates this host; needs a genuine packet):
+
+```sh
+cd <worker checkout>/local-worker
+./setup-worker.sh run --packet-stdin --json < <packet file>
+```
+
+`--json` emits one `aipster-worker-setup-status/1` document on stdout; human
+diagnostics go to stderr. Optional, mutually compatible flags:
+`--data-dir DIR`, `--config TOML`, `--expect-target FINGERPRINT`,
+`--allow-unqualified-platform` (macOS/Linux), `--retry-pair` (only after the
+operator confirms the resource is still unpaired), `--verify-inference`
+(explicit, one request, never reported as qualification). `status` and `check`
+never mutate; `check` is the safe pre-flight and prints the target
+fingerprint.
+
+**Synthetic qualification** (no install, no network, no credentials; the
+synthetic fixture packet only):
+
+```sh
+cd <worker checkout>/local-worker
+python3 setup_worker_fixture.py --packet-stdin --verify-inference \
+  --json-out <report path> < <fixture packet file>
+```
+
+Exit `0` = every check passed, `1` = a check failed or the report was
+suppressed because a code/token appeared in it. The report carries
+`passed`, `readiness` (installed / paired / reachable / usable /
+inference-qualified), `synthetic_only: true`, and
+`live_network/live_credentials/live_services/live_inference: false`.
+Create the fixture packet with
+`python3 setup_worker_fixture.py --write-fixture-packet <path>` (0600,
+`O_EXCL`).
+
+### Phase-to-exit-code table
+
+`run` stops at the first phase that does not succeed and returns that
+phase's code; `pair` is attempted even when `start` fails, and `verify` only
+runs after a successful `start`.
+
+| Phase / situation | Exit | Outcome | Meaning and next action |
+|---|---|---|---|
+| any: bad flags, unresolvable packet/code source, invalid code syntax, target mismatch or target change | 2 | failed | Fix the invocation. No mutation; `reason.code` names the fault. |
+| `check`: platform other than Windows x64 without `--allow-unqualified-platform`, Python < 3.9, `uv` not 0.12.12, < 1 GiB disk, bad loopback config, missing checkout files | 3 | blocked | Fix the prerequisite; the wrapper can bootstrap the pinned `uv`. |
+| `install`: partial `.venv`, installer failure, missing checkout files | 3 | blocked | Remove only `local-worker/.venv` and rerun; a partial tree is never deleted. |
+| `pair`: private store unreadable, previous attempt uncertain, no code supplied, claim rejected, local store missing after success | 4 | blocked | Repair the store or obtain a new code. Uncertain: check AIPSTER status/dashboard first, then `--retry-pair` only if still unpaired. |
+| `pair`: network failure, or an exception after the claim was dispatched | 5 | incomplete | The code may be consumed. Check status/dashboard before any retry. |
+| `start`: daemon cannot spawn/become healthy, port conflict, sender spawn failure, sender exited | 3 | blocked | Read the log tail printed to stderr; the unhealthy daemon is stopped through the ownership ledger. |
+| `start`: sender key revoked/expired (sender exit 4) | 4 | blocked | Pair again; install is preserved. |
+| `start`: sender exited without a heartbeat | 5 | incomplete | Retry `start`; the checkpoint is preserved. |
+| `start`: another sender already owns the data dir (sender exit 6) | 0 | complete | Not an error: one sender per data dir. |
+| `verify`: health unreachable or heartbeat stale/missing | 5 | incomplete | Retry later; nothing was deleted. |
+| `verify`: node identity rejected (401/403) | 3 | blocked | Credentials are not accepted; repair pairing. |
+| `verify`: pairing revoked/expired | 4 | blocked | Pair again. |
+| `verify`: facts disagree (e.g. `usable=false`) | 0 | complete | Connection target met; usability and inference are separate facts. |
+| any: another setup process holds the lock | 75 | blocked | Wait for it; nothing was mutated. |
+| any: Ctrl-C / interrupt | 130 | cancelled | The checkpoint is preserved and nothing is deleted. |
+| any: internal failure after dispatch | 2 | failed | `reason.detail` is `"<Type> during <command>; message suppressed"`; rerun with `--debug` for frames and the exception type only. |
+| `status` | 0, or 2 when the pairing status helper fails | complete / failed | Read-only; never mutates, never consumes a code. |
+
+Reserved: exit `6` is the sender's own "already running" code. `start` maps
+it to exit `0` (complete) rather than surfacing an error.
+
+`--json` never changes an exit code; the document's `outcome` and `exit_code`
+always agree with the table above.
+
 ## Target machine (ONB 04)
 
 An assistant can run a command in its own sandbox or on another host. Before
@@ -184,7 +255,11 @@ The QA-accepted Muse ownership API is integrated as the **only** destructive
 path in the engine. `setup_ownership.py` is copied byte-identically from Muse
 `d94b77f` (API v1.1.1; sha256
 `1a0950fd3a4f1c69ae1fe49648413cfa47b329aa9050595f95dfc736a67e142d`) and is
-never edited here; findings route back to Muse `a2a`.
+never edited here; findings route back to Muse `a2a`. The engine loads that
+file **by location**, not by module name, and attests that the resolved path
+is its own `local-worker/setup_ownership.py`: an embedding that imported
+another lane's copy first therefore cannot supply the component silently, and
+the import fails closed if the vendored file is not the one bound.
 
 Wired today — one path only, a daemon that never becomes healthy after
 `start`:

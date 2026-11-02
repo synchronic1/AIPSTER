@@ -49,7 +49,47 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-import setup_ownership as ownership  # noqa: E402 - reviewed Muse component, imported unchanged
+
+
+def _require_vendored_ownership(path: Any) -> Path:
+    """Refuse an ownership component that is not this tree's reviewed copy."""
+    expected = (ROOT / "setup_ownership.py").resolve()
+    found = Path(str(path)).resolve()
+    if found != expected:
+        raise ImportError(
+            "setup_worker requires the vendored ownership component at %s, "
+            "not %s; another setup_ownership module was imported first"
+            % (expected, found))
+    return found
+
+
+def _load_vendored_ownership() -> Any:
+    """Load ``setup_ownership.py`` from this directory, never from sys.modules.
+
+    A plain ``import setup_ownership`` resolves through ``sys.modules`` first,
+    so an embedding that imported another lane's copy under that name would
+    keep using it. The copy is byte-identical today, but the guarantee we ship
+    is *this* file: bind it by location and attest the resolved path.
+    """
+    import importlib.util  # noqa: PLC0415 - only needed at import time
+
+    path = ROOT / "setup_ownership.py"
+    spec = importlib.util.spec_from_file_location(
+        "aipster_worker_setup_ownership", str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the vendored ownership component at %s" % path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses need their module registered
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    _require_vendored_ownership(module.__file__)
+    return module
+
+
+ownership = _load_vendored_ownership()  # noqa: E402 - reviewed Muse component
 
 DEFAULT_CONFIG = ROOT / "configs" / "mock.toml"
 STATE_SCHEMA = "aipster-worker-setup/1"
