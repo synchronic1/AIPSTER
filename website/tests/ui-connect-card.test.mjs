@@ -743,6 +743,8 @@ test('resource cards show derivable link states, never installed/ready', async (
   const staleAt = new Date(Date.now() - 3600 * 1000).toISOString();
   await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .bind('r_stale', 'u_alice', 'n_uistale', 'stale-box', 'local', 'paired', 'c', 'g', 1, 1, 1, 0, staleAt, now).run();
+  await ui.db.prepare('INSERT INTO resources (id, owner_id, node_id, name, kind, origin, cpu, gpu, configured, authenticated, online, usable, heartbeat_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('r_unauthed', 'u_alice', 'n_uiunauthed', 'unauthed-box', 'local', 'declared', 'c', 'g', 1, 0, 1, 0, now, now).run();
   await ui.clickTab('compute');
   await ui.settleList('manual-box', 'link states render');
   const text = textOf(ui.el('compute-list').innerHTML);
@@ -750,6 +752,10 @@ test('resource cards show derivable link states, never installed/ready', async (
   assert.ok(text.includes('linked'), 'paired row awaits its beat');
   assert.ok(text.includes('reachable'), 'fresh beat reads reachable');
   assert.ok(text.includes('stale'), 'old beat reads stale');
+  const segments = ui.el('compute-list').innerHTML.split('<div class="card">');
+  const unauthed = segments.find((seg) => seg.includes('unauthed-box'));
+  assert.ok(unauthed && unauthed.includes('reachable'), 'fresh beat outranks the pairing flag');
+  assert.ok(unauthed && !unauthed.includes('needs-link'), 'no needs-link beside a fresh heartbeat');
   assert.ok(!/\binstalled\b/i.test(text), 'the browser never claims an install state');
 });
 

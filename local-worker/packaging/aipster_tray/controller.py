@@ -20,7 +20,8 @@ from . import state as st
 from .child import (EXIT_REPAIR_REQUIRED, EXIT_SENDER_RUNNING, SenderChild,
                       WorkerChild, port_busy, looks_like_bind_error)
 from .firstrun import (APP_NAME, bundle_dir, build_info, data_dir, ensure_setup,
-                       ensure_private_token, private_directory)
+                       ensure_private_token, explicit_demo_ready, first_run_ready, private_directory,
+                       runtime_note, setup_detail)
 
 if not getattr(sys, "frozen", False):
     # Source runs need local-worker/ itself for the pairing CLI probe
@@ -100,7 +101,7 @@ class Controller:
         if error:
             self.set_state(st.ERROR, error)
         else:
-            self.set_state(st.STOPPED)
+            self.set_state(st.STOPPED, runtime_note(self.loaded))
 
     def _reload(self):
         """(Re)load config + token. Returns an error detail or ''."""
@@ -381,7 +382,7 @@ class Controller:
             if code is not None:
                 self._classify_exit(code)
             elif self.loaded and _health_ok(self.loaded.node.host, self.loaded.node.port):
-                self.set_state(st.RUNNING)
+                self.set_state(st.RUNNING, runtime_note(self.loaded))
                 self.backend.notify("started", st.RUNNING)
             elif now >= (self.health_deadline or now):
                 self.log("worker did not become healthy in time")
@@ -737,7 +738,9 @@ def main(argv=None):
         controller.log(f"backend={controller.backend.name} windowed run")
         # The tray owns a running worker: start on launch (a busy port or bad
         # config becomes a visible state, never a silent exit).
-        if controller.state == st.STOPPED:
+        if controller.state == st.STOPPED \
+                and (first_run_ready(controller.loaded)
+                     or explicit_demo_ready(controller.loaded)):
             controller.start_worker()
         if headless:
             run_headless_loop(controller)

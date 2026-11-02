@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE ONLY. Nothing in this repository installs or loads it.
+
+  To use it, replace every __PLACEHOLDER__, check the paths, then copy it to
+  ~/Library/LaunchAgents/ and load it as your own user agent:
+
+      cp dev.aipster.worker.serve-jobs.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) \
+          ~/Library/LaunchAgents/dev.aipster.worker.serve-jobs.plist
+
+  KeepAlive is SuccessfulExit=false: launchd restarts the worker only after a
+  crash or a non-zero exit. A stop signal (SIGTERM/SIGINT) exits 0, so a
+  deliberately stopped worker stays stopped.
+
+  No secret belongs in this file. Pair the worker first so its heartbeat key
+  lives in the private store; if the local Ganglion needs a token, export
+  AIPSTER_GANGLION_TOKEN in the session that loads the agent. The worker never
+  logs prompts, completions or credentials, and neither should these logs.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.aipster.worker.serve-jobs</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>__LOCAL_WORKER_DIR__/pairing.py</string>
+		<string>--data-dir</string>
+		<string>__WORKER_DATA_DIR__</string>
+		<string>serve-jobs</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>__LOG_DIR__/serve-jobs.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_DIR__/serve-jobs.err.log</string>
+</dict>
+</plist>

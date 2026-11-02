@@ -1,0 +1,62 @@
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding-top: 1.25rem;
+}
+
+.backlink {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+  border-bottom: 1px solid var(--line-strong);
+  padding-bottom: 0.1rem;
+}
+
+.backlink:hover,
+.backlink:focus-visible {
+  border-bottom-color: var(--accent);
+}
+
+.experimental-label {
+  margin-top: 0.9rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  color: var(--ink);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.panel--access {
+  border-left: 4px solid var(--line-strong);
+}
+
+#access-message[data-state="checking"] {
+  color: var(--muted);
+}
+
+#access-message[data-state="authorized"] {
+  color: var(--green);
+}
+
+#access-message[data-state="anonymous"],
+#access-message[data-state="denied"] {
+  color: var(--warn);
+}
+
+#access-message[data-state="unavailable"] {
+  color: var(--bad);
+}
+
+.access-hint {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.access-hint a {
+  color: var(--accent);
+}

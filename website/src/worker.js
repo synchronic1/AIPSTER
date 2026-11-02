@@ -15,13 +15,17 @@ import { dgmPreviewEnabled } from './dgm/router.mjs';
 import { advisorEnabled, advisorDescriptor, handleAdvisorPost } from './advisor/router.mjs';
 import { ADVISOR_BODY_MAX } from './advisor/validate.mjs';
 import { schemaReady } from './lib/schema.js';
-import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS } from './lib/status.mjs';
+import { buildStatus, MAX_STATUS_ITEMS, STALE_AFTER_MS, resourceLiveness } from './lib/status.mjs';
 import { fixtureSearch, fixtureDetail, hubSearch, hubDetail, isFixtureEnv, validateRepoId } from './lib/catalog/hub.mjs';
 import { evaluateCompatibility, TELEMETRY_FRESH_MS } from './lib/catalog/estimate.mjs';
 import { validateManifestStructure, validateFileBytes, isByteEligible, validateRelPath as catalogRelPath, VALIDATOR_VERSION, MAX_MANIFEST_FILES, MAX_FILE_BYTES, MAX_ASSET_BYTES, MAX_HEADER_PEEK, MAX_MANIFEST_BYTES, MAX_PARTS_PER_UPLOAD, MAX_FINALIZE_FILE_BYTES } from './lib/catalog/validate.mjs';
 import { byteStore, storeAvailable, CHUNK_MAX_BYTES, assetPrefix, assetKey } from './lib/catalog/store.mjs';
 import { workerTransport, transportAvailable, TERMINAL_STATES, WORKER_STATES } from './lib/catalog/transport.mjs';
-import { grantPartiesSameSide, grantUsage } from './lib/access.js';
+import { grantPartiesSameSide, grantUsage, canUseResource } from './lib/access.js';
+import { createDispatchCoordinator } from './inference/dispatch-coordinator.mjs';
+import { createWorkerTransport, validateWorkerResultReport, WORKER_RESULT_MAX_BYTES } from './inference/worker-transport.mjs';
+import { getDispatchStore } from './inference/dispatch-wiring.mjs';
+import { matchGrant } from './fabric/policy.mjs';
 
 const VERSION = '0.5.0';
 const CSRF_HEADER = 'X-Aipster-CSRF';
@@ -95,6 +99,69 @@ const DISABLED_ALLOWED_AUTH = new Set(['/api/auth/sign-out', '/api/auth/revoke-s
 // session upkeep. Verified against better-auth 1.7.14 route sources
 // (dist/api/routes/*.mjs).
 const BUDGETED_AUTH_POST_ROUTES = new Set(['/api/auth/update-user', '/api/auth/change-email', '/api/auth/change-password', '/api/auth/delete-user', '/api/auth/update-session', '/api/auth/link-social']);
+
+// ---- inference dispatch (flag-gated; dark by default) --------------------
+// Every route below exists only when INFERENCE_ENABLED === '1'. Production
+// does not set the flag: POST /api/jobs keeps its exact 501 and every new
+// route falls through to the JSON 404, so no admission can be minted and no
+// worker job can be leased or completed.
+const inferenceEnabled = (env) => !!env && env.INFERENCE_ENABLED === '1';
+const ADMISSION_BODY_MAX = 4 * 1024;
+const DISPATCH_ROUTE_RE = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{7,127})$/;
+const DISPATCH_CANCEL_RE = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{7,127})\/cancel$/;
+const WORKER_RESULT_RE = /^\/api\/worker\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/result$/;
+const MODEL_ID_MAX = 256;
+// Addendum B: a Mac worker may serve a job from plain llama-server (Metal).
+// The runtime identity is server-validated here and pinned into the admission;
+// the coordinator carries it to task.placement.runtime_id and the instance id.
+const INFERENCE_RUNTIME_IDS = new Set(['ganglion', 'llama-server']);
+const DEFAULT_INFERENCE_RUNTIME_ID = 'ganglion';
+
+// Map a coordinator result onto HTTP. An explicit `http` always wins; the
+// fallbacks mirror the coordinator's own vocabulary and never turn an
+// unknown outcome into a success.
+function dispatchHttp(out) {
+  if (out && Number.isSafeInteger(out.http) && out.http >= 100 && out.http <= 599) return out.http;
+  if (!out) return 503;
+  if (out.status === 'settled') return 200;
+  if (out.status === 'dispatched') return 202;
+  if (out.status === 'pending') return 409;
+  if (out.status === 'released') return 409;
+  if (out.status === 'cancelled_before_start') return out.code === 'CANCELLED' ? 200 : 409;
+  if (out.status === 'expired_before_start') return 504;
+  if (out.status === 'rejected') return 400;
+  return 503;
+}
+
+// Normalize a live app-level grant into the fabric/policy.mjs shape the
+// coordinator re-checks, and prove it covers this exact request. The real
+// authorization is canUseResource (owner or live same-side grant with quota);
+// this step pins the remaining quota and exact resource/model so the stored
+// admission is a complete, no-stitching authority.
+function dispatchGrantFor({ grant, resource, principal_id, model_id, max_tokens, at }) {
+  const remainingTokens = Math.max(0, Number(grant.max_tokens) - Number(grant.used_tokens));
+  const remainingJobs = Math.max(0, Number(grant.max_jobs) - Number(grant.used_jobs));
+  if (!Number.isSafeInteger(remainingTokens) || !Number.isSafeInteger(remainingJobs)
+    || remainingJobs < 1 || remainingTokens < max_tokens) {
+    return { refused: 'GRANT_QUOTA_EXHAUSTED' };
+  }
+  const policy = {
+    id: grant.id, status: 'enforced', revoked: false, revision: 1,
+    recipientNode: resource.id, recipientWorkspace: 'default', consumers: [principal_id],
+    resourceId: resource.id, incarnation: resource.incarnation,
+    actions: ['inference'], models: [model_id], notBefore: grant.created_at,
+    expiry: new Date(at + 365 * 24 * 3600 * 1000).toISOString(),
+    ceilings: { maxTokens: remainingTokens }, route: 'internal',
+  };
+  const request = {
+    resourceId: resource.id, incarnation: resource.incarnation, action: 'inference', model: model_id,
+    peerNode: resource.id, peerWorkspace: 'default', consumer: principal_id, maxTokens: max_tokens,
+    route: 'internal', at: new Date(at).toISOString(),
+  };
+  const reasons = [];
+  if (!matchGrant(request, policy, reasons)) return { refused: 'NO_MATCHING_GRANT', reasons };
+  return { grant: policy };
+}
 
 function canonicalOrigin(env) {
   const raw = (env && env.BETTER_AUTH_URL) || '';
@@ -702,6 +769,33 @@ async function handleApi(request, env, url) {
     ? json(403, { error: 'The demo account cannot perform this action.', code: 'DEMO_RESTRICTED' })
     : null;
 
+  // Worker-pull endpoints require the existing heartbeat-scoped key bound to
+  // exactly one resource (migration 0013). Sessions, read keys, inference keys
+  // and unbound heartbeat keys authorize no worker job.
+  const workerScope = () => {
+    if (actor.kind === 'expired') return json(401, { error: 'API key expired.', code: 'KEY_EXPIRED' });
+    if (actor.kind !== 'key') {
+      return json(403, { error: 'Worker job endpoints require a heartbeat-scoped API key.', code: 'KEY_REQUIRED' });
+    }
+    if (actor.key.scope !== 'heartbeat' || !actor.key.resource_id) {
+      return json(403, { error: 'This API key is not a resource-bound heartbeat key.', code: 'KEY_SCOPE' });
+    }
+    return null;
+  };
+  // Trusted server mapping for the coordinator: principal and tenant are the
+  // authenticated user id (the app's tenant key), never client input.
+  const dispatchPrincipal = (a) => {
+    if (!a || (a.kind !== 'session' && a.kind !== 'key') || !a.user) return null;
+    if (a.kind === 'session') return { principal_id: a.user.id, tenant_id: a.user.id, actor_kind: 'session' };
+    return { principal_id: a.user.id, tenant_id: a.user.id, actor_kind: 'key', key_scope: a.key.scope };
+  };
+  const dispatchCoordinator = (store) => createDispatchCoordinator({
+    resolvePrincipal: dispatchPrincipal,
+    authority: store,
+    transport: createWorkerTransport(store),
+    now: () => Date.now(),
+  });
+
   // ---- inventory ----
   if (path === '/api/inventory' && method === 'GET') {
     const d = needAuthz('read'); if (d) return deny(d);
@@ -768,10 +862,16 @@ async function handleApi(request, env, url) {
         db.prepare(`UPDATE key_verifiers SET revoked_at = COALESCE(revoked_at, ?), resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(now, r.id, r.id, me()),
         db.prepare(`UPDATE pairing_codes SET resource_id = NULL WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM idempotency_keys WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
+        // Dispatch admissions reference the resource by FK (0024), so they
+        // must go before it; expiring queued/leased jobs revokes any pending
+        // worker pull. A later submit or lease therefore fails.
+        db.prepare(`UPDATE dispatch_jobs SET status = 'expired', updated_at = ?
+          WHERE resource_id = ? AND status IN ('queued', 'leased') AND ${owned}`).bind(now, r.id, r.id, me()),
+        db.prepare(`DELETE FROM dispatch_admissions WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
         db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
       ]);
-      if (Number(deleted[7].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      if (Number(deleted[9].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       return json(200, { ok: true });
     }
   }
@@ -2789,19 +2889,174 @@ async function handleApi(request, env, url) {
     }
   }
 
-  // ---- jobs (dispatch disabled; reads allowed) ----
+  // ---- inference admissions (server-issued; flag-gated, default off) ----
+  if (inferenceEnabled(env) && path === '/api/inference/admissions' && method === 'POST') {
+    const d = needAuthz('inference'); if (d) return deny(d);
+    if (actor.kind === 'session') { const c = needCsrf(); if (c) return deny(c); }
+    const body = await readJson(request, ADMISSION_BODY_MAX);
+    if (Object.keys(body).some((k) => !['resource_id', 'model_id', 'max_tokens', 'runtime_id'].includes(k))) {
+      return json(400, { error: 'Only resource_id, model_id, max_tokens and runtime_id are accepted.', code: 'UNSUPPORTED_FIELD' });
+    }
+    if (!isId(body.resource_id)) return json(400, { error: 'resource_id is required.', code: 'BAD_RESOURCE' });
+    if (typeof body.model_id !== 'string' || !body.model_id || body.model_id.length > MODEL_ID_MAX) {
+      return json(400, { error: 'model_id is required.', code: 'BAD_MODEL' });
+    }
+    if (!Number.isSafeInteger(body.max_tokens) || body.max_tokens < 1 || body.max_tokens > 4096) {
+      return json(400, { error: 'max_tokens must be an integer in 1..4096.', code: 'BAD_MAX_TOKENS' });
+    }
+    // Optional runtime identity (Addendum B). Absent means "ganglion"; any
+    // value outside the allowlist, including a non-string, is refused before
+    // the store is consulted so no admission is minted.
+    const runtime_id = body.runtime_id === undefined ? DEFAULT_INFERENCE_RUNTIME_ID : body.runtime_id;
+    if (typeof runtime_id !== 'string' || !INFERENCE_RUNTIME_IDS.has(runtime_id)) {
+      return json(400, { error: 'runtime_id must be one of: ganglion, llama-server.', code: 'BAD_RUNTIME' });
+    }
+    const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resource_id);
+    // Owner or live same-side grant with remaining quota; foreign and unknown
+    // resources answer the same 404 so existence is not disclosed.
+    const access = resource ? await canUseResource(db, actor.user.id, resource) : { ok: false };
+    if (!access.ok) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+    // "Reachable" freshness is the dashboard's read-time rule (online plus a
+    // heartbeat inside STALE_AFTER_MS), never the persisted flag alone.
+    const liveness = resourceLiveness(
+      { online: Number(resource.online) === 1, heartbeatAt: resource.heartbeat_at ?? null },
+      Date.now(),
+    );
+    if (liveness !== 'online') {
+      return json(409, { error: 'The resource heartbeat is stale; no admission was issued.', code: 'RESOURCE_STALE' });
+    }
+    let grant = null;
+    if (access.grantId) {
+      const pinned = dispatchGrantFor({
+        grant: access.grant, resource, principal_id: actor.user.id,
+        model_id: body.model_id, max_tokens: body.max_tokens, at: Date.now(),
+      });
+      if (pinned.refused === 'GRANT_QUOTA_EXHAUSTED') {
+        return json(429, { error: 'Grant capacity is exhausted for this request.', code: 'GRANT_QUOTA_EXHAUSTED' });
+      }
+      if (!pinned.grant) {
+        return json(403, { error: 'No single grant covers this request.', code: 'NO_MATCHING_GRANT', reasons: pinned.reasons || [] });
+      }
+      grant = pinned.grant;
+    }
+    const store = await getDispatchStore(env, db);
+    if (!store) return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+    let admission;
+    try {
+      admission = await store.issueAdmission({
+        principal: { principal_id: actor.user.id, tenant_id: actor.user.id },
+        resource_id: resource.id, model_id: body.model_id, max_tokens: body.max_tokens,
+        runtime_id, grant,
+      });
+    } catch (err) {
+      // A per-principal cap is a stable, retryable refusal, not an outage.
+      if (err && err.status === 429 && err.code === 'DISPATCH_LIMIT') {
+        return json(429, { error: err.message, code: 'DISPATCH_LIMIT' });
+      }
+      return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+    }
+    if (!admission || typeof admission.admission_ref !== 'string' || !admission.admission_ref
+      || !Number.isSafeInteger(admission.expires_at) || typeof admission.model_id !== 'string'
+      || !Number.isSafeInteger(admission.max_tokens)) {
+      return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+    }
+    return json(201, {
+      admission_ref: admission.admission_ref, expires_at: admission.expires_at,
+      model_id: admission.model_id, max_tokens: admission.max_tokens,
+    });
+  }
+
+  // ---- jobs (dispatch disabled unless the flag is on; reads allowed) ----
   if (path === '/api/jobs' && method === 'POST') {
     const d = needAuthz('inference'); if (d) return deny(d);
     if (actor.kind === 'session') { const c = needCsrf(); if (c) return deny(c); }
-    return json(501, { error: 'Inference dispatch is disabled. No job was created and no compute ran.', code: 'INFERENCE_DISABLED' });
+    if (!inferenceEnabled(env)) {
+      return json(501, { error: 'Inference dispatch is disabled. No job was created and no compute ran.', code: 'INFERENCE_DISABLED' });
+    }
+    const store = await getDispatchStore(env, db);
+    if (!store) return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+    const body = await readJson(request);
+    const out = await dispatchCoordinator(store).submit(actor, body);
+    return json(dispatchHttp(out), out);
+  }
+  // Reconcile and cancel are principal-scoped by idempotency key. They take
+  // precedence over the legacy job-by-id read while the flag is on.
+  if (inferenceEnabled(env)) {
+    const rec = DISPATCH_ROUTE_RE.exec(path);
+    if (rec && method === 'GET') {
+      const d = needAuthz('inference'); if (d) return deny(d);
+      const store = await getDispatchStore(env, db);
+      if (!store) return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+      const out = await dispatchCoordinator(store).reconcile(actor, rec[1]);
+      return json(dispatchHttp(out), out);
+    }
+    const cancel = DISPATCH_CANCEL_RE.exec(path);
+    if (cancel && method === 'POST') {
+      const d = needAuthz('inference'); if (d) return deny(d);
+      if (actor.kind === 'session') { const c = needCsrf(); if (c) return deny(c); }
+      const store = await getDispatchStore(env, db);
+      if (!store) return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+      const out = await dispatchCoordinator(store).cancel(actor, cancel[1]);
+      return json(dispatchHttp(out), out);
+    }
   }
   {
     const m = /^\/api\/jobs\/([A-Za-z0-9_-]{1,64})$/.exec(path);
-    if (m && method === 'GET') {
+    if (m && method === 'GET' && !inferenceEnabled(env)) {
       const d = needAuthz('read'); if (d) return deny(d);
       const j = await first(db, 'SELECT * FROM jobs WHERE id = ? AND owner_id = ?', m[1], me());
       if (!j) return json(404, { error: 'Job not found or not yours.', code: 'NOT_FOUND' });
       return json(200, mapJob(j));
+    }
+  }
+
+  // ---- worker pull (heartbeat-scoped key bound to one resource) ----
+  if (inferenceEnabled(env) && path === '/api/worker/jobs/next' && method === 'GET') {
+    const refusal = workerScope(); if (refusal) return refusal;
+    const store = await getDispatchStore(env, db);
+    if (!store) return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+    let lease;
+    try {
+      lease = await store.leaseNextJob({ resource_id: actor.key.resource_id, now: Date.now() });
+    } catch {
+      return json(503, { error: 'The job lease could not be read.', code: 'DISPATCH_UNAVAILABLE' });
+    }
+    if (lease === null) return new Response(null, { status: 204, headers: baseHeaders() });
+    if (!lease || typeof lease.job_id !== 'string' || typeof lease.lease_id !== 'string'
+      || !lease.envelope || !Number.isSafeInteger(lease.deadline_at)) {
+      // A malformed lease is an unknown outcome: hand out nothing.
+      return json(503, { error: 'The job lease could not be read.', code: 'DISPATCH_UNAVAILABLE' });
+    }
+    return json(200, {
+      job_id: lease.job_id, lease_id: lease.lease_id, envelope: lease.envelope, deadline_at: lease.deadline_at,
+    });
+  }
+  {
+    const m = WORKER_RESULT_RE.exec(path);
+    if (inferenceEnabled(env) && m && method === 'POST') {
+      const refusal = workerScope(); if (refusal) return refusal;
+      const body = await readJson(request, WORKER_RESULT_MAX_BYTES);
+      const checked = validateWorkerResultReport(body);
+      if (!checked.ok) return json(checked.http, { error: checked.message, code: checked.code });
+      const store = await getDispatchStore(env, db);
+      if (!store) return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+      let out;
+      try {
+        out = await store.completeJob({
+          job_id: m[1], lease_id: checked.value.lease_id, resource_id: actor.key.resource_id,
+          status: checked.value.status, result: checked.value.result,
+        });
+      } catch {
+        return json(503, { error: 'The result could not be stored.', code: 'DISPATCH_UNAVAILABLE' });
+      }
+      if (!out || out.accepted !== true) {
+        return json(409, {
+          error: 'The result was not accepted for this job, lease or resource.',
+          code: 'RESULT_REJECTED',
+          reason: out && typeof out.reason === 'string' ? out.reason : 'unknown',
+        });
+      }
+      return json(200, { ok: true, job_id: m[1], status: checked.value.status });
     }
   }
   if (path === '/api/jobs' && method === 'GET') {

@@ -1,11 +1,11 @@
 # Builds and qualifies the Windows x86-64 local-worker installer on every PR
 # touching the worker. This gates the packaging scripts only: it publishes
-# no release. The run-scoped screenshot PNGs are uploaded as workflow
-# artifacts (review evidence, not a release). The release owner builds the
-# release artifact from the merged commit with the same pinned script and
-# uploads it by hand after independent review; the manifest records the
-# source SHA so any build is verifiable. macOS/Linux jobs land with their
-# staged packaging PRs.
+# no release. The run-scoped Setup exe + manifest + checksums and the
+# screenshot PNGs are uploaded as workflow artifacts (review evidence, not
+# a release). The release owner builds the release artifact from the merged
+# commit with the same pinned script and uploads it by hand after independent
+# review; the manifest records the source SHA so any build is verifiable.
+# macOS/Linux jobs land with their staged packaging PRs.
 name: Worker installer build
 on:
   pull_request:
@@ -38,6 +38,19 @@ jobs:
         working-directory: local-worker
       - run: uv run --no-project --python 3.12.14 python packaging/windows/qualify.py
         working-directory: local-worker
+      # Qualified installer payload as review evidence (not a release): the
+      # Setup exe plus its identity files. dist/ holds only the frozen
+      # payload, licenses, manifest, checksums, and screenshots — no
+      # secrets, tokens, pairing stores, or data directories.
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5 verified 2026-10-29
+        with:
+          name: windows-installer-qualified
+          path: |
+            local-worker/packaging/windows/dist/AIPSTER-Worker-*-win64-setup.exe
+            local-worker/packaging/windows/dist/manifest.json
+            local-worker/packaging/windows/dist/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error
       # Isolated-runner GUI evidence: drives the real wizard, Start Menu,
       # worker console and uninstaller on the runner's own desktop (never the
       # owner's screen). Runs after qualify so ports/singletons are free.

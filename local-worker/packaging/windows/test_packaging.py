@@ -999,4 +999,223 @@ class InstallerPairingSurfaceTests(unittest.TestCase):
         self.assertIn(('pair_console', 'synthetic-exe', 'pair'), backend.events)
 
 
+class FirstRunHonestyTests(unittest.TestCase):
+    """GOOSE-REAL-WORKER-DELIVERY-0811 (packaging/first-run lane only).
+
+    Fresh first-run must read as setup-required/unqualified until a real
+    configured runtime is selected; mock stays an explicit test/demo
+    option, never silent operational success. Fixture metadata only: no
+    downloads, no runtime start/stop, no credentials, no enrollment.
+    """
+
+    def mock_only_loaded(self):
+        return SimpleNamespace(
+            node=SimpleNamespace(host='127.0.0.1', port=8090,
+                                 token_env='DENDRITE_API_TOKEN'),
+            runtimes=[SimpleNamespace(id='mock', kind='mock')],
+            models=[SimpleNamespace(id='mock-summary', runtime='mock',
+                                    capabilities=['summarize'], path=None,
+                                    upstream_model=None)])
+
+    def test_mock_only_config_is_setup_required(self):
+        result = first.classify_runtime_selection(self.mock_only_loaded())
+        self.assertEqual(result['status'], 'setup-required')
+        self.assertTrue(result['mock_only'])
+        self.assertIn('test/demo', result['reason'].lower())
+        self.assertIn('ik_llama', result['guidance'])
+
+    def test_shipped_default_toml_is_setup_required(self):
+        import tomllib
+        raw = tomllib.loads((WINDOWS / 'default.toml').read_text(encoding='utf-8'))
+        loaded = SimpleNamespace(
+            node=SimpleNamespace(host='127.0.0.1', port=8090,
+                                 token_env='DENDRITE_API_TOKEN'),
+            runtimes=[SimpleNamespace(id=r['id'], kind=r['kind'])
+                      for r in raw['runtimes']],
+            models=[SimpleNamespace(id=m['id'], runtime=m['runtime'],
+                                    capabilities=m['capabilities'],
+                                    path=m.get('path'), upstream_model=None)
+                    for m in raw['models']])
+        result = first.classify_runtime_selection(loaded)
+        self.assertEqual(result['status'], 'setup-required')
+        self.assertTrue(result['mock_only'])
+
+    def test_placeholder_cpu_model_is_setup_required(self):
+        loaded = SimpleNamespace(
+            node=SimpleNamespace(host='127.0.0.1', port=8090,
+                                 token_env='DENDRITE_API_TOKEN'),
+            runtimes=[SimpleNamespace(id='cpu', kind='ik_llama')],
+            models=[SimpleNamespace(id='operator-model', runtime='cpu',
+                                    capabilities=['summarize'],
+                                    path='../models/replace-with-your-model.gguf',
+                                    upstream_model=None)])
+        result = first.classify_runtime_selection(loaded)
+        self.assertEqual(result['status'], 'setup-required')
+        self.assertFalse(result['mock_only'])
+
+    def test_real_ik_llama_model_is_ready(self):
+        with tempfile.TemporaryDirectory(prefix='aipster-model-') as tmp:
+            gguf = Path(tmp) / 'model.gguf'
+            gguf.write_bytes(b'fixture-gguf')
+            loaded = SimpleNamespace(
+                node=SimpleNamespace(host='127.0.0.1', port=8090,
+                                     token_env='DENDRITE_API_TOKEN'),
+                runtimes=[SimpleNamespace(id='cpu', kind='ik_llama')],
+                models=[SimpleNamespace(id='operator-model', runtime='cpu',
+                                        capabilities=['summarize'],
+                                        path=str(gguf), upstream_model=None)])
+            result = first.classify_runtime_selection(loaded)
+            self.assertEqual(result['status'], 'ready')
+
+    def test_prepare_surfaces_setup_required_on_fresh_mock(self):
+        import types
+        saved = {name: sys.modules.get(name)
+                 for name in ('dendrite', 'dendrite.config', 'pydantic')}
+
+        def fixture_load_config(path):
+            import tomllib
+            raw = tomllib.loads(Path(path).read_text(encoding='utf-8'))
+            return SimpleNamespace(
+                node=SimpleNamespace(host=raw['node']['host'],
+                                     port=raw['node']['port'],
+                                     token_env='DENDRITE_API_TOKEN'),
+                runtimes=[SimpleNamespace(id=r['id'], kind=r['kind'])
+                          for r in raw['runtimes']],
+                models=[SimpleNamespace(id=m['id'], runtime=m['runtime'],
+                                        capabilities=m['capabilities'],
+                                        path=m.get('path'), upstream_model=None)
+                        for m in raw['models']])
+
+        fake_config_mod = types.ModuleType('dendrite.config')
+        fake_config_mod.load_config = fixture_load_config
+        fake_dendrite = types.ModuleType('dendrite')
+        fake_dendrite.config = fake_config_mod
+        fake_pydantic = types.ModuleType('pydantic')
+        fake_pydantic.ValidationError = type('ValidationError', (Exception,), {})
+        sys.modules['dendrite'] = fake_dendrite
+        sys.modules['dendrite.config'] = fake_config_mod
+        sys.modules['pydantic'] = fake_pydantic
+        try:
+            with tempfile.TemporaryDirectory(prefix='aipster-firstrun-honest-') as tmp:
+                data = Path(tmp) / 'worker-data'
+                logs = []
+                ctl = controller.Controller(data, HeadlessBackend(logs.append))
+                ctl.prepare()
+                self.assertEqual(ctl.state, state.STOPPED)
+                self.assertIn('setup required', ctl.detail.lower())
+                self.assertFalse(first.first_run_ready(ctl.loaded),
+                                 'mock-only first run must not auto-start as operational')
+        finally:
+            for name, module in saved.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+
+class ExplicitMockDemoTests(unittest.TestCase):
+    """Explicit mock test/demo start path (never silent auto-start).
+
+    Red-CI repro: installer-build run 41413151834 failed
+    (headless/fresh/orphan/rotation tray checks) because mock-only
+    configs honestly stay setup-required. The qualify matrix elects
+    the mock demo explicitly per launch via AIPSTER_WORKER_MOCK_DEMO=1.
+    """
+
+    def mock_only_loaded(self):
+        return SimpleNamespace(
+            node=SimpleNamespace(host='127.0.0.1', port=8090,
+                                 token_env='DENDRITE_API_TOKEN'),
+            runtimes=[SimpleNamespace(id='mock', kind='mock')],
+            models=[SimpleNamespace(id='mock-summary', runtime='mock',
+                                    capabilities=['summarize'], path=None,
+                                    upstream_model=None)])
+
+    def test_silent_auto_start_stays_banned_with_demo_env(self):
+        with patch.dict(os.environ, {first.MOCK_DEMO_ENV: '1'}):
+            self.assertFalse(first.first_run_ready(self.mock_only_loaded()))
+
+    def test_explicit_demo_election_labels_mock(self):
+        self.assertFalse(first.explicit_demo_ready(self.mock_only_loaded()))
+        self.assertIn('setup required',
+                      first.runtime_note(self.mock_only_loaded()))
+        with patch.dict(os.environ, {first.MOCK_DEMO_ENV: '1'}):
+            self.assertTrue(first.explicit_demo_ready(self.mock_only_loaded()))
+            note = first.runtime_note(self.mock_only_loaded())
+            self.assertIn('test/demo', note)
+            self.assertIn('not operational', note)
+
+    def test_demo_env_elects_only_mock(self):
+        placeholder = SimpleNamespace(
+            node=SimpleNamespace(host='127.0.0.1', port=8090,
+                                 token_env='DENDRITE_API_TOKEN'),
+            runtimes=[SimpleNamespace(id='cpu', kind='ik_llama')],
+            models=[SimpleNamespace(id='operator-model', runtime='cpu',
+                                    capabilities=['summarize'],
+                                    path='../models/replace-with-your-model.gguf',
+                                    upstream_model=None)])
+        with patch.dict(os.environ, {first.MOCK_DEMO_ENV: '1'}):
+            self.assertFalse(first.explicit_demo_ready(placeholder))
+            self.assertIn('setup required', first.runtime_note(placeholder))
+            with tempfile.TemporaryDirectory(prefix='aipster-model-') as tmp:
+                gguf = Path(tmp) / 'model.gguf'
+                gguf.write_bytes(b'fixture-gguf')
+                ready = SimpleNamespace(
+                    node=placeholder.node,
+                    runtimes=placeholder.runtimes,
+                    models=[SimpleNamespace(id='operator-model', runtime='cpu',
+                                            capabilities=['summarize'],
+                                            path=str(gguf), upstream_model=None)])
+                self.assertEqual(first.runtime_note(ready), '',
+                                 'a real runtime is unaffected by the demo flag')
+
+    def test_prepare_labels_explicit_demo_and_gate_passes(self):
+        import types
+        saved = {name: sys.modules.get(name)
+                 for name in ('dendrite', 'dendrite.config', 'pydantic')}
+
+        def fixture_load_config(path):
+            import tomllib
+            raw = tomllib.loads(Path(path).read_text(encoding='utf-8'))
+            return SimpleNamespace(
+                node=SimpleNamespace(host=raw['node']['host'],
+                                     port=raw['node']['port'],
+                                     token_env='DENDRITE_API_TOKEN'),
+                runtimes=[SimpleNamespace(id=r['id'], kind=r['kind'])
+                          for r in raw['runtimes']],
+                models=[SimpleNamespace(id=m['id'], runtime=m['runtime'],
+                                        capabilities=m['capabilities'],
+                                        path=m.get('path'), upstream_model=None)
+                        for m in raw['models']])
+
+        fake_config_mod = types.ModuleType('dendrite.config')
+        fake_config_mod.load_config = fixture_load_config
+        fake_dendrite = types.ModuleType('dendrite')
+        fake_dendrite.config = fake_config_mod
+        fake_pydantic = types.ModuleType('pydantic')
+        fake_pydantic.ValidationError = type('ValidationError', (Exception,), {})
+        sys.modules['dendrite'] = fake_dendrite
+        sys.modules['dendrite.config'] = fake_config_mod
+        sys.modules['pydantic'] = fake_pydantic
+        try:
+            with tempfile.TemporaryDirectory(prefix='aipster-demo-') as tmp:
+                data = Path(tmp) / 'worker-data'
+                logs = []
+                with patch.dict(os.environ, {first.MOCK_DEMO_ENV: '1'}):
+                    ctl = controller.Controller(data, HeadlessBackend(logs.append))
+                    ctl.prepare()
+                    self.assertEqual(ctl.state, state.STOPPED)
+                    self.assertIn('test/demo', ctl.detail)
+                    self.assertTrue(
+                        first.first_run_ready(ctl.loaded)
+                        or first.explicit_demo_ready(ctl.loaded),
+                        'the run gate admits only ready or explicitly elected demo')
+        finally:
+            for name, module in saved.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+
 if __name__ == '__main__': unittest.main(verbosity=2)

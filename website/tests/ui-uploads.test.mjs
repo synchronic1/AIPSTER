@@ -151,10 +151,10 @@ test('private detail opens from My assets and evaluates with the asset ref', asy
   ui.el('my-assets').onclick({ target: { dataset: { myasset: id } } });
   await ui.waitForDOM(() => ui.el('asset-detail').innerHTML.includes('Model card'), 'private detail never rendered');
   assert.ok(ui.el('asset-detail').innerHTML.includes('digest pending pinned resolve') || ui.el('asset-detail').innerHTML.includes('m.gguf'), 'manifest shown');
-  for (let i = 0; i < 200; i++) {
-    if (ui.el('compat-form').listeners.submit) break;
-    await new Promise(setImmediate);
-  }
+  // The submit listener registers after an awaited node fetch, so wait with
+  // the file's loud poll helper (400 ticks, clear timeout message) instead of
+  // a fixed silent tick budget. No assertion is changed by this wait.
+  await ui.pollProp(() => ui.el('compat-form').listeners.submit, 'compat submit listener never registered');
   ui.el('compat-node').value = reg.json.id;
   ui.el('compat-runtime').value = 'fixture-llama';
   ui.el('compat-context').value = '512';

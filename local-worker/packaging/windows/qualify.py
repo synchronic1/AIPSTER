@@ -427,6 +427,11 @@ class TrayLab:
         private_fixture_directory(data)
         env = scrubbed_env()
         env["AIPSTER_WORKER_DATA"] = str(data)
+        from aipster_tray.firstrun import MOCK_DEMO_ENV
+        # Explicit test/demo election: the tray matrix drives mock-only
+        # configs on purpose, so it elects the mock demo per launch instead
+        # of relying on silent auto-start (which stays banned).
+        env[MOCK_DEMO_ENV] = "1"
         return env, data
 
     def launch(self, env):
@@ -467,6 +472,9 @@ def tray_matrix(app_dir, work):
         check("headless tray reaches running", bool(payload and payload["state"] == "running"),
               json.dumps(payload) if payload else "no state file")
         worker_pid = (payload or {}).get("worker_pid")
+        check("mock demo run is labeled test/demo (never silent)",
+              "test/demo" in ((payload or {}).get("detail") or ""),
+              json.dumps(payload) if payload else "no state file")
         check("state carries the worker pid + endpoint",
               bool(worker_pid) and (payload or {}).get("port") == port, json.dumps(payload))
         token = (data / "api-token.txt").read_text(encoding="utf-8").strip()

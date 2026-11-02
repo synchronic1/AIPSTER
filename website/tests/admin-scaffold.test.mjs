@@ -147,8 +147,11 @@ test('admin: live grant unlocks scoped reads as unavailable envelopes, never zer
   assert.equal(status.status, 200);
   assert.equal(status.json.grant.role, 'operations_observer');
   assert.equal(status.json.elevation, 'not_implemented');
-  for (const p of ['/api/admin/v1/overview', '/api/admin/v1/fabrics', '/api/admin/v1/resources',
-    '/api/admin/v1/operations/health', '/api/admin/v1/operations/alerts', '/api/admin/v1/coverage']) {
+  // Milestone 1: overview, resources, operations/health, and coverage are
+  // live reads; their available/unavailable behavior is pinned in
+  // admin-milestone1.test.mjs (a healthy store reports available, a failed
+  // read reports unavailable with null totals - never a fabricated zero).
+  for (const p of ['/api/admin/v1/fabrics', '/api/admin/v1/operations/alerts']) {
     const out = await readJson(await t.call(p, { headers: t.as(t.alice) }));
     assert.equal(out.status, 200, p);
     assert.equal(out.json.state, 'unavailable', p);

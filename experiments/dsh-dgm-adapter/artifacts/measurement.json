@@ -1,0 +1,568 @@
+{
+  "schema": "aipster.dsh-dgm.measurement/v1",
+  "fixtures": 7,
+  "artifacts": 14,
+  "policies": [
+    "synthetic-no-gate",
+    "dgm-gate"
+  ],
+  "policy_labels": {
+    "synthetic-no-gate": "Synthetic no-gate reference: parse-only admission, upstream human pull-request review excluded",
+    "dgm-gate": "DGM fixture gate: deterministic predicates, identity, envelope and receipt"
+  },
+  "subject_sets": {
+    "baseline": "the fixture artifact that carries the authored labelled defects",
+    "candidate": "the repaired candidate artifact; clean by construction"
+  },
+  "repeats_per_request": 2,
+  "metrics": {
+    "synthetic-no-gate": {
+      "artifacts": 14,
+      "defect_admission_ppm": 1000000,
+      "false_rejection_ppm": 0,
+      "work_units_total": 14,
+      "repair_items_total": 0,
+      "criteria_coverage_ppm": 0
+    },
+    "dgm-gate": {
+      "artifacts": 14,
+      "defect_admission_ppm": 0,
+      "false_rejection_ppm": 0,
+      "work_units_total": 280,
+      "repair_items_total": 8,
+      "criteria_coverage_ppm": 1000000,
+      "labelled_defects_detected": 8,
+      "labelled_defects_missed": 0,
+      "unlabelled_failures": 0,
+      "exact_label_matches": 6,
+      "defective_artifacts": 6,
+      "clean_without_failures": 8,
+      "clean_artifacts": 8
+    }
+  },
+  "determinism": {
+    "verdicts": 14,
+    "distinct_digests": 14,
+    "all_replays_identical": true
+  },
+  "latency": {
+    "samples": 14,
+    "p50_ms": 0.5564999999999998,
+    "p95_ms": 3.4488000000000003,
+    "max_ms": 3.4488000000000003,
+    "note": "observed wall time on this machine; excluded from the report digest; not evidence of speed"
+  },
+  "rows": [
+    {
+      "fixture_id": "sm-101",
+      "subject": "baseline",
+      "labelled_defects": [
+        "C1",
+        "C3"
+      ],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": true,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "rejected",
+        "code": "DGM_CRITERIA_FAILED",
+        "subject_ppm": 750000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [
+          "C1",
+          "C3"
+        ],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [
+          "C1",
+          "C3"
+        ],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "9e578e79122c3a2392a2dc8b5a8ff47177197b1effd0605679a374917e67a1fb",
+        "verdict_sha256": "4bb822c288ba6e67cd210f71f3357bbd3702b8a43b6d9a4d74d2428ce76c389e"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-101",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 750000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "12a5d1dd9705155e734050f21104286433c6b4b8248d6aafe5ca85bfa9a1c4be",
+        "verdict_sha256": "b7ebb1f7c61a75322cbe7471914c369dc2cb14ad897d3b9d560f891a83364b58"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-102",
+      "subject": "baseline",
+      "labelled_defects": [
+        "C2"
+      ],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": true,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "rejected",
+        "code": "DGM_CRITERIA_FAILED",
+        "subject_ppm": 875000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [
+          "C2"
+        ],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [
+          "C2"
+        ],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "bb38e545de80204d2dad57ef570239ad5b3627f80677132292320f2d7da0531f",
+        "verdict_sha256": "98c1142dc42f6a49a2e2722fd4b42c806ce473eba604c8e76940487dff70b91d"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-102",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 875000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "ee4be8af6cbf43bc6b2095fa560ecfee44cbfcb8763c241c0eccd7c55a30d833",
+        "verdict_sha256": "a5eb61a5a7c697c6d2945f3f2fcf638955948812ea420ccf6abed6b9b99d9aea"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-103",
+      "subject": "baseline",
+      "labelled_defects": [
+        "C4"
+      ],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": true,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "rejected",
+        "code": "DGM_CRITERIA_FAILED",
+        "subject_ppm": 875000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [
+          "C4"
+        ],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [
+          "C4"
+        ],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "77eb32da920610c4d7f7828cc076cd3ee963c4adebf3dd58995f3d703ea68d45",
+        "verdict_sha256": "912528b9c2588ce611a807e63a6c3f0cff8be9ea10808e6f01443403e555e251"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-103",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 875000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "135f96adbe7de1309abb7efc80be1c0eee35f285a5f9a0ba5dcb559bd1c779a8",
+        "verdict_sha256": "2b5e9dae42ea3f36a0b6ed7d3a3d36a4b20114c651c44a3974c36cb60ca536db"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-104",
+      "subject": "baseline",
+      "labelled_defects": [
+        "C7"
+      ],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": true,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "rejected",
+        "code": "DGM_CRITERIA_FAILED",
+        "subject_ppm": 875000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [
+          "C7"
+        ],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [
+          "C7"
+        ],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "3044a0e4c42a80a6b0f53a100b4f01bc03610ca9cd81727f5259377e109f4ddf",
+        "verdict_sha256": "07f46f548f45ce5975c3b258bd21866ba54da54ef6352be11282110b3041ff24"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-104",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 875000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "25e299022541929d3f69c1084012db86dcfd7d371a333e9437b4c77fa39f4822",
+        "verdict_sha256": "80044090d20f2662a8619690969eadf7b01ce5d222f33ed0c65d7736333bdf45"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-105",
+      "subject": "baseline",
+      "labelled_defects": [
+        "C5"
+      ],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": true,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "rejected",
+        "code": "DGM_CRITERIA_FAILED",
+        "subject_ppm": 875000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [
+          "C5"
+        ],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [
+          "C5"
+        ],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "195d4f0a493e253d981a8d3eb26b74991ec808d2b5d44b94fb5a0bb110106658",
+        "verdict_sha256": "806bf91daceb3e8c6659b68944f4b95af5c5f19f1907eda3bae61e0c3af3a8b2"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-105",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 875000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "6fd8a54c4be3be159306e9bb26856f6ab66b9ce293d912e9ee7b99a349ccdc47",
+        "verdict_sha256": "cf352e8bf057640e3ad0703ce6b442850ccf01e54e53ab4e8753a4067a12b489"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-106",
+      "subject": "baseline",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "d0e1f4697c78b19d3735fd467bcd327e181ab141b6189d0934ec728de985e666",
+        "verdict_sha256": "9de77a6d13f76f93bf4c6d63b7293efdf7728981edcf49aab5edf20613af7081"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-106",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "01c61ede01ad28723ba4e04c22fc3b7ea5be2bccb5da5ceba6aa55ae4043bd99",
+        "verdict_sha256": "4b900c2da0cfc0b76f2265e8ef1e25ae4d9874a72c3b7e287662d21258d06ceb"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-107",
+      "subject": "baseline",
+      "labelled_defects": [
+        "C6",
+        "C8"
+      ],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": true,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "rejected",
+        "code": "DGM_CRITERIA_FAILED",
+        "subject_ppm": 750000,
+        "reference_ppm": 1000000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [
+          "C6",
+          "C8"
+        ],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [
+          "C6",
+          "C8"
+        ],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "f8f6d36fda99d7dbeaa2c68b149643262b95949282d71c2999971db93e801662",
+        "verdict_sha256": "2c5c760c90c2f4ffdae9f852ae8d90c7fa2d0c87ccce0c1858c0148456bf2e14"
+      },
+      "deterministic": true
+    },
+    {
+      "fixture_id": "sm-107",
+      "subject": "candidate",
+      "labelled_defects": [],
+      "parse_policy": {
+        "status": "selected",
+        "work_units": 1,
+        "admitted_defect": false,
+        "rejected_clean": false
+      },
+      "gate_policy": {
+        "status": "selected",
+        "code": "DGM_SELECTED",
+        "subject_ppm": 1000000,
+        "reference_ppm": 750000,
+        "work_units": 20,
+        "subject_predicates": 8,
+        "reference_predicates": 8,
+        "admitted_defect": false,
+        "rejected_clean": false,
+        "detected_defects": [],
+        "missed_defects": [],
+        "extra_failures": [],
+        "repair_items": [],
+        "exact_labels": true
+      },
+      "digests": {
+        "request_sha256": "c3b1503bf5fe95f1fa0d6fe3660f4ce1f71c58860e5cc8c015c6e268b1a84a9f",
+        "verdict_sha256": "e8dffaa8220b9917ecb092081f5c70b6ae7800bc07cd68ca0be954df25c94b72"
+      },
+      "deterministic": true
+    }
+  ],
+  "evidence": [],
+  "limitations": [
+    "No model runs in this experiment; every check is a deterministic predicate over fixture data.",
+    "The fixture set is authored and small; pass rates describe these fixtures, not general model quality.",
+    "The comparison policy is a synthetic no-gate reference (parse-only), with upstream human pull-request review excluded. It is not a measurement of dsh-superagent, of DeepSeek Harness, or of any model.",
+    "Latency is reported as observed wall time and is excluded from every digest; it is not reproducible evidence of speed.",
+    "Work units count deterministic predicate evaluations, not tokens, tool calls or money.",
+    "The adapter maps synthetic dsh-superagent-shaped records; it does not execute dsh-superagent or DeepSeek Harness.",
+    "No verdict applies, promotes, executes, merges or writes to GitHub, even when a proposal is selected.",
+    "Scores are fixture check pass rates in parts per million, not upstream or DGM harness scores.",
+    "Seals are unkeyed SHA-256 over canonical JSON: they prove integrity and determinism, not authorship or permission. Anyone who can run code here can re-seal a changed record.",
+    "Verdicts are bound to a fixture by re-derivation, not by identity. The adapter cannot tell who produced a record, only whether it reproduces.",
+    "The fixture corpus passed to select() is trusted input. A forged fixture reproduces by construction, so re-derivation proves consistency with the supplied fixtures, not their authenticity.",
+    "Request validation is total over JSON values. An in-process caller can still pass an object with a throwing getter or Proxy, which escapes as an exception; JSON.parse cannot produce that shape.",
+    "The runtime no-effect probe denies capabilities in a Node child process and exercises the Node-side path (adapter, evaluate, selection, measure). It does not load the browser demo, which cannot be imported outside a DOM; the browser surface is covered by manual QA only.",
+    "Metrics are fixture-relative: seven authored work items, fourteen artifacts, eight predicates.",
+    "The two policies differ in what they check, not in model or data; this is a gate comparison, not a capability comparison.",
+    "The no-gate column omits upstream human review of the pull request, which is the control that would catch these defects in practice. Do not read it as upstream performance.",
+    "A lower work-unit count is not a quality gain; it is a smaller predicate set."
+  ],
+  "report_sha256": "ca23d01f38727541ac8cd1f8bbe6553811c52b2a7a916be36bda72bdc6e0cfe9"
+}

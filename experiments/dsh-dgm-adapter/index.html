@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AIPSTER · DSH × DGM experiment</title>
+  <meta name="description" content="Shadow-only experimental adapter between dsh-superagent-shaped proposals and AIPSTER DGM's deterministic fixture gate. Synthetic fixtures. Nothing is applied." />
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="masthead">
+    <div class="wrap masthead__inner">
+      <div class="wordmark">
+        <span class="wordmark__mark" aria-hidden="true">A</span>
+        <span class="wordmark__text">AIPSTER</span>
+      </div>
+      <p class="eyebrow">Experiment 01 · DSH × DGM</p>
+      <h1 class="title">A bounded gate for proposals an agent wants to make about itself.</h1>
+      <p class="lede">
+        The upstream DSH superagent records a proposal and drops it. This adapter takes that same
+        proposal shape, binds it to a fixed synthetic fixture, runs deterministic acceptance
+        predicates, and returns a sealed verdict with a repair brief. It never applies, promotes,
+        merges or executes anything.
+      </p>
+      <ul class="badges" aria-label="Experiment properties">
+        <li class="badge badge--calm">shadow only</li>
+        <li class="badge badge--calm">synthetic fixtures</li>
+        <li class="badge badge--calm">no model</li>
+        <li class="badge badge--strong">nothing is applied</li>
+      </ul>
+      <dl class="meta">
+        <div><dt>Adapter</dt><dd id="meta-module">aipster.dsh-dgm.adapter</dd></div>
+        <div><dt>Version</dt><dd id="meta-version">1.1.0</dd></div>
+        <div><dt>Upstream base</dt><dd><code>6337fc8</code></dd></div>
+        <div><dt>Authority</dt><dd>shadow_only</dd></div>
+      </dl>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <section class="panel panel--gate" aria-labelledby="gate-title">
+      <div class="panel__head">
+        <div>
+          <h2 id="gate-title" class="panel__title">Opt-in gate</h2>
+          <p class="panel__note">
+            The adapter is disabled unless it is explicitly switched on. This mirrors the
+            <code>DSH_DGM_EXPERIMENT_ENABLED</code> flag; enabling it changes nothing outside this page.
+          </p>
+        </div>
+        <div class="gate-controls">
+          <span class="state" id="gate-state" data-state="off">disabled</span>
+          <button class="button" id="gate-toggle" type="button" aria-pressed="false">Enable experiment</button>
+        </div>
+      </div>
+      <p class="gate-message" id="gate-message" role="status">
+        The experiment is off. No fixture was read and no verdict exists yet.
+      </p>
+    </section>
+
+    <section class="panel" id="run-panel" aria-labelledby="run-title" hidden>
+      <div class="panel__head">
+        <div>
+          <h2 id="run-title" class="panel__title">Control</h2>
+          <p class="panel__note">
+            Every action runs in this browser tab against in-memory fixtures. Nothing is sent anywhere.
+          </p>
+        </div>
+        <div class="controls">
+          <button class="button button--primary" id="run-sweep" type="button">Run 14-artifact sweep</button>
+          <button class="button" id="run-replay" type="button">Replay determinism check</button>
+          <button class="button" id="run-tamper" type="button">Post-seal tamper check</button>
+          <button class="button" id="run-select" type="button">Select from candidates</button>
+        </div>
+      </div>
+      <p class="run-status" id="run-status" role="status">Ready. No verdict has been produced in this tab yet.</p>
+    </section>
+
+    <section class="results" id="results" hidden>
+      <section class="panel" aria-labelledby="metrics-title">
+        <h2 id="metrics-title" class="panel__title">Gate comparison</h2>
+        <p class="panel__note" id="metrics-note"></p>
+        <p class="panel__note">
+          The reference column is a <strong>synthetic no-gate policy</strong>, not upstream's behaviour:
+          upstream reviews the resulting pull request by hand, and that human review is excluded here.
+          No model ran, so nothing below measures dsh-superagent, DeepSeek Harness or model quality.
+        </p>
+        <div class="table-wrap">
+          <table class="table">
+            <caption class="visually-hidden">Synthetic no-gate reference policy compared with the DGM gate policy</caption>
+            <thead>
+              <tr>
+                <th scope="col">Metric</th>
+                <th scope="col">Synthetic no-gate reference</th>
+                <th scope="col">DGM gate</th>
+              </tr>
+            </thead>
+            <tbody id="metrics-body"></tbody>
+          </table>
+        </div>
+        <ul class="facts" id="metric-facts"></ul>
+        <p class="digest-line">Report digest <code id="report-digest"></code></p>
+      </section>
+
+      <section class="panel" aria-labelledby="fixtures-title">
+        <h2 id="fixtures-title" class="panel__title">Fixtures</h2>
+        <p class="panel__note">
+          Seven authored work items. The <em>baseline</em> artifact carries labelled defects; the
+          <em>candidate</em> artifact is the repair. Select a row to inspect its gates and checks.
+        </p>
+        <div class="fixtures" id="fixtures"></div>
+      </section>
+
+      <section class="panel panel--detail" id="detail-panel" aria-labelledby="detail-title" hidden>
+        <div class="panel__head">
+          <h2 id="detail-title" class="panel__title">Verdict detail</h2>
+          <button class="button button--quiet" id="detail-close" type="button">Close</button>
+        </div>
+        <div id="detail-body"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="selection-title">
+        <h2 id="selection-title" class="panel__title">Selection and rollback</h2>
+        <p class="panel__note">
+          Selection ranks passing candidates and names the revision a rollback would restore.
+          It is a recommendation with a receipt, not a promotion.
+        </p>
+        <div id="selection-body" class="selection">
+          <p class="empty">No selection has been made. Run the sweep, then select from the passing candidates.</p>
+        </div>
+      </section>
+    </section>
+
+    <section class="panel panel--limits" aria-labelledby="limits-title">
+      <h2 id="limits-title" class="panel__title">What this does not show</h2>
+      <ul class="limits" id="limits-list">
+        <li>No model ran. These verdicts are deterministic predicate results, not model judgement.</li>
+        <li>Fixtures are authored and small: seven work items, fourteen artifacts, eight predicates.</li>
+        <li>Pass rates are fixture-relative. A different contract would produce different numbers.</li>
+        <li>Fewer work units is not an improvement; it is a smaller predicate set.</li>
+        <li>The comparison column excludes upstream's human pull-request review, so it is a no-gate reference point, never an upstream or model measurement.</li>
+        <li>Seals are unkeyed SHA-256: they prove a record was not altered, not who produced it. Selection re-derives a verdict from its fixture instead of trusting its seal.</li>
+        <li>The fixtures passed to selection are trusted input: a forged fixture would reproduce by construction. Re-derivation proves consistency with the supplied fixtures, not their authenticity.</li>
+        <li>Request validation covers JSON values. An in-process caller passing an object with a throwing getter or Proxy can still provoke an exception; <code>JSON.parse</code> cannot produce that shape.</li>
+        <li>The runtime no-effect probe runs in Node and covers the Node-side path only. The browser surface of this page is checked by manual QA, not by that probe.</li>
+        <li>The adapter reads no repository, token, webhook, account or live ticket.</li>
+        <li>Nothing here is production-ready, and nothing here is connected to a running system.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer__inner">
+      <p>AIPSTER · experimental adapter · <span id="footer-version">v1.1.0</span></p>
+      <p class="footer__note">Synthetic fixtures only. Shadow authority. Nothing is applied.</p>
+    </div>
+  </footer>
+
+  <script type="module" src="./src/demo.mjs"></script>
+</body>
+</html>

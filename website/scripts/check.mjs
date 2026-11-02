@@ -5,12 +5,12 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {parse} from 'parse5';
 
-export const publicFiles=['404.html','_headers','admin/admin.js','admin/index.html','admin/styles.css','app/app.js','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/heurchain.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','assets/social-preview.png','assets/social-preview.svg','favicon.svg','index.html','release.json','styles.css'].sort();
+export const publicFiles=['404.html','_headers','admin/admin.js','admin/index.html','admin/styles.css','app/app.js','app/experiments/dsh-dgm/admin-gate.mjs','app/experiments/dsh-dgm/dsh-dgm.js','app/experiments/dsh-dgm/fixtures/work-items.mjs','app/experiments/dsh-dgm/index.html','app/experiments/dsh-dgm/site.css','app/experiments/dsh-dgm/src/adapter.mjs','app/experiments/dsh-dgm/src/canonical.mjs','app/experiments/dsh-dgm/src/checks.mjs','app/experiments/dsh-dgm/src/contract.mjs','app/experiments/dsh-dgm/src/demo.mjs','app/experiments/dsh-dgm/src/evaluate.mjs','app/experiments/dsh-dgm/src/measure.mjs','app/experiments/dsh-dgm/src/selection.mjs','app/experiments/dsh-dgm/src/view.mjs','app/experiments/dsh-dgm/styles.css','app/icon.svg','app/index.html','app/styles.css','assets/AIPSTER-model-LoRA-drilldown.png','assets/AIPSTER-model-LoRA-drilldown.svg','assets/IRB-DGM-JEV-component-flow.png','assets/IRB-DGM-JEV-component-flow.svg','assets/aipster-wordmark.svg','assets/aipster-wordmark-on-dark.svg','assets/progress-log-20261026.png','assets/progress-wordmark-d.png','assets/sponsors/baseten.svg','assets/sponsors/heurchain.svg','assets/sponsors/kainotomic.svg','assets/sponsors/meta.svg','assets/sponsors/modal.svg','assets/social-preview.png','assets/social-preview.svg','favicon.svg','index.html','release.json','styles.css'].sort();
 
 export const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function files(root,dir=root){const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){assert(!entry.isSymbolicLink(),'Symlinks are outside the public upload policy');const path=resolve(dir,entry.name);if(entry.isDirectory())result.push(...await files(root,path));else{assert(entry.isFile(),'Unexpected asset type');result.push(relative(root,path).replaceAll('\\','/'));}}return result.sort();}
 
-export const SPONSOR_DESTINATIONS=new Set(['https://www.meta.com/','https://modal.com/','https://www.baseten.co/','https://heurchain.com/beta']);
+export const SPONSOR_DESTINATIONS=new Set(['https://www.meta.com/','https://modal.com/','https://www.baseten.co/','https://heurchain.com/beta','https://kainotomic.com/']);
 const PRIVATE = /127\.0\.0\.1|localhost|4327|resource[-_. ]ledger|C:\\Users|(?:BEGIN (?:RSA |EC )?PRIVATE KEY)|(?:gh[pousr]_[\w]{20,})|(?:sk-[\w]{20,})/i;
 function checkPrivacy(text) {
   // Also catch ordinary escaped literals accidentally copied into the public JS.
@@ -64,7 +64,7 @@ function checkCss(text, path, ids = new Set()) {
 // Reviewed panel shells and their single approved same-origin script each.
 // Adding a shell here is a policy change: it must stay minimal, carry no
 // authority of its own, and keep every API call server-authorized.
-const APPROVED_PANEL_SCRIPTS = new Map([['app/index.html', '/app/app.js'], ['admin/index.html', '/admin/admin.js']]);
+const APPROVED_PANEL_SCRIPTS = new Map([['app/index.html', '/app/app.js'], ['admin/index.html', '/admin/admin.js'], ['app/experiments/dsh-dgm/index.html', '/app/experiments/dsh-dgm/dsh-dgm.js']]);
 
 function checkMarkup(text, path) {
   const errors = [];
@@ -138,7 +138,9 @@ export async function checkPublic(root){
   assert.deepEqual(await files(root),publicFiles,'Public directory must match the explicit static allowlist');
   const manifest=[];
   for(const path of publicFiles){const bytes=await readFile(resolve(root,path));assert(bytes.length<10*1024*1024,'Unexpected oversized asset');manifest.push({path,bytes:bytes.length,sha256:sha(bytes)});
-    if(/\.(?:html|css|svg|json|js)$/.test(path) || path === '_headers'){
+    // .mjs is JavaScript too: an allowlisted module must not skip the privacy
+    // and credential scan that the same bytes would receive as .js.
+    if(/\.(?:html|css|svg|json|js|mjs)$/.test(path) || path === '_headers'){
       const text=bytes.toString('utf8');
       checkPrivacy(text);
       if (/\.(?:html|svg)$/.test(path)) checkMarkup(text, path);

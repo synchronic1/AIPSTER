@@ -1,0 +1,16 @@
+{
+  "name": "dsh-dgm-adapter-experiment",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Opt-in, shadow-only experimental adapter between dsh-superagent-shaped proposals and AIPSTER DGM's deterministic fixture gate. Synthetic fixtures only.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\"",
+    "measure": "node scripts/measure.mjs",
+    "serve": "node scripts/serve.mjs"
+  }
+}

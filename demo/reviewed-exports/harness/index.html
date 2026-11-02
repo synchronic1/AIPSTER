@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harness status preview — SYNTHETIC ONLY</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:72ch;margin:2rem auto;padding:0 1rem;line-height:1.5;color:#1a1a1a;background:#fff}
+.banner{border:2px solid #1a1a1a;padding:.75rem 1rem;margin-bottom:1.5rem}
+.badge{display:inline-block;border:1px solid #555;font-size:.75rem;padding:0 .4rem;margin-left:.4rem;max-width:100%;overflow-wrap:anywhere}
+h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ccc;padding-bottom:.25rem}
+dt{font-weight:600}dd{margin:0 0 .5rem 1rem}
+code{background:#f0f0f0;padding:0 .25rem;overflow-wrap:anywhere}
+.reason{color:#333}
+</style>
+</head>
+<body>
+<div class="banner"><strong>SYNTHETIC ONLY — fixture demonstration.</strong> Nothing here is a live harness: no backend route, no collector, no dispatch. <span class="badge">SYNTHETIC/FIXTURE</span></div>
+<h1>Harness status preview <span class="badge">SYNTHETIC/FIXTURE</span></h1>
+
+<h2>1. Disabled mode <span class="badge">flag-gated: HARNESS_ENABLED unset</span></h2>
+<dl><dt>enabled</dt><dd>false</dd><dt>mode</dt><dd>&quot;disabled&quot;</dd><dt>threads</dt><dd>0</dd><dt>subscriptions</dt><dd>0</dd></dl>
+
+<h2>2. Fixture mode <span class="badge">SYNTHETIC/FIXTURE</span></h2>
+<dl><dt>enabled</dt><dd>true</dd><dt>mode</dt><dd>&quot;fixture&quot;</dd><dt>subscriptions</dt><dd>1</dd></dl>
+
+<h2>3. Live-read shape <span class="badge">FIXTURE data — no real collector: reads are stubbed</span></h2>
+<dl><dt>enabled</dt><dd>true</dd><dt>mode</dt><dd>&quot;live-read&quot;</dd><dt>subscriptions</dt><dd>1</dd></dl>
+<p class="reason">Honest reason: the live-read collector (durable store + coordinator reads) does not exist yet — integrator scope. Values below are fixture data in the live-read shape.</p>
+
+<h2>4. Threads &amp; subscriptions <span class="badge">SYNTHETIC/FIXTURE</span></h2>
+<ul><li><code>im:synthetic-topic-alpha</code> <span class="badge">SYNTHETIC/FIXTURE</span> → subscribers: synthetic-worker:alpha</li><li><code>github:synthetic-repo/9</code> <span class="badge">SYNTHETIC/FIXTURE</span> → subscribers: <em>none</em></li></ul>
+
+<h2>5. Recent filter verdicts <span class="badge">SYNTHETIC/FIXTURE</span></h2>
+<ul><li><code>{&quot;source&quot;:&quot;noisy&quot;,&quot;thread_key&quot;:null,&quot;verdict&quot;:&quot;drop&quot;,&quot;reason&quot;:&quot;SOURCE_IGNORE&quot;,&quot;policy_version&quot;:&quot;v1&quot;,&quot;at&quot;:&quot;2026-11-02T08:35:39.423Z&quot;}</code> <span class="badge">SYNTHETIC/FIXTURE</span></li><li><code>{&quot;source&quot;:&quot;im&quot;,&quot;thread_key&quot;:null,&quot;verdict&quot;:&quot;candidate&quot;,&quot;reason&quot;:&quot;CANDIDATE_SOURCE&quot;,&quot;policy_version&quot;:&quot;v1&quot;,&quot;at&quot;:&quot;2026-11-02T08:35:39.423Z&quot;}</code> <span class="badge">SYNTHETIC/FIXTURE</span></li><li><code>{&quot;source&quot;:&quot;im&quot;,&quot;verdict&quot;:&quot;handle&quot;,&quot;policy&quot;:&quot;synthetic-handle-all&quot;,&quot;version&quot;:&quot;v1&quot;,&quot;at&quot;:&quot;synthetic&quot;}</code> <span class="badge">SYNTHETIC/FIXTURE</span></li></ul>
+
+<h2>6. Recall &amp; channel norms <span class="badge">SYNTHETIC/FIXTURE</span></h2>
+<dl><dt>inlineSummaryChars</dt><dd>240</dd><dt>inlineSpilled</dt><dd>true</dd><dt>longReplyClipped</dt><dd>true</dd><dt>prShapeOk</dt><dd>true</dd></dl>
+
+<h2>7. Watchdog checks <span class="badge">SYNTHETIC/FIXTURE</span></h2>
+<ul><li><code>{&quot;op&quot;:&quot;syn-a&quot;,&quot;action&quot;:&quot;retain-hold&quot;,&quot;reason&quot;:&quot;UNCERTAIN_RETAIN&quot;}</code> <span class="badge">SYNTHETIC/FIXTURE</span></li><li><code>{&quot;op&quot;:&quot;syn-b&quot;,&quot;action&quot;:&quot;fence-release&quot;,&quot;reason&quot;:&quot;DEADLINE_PASSED&quot;}</code> <span class="badge">SYNTHETIC/FIXTURE</span></li></ul>
+
+<h2>8. Honest unsupported states</h2>
+<ul><li><code>slow-path-judge</code> — not provided by this slice <span class="badge">honest: absent by design</span></li><li><code>live-dispatch</code> — not provided by this slice <span class="badge">honest: absent by design</span></li><li><code>d1-persistence</code> — not provided by this slice <span class="badge">honest: absent by design</span></li><li><code>router-sharding</code> — not provided by this slice <span class="badge">honest: absent by design</span></li></ul>
+<p class="reason">No backend route serves this page yet (integrator scope: worker.js mounting). No collector feeds it (durable store scope). Flag-gated everywhere via <code>HARNESS_ENABLED</code>.</p>
+</body>
+</html>

@@ -14,6 +14,134 @@ APP_NAME = "AIPSTER-Worker"
 TOKEN_BYTES = 32  # token_urlsafe(32) -> 43 chars; worker requires >= 32 printable ASCII
 MIN_TOKEN_LENGTH = 32
 
+# First-run honesty (GOOSE-REAL-WORKER-DELIVERY-0811, packaging lane only).
+# The default config selects the mock engine, which is an explicit
+# test/demo option: fresh first-run stays setup-required/unqualified until
+# a real configured runtime is selected. Classification is metadata-only
+# (loaded runtimes/models); it never downloads models or binaries, never
+# starts or stops a runtime, never copies credentials, and never changes
+# enrollment. The native IK adapter (ik_llama) stays a supported choice.
+SETUP_REQUIRED = "setup-required"
+READY = "ready"
+MOCK_KIND = "mock"
+SUPPORTED_MANAGED_KINDS = ("ik_llama", "llama_cpp")
+PLACEHOLDER_MODEL_MARKER = "replace-with-your-model"
+
+
+def supported_configuration_guidance():
+    """Explicit supported-configuration guidance (no automatic selection)."""
+    return ("Supported configurations: native ik_llama managed runtime with a "
+            "real GGUF model file (set the [[models]] path yourself), or "
+            "llama_cpp managed with a real GGUF / attach with an "
+            "upstream_model on a loopback server you run yourself. The mock "
+            "runtime is a test/demo option only and never counts as "
+            "operational. To select: edit config.toml yourself; this worker "
+            "never downloads models, starts runtimes, copies credentials, "
+            "or changes enrollment automatically.")
+
+
+def classify_runtime_selection(loaded):
+    """Classify a loaded worker config as ready or setup-required.
+
+    Accepts the vendored dendrite Config or any fixture object exposing
+    .runtimes (with .id/.kind, optional .mode) and .models (with .id/
+    .runtime, optional .path/.upstream_model). Never raises: an
+    unreadable selection is setup-required. Returns {"status", "mock_only",
+    "reason", "guidance"}.
+    """
+    try:
+        runtimes = list(getattr(loaded, "runtimes", None) or [])
+        models = list(getattr(loaded, "models", None) or [])
+    except TypeError:
+        runtimes, models = [], []
+    guidance = supported_configuration_guidance()
+    if not runtimes or not models:
+        return {"status": SETUP_REQUIRED, "mock_only": False,
+                "reason": "no runtimes/models are configured",
+                "guidance": guidance}
+    by_id = {getattr(r, "id", None): r for r in runtimes}
+    mock_only = all(getattr(r, "kind", None) == MOCK_KIND for r in runtimes)
+    if mock_only:
+        return {"status": SETUP_REQUIRED, "mock_only": True,
+                "reason": ("mock runtime is a test/demo option only; "
+                           "select a real configured runtime to operate"),
+                "guidance": guidance}
+    for model in models:
+        runtime = by_id.get(getattr(model, "runtime", None))
+        if runtime is None:
+            continue
+        kind = getattr(runtime, "kind", None)
+        if kind == MOCK_KIND or kind not in SUPPORTED_MANAGED_KINDS:
+            continue
+        if getattr(runtime, "mode", "managed") == "attach":
+            if getattr(model, "upstream_model", None):
+                return {"status": READY, "mock_only": False,
+                        "reason": (f"attached runtime "
+                                   f"{getattr(runtime, 'id', '?')!r} serves model "
+                                   f"{getattr(model, 'id', '?')!r}"),
+                        "guidance": guidance}
+            continue
+        path = getattr(model, "path", None)
+        if not path:
+            continue
+        if PLACEHOLDER_MODEL_MARKER in str(path):
+            continue
+        if Path(str(path)).exists():
+            return {"status": READY, "mock_only": False,
+                    "reason": (f"managed runtime "
+                               f"{getattr(runtime, 'id', '?')!r} serves model "
+                               f"{getattr(model, 'id', '?')!r}"),
+                    "guidance": guidance}
+    return {"status": SETUP_REQUIRED, "mock_only": False,
+            "reason": ("no real model is configured; install a GGUF model "
+                       "file yourself (never downloaded automatically) and "
+                       "point a real runtime at it in config.toml"),
+            "guidance": guidance}
+
+
+def setup_detail(loaded):
+    """Honest first-run detail: '' when ready, else a setup-required line."""
+    result = classify_runtime_selection(loaded)
+    if result["status"] == READY:
+        return ""
+    return f"setup required: {result['reason']}"
+
+
+def first_run_ready(loaded):
+    """True only when a real configured runtime is selected (else no auto-start)."""
+    return classify_runtime_selection(loaded)["status"] == READY
+
+
+MOCK_DEMO_ENV = "AIPSTER_WORKER_MOCK_DEMO"
+
+
+def mock_demo_elected():
+    """Operator-explicit test/demo election for the mock engine.
+
+    Read live from the environment so lab/qualify harnesses elect it per
+    launch. Silent auto-start never elects it: only an explicit =="1"
+    counts, and it only ever applies to a mock-only selection.
+    """
+    return os.environ.get(MOCK_DEMO_ENV) == "1"
+
+
+def explicit_demo_ready(loaded):
+    """True only for an explicitly elected mock-demo selection (never silent)."""
+    return bool(mock_demo_elected()
+                and classify_runtime_selection(loaded)["mock_only"])
+
+
+def runtime_note(loaded):
+    """State detail for a loaded config: '' when ready, test/demo when the
+    mock engine was explicitly elected, else the setup-required line."""
+    result = classify_runtime_selection(loaded)
+    if result["status"] == READY:
+        return ""
+    if result["mock_only"] and mock_demo_elected():
+        return (f"test/demo: mock engine explicitly elected via "
+                f"{MOCK_DEMO_ENV}=1 (not operational)")
+    return f"setup required: {result['reason']}"
+
 
 def bundle_dir():
     """Directory holding the frozen exes (or the source tree in dev)."""

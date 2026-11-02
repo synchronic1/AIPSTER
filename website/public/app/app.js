@@ -124,6 +124,237 @@ function renderStatus(el, data) {
     <p class="muted">${esc(note)}</p>`;
 }
 
+// ---- fabric flow + throughput panels (read-only Overview slice) ----
+// Client mirror of website/src/lib/fabric-flow.mjs, which is the source of
+// truth; this file cannot import it because public/ ships verbatim to
+// browsers as one classic script (scripts/build.mjs copies, no bundler).
+// Server shapes verified against this tree: buildStatus in
+// src/lib/status.mjs and the /api/usage handler in src/worker.js. Every
+// string renders through esc(). Request/result lanes stay architectural
+// labels (dispatch is disabled); throughput is always unavailable because
+// usage carries cumulative counts, never measured tokens/sec. Liveness is
+// the server's derivation, but a row that claims online/stale without a
+// heartbeat timestamp never renders as live here.
+const FABRIC_LIVENESS = ['online', 'stale', 'offline', 'unknown'];
+const FABRIC_KINDS = ['local', 'cluster', 'provider'];
+function flowRowLiveness(r) {
+  if (!r || typeof r !== 'object') return null;
+  if (!FABRIC_LIVENESS.includes(r.liveness)) return null;
+  const seen = (r.liveness === 'online' || r.liveness === 'stale') && typeof r.lastSeenAt === 'string';
+  return seen ? r.liveness : (r.liveness === 'offline' ? 'offline' : 'unknown');
+}
+// Declared free-text evidence only: a blank or missing field is reported as
+// not reported, never invented. Memory, runtime, and resident-model readings
+// have no source in this build (verified: cardFor carries compute {cpu, gpu}
+// plus capabilities; heartbeat intake writes reachability only), so those
+// rows are always not reported.
+function fabricEvidence(inv) {
+  const text = (v) => typeof v === 'string' && v.trim() ? v.trim() : null;
+  const compute = inv && inv.compute && typeof inv.compute === 'object' ? inv.compute : null;
+  const caps = inv && Array.isArray(inv.capabilities) && inv.capabilities.length
+    ? inv.capabilities.map(String).join(', ')
+    : null;
+  return { cpu: compute ? text(compute.cpu) : null, gpu: compute ? text(compute.gpu) : null, caps };
+}
+function fabricFlowNode(r, inv) {
+  if (!r || typeof r !== 'object') return null;
+  if (typeof r.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(r.id)) return null;
+  if (typeof r.name !== 'string' || !r.name || r.name.length > 80) return null;
+  if (!FABRIC_KINDS.includes(r.kind)) return null;
+  if (!FABRIC_LIVENESS.includes(r.liveness)) return null;
+  // No live presentation from a bare historical timestamp: online/stale
+  // without a string heartbeat timestamp drops to unknown.
+  const disp = flowRowLiveness(r);
+  if (!disp) return null;
+  const age = r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs);
+  // Strip parity (renderStatus): only a fresh online row carries heartbeat-seen
+  // copy; stale rows read not currently reachable, so a relative age never
+  // accompanies a live-currency claim except the server's own fresh verdict.
+  const hb = disp !== 'online'
+    ? 'not currently reachable'
+    : r.usable === false
+      ? 'ATTENTION: reachable but NOT usable for inference'
+      : 'heartbeat seen (reachability only · not ready to run)';
+  const ev = fabricEvidence(inv);
+  const evRow = (label, value) => `<div><dt>${esc(label)}</dt><dd>${value === null ? 'not reported' : esc(value)}</dd></div>`;
+  const caps = ev.caps === null
+    ? '<span class="muted">none recorded</span>'
+    : String(ev.caps).split(',').map((c) => c.trim()).filter(Boolean).slice(0, 8).map((c) => `<span class="topo-chip">${esc(c)}</span>`).join('');
+  return `<li class="topo-node ${disp}"><header><div><span class="topo-dot" aria-hidden="true"></span><strong>${esc(r.name)}</strong></div><b>${esc(disp)}</b></header>`
+    + `<p class="topo-host">${esc(r.id)} · ${esc(r.kind)}${r.demoFixture ? ' · DEMO' : ''}</p>`
+    + `<dl class="ev">`
+    + evRow('CPU', ev.cpu) + evRow('GPU', ev.gpu)
+    + `<div><dt>Last seen</dt><dd>${esc(age)}</dd></div>`
+    + `</dl>`
+    + `<p class="muted">${esc(hb)}</p>`
+    + `<div class="topo-caps"><span class="muted">Capabilities (declared):</span> ${caps}</div>`
+    + `<p class="muted">Memory · Runtime · Resident model: not reported. Models: not reported.</p></li>`;
+}
+
+// Heartbeat-lane state derives from the row liveness SET, mirroring the
+// view-model's heartbeatLane: an all-stale fabric is stale, never live.
+function flowHeartbeatLane(rows) {
+  let stale = false, unknown = false;
+  for (const r of rows || []) {
+    const l = flowRowLiveness(r);
+    if (l === 'online') return 'live';
+    if (l === 'stale') stale = true;
+    else if (l === 'unknown') unknown = true;
+  }
+  if (stale) return 'stale';
+  if (unknown) return 'unknown';
+  return 'none';
+}
+// Per-node bench lanes: measurement-oriented detail adapted from the EIF
+// bench lane pattern. Every slot is either genuinely reported data or an
+// explicit unavailable note — tracks fill ONLY from numeric sources, and no
+// numeric source exists in this contract, so every track stays hatched.
+function fabricBenchLane(r, inv) {
+  const disp = flowRowLiveness(r);
+  if (!disp) return null;
+  const age = r.lastSeenAgeMs === null || r.lastSeenAgeMs === undefined ? 'never' : formatAge(r.lastSeenAgeMs);
+  const ev = fabricEvidence(inv);
+  const val = (label, value) => `<div class="bench-cell"><span>${esc(label)}</span><b>${value === null ? 'not reported' : esc(value)}</b></div>`;
+  const hatch = (label, note) => `<div class="bench-cell"><span>${esc(label)}</span><div class="bench-track sm"><span class="bench-hatch"></span></div><small>${esc(note)}</small></div>`;
+  return `<div class="bench-lane ${disp}">`
+    + `<header><span class="topo-dot" aria-hidden="true"></span><strong>${esc(r.name)}</strong><b>${esc(disp)}</b><span class="muted">${esc(r.id)} · ${esc(r.kind)}${r.demoFixture ? ' · DEMO' : ''}</span></header>`
+    + `<div class="bench-lane-grid">`
+    + `<div class="bench-col">`
+    + val('Heartbeat', `${age} · ${disp}`)
+    + val('Declared CPU', ev.cpu) + val('Declared GPU', ev.gpu)
+    + val('Capabilities', ev.caps === null ? 'none recorded' : ev.caps)
+    + hatch('CPU load', 'not reported: heartbeats carry no load numbers')
+    + hatch('Memory', 'not reported: no memory readings in contract')
+    + `</div><div class="bench-col">`
+    + `<div class="bench-axis" aria-hidden="true"><span>0</span><span>tok/s scale unavailable</span></div>`
+    + hatch('Generation rate', 'Not measured: no measured tok/s exist in this build')
+    + `</div><div class="bench-col">`
+    + hatch('Accelerator', 'unavailable: no accelerator inventory')
+    + hatch('Runtime · latency · prompt', 'unavailable: no runtime telemetry in contract')
+    + `</div></div>`
+    + `<p class="muted">Models: No models reported.</p></div>`;
+}
+function renderFabricFlow(flowEl, tpEl, statusData, usageData, invMap) {
+  const rows = statusData && Array.isArray(statusData.items) ? statusData.items : null;
+  if (!rows) {
+    state(flowEl, 'error', 'Fabric flow unavailable: unexpected status payload.');
+    state(tpEl, 'error', 'Throughput unavailable: unexpected status payload.');
+    return;
+  }
+  const nodes = [];
+  const lookup = invMap && typeof invMap.get === 'function' ? invMap : null;
+  // Lane-input parity with the view-model: the heartbeat lane sees exactly
+  // the rows that render (the module drops malformed rows before its lane),
+  // and non-object rows are skipped, never dereferenced.
+  const laneRows = [];
+  for (const raw of rows) {
+    const key = raw && typeof raw === 'object' ? raw.id : undefined;
+    const n = fabricFlowNode(raw, lookup ? lookup.get(key) : null);
+    if (n) { nodes.push(n); laneRows.push(raw); }
+  }
+  // Counts prefer the server aggregate over all owned rows; otherwise derive
+  // from the listed page. Totals that are absent stay unknown, never zero.
+  const s = statusData.summary;
+  const validCounts = s && typeof s === 'object' && ['online', 'stale', 'offline', 'unknown'].every((k) => Number.isSafeInteger(s[k]) && s[k] >= 0);
+  // Derived counts come from the same pure liveness helper as the rows, never
+  // by parsing rendered markup, and the fallback is labelled as derived.
+  const counts = validCounts ? s : rows.reduce((t, r) => {
+    const k = flowRowLiveness(r) || 'unknown';
+    t[k] += 1; return t;
+  }, { online: 0, stale: 0, offline: 0, unknown: 0 });
+  const countsNote = validCounts ? '' : ' · counts derived from the listed page (server aggregate unavailable)';
+  const total = Number.isSafeInteger(statusData.total) && statusData.total >= 0 ? statusData.total : nodes.length;
+  // Absent-vs-zero: a missing shared count renders unknown, never zero.
+  const shared = Number.isSafeInteger(statusData.sharedWithMe) && statusData.sharedWithMe >= 0 ? statusData.sharedWithMe : 'unknown';
+  const lane = flowHeartbeatLane(laneRows);
+  const laneWord = lane === 'live' ? 'live' : lane === 'stale' ? 'stale only' : lane === 'unknown' ? 'unknown only' : 'none seen';
+  const truncated = statusData.itemsTruncated === true || total > nodes.length
+    ? `<p class="muted">showing ${nodes.length} of ${total} · older resources omitted from the list; counts cover all resources.</p>`
+    : '';
+  const note = statusData.demo
+    ? 'DEMO DATA: simulated fixture, not a live node.'
+    : 'Worker heartbeats prove reachability only, never inference acceptance. Nothing here means ready to run.';
+  // Snapshot identity for a view left open: this panel does not poll, so it
+  // states the absolute captured-at time with snapshot-only wording. A
+  // relative age would freeze at render and mislead; invalid stamps stay
+  // unknown and future stamps stay absolute, never reworded as past.
+  const snapStamp = statusData && typeof statusData.generatedAt === 'string' && !Number.isNaN(Date.parse(statusData.generatedAt))
+    ? statusData.generatedAt
+    : null;
+  const snapLine = snapStamp === null
+    ? 'snapshot time unknown'
+    : `snapshot taken ${snapStamp} (snapshot only — this panel does not update until Overview reloads)`;
+  flowEl.innerHTML = `<div class="topo" role="group" aria-label="Fabric flow: the browser session reads the AIPSTER API, which reports worker resources from heartbeats. Request and result lanes are architectural, not live connections.">`
+    + `<div class="topo-head"><div><p class="eyebrow">snapshot · read-only</p><p class="muted">${total} resource(s) · ${counts.online} online · ${counts.stale} stale · ${counts.offline} offline · ${counts.unknown} unknown · ${shared} shared with me${countsNote}</p></div><p class="topo-note">Heartbeat freshness, not inference readiness.</p></div>`
+    + `<div class="topo-map">`
+    + `<div class="topo-stage"><span class="topo-icon" aria-hidden="true">→</span><div><b>Browser session</b><small>signed-in owner · read-only view</small></div></div>`
+    + `<div class="topo-link" aria-hidden="true"><i></i><span>Request</span></div>`
+    + `<div class="topo-stage"><span class="topo-icon" aria-hidden="true">≡</span><div><b>AIPSTER API</b><small>status · inventory · usage reads</small></div></div>`
+    + `<div class="topo-link" aria-hidden="true"><i></i><span>Request to node</span></div>`
+    + (nodes.length ? `<ul class="topo-nodes">${nodes.join('')}</ul>` : '<p class="muted">No resources yet — register or pair one to see it here.</p>')
+    + `</div>`
+    + truncated
+    + `<div class="topo-return"><span>Heartbeat returns: reachability only (${laneWord})</span><span>Result returns: usage totals only</span><span>Request lanes: architectural · dispatch availability unverified here</span></div>`
+    + `<p class="muted">Heartbeat freshness: online means a fresh heartbeat, stale an older one, unknown a flag without heartbeat, offline not flagged.</p>`
+    + `<footer class="topo-legend"><span><i class="sw-request"></i>Request (architectural)</span><span><i class="sw-heartbeat"></i>Heartbeat</span><span><i class="sw-result"></i>Result (architectural: usage totals only)</span><span><i class="sw-unsupported"></i>Resident / Cached / Unprovisioned (unsupported)</span></footer>`
+    + `<p class="muted">${esc(note)}</p>`
+    + `<p class="muted">${esc(snapLine)}.</p></div>`;
+  // Throughput is always unavailable: usage reports cumulative counts only.
+  const rawT = usageData && usageData.totals && typeof usageData.totals === 'object' ? usageData.totals : null;
+  // An all-absent totals object measures nothing: treat it as unavailable.
+  const t = rawT && (rawT.requests != null || rawT.tokensIn != null || rawT.tokensOut != null || rawT.modelCostUsd != null || rawT.executionCostUsd != null) ? rawT : null;
+  const num = (v) => Number.isSafeInteger(v) && v >= 0 ? String(v) : 'unknown';
+  const usd = (v) => v === null || v === undefined || v < 0 ? 'unknown (unmeasured)' : (Number.isFinite(v) ? '$' + String(v) : 'unknown (unmeasured)');
+  // Page coverage (review FINDING-1): usage totals sum the returned page.
+  const cov = usageData && Array.isArray(usageData.items) && Number.isSafeInteger(usageData.total) && usageData.total >= 0
+    ? (usageData.items.length >= usageData.total ? `totals cover all ${usageData.total} rows` : `totals cover the latest ${usageData.items.length} of ${usageData.total} rows (page-cumulative)`)
+    : null;
+  // Designed measurement/coverage layout: definition rows for what exists,
+  // an explicit unavailable marker for what does not. No bars anywhere, so
+  // no bar length can be misread as a measured or zero rate.
+  const lanes = [];
+  for (const raw of laneRows) { const l = fabricBenchLane(raw, lookup ? lookup.get(raw.id) : null); if (l) lanes.push(l); }
+  const benchRow = (label, value) => `<div><dt>${esc(label)}</dt><dd>${value}</dd></div>`;
+  tpEl.innerHTML = `<div class="bench" role="group" aria-label="Throughput bench: measured rates are unavailable; cumulative usage totals below.">`
+    + `<p><span class="pill bad">measured rate: unavailable</span></p>`
+    + `<div class="bench-plot"><div class="bench-axis" aria-hidden="true"><span>0</span><span>tok/s scale unavailable</span></div>`
+    + `<div class="bench-track"><span class="bench-hatch"></span><span class="bench-word">Not measured</span></div></div>`
+    + (lanes.length ? `<div class="bench-lanes">${lanes.join('')}</div>` : '<p class="muted">No node lanes: no resources.</p>')
+    + (t
+      ? `<dl class="ev">`
+        + benchRow('Requests (cumulative)', esc(num(t.requests)))
+        + benchRow('Tokens in / out (cumulative, not a rate)', `${esc(num(t.tokensIn))} / ${esc(num(t.tokensOut))}`)
+        + benchRow('Model cost', esc(usd(t.modelCostUsd)))
+        + benchRow('Execution cost', esc(usd(t.executionCostUsd)))
+        + (cov ? benchRow('Coverage', esc(cov)) : '')
+        + `</dl>`
+      : '<p class="muted">Usage totals unavailable.</p>')
+    + '<p class="muted">Throughput unavailable: no measured tokens/sec exist in this build. Unmeasured values stay unknown, never zero.</p></div>';
+}
+
+async function loadFabricFlow() {
+  const flow = $('fabric-flow'), tp = $('fabric-throughput');
+  if (!flow || !tp) return;
+  const gen = generation;
+  flow.innerHTML = '<p class="muted">Loading fabric flow…</p>';
+  tp.innerHTML = '<p class="muted">Loading throughput…</p>';
+  try {
+    const [statusData, usageData, invData] = await Promise.all([api('/api/status'), api('/api/usage?limit=50'), api('/api/inventory?limit=50')]);
+    if (gen !== generation) return;
+    const invMap = new Map(((invData && Array.isArray(invData.items)) ? invData.items : []).filter((c) => c && typeof c.id === 'string').map((c) => [c.id, c]));
+    renderFabricFlow(flow, tp, statusData, usageData, invMap);
+  } catch (e) {
+    if (isStale(e) || gen !== generation) return;
+    if (/AUTH_REQUIRED|KEY_EXPIRED|KEY_SCOPE|KEY_FORBIDDEN|FORBIDDEN|401|403/.test(e.message)) {
+      state(flow, '', 'Sign-in expired or this key cannot read status — fabric flow unavailable.');
+      state(tp, '', 'Throughput unavailable while reads are denied.');
+      return;
+    }
+    state(flow, 'error', e.message);
+    state(tp, 'error', e.message);
+  }
+}
+
 function scheduleStatusPoll(token, gen, delayMs, failures) {
   if (typeof setTimeout !== 'function') return;
   setTimeout(() => {
@@ -157,14 +388,14 @@ async function refreshStatusStrip(token, gen, failures) {
 
 function resourceCard(r) {
   const s = r.state || {};
-  // Pairing/link state from row fields only. The browser cannot observe an
+  // Link state from row fields only, ordered by evidence strength. The browser cannot observe an
   // install, so there is no "installed" state here — only what the server
   // row proves: needs-link (manual, never paired), linked (paired, never
-  // beaten), reachable (fresh heartbeat, still not inference-ready), stale.
-  const link = !s.authenticated ? 'needs-link — pair this worker to link it'
-    : !r.heartbeatAt ? 'linked — awaiting first heartbeat'
-    : s.online ? 'reachable — heartbeat seen (reachability only, never ready to run)'
-    : 'stale — last beat ' + (r.heartbeatAt || 'unknown') + '; start the worker sender or check its key';
+  // beaten), reachable (fresh heartbeat, still not inference-ready), stale: a heartbeat outranks the pairing flag, so a fresh beat never reads needs-link.
+  const link = s.online ? 'reachable — heartbeat seen (reachability only, never ready to run)'
+    : r.heartbeatAt ? 'stale — last beat ' + (r.heartbeatAt || 'unknown') + '; start the worker sender or check its key'
+    : !s.authenticated ? 'needs-link — pair this worker to link it'
+    : 'linked — awaiting first heartbeat';
   return `<div class="card"><h2>${esc(r.name)}</h2>
     <p class="muted">${esc(r.id)} · ${esc(r.kind)} · origin: ${esc(r.origin)} · owner: ${esc(r.owner && r.owner.name)}</p>
     <p>${esc(r.compute.cpu)} · ${esc(r.compute.gpu)}</p>
@@ -182,6 +413,7 @@ async function loadOverview() {
   const gen = generation;
   $('status-strip').innerHTML = '<h2>Resource status</h2><p class="muted">Checking resource status…</p>';
   refreshStatusStrip(token, gen, 0);
+  loadFabricFlow();
   try {
     const [inv, shared, usage, catalog] = await Promise.all([api('/api/inventory?limit=50'), api('/api/shared-with-me?limit=50'), api('/api/usage?limit=1'), api('/api/catalog/summary')]);
     // Reachability is fresh liveness, not terminal usability (Codex P2
@@ -193,8 +425,8 @@ async function loadOverview() {
       <div class="card"><h2>Usage</h2><p>${usage.totals.requests} requests · ${usage.totals.tokensIn + usage.totals.tokensOut} tokens</p></div>
       <div class="card"><h2>Models & adapters</h2><p>${catalog.privateAssets} private · ${catalog.activeDeployments} active deployment(s)</p><div class="actions"><button type="button" class="btn secondary" data-goto="models">Browse catalog</button></div></div>`;
     $('ov-note').innerHTML = me && me.demo
-      ? '<p class="muted">DEMO DATA: simulated fixtures for exploration. Grants and live actions are disabled. Inference dispatch is disabled.</p>'
-      : '<p class="muted">No demo data: only resources you register or pair appear here. Inference dispatch is disabled.</p>';
+      ? '<p class="muted">DEMO DATA: simulated fixtures for exploration. Grants and live actions are disabled. Inference dispatch needs a deployment flag this view does not verify.</p>'
+      : '<p class="muted">No demo data: only resources you register or pair appear here. Inference dispatch needs a deployment flag this view does not verify.</p>';
   } catch (e) { if (isStale(e)) return; state(el, 'error', e.message); }
 }
 
@@ -1607,7 +1839,7 @@ function resetState() {
   // every sign-in before the new identity renders, so a same-document account
   // switch never shows the previous identity's data (incl. revealed secrets).
   statusPollToken++;
-  for (const id of ['status-strip', 'ov-cards', 'ov-note', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
+  for (const id of ['status-strip', 'ov-cards', 'ov-note', 'fabric-flow', 'fabric-throughput', 'compute-list', 'shared-list', 'grant-list', 'key-list', 'usage-totals', 'usage-list', 'audit-list']) $(id).innerHTML = '';
   for (const id of ['fab-node-list', 'fab-inv-out', 'fab-inv-in', 'fab-conn-list', 'fab-grant-out', 'fab-grant-in', 'fab-deny-list', 'fab-authz-out']) $(id).innerHTML = '';
   for (const id of ['fab-inv-issuer', 'fab-accept-node', 'fab-authz-node', 'fab-prev-conn']) $(id).innerHTML = '';
   connect = null;

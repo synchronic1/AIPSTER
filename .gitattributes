@@ -1,0 +1,3 @@
+# Normalize line endings to LF on commit and checkout so admin-panel
+# diffs stay reviewable on every platform (recovery finding F6).
+* text=auto eol=lf
