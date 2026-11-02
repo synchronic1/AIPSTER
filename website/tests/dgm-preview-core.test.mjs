@@ -7,6 +7,7 @@ import {
   FIXTURES, RUN_STATUSES, TERMINAL_STATUSES, GATES, TERMINAL_OUTCOME,
   DISABLED_ACTIONS, ALLOWED_BODY_KEYS, FORBIDDEN_BODY_KEYS, MAX_LABEL_LEN,
   TARGET_NAME, BASELINE_SCORE_PPM, CANDIDATE_SCORE_PPM,
+  FIXTURE_SEED, FIXTURE_ADVISER_VERSION,
   transition, creationStatus, evaluateFixture, checkCreateBody, isRefusal,
   redactText, fixtureTelemetryRows, transitionOutcomeRow,
   latencySummary, outcomeCounts, tokensSummary, parseEventBody, buildTelemetryView
@@ -32,6 +33,8 @@ test('dgm core: contract tables list every fixture, state, gate, and key', () =>
   }
   assert.equal(MAX_LABEL_LEN, 128);
   assert.equal(TARGET_NAME, 'coord-jobs-v0');
+  assert.equal(FIXTURE_SEED, 'dgm-preview-seed-v1');
+  assert.equal(FIXTURE_ADVISER_VERSION, 'rules/v1');
 });
 
 test('dgm core: good completes VALIDATED with all gates passing', () => {

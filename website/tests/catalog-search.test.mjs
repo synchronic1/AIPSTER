@@ -8,6 +8,7 @@ import { hashPassword } from 'better-auth/crypto';
 import { createTestEnv, readJson } from './d1-shim.mjs';
 import { assertHubUrl, normalizeHubModel, hubDetail, hubSearch, __resetHubMetaCache } from '../src/lib/catalog/hub.mjs';
 import { budgetWindow } from '../src/lib/quotas.js';
+import { FIXTURE_MODELS, FIXTURE_REV_A, FIXTURE_REV_B, FIXTURE_REV_LORA } from '../src/lib/catalog/fixtures.mjs';
 
 const fx = () => createTestEnv({ CATALOG_FIXTURES: '1' });
 
@@ -289,4 +290,36 @@ test('R2: live search admits before outbound paging', async () => {
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('provenance: fixture corpus rows are synthetic-labeled with pinned revisions', () => {
+  assert.equal(FIXTURE_REV_A, 'f'.repeat(40));
+  assert.equal(FIXTURE_REV_B, 'e'.repeat(40));
+  assert.equal(FIXTURE_REV_LORA, 'd'.repeat(40));
+  const pinned = new Set([FIXTURE_REV_A, FIXTURE_REV_B, FIXTURE_REV_LORA]);
+  const byId = new Map(FIXTURE_MODELS.map((row) => [row.id, row]));
+  const lora = byId.get('fixture-org/tiny-lora');
+  assert.equal(lora.adapter_config.base_revision, FIXTURE_REV_B, 'lora base revision');
+  assert.equal(byId.get('fixture-org/tiny-base').sha, FIXTURE_REV_B, 'lora base resolves to tiny-base');
+  assert.ok(FIXTURE_MODELS.length > 0, 'fixture corpus is non-empty');
+  for (const row of FIXTURE_MODELS) {
+    assert.ok(row.id.startsWith('fixture-org/'), `fixture id: ${row.id}`);
+    // gated-clinical carries its own inline synthetic revision by design.
+    const want = row.id === 'fixture-org/gated-clinical' ? 'c'.repeat(40) : null;
+    assert.ok(want ? row.sha === want : pinned.has(row.sha), `pinned revision: ${row.id}`);
+    assert.ok(/\(fixture\)/i.test(row.card ?? ''), `synthetic card marker: ${row.id}`);
+  }
+});
+
+test('provenance: served catalog items carry fixture:true end to end', async () => {
+  const t = await fx();
+  const s = await readJson(await t.call('/api/catalog/search?limit=20', { headers: t.as(t.alice) }));
+  assert.equal(s.status, 200, s.text);
+  assert.ok(s.json.items.length > 0, 'fixture search returns items');
+  for (const item of s.json.items) {
+    assert.equal(item.fixture, true, `served fixture flag: ${item.id}`);
+  }
+  const d = await readJson(await t.call('/api/catalog/assets/' + encodeURIComponent('fixture-org/tiny-lora'), { headers: t.as(t.alice) }));
+  assert.equal(d.status, 200, d.text);
+  assert.equal(d.json.fixture, true, 'served detail fixture flag');
 });
