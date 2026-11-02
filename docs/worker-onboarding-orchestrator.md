@@ -103,14 +103,52 @@ the operator's existing dashboard/status view, after which `--retry-pair`
 resumes. Automating that lookup is a controller decision, not an onboarding
 implementation decision.
 
+## Structured status (ONB 10)
+
+`--json` replaces prose on stdout with exactly one versioned document
+(`aipster-worker-setup-status/1`); diagnostics are suppressed in that mode so
+an agent can parse stdout without scraping. The document agrees with the exit
+code:
+
+```json
+{
+  "schema": "aipster-worker-setup-status/1",
+  "command": "verify",
+  "target": "connection",
+  "outcome": "complete",
+  "stage": "verify",
+  "exit_code": 0,
+  "retryable": false,
+  "next_action": null,
+  "facts": {
+    "installed": {"value": "yes", "source": "local .venv and dendrite"},
+    "paired": {"value": "yes", "source": "private pairing store"},
+    "reachable": {"value": "yes", "source": "fresh authenticated heartbeat", "observed_at": "..."},
+    "usable": {"value": "false", "source": "last heartbeat flag", "authoritative": false},
+    "inference_qualified": {"value": "no (not exercised)", "source": "not exercised"}
+  },
+  "observed_at": "2026-11-01T00:00:00Z"
+}
+```
+
+Outcomes: `complete`, `blocked`, `incomplete`, `failed`, `cancelled`. Only a
+blocked or incomplete result is `retryable`; a complete connection result has
+`next_action: null` even when inference is unavailable. `usable.authoritative`
+is always `false` until a controller readiness read exists. No token, code,
+heartbeat key, or private path appears in the document.
+
 ## Owned-resource rollback (ONB 24)
 
-Rollback is **not implemented in this candidate**. Cancellation leaves the
-private checkpoint in place and reports residual processes; it never deletes
-`.venv`, pairing, or logs automatically. A separate Muse component
-(`setup_ownership.py`) owns ownership records, PID-reuse checks, path and
-symlink safety; this orchestrator integrates that API once it lands. Until
-then, treat cleanup as manual and reversible-step-only.
+Rollback is **not implemented in this candidate** and is **BLOCKED** on the
+reviewed Muse helper, not merely on its code existing. Muse candidate
+`6894b772e049ee2270cfb6bb94964c731dc0f3ff` provides `setup_ownership.py` with
+`create_ledger`, `claim_new_file`, `claim_new_process`, `rollback`, and
+`redacted_diagnostics`, but root/QA have open safety findings on sampled
+large-file hashes and external check/action races. No destructive automatic
+cleanup is wired until that review closes; then the DeepSeek owner integrates
+it here in a separate commit. Cancellation currently leaves the checkpoint and
+reports residue; it deletes nothing.
+
 
 
 State is a private, non-secret `setup-state.json` under the worker data dir:
@@ -266,7 +304,7 @@ python3 setup_worker_fixture.py --scenario resume --json-out /tmp/report.json
 ```
 
 Scenarios: `happy`, `resume`, `duplicate-sender`, `verify-honesty`,
-`target-mismatch`, `stale-heartbeat`. The driver
+`target-mismatch`, `stale-heartbeat`, `structured-status`. The driver
 uses the real `Setup` methods and real `pairing.cmd_pair` against a loopback
 fake claim API, with fake runner/spawner/HTTP. Every report is JSON with
 `live_network=false`, `live_credentials=false`, `live_services=false`,
@@ -274,7 +312,7 @@ fake claim API, with fake runner/spawner/HTTP. Every report is JSON with
 a genuine Codex or Muse harness session: the harness runs the command, not a
 simulated provider call, and no live credential or service is touched.
 
-Expected current result: all six scenarios pass. Labels distinguish
+Expected current result: all seven scenarios pass. Labels distinguish
 `mock-simulated` from real inference; the default verify path prints
 `inference=NOT EXERCISED`. `target-mismatch` proves a wrong-machine run writes
 no checkpoint, runs no installer, and spawns nothing; `stale-heartbeat` proves

@@ -48,6 +48,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "configs" / "mock.toml"
 STATE_SCHEMA = "aipster-worker-setup/1"
+STATUS_SCHEMA = "aipster-worker-setup-status/1"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -486,6 +487,10 @@ class Setup:
         self.poll_interval = poll_interval
         self.state_path = self.data_dir / "setup-state.json"
         self.state = self._load_state()
+        self.json_output = False
+        self.last_facts: Optional[Dict[str, Any]] = None
+        self.last_heartbeat: Optional[Dict[str, Any]] = None
+        self.last_blocked: List[Dict[str, str]] = []
 
     # -- state ---------------------------------------------------------------
     def _load_state(self) -> Dict[str, Any]:
@@ -803,6 +808,7 @@ class Setup:
         if not for_verify:
             self._record("check", "blocked" if report["blocked"] else "passed",
                          "; ".join(item["code"] for item in report["blocked"]))
+        self.last_blocked = list(report["blocked"])
         return report
 
     def print_check(self, report: Dict[str, Any]) -> None:
@@ -1210,12 +1216,9 @@ class Setup:
         except (OSError, ValueError, TypeError):
             return {"state": "unreadable"}
 
-    def _emit_facts(self, heartbeat: Dict[str, Any], inference_state: str) -> None:
-        """List the readiness facts separately, each with its evidence source.
-
-        The declared target is connection. A mock heartbeat with usable=false
-        completes that target; it never becomes usability or qualification.
-        """
+    def _facts_document(self, heartbeat: Dict[str, Any],
+                        inference_state: str) -> Dict[str, Any]:
+        """The five readiness facts as data, with their evidence source."""
         install = self._install_state()
         paired = heartbeat.get("state") != "not-paired"
         fresh = heartbeat.get("state") == "fresh"
@@ -1227,16 +1230,102 @@ class Setup:
             qualified = "no (one execute request is not qualification evidence)"
         else:
             qualified = "no (not exercised)"
+        return {
+            "installed": {"value": "yes" if install["installed"] else
+                          ("partial" if install["partial"] else "no"),
+                          "source": "local .venv and dendrite"},
+            "paired": {"value": "yes" if paired else "no",
+                       "source": "private pairing store"},
+            "reachable": {"value": "yes" if fresh else "no",
+                          "source": "fresh authenticated heartbeat",
+                          "observed_at": heartbeat.get("heartbeatAt")},
+            "usable": {"value": usable, "source": "last heartbeat flag",
+                       "authoritative": False},
+            "inference_qualified": {"value": qualified,
+                                    "source": "explicit execute request" if
+                                    inference_state == "real-inference-exercised"
+                                    else "not exercised"},
+        }
+
+    def _emit_facts(self, heartbeat: Dict[str, Any], inference_state: str) -> None:
+        """List the readiness facts separately, each with its evidence source.
+
+        The declared target is connection. A mock heartbeat with usable=false
+        completes that target; it never becomes usability or qualification.
+        """
+        facts = self._facts_document(heartbeat, inference_state)
+        self.last_facts = facts
+        self.last_heartbeat = heartbeat
         self.out("verify: target=connection (usability and inference are separate facts)")
-        self.out("verify: fact installed=%s (local .venv and dendrite)"
-                 % ("yes" if install["installed"] else
-                    ("partial" if install["partial"] else "no")))
-        self.out("verify: fact paired=%s (private pairing store)" % ("yes" if paired else "no"))
-        self.out("verify: fact reachable=%s (fresh authenticated heartbeat at %s)"
-                 % ("yes" if fresh else "no", heartbeat.get("heartbeatAt") or "none"))
+        self.out("verify: fact installed=%s (%s)"
+                 % (facts["installed"]["value"], facts["installed"]["source"]))
+        self.out("verify: fact paired=%s (%s)"
+                 % (facts["paired"]["value"], facts["paired"]["source"]))
+        self.out("verify: fact reachable=%s (%s at %s)"
+                 % (facts["reachable"]["value"], facts["reachable"]["source"],
+                    heartbeat.get("heartbeatAt") or "none"))
         self.out("verify: fact usable=%s (last heartbeat flag; not authoritative controller readiness)"
-                 % usable)
-        self.out("verify: fact inference-qualified=%s" % qualified)
+                 % facts["usable"]["value"])
+        self.out("verify: fact inference-qualified=%s" % facts["inference_qualified"]["value"])
+
+    # -- structured status (ONB 10) ------------------------------------------
+    def status_document(self, command: str, exit_code: int) -> Dict[str, Any]:
+        """One versioned machine-readable result; agrees with the exit code."""
+        outcome = {
+            EXIT_OK: "complete",
+            EXIT_USAGE: "failed",
+            EXIT_PREREQ: "blocked",
+            EXIT_PAIRING: "blocked",
+            EXIT_NETWORK: "incomplete",
+            EXIT_SENDER_RUNNING: "complete",
+            EXIT_BUSY: "blocked",
+            EXIT_INTERRUPTED: "cancelled",
+        }.get(exit_code, "failed")
+        phase = {"run": "verify", "check": "check", "install": "install",
+                 "pair": "pair", "start": "start", "verify": "verify",
+                 "status": "status"}.get(command, command)
+        record = self.state.get("phases", {}).get(phase) or {}
+        reason = None
+        if exit_code != EXIT_OK:
+            blocked = self.last_blocked[0] if self.last_blocked else None
+            reason = {"code": blocked["code"] if blocked else record.get("state", "UNKNOWN"),
+                      "detail": redact(blocked["detail"] if blocked else record.get("detail", ""))}
+        facts = self.last_facts or self._facts_document(
+            self.last_heartbeat or self._heartbeat(), "not-exercised")
+        document = {
+            "schema": STATUS_SCHEMA,
+            "command": command,
+            "target": "connection",
+            "outcome": outcome,
+            "stage": phase,
+            "exit_code": int(exit_code),
+            "retryable": outcome in ("blocked", "incomplete"),
+            "next_action": self._next_action(reason, outcome),
+            "facts": facts,
+            "observed_at": utc_now(),
+        }
+        return document
+
+    @staticmethod
+    def _next_action(reason: Optional[Dict[str, str]], outcome: str) -> Optional[str]:
+        if outcome == "complete":
+            return None
+        if outcome == "cancelled":
+            return "rerun setup to resume from the last verified step"
+        code = (reason or {}).get("code") or ""
+        return {
+            "UV_VERSION": "let the wrapper bootstrap the pinned uv, or install uv 0.12.12",
+            "PARTIAL_INSTALL": "remove only local-worker/.venv and rerun install",
+            "PYTHON_VERSION": "install Python 3.9+ and rerun setup",
+            "UNQUALIFIED_PLATFORM": "run on Windows x64, or pass --allow-unqualified-platform",
+            "TARGET_MISMATCH": "run setup on the machine the user selected",
+            "TARGET_CHANGED": "run on the original machine, or pass --expect-target with its fingerprint",
+            "LOW_DISK": "free at least 1 GiB and rerun setup",
+            "UNCERTAIN": "check AIPSTER status/dashboard, then pass --retry-pair",
+            "in_progress": "check AIPSTER status/dashboard, then pass --retry-pair",
+            "uncertain": "check AIPSTER status/dashboard, then pass --retry-pair",
+            "repair-required": "pair again; the sender key was revoked or expired",
+        }.get(code, "resolve the reported block and rerun setup")
 
     def _log_tail(self, path: Path, extra: Sequence[str]) -> str:
         try:
@@ -1444,6 +1533,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-timeout", type=float, default=20.0)
     parser.add_argument("--heartbeat-wait", type=float, default=15.0)
     parser.add_argument("--debug", action="store_true", help="show a traceback for unexpected errors")
+    parser.add_argument("--json", action="store_true",
+                        help="emit one versioned JSON result on stdout instead of prose")
     return parser
 
 
@@ -1490,47 +1581,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     install_timeout=args.install_timeout, start_timeout=args.start_timeout,
                     heartbeat_wait=args.heartbeat_wait)
     mutating = args.command in ("run", "install", "pair", "start")
+    if args.json:
+        # Structured mode: stdout carries exactly one JSON document, so human
+        # progress is suppressed rather than mixed into the machine result.
+        session.out = lambda _line: None
+        session.err = lambda _line: None
     lock = SetupLock(data_dir / "setup.lock")
     try:
         if mutating:
             try:
                 acquired = lock.acquire()
             except SetupError as exc:
-                print("setup: " + str(exc), file=sys.stderr)
-                return exc.exit_code
+                if not args.json:
+                    print("setup: " + str(exc), file=sys.stderr)
+                raise
             if not acquired:
+                if args.json:
+                    print(json.dumps({"schema": STATUS_SCHEMA, "command": args.command,
+                                      "target": "connection", "outcome": "blocked",
+                                      "stage": args.command, "exit_code": EXIT_BUSY,
+                                      "retryable": True,
+                                      "next_action": "wait for the other setup process to finish",
+                                      "facts": {}, "observed_at": utc_now()}, sort_keys=True))
+                    return EXIT_BUSY
                 print("setup: BUSY: another setup process holds %s" % lock.path, file=sys.stderr)
                 return EXIT_BUSY
         if args.command == "check":
             report = session.check()
             session.print_check(report)
-            return EXIT_PREREQ if report["blocked"] else EXIT_OK
-        if args.command == "install":
-            return session.install()
-        if args.command == "pair":
-            return session.pair(code)
-        if args.command == "start":
-            return session.start()
-        if args.command == "verify":
-            return session.verify()
-        if args.command == "status":
-            return session.status()
-        return session.run(code)
+            rc = EXIT_PREREQ if report["blocked"] else EXIT_OK
+        elif args.command == "install":
+            rc = session.install()
+        elif args.command == "pair":
+            rc = session.pair(code)
+        elif args.command == "start":
+            rc = session.start()
+        elif args.command == "verify":
+            rc = session.verify()
+        elif args.command == "status":
+            rc = session.status()
+        else:
+            rc = session.run(code)
     except SetupError as exc:
-        print("setup: BLOCKED [%s] %s" % (exc.code, redact(exc)), file=sys.stderr)
-        return exc.exit_code
+        if not args.json:
+            print("setup: BLOCKED [%s] %s" % (exc.code, redact(exc)), file=sys.stderr)
+        session.last_blocked = [{"code": exc.code, "detail": redact(exc)}]
+        rc = exc.exit_code
     except KeyboardInterrupt:
-        print("setup: interrupted; rerun to resume", file=sys.stderr)
-        return EXIT_INTERRUPTED
+        if not args.json:
+            print("setup: interrupted; rerun to resume", file=sys.stderr)
+        rc = EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - never leak a code/token in a traceback path
-        if args.debug:
-            # A raw traceback carries str(exc), which may contain a credential.
-            # Show frames and the exception type only; values go through redact().
-            print(sanitized_traceback(exc), file=sys.stderr)
-        print("setup: FAILED [INTERNAL] " + redact(exc), file=sys.stderr)
-        return EXIT_USAGE
+        if not args.json:
+            if args.debug:
+                # A raw traceback carries str(exc), which may contain a credential.
+                # Show frames and the exception type only; values go through redact().
+                print(sanitized_traceback(exc), file=sys.stderr)
+            print("setup: FAILED [INTERNAL] " + redact(exc), file=sys.stderr)
+        rc = EXIT_USAGE
     finally:
         lock.release()
+    if args.json:
+        print(json.dumps(session.status_document(args.command, rc), sort_keys=True))
+    return rc
 
 
 if __name__ == "__main__":

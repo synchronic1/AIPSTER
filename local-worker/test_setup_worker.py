@@ -1359,5 +1359,84 @@ class CodeTimingTests(unittest.TestCase):
         self.assertIn("UV_VERSION", "\n".join(out))
 
 
+class StructuredStatusTests(unittest.TestCase):
+    """ONB 10: one versioned machine result that agrees with the exit code."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = make_root(self.tmp.name)
+        make_venv(self.root)
+        self.api = ApiFixture(self)
+        self.data = Path(self.tmp.name) / "paired data"
+        self.assertEqual(pair_real(self.tmp.name, self.api.base, data=self.data)[0], 0)
+
+    def session(self, **kw):
+        http = kw.pop("http", FakeHttp(health=(200, {"status": "ok"}, ""),
+                                       node=(200, node_body(), "")))
+        return make_setup(self.tmp.name, root=self.root, data=self.data,
+                          http=http, **kw)
+
+    def test_verify_document_lists_five_facts_and_matches_exit(self):
+        write_fresh_beat(self.data, usable=False)
+        session, *_ = self.session()
+        rc = session.verify()
+        document = session.status_document("verify", rc)
+        self.assertEqual(document["schema"], "aipster-worker-setup-status/1")
+        self.assertEqual(document["outcome"], "complete")
+        self.assertEqual(document["exit_code"], 0)
+        self.assertEqual(document["target"], "connection")
+        self.assertIsNone(document["next_action"])
+        self.assertEqual(set(document["facts"]), {
+            "installed", "paired", "reachable", "usable", "inference_qualified"})
+        self.assertEqual(document["facts"]["usable"]["value"], "false")
+        self.assertFalse(document["facts"]["usable"]["authoritative"])
+        self.assertEqual(document["facts"]["reachable"]["value"], "yes")
+        json.dumps(document)  # must be serializable
+
+    def test_blocked_document_names_one_next_action_and_is_retryable(self):
+        data = Path(self.tmp.name) / "unpaired data"
+        http = FakeHttp(health=(200, {"status": "ok"}, ""), node=(200, node_body(), ""))
+        session, *_ = make_setup(self.tmp.name, root=self.root, data=data, http=http)
+        rc = session.verify()
+        document = session.status_document("verify", rc)
+        self.assertEqual(document["outcome"], "blocked")
+        self.assertEqual(document["exit_code"], rc)
+        self.assertTrue(document["retryable"])
+        self.assertIsInstance(document["next_action"], str)
+        self.assertTrue(document["next_action"])
+
+    def test_document_carries_no_secret_or_private_path(self):
+        write_fresh_beat(self.data, usable=False)
+        session, *_ = self.session()
+        rc = session.verify()
+        sw.register_secret(FAKE_TOKEN)
+        document = session.status_document("verify", rc)
+        text = json.dumps(document, sort_keys=True)
+        for secret in (FAKE_SECRET, FAKE_TOKEN, FAKE_CODE):
+            self.assertNotIn(secret, text)
+        self.assertNotIn(str(self.data), text)
+
+    def test_cli_status_json_is_a_single_parseable_document(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = sw.main(["status", "--data-dir", str(self.data), "--json"])
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["schema"], "aipster-worker-setup-status/1")
+        self.assertEqual(document["command"], "status")
+        self.assertEqual(document["exit_code"], rc)
+        self.assertNotIn("setup status:", stdout.getvalue())
+
+    def test_cli_check_json_keeps_stdout_machine_only(self):
+        data = Path(self.tmp.name) / "check data"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = sw.main(["check", "--data-dir", str(data), "--json"])
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["exit_code"], rc)
+        self.assertEqual(document["command"], "check")
+        self.assertNotIn("setup check:", stdout.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

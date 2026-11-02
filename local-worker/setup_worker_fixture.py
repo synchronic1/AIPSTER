@@ -423,6 +423,37 @@ def scenario_stale_heartbeat(tmp: Path, base: str) -> Dict[str, Any]:
                       "execute_requests": 0}}
 
 
+def scenario_structured_status(tmp: Path, base: str) -> Dict[str, Any]:
+    """ONB 10: the machine result agrees with the facts and the exit code."""
+    root, data = paired_setup(tmp, base)
+    make_venv(root)
+    write_fresh_beat(data)
+    http = FakeHttp()
+    http.health_responses = (200, {"status": "ok"}, "")
+    session, _runner, _spawner, http, out, err = make_session(
+        tmp, root, data, base, http=http)
+    rc = session.verify()
+    document = session.status_document("verify", rc)
+    text = json.dumps(document, sort_keys=True)
+    checks: List[Dict[str, Any]] = []
+    check(rc == 0, "verify exits 0", checks)
+    check(document["schema"] == sw.STATUS_SCHEMA, "versioned status schema", checks)
+    check(document["outcome"] == "complete", "outcome agrees with exit 0", checks)
+    check(document["exit_code"] == rc, "exit_code echoed", checks)
+    check(document["target"] == "connection", "declared target is connection", checks)
+    check(document["next_action"] is None, "complete setup has no next action", checks)
+    check(document["facts"]["usable"]["value"] == "false",
+          "usable=false while connection completes", checks)
+    check(document["facts"]["usable"]["authoritative"] is False,
+          "usable is not presented as authoritative", checks)
+    check(len(document["facts"]) == 5, "five readiness facts", checks)
+    assert_absent(text)
+    checks.append({"check": "no synthetic secret in the JSON result", "passed": True})
+    return {"checks": checks, "transcript": out + err + [text],
+            "facts": {"outcome": document["outcome"], "exit": rc,
+                      "facts": sorted(document["facts"])}}
+
+
 SCENARIOS = {
     "happy": scenario_happy,
     "resume": scenario_resume,
@@ -430,6 +461,7 @@ SCENARIOS = {
     "verify-honesty": scenario_verify_honesty,
     "target-mismatch": scenario_target_mismatch,
     "stale-heartbeat": scenario_stale_heartbeat,
+    "structured-status": scenario_structured_status,
 }
 
 
