@@ -840,8 +840,8 @@ class WrapperTests(unittest.TestCase):
         self.bin.mkdir()
         self.record = Path(self.tmp.name) / "uv-args.txt"
 
-    def make_uv(self, version):
-        uv = self.bin / "uv"
+    def make_uv(self, version, name="uv"):
+        uv = self.bin / name
         uv.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = \"--version\" ]; then echo \"uv %s\"; exit 0; fi\n"
@@ -850,9 +850,38 @@ class WrapperTests(unittest.TestCase):
         uv.chmod(0o755)
         return uv
 
-    def run_shell(self, *args):
+    def make_bootstrap_python(self, uv_path, exit_code=0):
+        record = Path(self.tmp.name) / "bootstrap-args.txt"
+        script = self.bin / "python3"
+        script.write_text(
+            "#!/bin/sh\n"
+            "printf '%%s\\n' \"$@\" >> \"%s\"\n"
+            "if [ \"$1\" = \"-c\" ]; then exit 0; fi\n"
+            "if [ \"%d\" -ne 0 ]; then exit %d; fi\n"
+            "printf '%%s\\n' \"%s\"\n"
+            % (record, exit_code, exit_code, uv_path), encoding="utf-8")
+        script.chmod(0o755)
+        return record
+
+    def make_boot_uv(self, uv_path):
+        args = Path(self.tmp.name) / "boot-uv-args.txt"
+        envs = Path(self.tmp.name) / "boot-uv-env.txt"
+        uv_path.write_text(
+            "#!/bin/sh\n"
+            "printf '%%s\\n' \"$@\" > \"%s\"\n"
+            "printf '%%s\\n' \"$AIPSTER_UV\" > \"%s\"\n"
+            "printf '%%s\\n' \"$PATH\" > \"%s.path\"\n"
+            "exit 0\n" % (args, envs, envs), encoding="utf-8")
+        uv_path.chmod(0o755)
+        return args, envs
+
+    def run_shell(self, *args, env_overrides=None):
         env = dict(os.environ)
         env["AIPSTER_UV"] = str(self.bin / "uv")
+        env["PATH"] = str(self.bin) + ":" + env.get("PATH", "")
+        env.pop("AIPSTER_PYTHON", None)
+        if env_overrides:
+            env.update(env_overrides)
         return subprocess.run(["sh", str(ROOT / "setup-worker.sh"), *args],
                               cwd=ROOT, env=env, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -867,23 +896,72 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(recorded[-3:], ["status", "--data-dir",
                                          str(Path(self.tmp.name) / "a b")])
 
-    def test_shell_wrapper_refuses_a_different_uv_without_substitution(self):
-        self.make_uv("0.10.3")
+    def test_correct_global_uv_is_reused_without_bootstrap(self):
+        self.make_uv("0.12.12")
+        bootstrap_record = self.make_bootstrap_python(str(self.bin / "unused-uv"))
         result = self.run_shell("check")
-        self.assertEqual(result.returncode, 3)
-        self.assertIn("0.12.12", result.stderr)
-        self.assertIn("0.10.3", result.stderr)
-        self.assertFalse(self.record.exists(), "mismatched uv must not execute the orchestrator")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(bootstrap_record.exists(), "a matching uv must not be bootstrapped")
+
+    def test_wrong_global_uv_is_preserved_and_private_uv_is_used_for_child(self):
+        wrong = self.make_uv("0.10.3")
+        boot_dir = Path(self.tmp.name) / "private uv dir"
+        boot_dir.mkdir()
+        boot_uv = boot_dir / "uv"
+        boot_args, boot_envs = self.make_boot_uv(boot_uv)
+        bootstrap_record = self.make_bootstrap_python(boot_uv)
+        result = self.run_shell("status", "--data-dir", str(Path(self.tmp.name) / "a b"),
+                                env_overrides={"AIPSTER_UV": str(wrong)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not the pinned 0.12.12", result.stderr)
+        self.assertEqual(wrong.read_text(encoding="utf-8").splitlines()[1],
+                         "if [ \"$1\" = \"--version\" ]; then echo \"uv 0.10.3\"; exit 0; fi")
+        self.assertIn(str(ROOT / "uv_bootstrap.py"), bootstrap_record.read_text(encoding="utf-8"))
+        recorded = boot_args.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(recorded[:6], ["run", "--no-project", "--python", "3.12.14",
+                                        "python", str(ROOT / "setup_worker.py")])
+        self.assertEqual(recorded[-3:], ["status", "--data-dir",
+                                         str(Path(self.tmp.name) / "a b")])
+        self.assertEqual(boot_envs.read_text(encoding="utf-8").strip(), str(boot_uv))
+        path = Path(str(boot_envs) + ".path").read_text(encoding="utf-8").split(":")[0]
+        self.assertEqual(path, str(boot_dir))
+
+    def test_missing_uv_bootstraps_into_a_private_path_for_the_child(self):
+        boot_uv = self.bin / "boot uv"
+        boot_args, boot_envs = self.make_boot_uv(boot_uv)
+        self.make_bootstrap_python(boot_uv)
+        env = dict(os.environ)
+        env.pop("AIPSTER_UV", None)
+        env["PATH"] = str(self.bin) + ":/usr/bin:/bin"
+        result = subprocess.run(["sh", str(ROOT / "setup-worker.sh"), "check"],
+                                cwd=ROOT, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(boot_args.read_text(encoding="utf-8").splitlines()[:6],
+                         ["run", "--no-project", "--python", "3.12.14",
+                          "python", str(ROOT / "setup_worker.py")])
+        self.assertEqual(boot_envs.read_text(encoding="utf-8").strip(), str(boot_uv))
+
+    def test_bootstrap_failure_propagates_and_does_not_run_the_orchestrator(self):
+        self.make_uv("0.10.3")
+        self.make_bootstrap_python(self.bin / "unused-uv", exit_code=7)
+        result = self.run_shell("check")
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("private pinned uv bootstrap failed", result.stderr)
+        self.assertFalse(self.record.exists())
 
     def test_powershell_wrapper_is_pinned_and_has_no_argv_code_path(self):
         script = (ROOT / "setup-worker.ps1").read_text(encoding="utf-8")
         self.assertIn('"0.12.12"', script)
         self.assertIn("--python 3.12.14", script)
         self.assertIn("setup_worker.py", script)
+        self.assertIn("uv_bootstrap.py", script)
+        self.assertIn("AIPSTER_UV", script)
         self.assertNotIn("--code ", script)
         self.assertNotIn("--code=", script)
         if not shutil.which("pwsh"):
             self.skipTest("pwsh is not installed; static contract checked only")
+
 
 
 class CliAndLockTests(unittest.TestCase):
@@ -946,6 +1024,9 @@ class CliAndLockTests(unittest.TestCase):
         finally:
             child.terminate()
             child.wait(timeout=5)
+            for pipe in (child.stdout, child.stderr):
+                if pipe is not None:
+                    pipe.close()
 
 
 class RunResumeTests(unittest.TestCase):

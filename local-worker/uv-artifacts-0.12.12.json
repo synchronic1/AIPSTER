@@ -1,0 +1,31 @@
+{
+  "version": "0.12.12",
+  "source": "https://github.com/astral-sh/uv/releases/tag/0.12.12",
+  "assets": [
+    {
+      "name": "uv-aarch64-apple-darwin.tar.gz",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.12/uv-aarch64-apple-darwin.tar.gz",
+      "sha256": "46740540b63fdee9a6cb2e19baf3f1f475b850c440a33e63455087a6871263f1"
+    },
+    {
+      "name": "uv-aarch64-unknown-linux-gnu.tar.gz",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.12/uv-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "fe08db50cc1b56cd1da7801065ed1103d27ed3f9571cd122386cfc7faf1b8df5"
+    },
+    {
+      "name": "uv-x86_64-apple-darwin.tar.gz",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.12/uv-x86_64-apple-darwin.tar.gz",
+      "sha256": "0dc8cd6c961582b0d140b5398f96b23502885277fb3464241456a2435e460dfa"
+    },
+    {
+      "name": "uv-x86_64-pc-windows-msvc.zip",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.12/uv-x86_64-pc-windows-msvc.zip",
+      "sha256": "3d54912924c36e862c14f427d04f2ed70a99e8001d1c30caa101f6d5711626d5"
+    },
+    {
+      "name": "uv-x86_64-unknown-linux-gnu.tar.gz",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.12/uv-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "ab9b309d4586403f024e100abaceb396616e178a553e2500c36087d180f09509"
+    }
+  ]
+}

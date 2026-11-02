@@ -6,6 +6,11 @@ into the published setup packet, and not a claim that a live worker, model, or
 inference path has been qualified. Windows x64 is the only qualified platform;
 macOS and Linux remain explicitly experimental.
 
+**Cold-start claim:** the private uv bootstrap covers a missing or mismatched
+`uv`, but it still needs a system Python 3.9+ to run. A host with neither a
+suitable uv nor Python is a known unfinished edge, so this candidate does not
+claim universal one-command cold-start completion.
+
 ## One command
 
 From a worker checkout:
@@ -109,15 +114,50 @@ a synthetic heartbeat key into a child log and asserts that the displayed tail
 is redacted while the private file still contains it. Treat the log directory as
 private diagnostic state, not as publishable evidence.
 
-## Private uv bootstrap (HOLD, not in this candidate)
+## Pinned uv bootstrap (cold start)
 
-The first candidate requires an existing `uv 0.12.12`; the wrappers fail closed
-with exit 3 if it is missing or different. They do not install or upgrade a
-global tool. Private pinned-uv cold-start bootstrap is explicitly **HOLD** and
-is being developed as a separate follow-up commit on the same branch. Until
-that commit lands and its synthetic archive/digest/runner tests pass, this
-candidate must not advertise one-command cold-start completion: a machine with
-no suitable uv still needs an operator-provided uv 0.12.12.
+The wrappers first use an existing `uv 0.12.12` (from `AIPSTER_UV` or `PATH`).
+If it is missing or a different version, they do **not** fail back to the user
+and do **not** upgrade/replace a global uv. They run `uv_bootstrap.py` with the
+system Python:
+
+```sh
+python3 local-worker/uv_bootstrap.py --print-path
+```
+
+The helper:
+
+1. Loads `local-worker/uv-artifacts-0.12.12.json`, which pins the official
+   Astral release source, the five accepted asset names, and each **archive**
+   SHA-256 (not the detached `.sha256` file digest).
+2. Selects only the asset matching the current OS/architecture. Unknown
+   combinations are refused before any download.
+3. Downloads the archive into `<worker data>/uv-bootstrap/0.12.12/`, a
+   user-private directory established through `pairing.private_dir`.
+4. Verifies the fixed SHA-256 **before** opening the archive.
+5. Rejects absolute paths, `..`, control characters, symlinks/hardlinks/device
+   members, encrypted zip members, oversized members, and archives that do not
+   contain exactly one `uv` (or `uv.exe`) binary. It extracts only that member.
+6. Writes the binary with 0700 permissions and records its digest in a private
+   cache marker. Reuse re-verifies the binary digest.
+7. Runs `uv --version` and requires exactly `0.12.12`.
+
+The wrapper then adds the private directory to `PATH`, sets `AIPSTER_UV`, and
+executes `uv run --no-project --python 3.12.14 python setup_worker.py ...`.
+Those environment changes are scoped to that child; the global uv installation
+and user PATH are untouched.
+
+Remaining cold-start edge: the bootstrap itself needs a system Python 3.9+.
+If none exists, the wrapper exits 3 with that exact limitation. It does not
+download or install Python. `uv run --python 3.12.14` may download that Python
+interpreter on first use, as the reviewed install path already did; that is a
+network action and needs the operator's normal approval.
+
+Qualification status: Windows x64 is the first qualified target. macOS and
+Linux bootstrap paths are experimental; `setup_worker.py` still requires
+`--allow-unqualified-platform` there. All bootstrap tests use synthetic
+archives and fake downloader/digest/extractor/runner hooks; none downloaded or
+executed a real uv binary on the development Mac.
 
 ## Dependency-injection contract (for QA)
 
