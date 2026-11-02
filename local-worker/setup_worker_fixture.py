@@ -163,6 +163,32 @@ class FakeSpawner:
         return sum(1 for call in self.calls if marker in call["argv"])
 
 
+class FakeProcessOps:
+    """Synthetic ProcessOps: no real PID is probed or signalled."""
+
+    def __init__(self):
+        self.alive = {}
+        self.stopped = []
+
+    @staticmethod
+    def _identity(pid):
+        return type("Identity", (), {
+            "start_time": "start-%d" % pid,
+            "executable": "/synthetic/dendrite",
+            "owner": str(getattr(os, "getuid", lambda: 501)())})()
+
+    def probe(self, pid):
+        return self.alive.setdefault(pid, self._identity(pid))
+
+    def stop_owned(self, pid, expected):
+        ident = self.probe(pid)
+        if ident.start_time != expected["start_time"]:
+            raise sw.ownership.Refusal("PID reused", "reuse")
+        self.stopped.append(pid)
+        self.alive.pop(pid, None)
+        return True
+
+
 class FakeHttp:
     def __init__(self):
         self.calls = []
@@ -266,6 +292,7 @@ def make_session(tmp: Path, root: Path, data: Path, base: str, *,
         api_base=base, allow_unqualified=True, retry_pair=retry_pair,
         verify_inference=verify_inference, runner=runner, spawner=spawner,
         http=http, token_provider=lambda create=True: FAKE_TOKEN,
+        file_ops=sw.ownership.OsFileOps(), process_ops=FakeProcessOps(),
         sender_lock_probe=lambda _data: sender_lock,
         which=lambda _name: "/synthetic/uv",
         port_open=lambda _host, _port: False,

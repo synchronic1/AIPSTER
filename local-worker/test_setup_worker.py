@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import pairing
+import setup_ownership as ownership
 import setup_worker as sw
 import setup_worker_fixture as fixture
 
@@ -161,8 +162,43 @@ def clock_sequence(step=1.0):
     return clock
 
 
+class FakeProcessOps:
+    """Synthetic ProcessOps: no real PID is ever probed or signalled."""
+
+    def __init__(self):
+        self.alive = {}
+        self.stopped = []
+        self.probes = {}
+        self.flip_all = False
+        self.gone = False
+
+    def _identity(self, pid, start=None):
+        return SimpleNamespace(start_time=start or ("start-%d" % pid),
+                               executable="/synthetic/dendrite",
+                               owner=str(getattr(os, "getuid", lambda: 501)()))
+
+    def probe(self, pid):
+        if self.gone:
+            return None
+        self.probes[pid] = self.probes.get(pid, 0) + 1
+        if self.flip_all and self.probes[pid] > 1:
+            return self._identity(pid, start="reused-%d" % pid)
+        return self.alive.setdefault(pid, self._identity(pid))
+
+    def stop_owned(self, pid, expected):
+        ident = self.probe(pid)
+        if ident is None:
+            return False
+        if ident.start_time != expected["start_time"]:
+            raise ownership.Refusal("PID reused", "reuse")
+        self.stopped.append({"pid": pid, "expected": dict(expected)})
+        self.alive.pop(pid, None)
+        return True
+
+
 def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=None,
                http=None, pairer=None, token=FAKE_TOKEN, token_provider=None,
+               file_ops=None, process_ops=None,
                allow=True,
                platform_name="posix", machine="arm64", retry_pair=False,
                verify_inference=False, sender_lock=False, port_open=False,
@@ -180,6 +216,7 @@ def make_setup(tmp, *, root=None, data=None, config=None, runner=None, spawner=N
         allow_unqualified=allow, retry_pair=retry_pair, verify_inference=verify_inference,
         runner=runner, spawner=spawner, http=http, pairer=pairer,
         token_provider=token_provider or (lambda create=True: token),
+        file_ops=file_ops, process_ops=process_ops or FakeProcessOps(),
         sender_lock_probe=lambda _data: sender_lock,
         which=(lambda _name: "/fixture/uv") if uv_present else (lambda _name: None),
         port_open=lambda _host, _port: port_open,
@@ -585,18 +622,66 @@ class StartTests(unittest.TestCase):
         self.assertEqual(spawner.calls, [])
         self.assertIn("already in use", "\n".join(err))
 
-    def test_daemon_that_never_becomes_healthy_is_terminated(self):
+    def test_daemon_that_never_becomes_healthy_is_stopped_with_verified_identity(self):
         handle = FakeHandle()
         spawner = FakeSpawner([handle])
         http = FakeHttp(health=(None, {}, "refused"))
-        session, _runner, spawner, _http, _out, err = make_setup(
+        session, _runner, spawner, _http, out, err = make_setup(
             self.tmp.name, root=self.root, http=http, spawner=spawner,
             start_timeout=0.0)
         self.assertEqual(session.start(), sw.EXIT_NETWORK)
-        self.assertTrue(handle.terminated)
-        self.assertTrue(handle.waited)
+        ops = session.process_ops
+        self.assertEqual(len(ops.stopped), 1, "one single-PID ownership stop")
+        self.assertEqual(ops.stopped[0]["pid"], handle.pid)
+        self.assertEqual(ops.stopped[0]["expected"]["start_time"],
+                         "start-%d" % handle.pid)
+        self.assertFalse(handle.terminated,
+                         "the legacy group termination path must not run")
         self.assertEqual(session.state["phases"]["start"]["state"], "failed")
         self.assertIn("did not become healthy", "\n".join(err))
+        self.assertIn("rollback:", "\n".join(out))
+
+    def test_daemon_stop_refuses_a_reused_pid_and_leaves_a_residual(self):
+        handle = FakeHandle()
+        spawner = FakeSpawner([handle])
+        http = FakeHttp(health=(None, {}, "refused"))
+        ops = FakeProcessOps()
+        ops.flip_all = True  # claim sees the birth identity; rollback sees another
+        session, _runner, spawner, _http, out, err = make_setup(
+            self.tmp.name, root=self.root, http=http, spawner=spawner,
+            process_ops=ops, start_timeout=0.0)
+        self.assertEqual(session.start(), sw.EXIT_NETWORK)
+        self.assertEqual(ops.stopped, [], "a mismatched PID must never be signalled")
+        self.assertFalse(handle.terminated)
+        self.assertIn("residuals=1", "\n".join(out))
+
+    def test_unprobeable_child_falls_back_to_the_direct_owned_handle(self):
+        handle = FakeHandle()
+        spawner = FakeSpawner([handle])
+        http = FakeHttp(health=(None, {}, "refused"))
+        ops = FakeProcessOps()
+        ops.gone = True  # nothing to claim: the PID already looks exited
+        session, _runner, spawner, _http, _out, _err = make_setup(
+            self.tmp.name, root=self.root, http=http, spawner=spawner,
+            process_ops=ops, start_timeout=0.0)
+        self.assertEqual(session.start(), sw.EXIT_NETWORK)
+        self.assertTrue(handle.terminated)
+        self.assertEqual(ops.stopped, [])
+
+    def test_os_process_ops_refuses_identity_mismatch_without_signalling(self):
+        class Ops(sw.OsProcessOps):
+            def probe(self, pid):
+                return sw.ProcessIdentity("other", "/synthetic/dendrite", "501")
+
+        calls = []
+        session, *_ = make_setup(self.tmp.name, root=self.root)
+        session.process_ops = Ops()
+        with patch.object(sw.os, "kill", lambda *args: calls.append(args)):
+            with self.assertRaises(ownership.Refusal):
+                session.process_ops.stop_owned(4321, {
+                    "start_time": "expected", "executable": "/synthetic/dendrite",
+                    "owner": "501"})
+        self.assertEqual(calls, [], "identity mismatch must not send even signal 0")
 
     def test_sender_argv_quotes_spaces_and_is_not_shell_text(self):
         self.api = ApiFixture(self)

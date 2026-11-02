@@ -180,17 +180,61 @@ default. `detail` is redacted; a complete result has `reason: null`.
 
 ## Owned-resource rollback (ONB 24)
 
-Rollback is **not implemented in this candidate** and is **BLOCKED** on the
-reviewed Muse helper, not merely on its code existing. Muse candidate
-`6894b772e049ee2270cfb6bb94964c731dc0f3ff` provides `setup_ownership.py` with
-`create_ledger`, `claim_new_file`, `claim_new_process`, `rollback`, and
-`redacted_diagnostics`, but root/QA have open safety findings on sampled
-large-file hashes and external check/action races. No destructive automatic
-cleanup is wired until that review closes; then the DeepSeek owner integrates
-it here in a separate commit. Cancellation currently leaves the checkpoint and
-reports residue; it deletes nothing.
+The QA-accepted Muse ownership API is integrated as the **only** destructive
+path in the engine. `setup_ownership.py` is copied byte-identically from Muse
+`d94b77f` (API v1.1.1; sha256
+`1a0950fd3a4f1c69ae1fe49648413cfa47b329aa9050595f95dfc736a67e142d`) and is
+never edited here; findings route back to Muse `a2a`.
 
+Wired today — one path only, a daemon that never becomes healthy after
+`start`:
 
+1. `create_ledger(roots=[root, data_dir], attempt_id="setup-<uuid12>",
+   preserved=PreservedGuard(...))`. Preserved entries are the checkpoint file
+   and the pairing meta/status/key files, so rollback can never delete the
+   evidence a human needs.
+2. `claim_new_process(ledger, pid, process_ops)` records the child the engine
+   itself just spawned.
+3. `rollback(ledger, file_ops, process_ops)` runs with identity-bound deletes
+   and no group signals. If it reports `complete=False`, it is retried once
+   with `prior=<previous report>` so the residual set is recomputed rather than
+   dropped.
+4. Exactly one `rollback: ...` line is printed with
+   `redacted_diagnostics(report)` — counts and refusal categories, never a
+   path, PID, or token.
+
+The orchestrator supplies the missing `stop_owned` adapter as `OsProcessOps`:
+
+* `probe(pid)` does an `os.kill(pid, 0)` existence precheck first, so a
+  nonexistent or already-reaped PID costs no subprocess. On Linux it reads
+  `/proc/<pid>/stat` for the start time, `/proc/<pid>/exe` and the directory
+  owner; on macOS it runs `ps -o lstart= -o uid= -o comm= -p <pid>`.
+* `stop_owned(pid, expected)` re-verifies the full identity tuple
+  `(start_time, executable, owner)` before signalling. A mismatch raises
+  `Refusal("PID reused (birth identity mismatch)", "reuse")` and **sends no
+  signal** — a recycled PID is never killed. Only after that check does it
+  send `SIGTERM`, poll for a bounded interval, re-verify identity, then send
+  `SIGKILL`. No process groups are signalled.
+
+Fail-safe behaviour, unchanged from before:
+
+* If the child cannot be probed (nonexistent, permission denied, or a
+  synthetic handle with no real PID) or the ledger refuses the claim, the
+  engine falls back to the live `Popen` handle it owns by construction:
+  `terminate()` then a bounded `wait()`. No unowned PID is ever signalled.
+* A reused/mismatched PID is reported as a residual and left alone.
+* Cancellation, Ctrl-C, and every other failure path still delete nothing and
+  leave the checkpoint. No file claim (`claim_new_file` / `claim_new_dir`) is
+  wired yet, so an install, `.venv`, or private store is never removed by
+  rollback.
+
+Gaps in this integration (routed to Muse `a2a`, not patched here): the
+fallback path is outside the ledger, so its outcome is not counted in the
+rollback diagnostics; and `ps lstart` text is locale- and platform-formatted,
+which is fine for same-session comparison but is not a stable cross-tool
+identity format.
+
+## Setup state
 
 State is a private, non-secret `setup-state.json` under the worker data dir:
 
@@ -317,7 +361,7 @@ Setup(
     hostname=callable, expect_target=str,
     sleep=callable, clock=callable, out=callable, err=callable,
     install_timeout=900.0, start_timeout=20.0, heartbeat_wait=15.0,
-    poll_interval=0.25,
+    poll_interval=0.25, file_ops=object, process_ops=object,
 )
 ```
 
@@ -336,6 +380,12 @@ Hook shapes actually used by the implementation:
 * `hostname() -> str` feeds the target fingerprint; `expect_target` is the
   caller's asserted fingerprint (`None` disables the assertion).
 * `clock()` / `sleep(seconds)` make bounded waits deterministic.
+* `file_ops` / `process_ops` are the Muse ownership adapters passed to
+  `rollback`. Defaults are `ownership.OsFileOps()` and the engine's
+  `OsProcessOps`. A fake `process_ops` needs `probe(pid) -> identity | None`
+  and `stop_owned(pid, expected) -> bool`; the author tests pass the real
+  `OsFileOps` over temp roots with a fake `process_ops`, so no real process is
+  signalled. The fixture driver does the same.
 
 Public methods: `check()`, `install(report=None)`, `pair(code)`, `start(report=None)`,
 `verify()`, `status()`, `run(code)`. Do not require private helper names.

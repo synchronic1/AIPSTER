@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
@@ -46,6 +47,10 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import setup_ownership as ownership  # noqa: E402 - reviewed Muse component, imported unchanged
+
 DEFAULT_CONFIG = ROOT / "configs" / "mock.toml"
 STATE_SCHEMA = "aipster-worker-setup/1"
 STATUS_SCHEMA = "aipster-worker-setup-status/1"
@@ -471,6 +476,116 @@ class ProcessHandle:
                 pass
 
 
+class ProcessIdentity:
+    """Birth identity checked before any single-PID stop."""
+
+    __slots__ = ("start_time", "executable", "owner")
+
+    def __init__(self, start_time: str, executable: str, owner: str):
+        self.start_time = str(start_time)
+        self.executable = str(executable)
+        self.owner = str(owner)
+
+
+class OsProcessOps:
+    """Production ProcessOps for ownership rollback (POSIX).
+
+    ``probe`` reads (start_time, executable, owner) without signalling; it
+    returns None when the PID is gone and raises on an unsupported platform so
+    rollback fails safe rather than assuming a process exited. ``stop_owned``
+    re-probes, refuses on any mismatch, and sends SIGTERM then a bounded
+    SIGKILL to that single PID only. It never signals a process group. Windows
+    process identity is unsupported here; callers get a fail-safe residual.
+    """
+
+    def __init__(self, timeout: float = 5.0, interval: float = 0.1):
+        self.timeout = timeout
+        self.interval = interval
+
+    @staticmethod
+    def _unsupported() -> bool:
+        return os.name != "posix"
+
+    def probe(self, pid: int) -> Optional[ProcessIdentity]:
+        if self._unsupported():
+            raise ownership.OwnershipError("process identity is unsupported on this platform")
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass  # exists, owned by another user; identity comparison will refuse
+        except OSError:
+            return None
+        if sys.platform.startswith("linux"):
+            return self._probe_linux(pid)
+        return self._probe_ps(pid)
+
+    @staticmethod
+    def _probe_linux(pid: int) -> Optional[ProcessIdentity]:
+        try:
+            raw = Path("/proc/%d/stat" % pid).read_text(encoding="utf-8", errors="replace")
+            fields = raw[raw.rfind(")") + 2:].split()
+            start_time = fields[19]  # field 22 overall, after state..starttime
+            executable = os.readlink("/proc/%d/exe" % pid)
+            owner = str(os.stat("/proc/%d" % pid).st_uid)
+        except (OSError, IndexError, ValueError):
+            return None
+        return ProcessIdentity(start_time, executable, owner)
+
+    def _probe_ps(self, pid: int) -> Optional[ProcessIdentity]:
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "lstart=", "-o", "uid=", "-o", "comm=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5.0, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        line = (result.stdout or "").strip()
+        parts = line.split(None, 6)
+        if result.returncode != 0 or len(parts) < 7:
+            return None
+        return ProcessIdentity(" ".join(parts[:5]), parts[6], parts[5])
+
+    @staticmethod
+    def _matches(pid: int, ident: ProcessIdentity, expected: Dict[str, Any]) -> None:
+        if ident.start_time != str(expected.get("start_time")):
+            raise ownership.Refusal("PID reused (birth identity mismatch)", "reuse")
+        if ident.executable != str(expected.get("executable")):
+            raise ownership.Refusal("executable mismatch", "identity")
+        if ident.owner != str(expected.get("owner")):
+            raise ownership.Refusal("owner mismatch", "identity")
+
+    def stop_owned(self, pid: int, expected: Dict[str, Any]) -> bool:
+        ident = self.probe(pid)
+        if ident is None:
+            return False  # exited inside the stop window: success, no signal
+        self._matches(pid, ident, expected)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise ownership.Refusal("cannot signal owned process: " + type(exc).__name__,
+                                    "signal") from exc
+        deadline = time.monotonic() + max(self.timeout, 0.0)
+        while time.monotonic() < deadline:
+            time.sleep(self.interval)
+            current = self.probe(pid)
+            if current is None:
+                return True
+            self._matches(pid, current, expected)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except OSError as exc:
+            raise ownership.Refusal("cannot stop owned process: " + type(exc).__name__,
+                                    "signal") from exc
+        return True
+
+
 def _default_runner(argv: Sequence[str], *, cwd: Optional[Path] = None,
                     env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None,
                     capture: bool = False):
@@ -516,6 +631,8 @@ class Setup:
                  sender_lock_probe: Optional[Callable[[Path], bool]] = None,
                  which: Optional[Callable[[str], Optional[str]]] = None,
                  port_open: Optional[Callable[[str, int], bool]] = None,
+                 file_ops: Optional[Any] = None,
+                 process_ops: Optional[Any] = None,
                  platform_name: Optional[str] = None,
                  machine: Optional[str] = None,
                  hostname: Optional[Callable[[], str]] = None,
@@ -545,6 +662,8 @@ class Setup:
         self.sender_lock_probe = sender_lock_probe
         self.which = which or shutil.which
         self.port_open = port_open or self._default_port_open
+        self.file_ops = file_ops or ownership.OsFileOps()
+        self.process_ops = process_ops or OsProcessOps()
         self.platform_name = platform_name if platform_name is not None else os.name
         self.machine = machine if machine is not None else platform.machine()
         self.hostname = hostname or socket.gethostname
@@ -563,6 +682,65 @@ class Setup:
         self.last_facts: Optional[Dict[str, Any]] = None
         self.last_heartbeat: Optional[Dict[str, Any]] = None
         self.last_blocked: List[Dict[str, str]] = []
+        self._ledger: Optional[ownership.OwnershipLedger] = None
+
+    # -- owned-resource rollback (ONB 24) ------------------------------------
+    def _ownership_ledger(self) -> ownership.OwnershipLedger:
+        """A per-session ledger for resources this attempt creates.
+
+        The reviewed Muse component owns the contract; this class only records
+        what it spawned and never deletes an unverified path. Pairing,
+        credentials, and the checkpoint are preserved even if a future claim
+        tried to include them.
+        """
+        if self._ledger is None:
+            preserved = [str(self.state_path)]
+            try:
+                files = self._pairing().pairing_files(self.data_dir)
+                preserved.extend(str(files[key]) for key in ("meta", "status", "key")
+                                 if key in files)
+            except Exception:  # noqa: BLE001 - preservation fails closed via guard
+                preserved.append(str(self.data_dir))
+            clock = type("_Clock", (), {"now": staticmethod(utc_now)})()
+            self._ledger = ownership.create_ledger(
+                roots=[self.root, self.data_dir],
+                attempt_id="setup-%s" % uuid.uuid4().hex[:12],
+                clock=clock, preserved=ownership.PreservedGuard(preserved))
+        return self._ledger
+
+    def _stop_owned_child(self, handle: Any) -> Optional[ownership.CleanupReport]:
+        """Stop a just-spawned child with an identity-bound, single-PID stop.
+
+        The live handle already proves this process created the child. The
+        Muse ledger adds an independent birth identity and revalidates it at
+        the stop boundary. An identity mismatch is never signalled and stays a
+        reported residual; only a PID that cannot be probed at claim time
+        (normally because it already exited, or a synthetic handle) falls back
+        to the direct child handle.
+        """
+        pid = getattr(handle, "pid", None)
+        ledger = self._ownership_ledger()
+        claim_error: Optional[BaseException] = None
+        if isinstance(pid, int) and pid > 0:
+            try:
+                ownership.claim_new_process(ledger, pid, self.process_ops)
+            except ownership.Refusal as exc:
+                claim_error = exc
+            except Exception as exc:  # noqa: BLE001 - fail safe, report as handled
+                claim_error = exc
+        if claim_error is None and pid in ledger.processes:
+            report = ownership.rollback(ledger, self.file_ops, self.process_ops)
+            if not report.complete:
+                report = ownership.rollback(ledger, self.file_ops, self.process_ops,
+                                            prior=report)
+            self.out("rollback: " + ownership.redacted_diagnostics(report).replace("\n", "; "))
+            return report
+        # No identity was recorded before the stop. The direct child handle is
+        # the only object this process may still stop (never a PID read from a
+        # checkpoint). If it already exited, terminate() is a no-op.
+        handle.terminate()
+        handle.wait(5.0)
+        return None
 
     # -- state ---------------------------------------------------------------
     def _is_reparse_point(self, st: os.stat_result) -> bool:
@@ -1272,8 +1450,7 @@ class Setup:
             if result == "ok":
                 daemon_state = "started"
             else:
-                handle.terminate()
-                handle.wait(5.0)
+                self._stop_owned_child(handle)
                 self._record("start", "failed", detail)
                 self._save_state()
                 self.err("start: FAILED: " + detail)
