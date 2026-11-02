@@ -1358,7 +1358,7 @@ class Setup:
         return 0 if returncode == 0 else EXIT_USAGE
 
     # -- run -----------------------------------------------------------------
-    def run(self, code: Optional[str]) -> int:
+    def run(self, code: Any) -> int:
         blocked = self._block_on_target("check")
         if blocked is not None:
             return blocked
@@ -1370,6 +1370,20 @@ class Setup:
         install_code = self.install(report)
         if install_code != EXIT_OK:
             return install_code
+        # ONB 11: obtain the short-lived code after the slow work, not at launch.
+        if callable(code):
+            try:
+                code = code()
+            except SetupError as exc:
+                self._record("pair", "blocked", "private pairing code unavailable: " + exc.code)
+                self._save_state()
+                self.err("pair: " + str(exc))
+                return exc.exit_code
+            except (OSError, UnicodeError):
+                self._record("pair", "blocked", "private pairing-code source failed")
+                self._save_state()
+                self.err("pair: could not read the private pairing-code source")
+                return EXIT_USAGE
         pair_code = self.pair(code)
         start_code = self.start()
         if start_code != EXIT_OK:
@@ -1453,8 +1467,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_USAGE
     config = _resolve_config(args.config)
 
-    code: Optional[str] = None
-    if args.command in ("run", "pair"):
+    code: Any = None
+    if args.command == "pair":
         try:
             code = read_private_code(args)
         except SetupError as exc:
@@ -1463,6 +1477,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except (OSError, UnicodeError):
             print("setup: could not read the private pairing-code source", file=sys.stderr)
             return EXIT_USAGE
+    elif args.command == "run":
+        # Deferred: read the packet/code only after install, so a slow
+        # prerequisite step cannot consume the short-lived pairing window.
+        code = lambda: read_private_code(args)
 
     session = Setup(root=ROOT, data_dir=data_dir, config=config, api_base=api_base,
                     name=args.name, allow_unqualified=args.allow_unqualified_platform,

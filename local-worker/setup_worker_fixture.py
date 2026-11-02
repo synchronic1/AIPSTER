@@ -253,7 +253,7 @@ def scenario_happy(tmp: Path, base: str) -> Dict[str, Any]:
         return returncode
 
     session.pairer = pairer
-    rc = session.run(FAKE_CODE)
+    rc = session.run(lambda: FAKE_CODE)  # deferred: read after install, before pairing
     checks: List[Dict[str, Any]] = []
     check(rc == 0, "run exits 0", checks)
     check(len(runner.install_calls) == 1, "install.py invoked once", checks)

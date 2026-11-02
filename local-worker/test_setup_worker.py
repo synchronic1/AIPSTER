@@ -1308,5 +1308,56 @@ class ContinuityTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
 
 
+class CodeTimingTests(unittest.TestCase):
+    """ONB 11: obtain the short-lived code after slow prerequisite work."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = make_root(self.tmp.name)
+        self.api = ApiFixture(self)
+        self.data = Path(self.tmp.name) / "data dir"
+
+    def test_run_reads_the_code_only_after_install(self):
+        order = []
+        runner = FakeRunner(on_install=lambda: (order.append("install"), make_venv(self.root)))
+
+        def code_source():
+            order.append("code")
+            return FAKE_CODE
+
+        session, _runner, _spawner, _http, _out, err = make_setup(
+            self.tmp.name, root=self.root, data=self.data, runner=runner,
+            http=FakeHttp(health=(200, {"status": "ok"}, ""),
+                          node=(200, node_body(), "")))
+        session.api_base = self.api.base
+
+        def pairer(code):
+            order.append("pair")
+            returncode = session._default_pairer(code)
+            write_fresh_beat(session.data_dir)
+            return returncode
+
+        session.pairer = pairer
+        self.assertEqual(session.run(code_source), sw.EXIT_OK, "\n".join(err))
+        self.assertEqual(order, ["install", "code", "pair"],
+                         "the code must be read after install, immediately before pairing")
+
+    def test_blocked_install_never_reads_or_consumes_the_code(self):
+        read = []
+
+        def code_source():
+            read.append(True)
+            return FAKE_CODE
+
+        runner = FakeRunner()
+        session, _runner, _spawner, _http, out, _err = make_setup(
+            self.tmp.name, root=self.root, data=self.data, runner=runner,
+            uv_present=False)
+        self.assertEqual(session.run(code_source), sw.EXIT_PREREQ)
+        self.assertEqual(read, [], "a blocked prerequisite must not touch the code")
+        self.assertIn("UV_VERSION", "\n".join(out))
+
+
 if __name__ == "__main__":
     unittest.main()

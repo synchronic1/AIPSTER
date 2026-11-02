@@ -65,6 +65,11 @@ can compare it with the machine the user chose before running `run`.
 | `check` | platform, Python >= 3.9, loopback config, `uv 0.12.12`, >= 1 GiB disk, checkout files | read-only; no state write |
 | `install` | runs the reviewed `install.py` once | existing complete `.venv` is skipped; partial `.venv` fails and is never deleted |
 | `pair` | calls `pairing.cmd_pair` in-process; stores the heartbeat credential privately | an existing valid pairing is preserved and does not consume a code |
+
+`run` reads the packet/code only after `install` completes and immediately
+before the pairing claim, so slow prerequisite work cannot spend the
+short-lived code's window. A blocked prerequisite never reads the code at all.
+
 | `start` | one daemon, one sender; verifies an existing instance first | a healthy matching daemon is reused; the sender's own lock prevents duplicates |
 | `verify` | health, node identity, heartbeat freshness, optional explicit inference | reports each fact separately; no inference by default |
 
