@@ -49,6 +49,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "configs" / "mock.toml"
 STATE_SCHEMA = "aipster-worker-setup/1"
 STATUS_SCHEMA = "aipster-worker-setup-status/1"
+STATE_MAX_BYTES = 4 * 1024 * 1024
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -142,6 +143,67 @@ def sanitized_traceback(exc: BaseException) -> str:
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+_OUTCOME_BY_EXIT = {
+    EXIT_OK: "complete",
+    EXIT_USAGE: "failed",
+    EXIT_PREREQ: "blocked",
+    EXIT_PAIRING: "blocked",
+    EXIT_NETWORK: "incomplete",
+    EXIT_SENDER_RUNNING: "complete",
+    EXIT_BUSY: "blocked",
+    EXIT_INTERRUPTED: "cancelled",
+}
+
+_NEXT_ACTIONS = {
+    "UV_VERSION": "let the wrapper bootstrap the pinned uv, or install uv 0.12.12",
+    "PARTIAL_INSTALL": "remove only local-worker/.venv and rerun install",
+    "PYTHON_VERSION": "install Python 3.9+ and rerun setup",
+    "UNQUALIFIED_PLATFORM": "run on Windows x64, or pass --allow-unqualified-platform",
+    "TARGET_MISMATCH": "run setup on the machine the user selected",
+    "TARGET_CHANGED": "run on the original machine, or pass --expect-target with its fingerprint",
+    "LOW_DISK": "free at least 1 GiB and rerun setup",
+    "STATE_SYMLINK": "remove the link or reparse point at the setup checkpoint, then rerun",
+    "STATE_UNREADABLE": "keep the unreadable checkpoint for diagnosis, check AIPSTER status, "
+                        "move it aside only after that check, then rerun",
+    "STATE_SCHEMA": "this checkpoint came from another version; check AIPSTER status, "
+                    "move it aside only after that check, then rerun",
+    "UNCERTAIN": "check AIPSTER status/dashboard, then pass --retry-pair",
+    "in_progress": "check AIPSTER status/dashboard, then pass --retry-pair",
+    "uncertain": "check AIPSTER status/dashboard, then pass --retry-pair",
+    "repair-required": "pair again; the sender key was revoked or expired",
+}
+
+
+def next_action_for(code: str, outcome: str) -> Optional[str]:
+    if outcome == "complete":
+        return None
+    if outcome == "cancelled":
+        return "rerun setup to resume from the last verified step"
+    return _NEXT_ACTIONS.get(code, "resolve the reported block and rerun setup")
+
+
+def standalone_status_document(command: str, exit_code: int,
+                               reason: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """A stable JSON result for failures that happen before a session exists."""
+    outcome = _OUTCOME_BY_EXIT.get(exit_code, "failed")
+    code = (reason or {}).get("code", "UNKNOWN")
+    return {
+        "schema": STATUS_SCHEMA,
+        "command": command,
+        "target": "connection",
+        "outcome": outcome,
+        "stage": command,
+        "exit_code": int(exit_code),
+        "retryable": outcome in ("blocked", "incomplete"),
+        "next_action": next_action_for(code, outcome),
+        "reason": {"code": code, "detail": redact((reason or {}).get("detail", ""))}
+        if reason else None,
+        "facts": {},
+        "observed_at": utc_now(),
+    }
+
 
 
 def extract_pairing_code(packet: str) -> str:
@@ -493,21 +555,109 @@ class Setup:
         self.last_blocked: List[Dict[str, str]] = []
 
     # -- state ---------------------------------------------------------------
-    def _load_state(self) -> Dict[str, Any]:
-        fresh = {"schema": STATE_SCHEMA, "phases": {}, "processes": {}}
+    def _is_reparse_point(self, st: os.stat_result) -> bool:
+        attrs = getattr(st, "st_file_attributes", 0)
+        flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(flag and attrs & flag)
+
+    def _read_checkpoint(self) -> str:
+        """Read the checkpoint only if it is a plain regular file.
+
+        A link or reparse point is refused before its target is followed, so a
+        planted checkpoint cannot redirect a read outside the private store.
+        """
         try:
-            if self.state_path.exists():
-                candidate = json.loads(self.state_path.read_text(encoding="utf-8"))
-                if isinstance(candidate, dict):
-                    candidate.setdefault("schema", STATE_SCHEMA)
-                    candidate.setdefault("phases", {})
-                    candidate.setdefault("processes", {})
-                    if isinstance(candidate["phases"], dict) and isinstance(candidate["processes"], dict):
-                        return candidate
-                self.err("setup: existing setup state is unreadable; starting a fresh non-secret record")
-        except (OSError, ValueError, UnicodeError):
-            self.err("setup: existing setup state is unreadable; starting a fresh non-secret record")
-        return fresh
+            st = self.state_path.lstat()
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint cannot be inspected: " + redact(exc),
+                             EXIT_PREREQ) from exc
+        if stat.S_ISLNK(st.st_mode) or self._is_reparse_point(st):
+            raise SetupError("STATE_SYMLINK",
+                             "setup checkpoint is a link or reparse point; refusing to follow it",
+                             EXIT_PREREQ)
+        if not stat.S_ISREG(st.st_mode):
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint is not a regular file", EXIT_PREREQ)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(self.state_path), flags)
+        except OSError as exc:
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint cannot be opened safely: " + redact(exc),
+                             EXIT_PREREQ) from exc
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                opened = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise SetupError("STATE_UNREADABLE",
+                                     "setup checkpoint changed while opening; refusing to read",
+                                     EXIT_PREREQ)
+                data = handle.read(STATE_MAX_BYTES + 1)
+        except UnicodeError as exc:
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint is not valid UTF-8; the file is preserved",
+                             EXIT_PREREQ) from exc
+        except OSError as exc:
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint could not be read: " + redact(exc),
+                             EXIT_PREREQ) from exc
+        if len(data) > STATE_MAX_BYTES:
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint is unexpectedly large; the file is preserved",
+                             EXIT_PREREQ)
+        return data
+
+    def _load_state(self) -> Dict[str, Any]:
+        """Load the checkpoint, or fail closed without touching it.
+
+        Corruption, an unknown schema, malformed types, or a link are states
+        the operator must resolve. Starting fresh would discard a pending
+        pairing intent and could turn an unknown outcome into a guessed safe
+        restart, so the file is preserved and the caller gets one action.
+        """
+        fresh = {"schema": STATE_SCHEMA, "phases": {}, "processes": {}}
+        text = self._read_checkpoint()
+        if not text.strip():
+            return fresh
+        try:
+            candidate = json.loads(text)
+        except ValueError as exc:
+            raise SetupError("STATE_UNREADABLE",
+                             "setup checkpoint is not valid JSON; the file is preserved",
+                             EXIT_PREREQ) from exc
+        if not isinstance(candidate, dict):
+            raise SetupError("STATE_SCHEMA",
+                             "setup checkpoint root is not an object; the file is preserved",
+                             EXIT_PREREQ)
+        schema = candidate.get("schema")
+        if schema != STATE_SCHEMA:
+            raise SetupError("STATE_SCHEMA",
+                             "unsupported setup checkpoint schema %r; the file is preserved"
+                             % str(schema)[:40], EXIT_PREREQ)
+        phases = candidate.get("phases")
+        processes = candidate.get("processes")
+        if not isinstance(phases, dict) or not isinstance(processes, dict):
+            raise SetupError("STATE_SCHEMA",
+                             "setup checkpoint phases/processes are not objects; the file is preserved",
+                             EXIT_PREREQ)
+        for name, record in phases.items():
+            if not isinstance(name, str) or not isinstance(record, dict):
+                raise SetupError("STATE_SCHEMA",
+                                 "setup checkpoint has a malformed phase record; the file is preserved",
+                                 EXIT_PREREQ)
+            if "state" in record and not isinstance(record["state"], str):
+                raise SetupError("STATE_SCHEMA",
+                                 "setup checkpoint has a malformed phase state; the file is preserved",
+                                 EXIT_PREREQ)
+        for key, record in processes.items():
+            if not isinstance(key, str) or not isinstance(record, dict):
+                raise SetupError("STATE_SCHEMA",
+                                 "setup checkpoint has a malformed process record; the file is preserved",
+                                 EXIT_PREREQ)
+        return candidate
 
     def _save_state(self) -> None:
         self.state["schema"] = STATE_SCHEMA
@@ -1271,16 +1421,7 @@ class Setup:
     # -- structured status (ONB 10) ------------------------------------------
     def status_document(self, command: str, exit_code: int) -> Dict[str, Any]:
         """One versioned machine-readable result; agrees with the exit code."""
-        outcome = {
-            EXIT_OK: "complete",
-            EXIT_USAGE: "failed",
-            EXIT_PREREQ: "blocked",
-            EXIT_PAIRING: "blocked",
-            EXIT_NETWORK: "incomplete",
-            EXIT_SENDER_RUNNING: "complete",
-            EXIT_BUSY: "blocked",
-            EXIT_INTERRUPTED: "cancelled",
-        }.get(exit_code, "failed")
+        outcome = _OUTCOME_BY_EXIT.get(exit_code, "failed")
         phase = {"run": "verify", "check": "check", "install": "install",
                  "pair": "pair", "start": "start", "verify": "verify",
                  "status": "status"}.get(command, command)
@@ -1300,7 +1441,7 @@ class Setup:
             "stage": phase,
             "exit_code": int(exit_code),
             "retryable": outcome in ("blocked", "incomplete"),
-            "next_action": self._next_action(reason, outcome),
+            "next_action": next_action_for((reason or {}).get("code") or "", outcome),
             "facts": facts,
             "observed_at": utc_now(),
         }
@@ -1308,24 +1449,7 @@ class Setup:
 
     @staticmethod
     def _next_action(reason: Optional[Dict[str, str]], outcome: str) -> Optional[str]:
-        if outcome == "complete":
-            return None
-        if outcome == "cancelled":
-            return "rerun setup to resume from the last verified step"
-        code = (reason or {}).get("code") or ""
-        return {
-            "UV_VERSION": "let the wrapper bootstrap the pinned uv, or install uv 0.12.12",
-            "PARTIAL_INSTALL": "remove only local-worker/.venv and rerun install",
-            "PYTHON_VERSION": "install Python 3.9+ and rerun setup",
-            "UNQUALIFIED_PLATFORM": "run on Windows x64, or pass --allow-unqualified-platform",
-            "TARGET_MISMATCH": "run setup on the machine the user selected",
-            "TARGET_CHANGED": "run on the original machine, or pass --expect-target with its fingerprint",
-            "LOW_DISK": "free at least 1 GiB and rerun setup",
-            "UNCERTAIN": "check AIPSTER status/dashboard, then pass --retry-pair",
-            "in_progress": "check AIPSTER status/dashboard, then pass --retry-pair",
-            "uncertain": "check AIPSTER status/dashboard, then pass --retry-pair",
-            "repair-required": "pair again; the sender key was revoked or expired",
-        }.get(code, "resolve the reported block and rerun setup")
+        return next_action_for((reason or {}).get("code") or "", outcome)
 
     def _log_tail(self, path: Path, extra: Sequence[str]) -> str:
         try:
@@ -1547,7 +1671,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         data_dir = _resolve_data_dir(args.data_dir)
     except Exception as exc:  # noqa: BLE001
-        print("setup: BLOCKED: cannot locate the worker data dir: " + redact(exc), file=sys.stderr)
+        detail = "cannot locate the worker data dir: " + redact(exc)
+        if args.json:
+            print(json.dumps(standalone_status_document(
+                args.command, EXIT_PREREQ, {"code": "DATA_DIR", "detail": detail}),
+                sort_keys=True))
+        else:
+            print("setup: BLOCKED: " + detail, file=sys.stderr)
         return EXIT_PREREQ
     try:
         if str(ROOT) not in sys.path:
@@ -1555,7 +1685,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         import pairing  # noqa: PLC0415
         api_base = pairing.check_api_base(args.api_base or pairing.DEFAULT_API_BASE)
     except Exception as exc:  # noqa: BLE001
-        print("setup: BLOCKED: invalid AIPSTER API base: " + redact(exc), file=sys.stderr)
+        detail = "invalid AIPSTER API base: " + redact(exc)
+        if args.json:
+            print(json.dumps(standalone_status_document(
+                args.command, EXIT_USAGE, {"code": "INVALID_API_BASE", "detail": detail}),
+                sort_keys=True))
+        else:
+            print("setup: BLOCKED: " + detail, file=sys.stderr)
         return EXIT_USAGE
     config = _resolve_config(args.config)
 
@@ -1564,30 +1700,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             code = read_private_code(args)
         except SetupError as exc:
-            print("setup: " + str(exc), file=sys.stderr)
+            if args.json:
+                print(json.dumps(standalone_status_document(
+                    args.command, exc.exit_code, {"code": exc.code, "detail": redact(exc)}),
+                    sort_keys=True))
+            else:
+                print("setup: " + str(exc), file=sys.stderr)
             return exc.exit_code
         except (OSError, UnicodeError):
-            print("setup: could not read the private pairing-code source", file=sys.stderr)
+            if args.json:
+                print(json.dumps(standalone_status_document(
+                    args.command, EXIT_USAGE,
+                    {"code": "CODE_SOURCE", "detail": "could not read the private pairing-code source"}),
+                    sort_keys=True))
+            else:
+                print("setup: could not read the private pairing-code source", file=sys.stderr)
             return EXIT_USAGE
     elif args.command == "run":
         # Deferred: read the packet/code only after install, so a slow
         # prerequisite step cannot consume the short-lived pairing window.
         code = lambda: read_private_code(args)
 
-    session = Setup(root=ROOT, data_dir=data_dir, config=config, api_base=api_base,
-                    name=args.name, allow_unqualified=args.allow_unqualified_platform,
-                    retry_pair=args.retry_pair, verify_inference=args.verify_inference,
-                    expect_target=args.expect_target,
-                    install_timeout=args.install_timeout, start_timeout=args.start_timeout,
-                    heartbeat_wait=args.heartbeat_wait)
+    session = None
+    failure: Optional[Dict[str, str]] = None
     mutating = args.command in ("run", "install", "pair", "start")
-    if args.json:
-        # Structured mode: stdout carries exactly one JSON document, so human
-        # progress is suppressed rather than mixed into the machine result.
-        session.out = lambda _line: None
-        session.err = lambda _line: None
     lock = SetupLock(data_dir / "setup.lock")
     try:
+        session = Setup(root=ROOT, data_dir=data_dir, config=config, api_base=api_base,
+                        name=args.name, allow_unqualified=args.allow_unqualified_platform,
+                        retry_pair=args.retry_pair, verify_inference=args.verify_inference,
+                        expect_target=args.expect_target,
+                        install_timeout=args.install_timeout, start_timeout=args.start_timeout,
+                        heartbeat_wait=args.heartbeat_wait)
+        if args.json:
+            # Structured mode: stdout carries exactly one JSON document, so human
+            # progress is suppressed rather than mixed into the machine result.
+            session.out = lambda _line: None
+            session.err = lambda _line: None
         if mutating:
             try:
                 acquired = lock.acquire()
@@ -1623,15 +1772,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             rc = session.run(code)
     except SetupError as exc:
+        failure = {"code": exc.code, "detail": redact(exc)}
         if not args.json:
             print("setup: BLOCKED [%s] %s" % (exc.code, redact(exc)), file=sys.stderr)
-        session.last_blocked = [{"code": exc.code, "detail": redact(exc)}]
+        if session is not None:
+            session.last_blocked = [failure]
         rc = exc.exit_code
     except KeyboardInterrupt:
+        failure = {"code": "CANCELLED", "detail": "setup was interrupted"}
         if not args.json:
             print("setup: interrupted; rerun to resume", file=sys.stderr)
         rc = EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - never leak a code/token in a traceback path
+        failure = {"code": "INTERNAL", "detail": redact(exc)}
         if not args.json:
             if args.debug:
                 # A raw traceback carries str(exc), which may contain a credential.
@@ -1642,7 +1795,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         lock.release()
     if args.json:
-        print(json.dumps(session.status_document(args.command, rc), sort_keys=True))
+        if session is not None:
+            document = session.status_document(args.command, rc)
+        else:
+            # Construction failed (for example an unreadable checkpoint).
+            # Still emit the stable schema, with no session-derived facts.
+            document = standalone_status_document(args.command, rc, failure)
+        print(json.dumps(document, sort_keys=True))
     return rc
 
 

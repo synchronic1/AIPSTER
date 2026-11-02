@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 import pairing
 import setup_worker as sw
+import setup_worker_fixture as fixture
 
 FAKE_CODE = "pair-01234567-89AB-CDEF-GHJKMNPQ"
 FAKE_CODE2 = "pair-aaaaaaaa-bbbb-cccc-ddddeeee"
@@ -1436,6 +1437,200 @@ class StructuredStatusTests(unittest.TestCase):
         self.assertEqual(document["exit_code"], rc)
         self.assertEqual(document["command"], "check")
         self.assertNotIn("setup check:", stdout.getvalue())
+
+
+class CheckpointIntegrityTests(unittest.TestCase):
+    """ONB 05/06: a damaged checkpoint fails closed and is never overwritten."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = make_root(self.tmp.name)
+        make_venv(self.root)
+        self.api = ApiFixture(self)
+        self.data = Path(self.tmp.name) / "data dir"
+        self.data.mkdir(parents=True, mode=0o700)
+        self.state_path = self.data / "setup-state.json"
+
+    def valid_state(self, **phases):
+        state = {"schema": sw.STATE_SCHEMA, "phases": phases, "processes": {}}
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    def assert_refused(self, code, **kw):
+        before = self.state_path.read_bytes() if self.state_path.exists() else b""
+        with self.assertRaises(sw.SetupError) as raised:
+            make_setup(self.tmp.name, root=self.root, data=self.data, **kw)
+        self.assertEqual(raised.exception.code, code, str(raised.exception))
+        self.assertEqual(self.state_path.read_bytes(), before,
+                         "a refused checkpoint must not be rewritten")
+        return raised.exception
+
+    def test_corrupt_json_fails_closed_and_preserves_pairing(self):
+        self.assertEqual(pair_real(self.tmp.name, self.api.base, data=self.data)[0], 0)
+        self.state_path.write_text('{"schema": "aipster-worker-setup/1", "phases": {',
+                                   encoding="utf-8")
+        error = self.assert_refused("STATE_UNREADABLE")
+        self.assertIn("preserved", str(error))
+        self.assertTrue(pairing.pairing_files(self.data)["meta"].exists(),
+                        "the pairing store must survive an unreadable checkpoint")
+        self.assertEqual(pairing.load_pairing(self.data)["resource_id"], "r_setup_fixture")
+
+    def test_unknown_schema_is_rejected(self):
+        self.state_path.write_text(json.dumps(
+            {"schema": "aipster-worker-setup/999", "phases": {}, "processes": {}}),
+            encoding="utf-8")
+        self.assert_refused("STATE_SCHEMA")
+
+    def test_malformed_phase_and_process_types_are_rejected(self):
+        cases = [
+            {"schema": sw.STATE_SCHEMA, "phases": [], "processes": {}},
+            {"schema": sw.STATE_SCHEMA, "phases": {}, "processes": "nope"},
+            {"schema": sw.STATE_SCHEMA, "phases": {"pair": "in_progress"}, "processes": {}},
+            {"schema": sw.STATE_SCHEMA, "phases": {"pair": {"state": 7}}, "processes": {}},
+            {"schema": sw.STATE_SCHEMA, "phases": {}, "processes": {"12": "pid"}},
+            {"schema": None, "phases": {}, "processes": {}},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.state_path.write_text(json.dumps(case), encoding="utf-8")
+                self.assert_refused("STATE_SCHEMA")
+
+    def test_checkpoint_symlink_is_refused_before_following_it(self):
+        if os.name == "nt":
+            self.skipTest("symlink creation needs privileges on Windows")
+        target = Path(self.tmp.name) / "outside-state.json"
+        target.write_text(json.dumps(
+            {"schema": sw.STATE_SCHEMA, "phases": {"pair": {"state": "in_progress"}},
+             "processes": {}}), encoding="utf-8")
+        self.state_path.symlink_to(target)
+        error = self.assert_refused("STATE_SYMLINK")
+        self.assertIn("refusing to follow", str(error))
+        self.assertEqual(json.loads(target.read_text())["phases"]["pair"]["state"],
+                         "in_progress", "the link target must be untouched")
+
+    def test_pending_claim_intent_is_not_discarded_as_a_safe_restart(self):
+        state = {
+            "schema": sw.STATE_SCHEMA,
+            "phases": {"install": {"state": "passed"},
+                       "pair": {"state": "in_progress",
+                                "detail": "pairing claim in progress"}},
+            "processes": {},
+        }
+        # Valid JSON with trailing data: unreadable, but the pending intent is
+        # still legible and must not be replaced by a fresh record.
+        self.state_path.write_text(json.dumps(state) + "\ntrailing", encoding="utf-8")
+        runner = FakeRunner()
+        spawner = FakeSpawner()
+        self.assert_refused("STATE_UNREADABLE", runner=runner, spawner=spawner)
+        self.assertIn('"state": "in_progress"', self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(runner.calls, [], "no installer may run after a refused checkpoint")
+        self.assertEqual(spawner.calls, [], "no process may be spawned after a refused checkpoint")
+        self.assertEqual(self.api.state.claims, [], "no pairing claim may be attempted")
+        self.assertEqual(pairing.pairing_files(self.data)["meta"].exists(), False)
+
+    def test_valid_checkpoint_remains_resumable(self):
+        state = self.valid_state(install={"state": "passed"}, pair={"state": "in_progress"})
+        session, _runner, _spawner, _http, _out, _err = make_setup(
+            self.tmp.name, root=self.root, data=self.data)
+        self.assertEqual(session.state["phases"]["pair"]["state"], "in_progress")
+        self.assertEqual(session.state["phases"]["install"]["state"], "passed")
+        self.assertEqual(json.loads(self.state_path.read_text()), state)
+
+    def test_constructor_failure_uses_the_json_error_path_without_traceback(self):
+        self.state_path.write_text("{not json", encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = sw.main(["status", "--data-dir", str(self.data), "--json"])
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(rc, sw.EXIT_PREREQ)
+        self.assertEqual(document["schema"], sw.STATUS_SCHEMA)
+        self.assertEqual(document["outcome"], "blocked")
+        self.assertEqual(document["exit_code"], sw.EXIT_PREREQ)
+        self.assertEqual(document["reason"]["code"], "STATE_UNREADABLE")
+        self.assertTrue(document["next_action"])
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), "{not json")
+
+    def test_constructor_failure_human_output_is_sanitized(self):
+        self.state_path.write_text("{not json", encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = sw.main(["status", "--data-dir", str(self.data)])
+        self.assertEqual(rc, sw.EXIT_PREREQ)
+        self.assertIn("STATE_UNREADABLE", stderr.getvalue())
+        self.assertIn("preserved", stderr.getvalue())
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
+
+
+class FixturePacketInputTests(unittest.TestCase):
+    """The private-stdin fixture mode is synthetic-only and never echoes input."""
+
+    def test_fixture_packet_has_exactly_one_documented_code(self):
+        packet = fixture.build_fixture_packet()
+        self.assertEqual(packet.count("PAIRING CODE:"), 1)
+        self.assertIn("SYNTHETIC FIXTURE", packet)
+        self.assertEqual(sw.extract_pairing_code(packet), fixture.FAKE_CODE)
+
+    def test_fixture_guard_rejects_every_other_code_without_echoing_it(self):
+        other = "pair-99999999-8888-7777-66666aaaaa"
+        for value in (other, None, "", fixture.FAKE_CODE + "x"):
+            with self.assertRaises(fixture.FixtureFailure) as caught:
+                fixture.require_fixture_code(value)
+            self.assertNotIn("pair-99999999", str(caught.exception))
+
+    def test_write_fixture_packet_is_private_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "synthetic-packet.txt"
+            fixture.write_fixture_packet(path)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(sw.extract_pairing_code(path.read_text()), fixture.FAKE_CODE)
+            with self.assertRaises(FileExistsError):
+                fixture.write_fixture_packet(path)
+
+    def test_packet_mode_rejects_a_non_fixture_code_before_engine(self):
+        packet = "PAIRING CODE: pair-99999999-8888-7777-66666aaaaa\n"
+        report = fixture.run_packet_stdin("http://127.0.0.1:9", stdin=io.StringIO(packet))
+        text = json.dumps(report, sort_keys=True)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["private_input"]["accepted"])
+        self.assertEqual(report["status"]["reason"]["code"], "FIXTURE_INPUT_REFUSED")
+        self.assertEqual(report["readiness"]["paired"]["value"], "unknown")
+        self.assertNotIn("pair-99999999", text)
+        self.assertFalse(report["live_network"] or report["live_services"]
+                         or report["live_credentials"] or report["live_inference"])
+
+    def test_packet_mode_refuses_a_terminal_before_reading(self):
+        class Terminal:
+            def isatty(self):
+                return True
+
+            def read(self, _size=-1):
+                raise AssertionError("a terminal packet must never be read")
+
+        report = fixture.run_packet_stdin("http://127.0.0.1:9", stdin=Terminal())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"]["reason"]["code"], "PACKET_TTY_REFUSED")
+        self.assertFalse(report["private_input"]["accepted"])
+
+    def test_packet_mode_drives_the_real_engine_with_fakes(self):
+        state = fixture.FakeApiState()
+        server, base = fixture.make_api_server(state)
+        try:
+            report = fixture.run_packet_stdin(
+                base, stdin=io.StringIO(fixture.build_fixture_packet()))
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertTrue(report["passed"], report)
+        self.assertTrue(report["synthetic_only"])
+        self.assertEqual(report["status"]["outcome"], "complete")
+        self.assertEqual(report["readiness"]["usable"]["value"], "false")
+        self.assertFalse(report["readiness"]["usable"]["authoritative"])
+        self.assertTrue(report["readiness"]["inference_qualified"]["value"].startswith("no"))
+        self.assertEqual(report["engine"]["code_read_events"], ["code-read-after-install"])
+        self.assertEqual(len(state.claims), 1, "exactly one loopback claim")
+        self.assertEqual(state.claims[0].get("code"), fixture.FAKE_CODE)
 
 
 if __name__ == "__main__":

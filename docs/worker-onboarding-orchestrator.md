@@ -103,6 +103,38 @@ the operator's existing dashboard/status view, after which `--retry-pair`
 resumes. Automating that lookup is a controller decision, not an onboarding
 implementation decision.
 
+## Checkpoint integrity (ONB 05 / ONB 06)
+
+The private checkpoint (`setup-state.json`, `aipster-worker-setup/1`) is the
+only record of which phases completed and whether a pairing claim may have
+been sent. A damaged or foreign checkpoint is therefore **not** replaced by a
+fresh record: doing that would forget a pending claim and let the next run
+guess that a restart is safe.
+
+Before any JSON is parsed, the checkpoint is opened with `lstat` plus
+`O_NOFOLLOW`, rejected if it is a symlink or Windows reparse point, required to
+be a regular file, and bounded to 4 MiB. Then:
+
+| Condition | Result |
+|---|---|
+| missing or empty | a new record is created (normal first run) |
+| unreadable, not regular, or oversized | blocked, exit 3, code `STATE_UNREADABLE` |
+| invalid JSON | blocked, exit 3, code `STATE_UNREADABLE` |
+| non-object, wrong `schema`, or malformed phase/process types | blocked, exit 3, code `STATE_SCHEMA` |
+| symlink / reparse point | blocked, exit 3, code `STATE_SYMLINK` |
+
+On every one of those blocks the file is left byte-for-byte unchanged, the
+pairing store is untouched, and no installer, spawn, claim, or other network
+request occurs. Prose and `--json` report the same code and exactly one next
+action: keep the checkpoint for diagnosis, check AIPSTER status, move it aside
+only after that check, then rerun. Valid checkpoints, including an
+`in_progress` or `uncertain` pair phase, remain resumable exactly as before, so
+this change cannot silently convert an unknown outcome into a clean one.
+
+Constructor failures use the same stable path: `setup_worker.py --json` emits
+one `aipster-worker-setup-status/1` document (never a traceback), and prose
+prints a single sanitized `BLOCKED` line.
+
 ## Structured status (ONB 10)
 
 `--json` replaces prose on stdout with exactly one versioned document
@@ -304,7 +336,8 @@ python3 setup_worker_fixture.py --scenario resume --json-out /tmp/report.json
 ```
 
 Scenarios: `happy`, `resume`, `duplicate-sender`, `verify-honesty`,
-`target-mismatch`, `stale-heartbeat`, `structured-status`. The driver
+`target-mismatch`, `stale-heartbeat`, `structured-status`,
+`checkpoint-corrupt`. The driver
 uses the real `Setup` methods and real `pairing.cmd_pair` against a loopback
 fake claim API, with fake runner/spawner/HTTP. Every report is JSON with
 `live_network=false`, `live_credentials=false`, `live_services=false`,
@@ -312,12 +345,61 @@ fake claim API, with fake runner/spawner/HTTP. Every report is JSON with
 a genuine Codex or Muse harness session: the harness runs the command, not a
 simulated provider call, and no live credential or service is touched.
 
-Expected current result: all seven scenarios pass. Labels distinguish
+Expected current result: all eight scenarios pass. Labels distinguish
 `mock-simulated` from real inference; the default verify path prints
 `inference=NOT EXERCISED`. `target-mismatch` proves a wrong-machine run writes
 no checkpoint, runs no installer, and spawns nothing; `stale-heartbeat` proves
 a stale `usable=true` beat is reported as `fact usable=unknown` and never
-`reachable`.
+`reachable`; `checkpoint-corrupt` proves a damaged checkpoint is preserved and
+no installer, spawn, or claim is attempted.
+
+### Private-input mode (`--packet-stdin`)
+
+The scenarios above supply the code from a Python callable, so they do not
+prove that an agent can drive the private stdin channel. `--packet-stdin` does:
+it calls the **real** `setup_worker.read_private_code` parser on stdin, accepts
+**only** the published synthetic fixture code, and then runs the **real**
+`Setup.run` engine against temp roots with `FakeRunner`, `FakeSpawner`,
+`FakeHttp`, and the loopback claim API.
+
+Create the private packet once (0600, refuses to overwrite, never taken from
+argv):
+
+```sh
+python3 setup_worker_fixture.py --write-fixture-packet "$HOME/.aipster-fixture/synthetic-packet.txt"
+```
+
+The exact documented packet (`aipster-setup-worker-harness-packet/1`) is:
+
+```
+AIPSTER agent setup packet v2.
+
+SYNTHETIC FIXTURE - NOT A REAL PAIRING CODE
+
+  PAIRING CODE: pair-01234567-89AB-CDEF-GHJKMNPQ
+
+This packet belongs to local-worker/setup_worker_fixture.py. ...
+```
+
+Then the one-command invocation, with the private file redirected on stdin:
+
+```sh
+python3 setup_worker_fixture.py --packet-stdin \
+  --json-out "$HOME/.aipster-fixture/report.json" \
+  < "$HOME/.aipster-fixture/synthetic-packet.txt"
+```
+
+The process emits one sanitized JSON report (no transcript that could carry
+input) with `synthetic_only=true`, the four `live_*` flags false, an
+`accepted` flag for the input, the engine's own
+`aipster-worker-setup-status/1` document, `installed` / `paired` /
+`reachable` / `usable` / `inference_qualified` as separate facts (usable is
+never authoritative), and per-check results. Any other code, an empty stream,
+or a terminal (`PACKET_TTY_REFUSED`) is refused before the engine starts and
+reported as a blocked status document without echoing the input. No real
+credential, account, endpoint, install, enrollment, worker, or inference is
+involved; `--verify-inference` only sends one request to the fake loopback
+node and still reports `inference_qualified=no`.
 
 ## Worker continuity (ONB 08)
 
