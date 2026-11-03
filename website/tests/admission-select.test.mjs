@@ -88,6 +88,35 @@ test('select with unattested fresh/usable resource refuses with advisory evidenc
   assert.ok(!('selection' in explicit.json));
 });
 
+test('invented client-asserted qualification cannot unlock the select path', async () => {
+  const t = await createTestEnv(ENABLED);
+  const store = useStore(t);
+  await ready(t, t.alice, 'abox', ['test-model-uno']);
+  // A qualification assertion smuggled in the select object is rejected as an
+  // unknown field — callers cannot grant themselves qualification.
+  const smuggled = await admitSelect(t, t.alice, { model_id: 'test-model-uno', max_tokens: 64,
+    select: { device: 'cpu', qualification: { qualified: true,
+      runtimeDigest: 'x', modelDigest: 'y', authority: 'z', attestedAt: Date.now() } } });
+  assert.equal(smuggled.status, 400, smuggled.text);
+  assert.equal(smuggled.json.code, 'UNSUPPORTED_FIELD');
+  // A qualification member on resource registration is ignored (never stored
+  // or wired): the select path still refuses on the same resource.
+  const reg = await readJson(await t.call('/api/inventory', {
+    method: 'POST', headers: S(t, t.alice),
+    body: { name: 'cbox', kind: 'local', origin: 'lab', cpu: 'x', gpu: 'y',
+      capabilities: ['test-model-uno'],
+      qualification: { qualified: true, runtimeDigest: 'x', modelDigest: 'y', authority: 'z', attestedAt: Date.now() } },
+  }));
+  assert.ok(reg.status === 201 || reg.status === 200, reg.text);
+  const hb = await mintKey(t, t.alice, 'heartbeat', reg.json.id);
+  assert.equal((await beat(t, hb.secret, reg.json.id)).status, 200);
+  const out = await admitSelect(t, t.alice, { model_id: 'test-model-uno', max_tokens: 64, select: {} });
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'SELECTION_UNQUALIFIED');
+  assert.ok(!('admission_ref' in out.json));
+  assert.deepEqual(store.state.admissions, {});
+});
+
 test('select with an unknown model string refuses despite zero token match', async () => {
   const t = await createTestEnv(ENABLED);
   const store = useStore(t);

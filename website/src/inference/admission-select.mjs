@@ -4,9 +4,10 @@
 // path. Derives candidates server-side via the existing principal-scoped
 // `listEligible` (owner + live same-side grants, never foreign rows), runs the
 // reviewed `selectPlacement` + `validatePlacementBinding`, and returns the
-// winning resource id with advisory evidence — or a precise refusal. This
-// module mints nothing: the route feeds the winner through the unchanged
-// access/liveness/grant/store authority afterwards.
+// winning resource id with advisory evidence — then unconditionally refuses
+// issuance under the current contract. This module mints nothing and issues
+// nothing: the route answers 409 SELECTION_UNQUALIFIED with the advisory
+// selection, before any access/grant/store contact for the automatic path.
 //
 // Design notes (API decisions, see ADMISSION-RESULT):
 // - Candidates are always server-derived descriptors; no caller field (score,
@@ -24,46 +25,23 @@
 //   listEligible. They are not caller assertions.
 import { listEligible } from '../routing/eligibility.mjs';
 import { selectPlacement, validatePlacementBinding } from './placement-binding.mjs';
-import { STALE_AFTER_MS } from '../lib/status.mjs';
 
-const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
-
-// Qualification gate: a bounded disabled prerequisite, not a new authority.
-// Automatic selection may feed admission issuance only when the winning
-// descriptor carries explicit, server-shaped runtime/model qualification
-// evidence — a resident exact-instance attestation with named authority.
-// No such evidence exists in the current descriptor contract
-// (routing `buildDescriptor` carries no qualification field), so every row
-// is unqualified today and the select path refuses with advisory evidence
-// instead of minting. This gates ONLY the new automatic path: explicit
-// issuance names the caller's own resource and is unchanged.
-// Exact data prerequisite (forward-looking; nothing in-repo produces it):
-//   descriptor.qualification = { qualified: true,
-//     runtimeDigest: <non-empty string>, modelDigest: <non-empty string>,
-//     authority: <non-empty string>, attestedAt: <safe-int epoch ms> }
-// where attestedAt must be within STALE_AFTER_MS (freshness), never future.
-function qualificationOf(descriptor, nowMs) {
-  const missing = 'No runtime/model qualification evidence is recorded for this resource: no resident exact-instance attestation exists. Automatic selection cannot qualify execution; explicit issuance is unchanged.';
-  const q = isObj(descriptor) ? descriptor.qualification : undefined;
-  if (q === undefined || q === null) return { qualified: false, reason: missing };
-  const malformed = !isObj(q) || q.qualified !== true
-    || typeof q.runtimeDigest !== 'string' || q.runtimeDigest.length === 0
-    || typeof q.modelDigest !== 'string' || q.modelDigest.length === 0
-    || typeof q.authority !== 'string' || q.authority.length === 0
-    || !Number.isSafeInteger(q.attestedAt) || q.attestedAt > nowMs;
-  if (malformed) {
-    return { qualified: false, reason: 'Runtime/model qualification evidence is malformed or future-dated and cannot qualify automatic execution; explicit issuance is unchanged.' };
-  }
-  if (nowMs - q.attestedAt > STALE_AFTER_MS) {
-    return { qualified: false, reason: 'Runtime/model qualification evidence is stale (attestation older than the freshness window); explicit issuance is unchanged.' };
-  }
-  return { qualified: true };
-}
+// Bounded disabled prerequisite (no future authority, no auto-open path).
+// Automatic selection never feeds admission issuance under the CURRENT
+// implemented contract: heartbeat liveness and capability-token observation
+// prove reachability and soft model affinity only. They are not residency,
+// exact-instance identity, or model attestation — no such evidence exists
+// anywhere in the current server contract (admission pins placeholders per
+// Addenda A/B; results are worker-asserted parrot equality). A future
+// reviewed qualification integration must intentionally change code once the
+// actual contract and its owner supply real evidence. This gates ONLY the new
+// automatic path: explicit issuance names the caller's own resource and is
+// unchanged.
 
 /**
  * Server-side opt-in target selection for one principal.
  * @param {{db:object,tenantId:string,model:string,maxTokens:number,device?:string,runtimeId?:string,nowMs?:number}} args
- * @returns {Promise<{ok:true,resourceId:string,selection:object}|{ok:false,code:string,reason:string,http:number,examined:number,excluded:number}>}
+ * @returns {Promise<{ok:false,code:string,reason:string,http:number,examined:number,excluded:number,selection?:object}>}
  */
 export async function selectAdmissionTarget({ db, tenantId, model, maxTokens, device = 'cpu', runtimeId = 'ganglion', nowMs } = {}) {
   if (!db || typeof tenantId !== 'string' || tenantId.length === 0) {
@@ -102,15 +80,16 @@ export async function selectAdmissionTarget({ db, tenantId, model, maxTokens, de
     examined: decided.examined,
     excluded: decided.excluded.length,
   };
-  // The gate: without qualification evidence the wired selection is advisory
-  // only. The refusal carries the same advisory selection so the caller sees
-  // exactly what would have been picked and why it cannot execute yet.
-  const qual = qualificationOf(winner.candidate, now);
-  if (!qual.qualified) {
-    return {
-      ok: false, code: 'SELECTION_UNQUALIFIED', reason: qual.reason, http: 409,
-      selection, examined: decided.examined, excluded: decided.excluded.length,
-    };
-  }
-  return { ok: true, resourceId: winner.resourceId, selection };
+  // Unconditional under the current contract: the wired selection stays
+  // advisory. The refusal carries the same advisory selection so the caller
+  // sees exactly what would have been picked and why it cannot execute yet.
+  // No descriptor property can unlock issuance — there is no allow flag,
+  // bypass, or future schema evaluated here.
+  return {
+    ok: false,
+    code: 'SELECTION_UNQUALIFIED',
+    reason: 'No runtime/model qualification evidence exists under the current contract: heartbeat liveness and capability-token observation prove reachability only, not residency, exact-instance identity, or model attestation. Automatic selection cannot qualify execution; explicit issuance is unchanged.',
+    http: 409,
+    selection, examined: decided.examined, excluded: decided.excluded.length,
+  };
 }
