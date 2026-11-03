@@ -95,6 +95,7 @@ def wait_gone(path, timeout=180):
 
 UNINSTALL_SYNC_TIMEOUT = 120
 UNINSTALL_COPY_NAME = "uninstall-observe.exe"
+HALTED_MARKER_NAME = "HALTED-unknown-uninstall.txt"
 _WORKER_IMAGE_NAMES = ("aipster-tray.exe", "aipster-worker.exe", "dendrite.exe")
 
 
@@ -120,6 +121,35 @@ def uninstall_cmdline(exe_path, target_dir, extra=()):
     switches = " ".join([f'"{exe}"', "/S"] + [
         f'"{p}"' if (" " in p or p == "") else p for p in extra])
     return f"{switches} _?={target}"
+
+
+def _stage_owned_copy(src, copy, label):
+    """Byte-copy src to copy, creating the destination leaf exclusively.
+
+    O_CREAT|O_EXCL fails when the destination name already exists --
+    whether a plain file, symlink, junction, or any other leaf -- so
+    staging never writes through a pre-existing link and never replaces
+    unknown files. Raises SystemExit on any setup failure without
+    launching anything and without deleting the pre-existing leaf.
+    """
+    try:
+        fd = os.open(copy, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(f"{label}: owned-copy destination already exists; "
+                         f"refusing to write through it: {copy}")
+    except OSError as exc:
+        raise SystemExit(f"{label}: owned copy failed: {exc}")
+    try:
+        dst = os.fdopen(fd, "wb")
+    except OSError as exc:
+        os.close(fd)
+        raise SystemExit(f"{label}: owned copy failed: {exc}")
+    try:
+        with dst, open(src, "rb") as fh:
+            shutil.copyfileobj(fh, dst, 1 << 20)
+    except OSError as exc:
+        _drop_owned_copy(copy)
+        raise SystemExit(f"{label}: owned copy failed: {exc}")
 
 
 def _file_sha256(path):
@@ -161,10 +191,17 @@ def sync_uninstall_owned(target, work, env, label="uninstall",
         raise SystemExit(f"{label}: owned copy must live outside the removal target")
     cmd = uninstall_cmdline(copy, target, extra)  # raises before anything is staged
     probe_dir.mkdir(parents=True, exist_ok=True)
+    if probe_dir.is_symlink() or probe_dir.resolve().parent != Path(work).resolve():
+        # A pre-existing link at the scratch dir would redirect the staged
+        # copy outside owned scratch (resolve() follows symlinks and
+        # junctions alike): refuse without staging, launching, or deleting.
+        raise SystemExit(f"{label}: scratch dir is not an owned directory: {probe_dir}")
     proc = None
     detail = f"{label}: never launched"
+    staged = False
     try:
-        shutil.copy2(src, copy)
+        _stage_owned_copy(src, copy, label)
+        staged = True
         if not (copy.is_file()
                 and copy.stat().st_size == src.stat().st_size
                 and _file_sha256(copy) == _file_sha256(src)):
@@ -180,7 +217,9 @@ def sync_uninstall_owned(target, work, env, label="uninstall",
     except OSError as exc:
         raise SystemExit(f"{label}: owned copy failed: {exc}")
     finally:
-        drop = _drop_owned_copy(copy)
+        # Only remove a copy this run actually staged: never delete a
+        # pre-existing occupant leaf that exclusive creation refused.
+        drop = _drop_owned_copy(copy) if staged else "not staged"
     return proc, f"{detail}; copy cleanup: {drop}"
 
 
@@ -1308,6 +1347,11 @@ def full_profile(setup):
                     wait_gone(existing, timeout=120)
             except Exception:
                 pass
+        halt_marker = work / HALTED_MARKER_NAME
+        if halt_marker.exists():
+            # An unknown detached uninstall may still be live: preserve
+            # the scratch root and diagnostics; never clean up against it.
+            return
         shutil.rmtree(work, ignore_errors=True)
 
     import atexit
@@ -1538,6 +1582,9 @@ def full_profile(setup):
         install, env, "silent uninstall")
     check("silent uninstall exits 0", launcher_ok, how)
     check("uninstall completes (async self-copy)", completed, how)
+    halted = not completed
+    halt_why = ("detached completion unknown; stopping all further "
+                "destructive work (shared HKCU singletons)")
     if completed:
         check("uninstall removes payload but preserves unrelated user files",
               not launcher.exists() and unrelated.exists()
@@ -1573,63 +1620,82 @@ def full_profile(setup):
             # Never launch against an unknown-running target again,
             # including the atexit cleanup pass.
             created.remove(install)
+            released = f"released {install} from atexit cleanup; "
+        else:
+            released = "nothing registered for atexit cleanup; "
+        # An on-disk marker preserves the scratch root through every
+        # cleanup path (including atexit) and records the stop reason.
+        (work / HALTED_MARKER_NAME).write_text(
+            "detached uninstall outcome unknown; target may still be live; "
+            + released +
+            "no second launch or cleanup against it", encoding="utf-8")
 
-    install2 = work / "app2"
-    proc = run_silent([str(setup), "/S", "/AUTOSTART=1", f"/D={install2}"], env)
-    check("install with /AUTOSTART=1 exits 0", proc.returncode == 0, proc.stderr[-500:])
-    created.append(install2)
-    run_value = reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") or ""
-    check("Run key points at the installed tray",
-          str(install2) in run_value and run_value.endswith('aipster-tray.exe"'), run_value)
-    proc, how = uninstall_cycle(install2, work, env, "second uninstall")
-    check("second uninstall exits 0",
-          proc is not None and proc.returncode == 0,
-          (proc.stderr[-500:] if proc is not None else how) + " | " + how)
-    check("second uninstall completes (observed sync exit)",
-          proc is not None and proc.returncode == 0
-          and not (install2 / "uninstall.exe").exists(), how)
-    check("Run key cleared by uninstall",
-          reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") is None)
-    check("second install dir removed", not install2.exists())
-
-    # /REMOVEDATA=1 removes the default data dir (marker proves it). Refuse
-    # when the real profile already holds data: never delete unknown files.
-    real_data = Path(os.environ["LOCALAPPDATA"]) / "AIPSTER-Worker"
-    preexisting = real_data.exists() and any(real_data.iterdir())
-    install3 = work / "app3"
-    proc = run_silent([str(setup), "/S", f"/D={install3}"], env)
-    check("third install exits 0", proc.returncode == 0, proc.stderr[-500:])
-    created.append(install3)
-    if preexisting:
-        skip("/REMOVEDATA removes data", "real profile already holds data; refusing to touch it")
-        proc, how = uninstall_cycle(install3, work, env, "third uninstall")
-        check("third uninstall exits 0",
-              proc is not None and proc.returncode == 0,
-              (proc.stderr[-500:] if proc is not None else how) + " | " + how)
-        check("third uninstall completes (observed sync exit)",
-              proc is not None and proc.returncode == 0
-              and not (install3 / "uninstall.exe").exists(), how)
+    if halted:
+        # An unknown detached uninstall may still be live: stop ALL
+        # further destructive work, including disjoint later installs
+        # that share the HKCU singleton registration. No retry, no sync
+        # fallback, no second launch.
+        skip("cycle 2 (AUTOSTART install + uninstall)", halt_why)
+        skip("cycle 3 (third/removal uninstall)", halt_why)
+        skip("uninstall failure matrix", halt_why)
+        skip("registry fully clean", halt_why)
     else:
-        removal_marker = real_data / "qual-removal-marker.txt"
-        real_data.mkdir(parents=True, exist_ok=True)
-        removal_marker.write_text("remove-me", encoding="utf-8")
-        proc, how = uninstall_cycle(install3, work, env, "removal uninstall",
-                                    extra=("/REMOVEDATA=1",))
-        check("uninstall with /REMOVEDATA=1 exits 0",
+        install2 = work / "app2"
+        proc = run_silent([str(setup), "/S", "/AUTOSTART=1", f"/D={install2}"], env)
+        check("install with /AUTOSTART=1 exits 0", proc.returncode == 0, proc.stderr[-500:])
+        created.append(install2)
+        run_value = reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") or ""
+        check("Run key points at the installed tray",
+              str(install2) in run_value and run_value.endswith('aipster-tray.exe"'), run_value)
+        proc, how = uninstall_cycle(install2, work, env, "second uninstall")
+        check("second uninstall exits 0",
               proc is not None and proc.returncode == 0,
               (proc.stderr[-500:] if proc is not None else how) + " | " + how)
-        check("removal uninstall completes (observed sync exit)",
+        check("second uninstall completes (observed sync exit)",
               proc is not None and proc.returncode == 0
-              and not (install3 / "uninstall.exe").exists(), how)
-        # Data removal runs after the app dir goes; poll the marker too.
-        check("data removal completes", wait_gone(removal_marker))
-        check("default data dir removed by /REMOVEDATA=1", not removal_marker.exists())
-        check("data dir fully gone when it held only the marker", not real_data.exists())
-    skip("uninstall data checkbox", "UI-only path; /REMOVEDATA=1 covers the code path headless")
-    uninstall_failure_matrix(setup, env, work, created, procs)
-    check("registry fully clean",
-          not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY)
-          and not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
+              and not (install2 / "uninstall.exe").exists(), how)
+        check("Run key cleared by uninstall",
+              reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") is None)
+        check("second install dir removed", not install2.exists())
+
+        # /REMOVEDATA=1 removes the default data dir (marker proves it). Refuse
+        # when the real profile already holds data: never delete unknown files.
+        real_data = Path(os.environ["LOCALAPPDATA"]) / "AIPSTER-Worker"
+        preexisting = real_data.exists() and any(real_data.iterdir())
+        install3 = work / "app3"
+        proc = run_silent([str(setup), "/S", f"/D={install3}"], env)
+        check("third install exits 0", proc.returncode == 0, proc.stderr[-500:])
+        created.append(install3)
+        if preexisting:
+            skip("/REMOVEDATA removes data", "real profile already holds data; refusing to touch it")
+            proc, how = uninstall_cycle(install3, work, env, "third uninstall")
+            check("third uninstall exits 0",
+                  proc is not None and proc.returncode == 0,
+                  (proc.stderr[-500:] if proc is not None else how) + " | " + how)
+            check("third uninstall completes (observed sync exit)",
+                  proc is not None and proc.returncode == 0
+                  and not (install3 / "uninstall.exe").exists(), how)
+        else:
+            removal_marker = real_data / "qual-removal-marker.txt"
+            real_data.mkdir(parents=True, exist_ok=True)
+            removal_marker.write_text("remove-me", encoding="utf-8")
+            proc, how = uninstall_cycle(install3, work, env, "removal uninstall",
+                                        extra=("/REMOVEDATA=1",))
+            check("uninstall with /REMOVEDATA=1 exits 0",
+                  proc is not None and proc.returncode == 0,
+                  (proc.stderr[-500:] if proc is not None else how) + " | " + how)
+            check("removal uninstall completes (observed sync exit)",
+                  proc is not None and proc.returncode == 0
+                  and not (install3 / "uninstall.exe").exists(), how)
+            # Data removal runs after the app dir goes; poll the marker too.
+            check("data removal completes", wait_gone(removal_marker))
+            check("default data dir removed by /REMOVEDATA=1", not removal_marker.exists())
+            check("data dir fully gone when it held only the marker", not real_data.exists())
+        skip("uninstall data checkbox", "UI-only path; /REMOVEDATA=1 covers the code path headless")
+        uninstall_failure_matrix(setup, env, work, created, procs)
+        check("registry fully clean",
+              not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY)
+              and not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
     ports_closed = True
     for used in USED_PORTS:
         with socket.socket() as probe:
@@ -1638,7 +1704,11 @@ def full_profile(setup):
             except OSError:
                 ports_closed = False
     check("no listener left behind", ports_closed)
-    shutil.rmtree(work, ignore_errors=True)
+    if halted:
+        skip("work dir cleanup",
+             "preserving unknown-target scratch root for diagnosis")
+    else:
+        shutil.rmtree(work, ignore_errors=True)
     print(f"\n{len(FAILURES)} failure(s)" + (": " + ", ".join(FAILURES) if FAILURES else ""))
     return 1 if FAILURES else 0
 
