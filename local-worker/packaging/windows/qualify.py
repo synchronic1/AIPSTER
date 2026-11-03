@@ -151,36 +151,37 @@ def sync_uninstall_owned(target, work, env, label="uninstall",
     if not src.is_file():
         raise SystemExit(f"{label}: {src} is missing")
     probe_dir = work / "uninstall-owned-copy"
-    probe_dir.mkdir(parents=True, exist_ok=True)
     copy = probe_dir / UNINSTALL_COPY_NAME
-    if copy.exists():
-        copy.unlink()
+    try:
+        resolved_target = target.resolve()
+        resolved_copy = copy.resolve()
+    except OSError as exc:
+        raise SystemExit(f"{label}: cannot canonicalize paths: {exc}")
+    if resolved_copy == resolved_target or resolved_target in resolved_copy.parents:
+        raise SystemExit(f"{label}: owned copy must live outside the removal target")
+    cmd = uninstall_cmdline(copy, target, extra)  # raises before anything is staged
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    proc = None
+    detail = f"{label}: never launched"
     try:
         shutil.copy2(src, copy)
-        verified = (copy.is_file()
-                    and copy.stat().st_size == src.stat().st_size
-                    and _file_sha256(copy) == _file_sha256(src))
+        if not (copy.is_file()
+                and copy.stat().st_size == src.stat().st_size
+                and _file_sha256(copy) == _file_sha256(src)):
+            raise SystemExit(f"{label}: owned copy failed verification")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                                  timeout=timeout, cwd=str(probe_dir))
+            detail = f"{label}: observed exit {proc.returncode}"
+        except subprocess.TimeoutExpired:
+            detail = f"{label}: timed out after {timeout}s (stdlib reaps the child)"
+        except OSError as exc:
+            detail = f"{label}: launch failed: {exc}"
     except OSError as exc:
         raise SystemExit(f"{label}: owned copy failed: {exc}")
-    if not verified:
-        try:
-            copy.unlink()
-        except OSError:
-            pass
-        raise SystemExit(f"{label}: owned copy failed verification")
-    try:
-        proc = subprocess.run(uninstall_cmdline(copy, target, extra),
-                              capture_output=True, text=True, env=env,
-                              timeout=timeout, cwd=str(probe_dir))
-    except subprocess.TimeoutExpired:
+    finally:
         drop = _drop_owned_copy(copy)
-        return None, (f"{label}: timed out after {timeout}s "
-                      f"(stdlib reaps the child); copy cleanup: {drop}")
-    except OSError as exc:
-        drop = _drop_owned_copy(copy)
-        return None, f"{label}: launch failed: {exc}; copy cleanup: {drop}"
-    drop = _drop_owned_copy(copy)
-    return proc, f"{label}: observed exit {proc.returncode}; copy cleanup: {drop}"
+    return proc, f"{detail}; copy cleanup: {drop}"
 
 
 def _drop_owned_copy(copy):
@@ -245,6 +246,42 @@ def uninstall_cycle(target, work, env, label, extra=()):
                                            label=label + " retry", extra=extra)
     log.append(f"attempt2: {detail2}")
     return second, "; ".join(log)
+
+
+def detached_uninstall_cycle(target, env, label, timeout=180):
+    """One ordinary (detached) uninstall with bounded completion evidence.
+
+    Launches target/uninstall.exe /S — the real user path, where exit 0
+    means spawned, not done — and polls for the uninstaller's
+    disappearance. Returns (launcher_ok, completed, log). On timeout or
+    any unknown outcome the caller must FAIL that cycle, skip its
+    target-state assertions, never retry or launch another
+    installer/uninstaller against that target (the temp copy may still
+    be alive), and drop the target from any cleanup list. No sync
+    fallback may convert this ordinary-path failure into a pass.
+    Read-only diagnostics (payload listing, worker-image snapshot) are
+    included in the log; nothing is touched.
+    """
+    target = Path(target)
+    try:
+        proc = subprocess.run([str(target / "uninstall.exe"), "/S"],
+                              capture_output=True, text=True, env=env,
+                              timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, False, f"{label}: launcher itself timed out (unknown state)"
+    except OSError as exc:
+        return False, False, f"{label}: launch failed: {exc}"
+    if proc.returncode != 0:
+        return False, False, (f"{label}: launcher exit {proc.returncode}: "
+                              f"{(proc.stderr or '')[-500:]}")
+    if wait_gone(target / "uninstall.exe", timeout=timeout):
+        return True, True, f"{label}: detached uninstall completed"
+    running, unknown = worker_images_running()
+    left = sorted(p.name for p in target.iterdir()) if target.exists() else []
+    return True, False, (f"{label}: completion unobserved after {timeout}s; "
+                         f"payload left={left}; "
+                         f"uninstall.exe present={(target / 'uninstall.exe').exists()}; "
+                         f"worker images running={running} unknown={unknown}")
 
 
 def reg_value(root, path, name):
@@ -1497,32 +1534,45 @@ def full_profile(setup):
           and (home / "AIPSTER-Worker/qual-marker.txt").read_text(encoding="utf-8") == "preserve-me")
     unrelated = install / "unrelated-user-file.txt"
     unrelated.write_text("synthetic preserve-me")
-    proc, how = uninstall_cycle(install, work, env, "silent uninstall")
-    check("silent uninstall exits 0",
-          proc is not None and proc.returncode == 0,
-          (proc.stderr[-500:] if proc is not None else how) + " | " + how)
-    check("uninstall completes (observed sync exit)",
-          proc is not None and proc.returncode == 0
-          and not (install / "uninstall.exe").exists(), how)
-    check("uninstall removes payload but preserves unrelated user files",
-          not launcher.exists() and unrelated.exists()
-          and unrelated.read_text() == "synthetic preserve-me")
-    unrelated.unlink()
-    try:
-        install.rmdir()  # Empty test directory only; never recursive.
-    except FileNotFoundError:
-        pass  # Sync uninstaller already removed the now-empty directory.
-    check("empty install directory can be removed", not install.exists())
-    check("Start Menu entry removed", not start_menu.exists())
-    check("desktop shortcut removed", not desktop_lnk.exists())
-    check("app registry removed", not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
-    check("Add/Remove entry removed", not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
-    check("Run key absent after uninstall",
-          reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") is None)
-    check("data dir preserved by uninstall",
-          (home / "AIPSTER-Worker/qual-marker.txt").exists()
-          and (home / "AIPSTER-Worker/api-token.txt").exists()
-          and (home / "AIPSTER-Worker/logs").is_dir())
+    launcher_ok, completed, how = detached_uninstall_cycle(
+        install, env, "silent uninstall")
+    check("silent uninstall exits 0", launcher_ok, how)
+    check("uninstall completes (async self-copy)", completed, how)
+    if completed:
+        check("uninstall removes payload but preserves unrelated user files",
+              not launcher.exists() and unrelated.exists()
+              and unrelated.read_text() == "synthetic preserve-me")
+        unrelated.unlink()
+        try:
+            install.rmdir()  # Empty test directory only; never recursive.
+        except FileNotFoundError:
+            pass  # Async uninstaller may have just removed the now-empty directory.
+        check("empty install directory can be removed", not install.exists())
+        check("Start Menu entry removed", not start_menu.exists())
+        check("desktop shortcut removed", not desktop_lnk.exists())
+        check("app registry removed", not reg_key_exists(winreg.HKEY_CURRENT_USER, APP_KEY))
+        check("Add/Remove entry removed", not reg_key_exists(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY))
+        check("Run key absent after uninstall",
+              reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") is None)
+        check("data dir preserved by uninstall",
+              (home / "AIPSTER-Worker/qual-marker.txt").exists()
+              and (home / "AIPSTER-Worker/api-token.txt").exists()
+              and (home / "AIPSTER-Worker/logs").is_dir())
+    else:
+        unknown_note = ("detached completion unknown; no second launch "
+                        "against this target (temp copy may still be alive)")
+        skip("uninstall removes payload but preserves unrelated user files", unknown_note)
+        skip("empty install directory can be removed", unknown_note)
+        skip("Start Menu entry removed", unknown_note)
+        skip("desktop shortcut removed", unknown_note)
+        skip("app registry removed", unknown_note)
+        skip("Add/Remove entry removed", unknown_note)
+        skip("Run key absent after uninstall", unknown_note)
+        skip("data dir preserved by uninstall", unknown_note)
+        if install in created:
+            # Never launch against an unknown-running target again,
+            # including the atexit cleanup pass.
+            created.remove(install)
 
     install2 = work / "app2"
     proc = run_silent([str(setup), "/S", "/AUTOSTART=1", f"/D={install2}"], env)
