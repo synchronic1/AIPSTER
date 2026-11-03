@@ -90,15 +90,50 @@ def content_digest(path):
 def identity_for(path):
     """Both identities for one model file: stat fingerprint + content digest.
 
-    Always freshly measured; there is no cache, so `fresh` is always true
-    and `measured_at` names this measurement. Any future cache must flip
-    `fresh` to false on reuse.
+    Single-open measurement: the stat tuple, GGUF magic probe, and content
+    digest all come from one opened file descriptor with fstat
+    before/after stability checks. A file that changes detectably during
+    measurement raises FileChangedError instead of returning a mixed row
+    (old stat beside a new digest); there is no cache, so `fresh` is
+    always true and `measured_at` names this measurement. Any future
+    cache must flip `fresh` to false on reuse.
+
+    For a stable file the row is field-for-field identical to composing
+    stat_fingerprint() with content_digest(): same resolved-path
+    identity string, same magic rule, same digest. Open/read failures
+    (missing, unreadable, non-file) propagate exactly as the composed
+    calls raised them; identity_for never fabricates a row.
+
+    This closes composition mixing, not all concurrent modification: a
+    same-size rewrite with a restored mtime landing entirely between
+    the two fstats is undetectable, and a path replacement during the
+    read still measures the opened file consistently (never a mix).
     """
-    identity = stat_fingerprint(path)
-    identity["content_digest"] = content_digest(path)
-    identity["measured_at"] = datetime.now(timezone.utc).isoformat()
-    identity["fresh"] = True
-    return identity
+    target = Path(path)
+    digest = hashlib.sha256()
+    with open(target, "rb") as handle:
+        before = _stat_key(os.fstat(handle.fileno()))
+        magic = handle.read(4)
+        digest.update(magic)
+        while True:
+            chunk = handle.read(CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = _stat_key(os.fstat(handle.fileno()))
+    if before != after:
+        raise FileChangedError(f"{path}: file changed during measurement")
+    identity = (f"{target.resolve()}:{before[0]}:{before[1]}:"
+                f"{before[2]}:{before[3]}")
+    return {
+        "cached_on_disk": magic == b"GGUF",
+        "size_bytes": before[2],
+        "fingerprint": hashlib.sha256(identity.encode()).hexdigest(),
+        "fingerprint_kind": "local-file-stat",
+        "content_digest": f"sha256:{digest.hexdigest()}",
+        "measured_at": datetime.now(timezone.utc).isoformat(),
+        "fresh": True,
+    }
 
 
 def main(argv):

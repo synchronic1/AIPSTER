@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -150,6 +151,158 @@ class CliTests(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         )
         self.assertNotEqual(proc.returncode, 0)
+
+
+class _SpyReader:
+    """Delegating proxy around a real binary file object.
+
+    identity_for() resolves `open` through builtins at call time, so
+    tests can observe each read call deterministically; C-level file
+    types themselves are immutable and cannot be patched. Counts
+    top-level read() calls and fires on_read(count) after each one.
+    """
+
+    def __init__(self, raw, on_read):
+        self._raw = raw
+        self._on_read = on_read
+        self._calls = 0
+
+    def read(self, size=-1):
+        data = self._raw.read(size)
+        self._calls += 1
+        self._on_read(self._calls)
+        return data
+
+    def fileno(self):
+        return self._raw.fileno()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._raw.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def _wrap_target_open(real_open, target, on_read):
+    """builtins.open replacement that proxies reads of one target file."""
+    def interfering_open(file, *args, **kwargs):
+        handle = real_open(file, *args, **kwargs)
+        if os.fspath(file) == os.fspath(target):
+            return _SpyReader(handle, on_read)
+        return handle
+    return interfering_open
+
+
+class IdentityForCompositionTests(unittest.TestCase):
+    """identity_for() must never return a mixed row (P2 regression tests).
+
+    All fixtures use tiny synthetic GGUF files; no model reads, no store
+    access. Timing-sensitive interleavings use strict event ordering, so
+    every assertion holds in all thread schedules.
+    """
+
+    def test_replacement_during_read_never_mixes(self):
+        old = b"GGUF" + bytes(range(256)) * 16
+        new = b"GGUF" + b"N" * 8192
+        real_open = open
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "r.gguf"
+            target.write_bytes(old)
+            started = threading.Event()
+            done = threading.Event()
+
+            def replace():
+                # Strictly after the first read began, so identity_for's
+                # open already pins the old file; on platforms refusing
+                # delete-while-open the replace fails and the file is
+                # simply undisturbed. Either way the row must describe
+                # exactly one generation.
+                if not started.wait(timeout=30):
+                    return
+                other = Path(tmp) / "new.gguf"
+                other.write_bytes(new)
+                try:
+                    os.replace(other, target)
+                except OSError:
+                    pass
+                done.set()
+
+            opener = _wrap_target_open(real_open, target,
+                                       lambda n: started.set())
+            worker = threading.Thread(target=replace)
+            with mock.patch.object(model_identity, "CHUNK_BYTES", 16), \
+                 mock.patch("builtins.open", side_effect=opener):
+                worker.start()
+                try:
+                    row = model_identity.identity_for(str(target))
+                finally:
+                    worker.join(timeout=30)
+            self.assertTrue(done.is_set(), "replacer must have run mid-read")
+            self.assertTrue(row["fresh"])
+            self.assertEqual(row["size_bytes"], len(old))
+            self.assertEqual(row["content_digest"],
+                             "sha256:" + hashlib.sha256(old).hexdigest())
+
+    def test_inplace_change_mid_read_raises(self):
+        real_open = open
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "c.gguf"
+            target.write_bytes(b"GGUF" + b"A" * 1024)
+
+            def on_read(n):
+                if n == 2:
+                    st = target.stat()
+                    target.write_bytes(b"GGUF" + b"B" * 2048)
+                    os.utime(target, ns=(st.st_atime_ns,
+                                         st.st_mtime_ns + 5_000_000))
+
+            opener = _wrap_target_open(real_open, target, on_read)
+            with mock.patch.object(model_identity, "CHUNK_BYTES", 64), \
+                 mock.patch("builtins.open", side_effect=opener):
+                with self.assertRaises(model_identity.FileChangedError):
+                    model_identity.identity_for(str(target))
+
+    def test_missing_file_raises_filenotfound(self):
+        with self.assertRaises(FileNotFoundError):
+            model_identity.identity_for(str(ROOT / "does-not-exist.gguf"))
+
+    def test_open_failure_propagates_without_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "u.gguf"
+            target.write_bytes(b"GGUF" + b"secret")
+            with mock.patch("builtins.open",
+                            side_effect=PermissionError(13, "denied")):
+                with self.assertRaises(PermissionError):
+                    model_identity.identity_for(str(target))
+
+    def test_non_file_path_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(OSError):
+                model_identity.identity_for(tmp)
+
+    def test_canonical_path_spellings_agree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "sub"
+            sub.mkdir()
+            target = Path(tmp) / "m.gguf"
+            target.write_bytes(b"GGUF" + os.urandom(64))
+            direct = model_identity.identity_for(str(target))
+            dotted = model_identity.identity_for(str(sub / ".." / "m.gguf"))
+            self.assertEqual(direct["fingerprint"], dotted["fingerprint"])
+            self.assertEqual(direct["content_digest"], dotted["content_digest"])
+            link = Path(tmp) / "link.gguf"
+            try:
+                link.symlink_to(target)
+            except OSError:
+                pass
+            else:
+                linked = model_identity.identity_for(str(link))
+                self.assertEqual(direct["fingerprint"], linked["fingerprint"])
+                self.assertEqual(direct["content_digest"],
+                                 linked["content_digest"])
 
 
 if __name__ == "__main__":
