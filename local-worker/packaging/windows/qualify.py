@@ -456,6 +456,162 @@ class TrayLab:
                     pass
 
 
+# --------------------------------------- frozen preflight qualification
+PREFLIGHT_COMMANDS = ("delivery-check", "runtime-plan")
+PREFLIGHT_TIMEOUT = 15
+
+PREFLIGHT_MOCK_CONFIG = (
+    '[node]\nid = "preflight-mock"\nhost = "127.0.0.1"\nport = {port}\nstate_dir = "state"\n'
+    '\n[[runtimes]]\nid = "mock"\nkind = "mock"\ngpu_layers = 0\n'
+    '\n[[models]]\nid = "mock-summary"\nruntime = "mock"\ncapabilities = ["summarize"]\n'
+)
+
+PREFLIGHT_READY_CONFIG = (
+    '[node]\nid = "preflight-real"\nhost = "127.0.0.1"\nport = {port}\nstate_dir = "state"\n'
+    '\n[[runtimes]]\nid = "cpu"\nkind = "ik_llama"\nmode = "managed"\n'
+    'executable = "llama-server"\nthreads = 2\ngpu_layers = 0\n'
+    '\n[[models]]\nid = "m"\nruntime = "cpu"\ncapabilities = ["summarize"]\npath = "{model}"\n'
+)
+
+
+def preflight_argv(worker_exe, command, args):
+    """Frozen preflight invocation; only read-only commands are allowlisted."""
+    if command not in PREFLIGHT_COMMANDS:
+        raise SystemExit(f"preflight refuses non-read-only command: {command}")
+    return [str(worker_exe), command, *args]
+
+
+def preflight_env(work, name, extra_path=None):
+    """Scrubbed env with an isolated synthetic data dir (never a real store)."""
+    data = work / name
+    private_fixture_directory(data)
+    env = scrubbed_env()
+    env["AIPSTER_WORKER_DATA"] = str(data)
+    if extra_path is not None:
+        env["PATH"] = str(extra_path) + os.pathsep + env["PATH"]
+    return env, data
+
+
+def preflight_verdict(proc, *, expect_exit, markers=(), label=""):
+    """Validate one frozen preflight result.
+
+    Detects wrong exits (missing bundled imports surface as tracebacks
+    with nonzero exits), malformed output (missing markers), and
+    tracebacks anywhere in the output. Returns (ok, detail).
+    """
+    if proc is None:
+        return False, f"{label}: timed out after {PREFLIGHT_TIMEOUT}s"
+    text = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != expect_exit:
+        return False, f"{label}: exit {proc.returncode}, want {expect_exit}: {text[:300]}"
+    missing = [m for m in markers if m not in text]
+    if missing:
+        return False, f"{label}: missing output markers {missing}: {text[:300]}"
+    if "Traceback" in text:
+        return False, f"{label}: traceback in output (bundled import failure?)"
+    return True, ""
+
+
+def preflight_matrix(app_dir, work):
+    """Bounded frozen-exe preflight: delivery-check + runtime-plan only.
+
+    Read-only console commands against synthetic temp config/data with a
+    scrubbed env. Starts no daemon/tray/server, provisions nothing
+    outside work/, binds no ports. Every command has an explicit 15 s
+    timeout; unexpected provisioning (new files, sender lock) and
+    tracebacks fail the check.
+    """
+    app_dir = Path(app_dir)
+    worker_exe = app_dir / "aipster-worker.exe"
+    if not worker_exe.is_file():
+        raise SystemExit(f"preflight: {worker_exe} is missing")
+    lab = work / "preflight"
+    lab.mkdir(parents=True, exist_ok=True)
+    port = free_port()
+
+    bin_dir = lab / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "llama-server.exe").write_bytes(b"not-an-engine")
+    model = lab / "m.gguf"
+    model.write_bytes(b"GGUF" + b"\x00" * 64)
+    mock_cfg = lab / "mock.toml"
+    mock_cfg.write_text(PREFLIGHT_MOCK_CONFIG.format(port=port), encoding="utf-8")
+    ready_cfg = lab / "ready.toml"
+    ready_cfg.write_text(
+        PREFLIGHT_READY_CONFIG.format(port=port, model=model.as_posix()),
+        encoding="utf-8")
+
+    def run(command, args, env):
+        try:
+            return subprocess.run(preflight_argv(worker_exe, command, args),
+                                  capture_output=True, text=True, env=env,
+                                  timeout=PREFLIGHT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def note(name, proc, **expect):
+        ok, detail = preflight_verdict(proc, label=name, **expect)
+        check(name, ok, detail)
+
+    # delivery-check on a ready synthetic store: exit 0, nothing provisioned.
+    env, data = preflight_env(work, "preflight-ready", extra_path=bin_dir)
+    (data / "config.toml").write_text(ready_cfg.read_text(encoding="utf-8"),
+                                      encoding="utf-8")
+    before = sorted(p.name for p in data.iterdir())
+    ready = run("delivery-check",
+                ["--app-dir", str(app_dir), "--data-dir", str(data)], env)
+    note("frozen delivery-check ready exits 0 with ready markers", ready,
+         expect_exit=0, markers=("delivery-check: ready",))
+    after = sorted(p.name for p in data.iterdir())
+    check("frozen delivery-check provisions nothing in the data dir",
+          after == before and not (data / "sender.lock").exists(), ",".join(after))
+
+    # delivery-check on an absent data dir: blocked, and it stays absent.
+    ghost = work / "preflight-ghost"
+    if ghost.exists():
+        shutil.rmtree(ghost, ignore_errors=True)
+    absent = run("delivery-check",
+                 ["--app-dir", str(app_dir), "--data-dir", str(ghost)], env)
+    note("frozen delivery-check absent store blocked without provisioning", absent,
+         expect_exit=2, markers=("delivery-check: blocked", "config.toml"))
+    check("absent data dir still absent after delivery-check", not ghost.exists())
+
+    # delivery-check on a mock-only store: mock never counts as operational.
+    menv, mdata = preflight_env(work, "preflight-mock")
+    (mdata / "config.toml").write_text(mock_cfg.read_text(encoding="utf-8"),
+                                       encoding="utf-8")
+    mocked = run("delivery-check",
+                 ["--app-dir", str(app_dir), "--data-dir", str(mdata)], menv)
+    note("frozen delivery-check mock stays setup-required", mocked,
+         expect_exit=2, markers=("delivery-check: blocked", "setup required"))
+
+    # runtime-plan: ready keeps preflight scope, mock/missing fail closed.
+    penv, _ = preflight_env(work, "preflight-plan", extra_path=bin_dir)
+    plan_ready = run("runtime-plan", ["--config", str(ready_cfg)], penv)
+    note("frozen runtime-plan ready exits 0 with preflight scope", plan_ready,
+         expect_exit=0, markers=("status: ready", "preflight", "not verified (not run)"))
+    plan_mock = run("runtime-plan", ["--config", str(mock_cfg)], penv)
+    note("frozen runtime-plan mock stays setup-required", plan_mock,
+         expect_exit=2, markers=("setup-required",))
+    plan_missing = run("runtime-plan", ["--config", str(lab / "nope.toml")], penv)
+    note("frozen runtime-plan missing config exits 1 config-error", plan_missing,
+         expect_exit=1, markers=("config-error",))
+    bad = lab / "bad.toml"
+    bad.write_text("[[runtimes\nbroken = = =", encoding="utf-8")
+    plan_bad = run("runtime-plan", ["--config", str(bad), "--json"], penv)
+    try:
+        parsed = json.loads(plan_bad.stdout) if plan_bad is not None else {}
+        json_ok = parsed.get("status") == "config-error"
+    except ValueError:
+        json_ok = False
+    check("frozen runtime-plan malformed config is structured config-error",
+          plan_bad is not None and plan_bad.returncode == 1 and json_ok,
+          (plan_bad.stdout or "")[:200] if plan_bad is not None else "timed out")
+
+    check("preflight creates no sender.lock anywhere under work",
+          not list(work.rglob("sender.lock")))
+
+
 def tray_matrix(app_dir, work):
     lab = TrayLab(app_dir, work)
     try:
@@ -1176,6 +1332,7 @@ def full_profile(setup):
     check("token value absent from console output", token_again not in output)
 
     pure_tests()
+    preflight_matrix(install, work)
     tray_matrix(install, work)
 
     proc = run_silent([str(setup), "/S", f"/D={install}"], env)
@@ -1432,6 +1589,7 @@ def coexist_profile(app_dir):
         detail = ""
     check("ICOs hold 7 PNG sizes incl. 16/32/48", icons_ok, detail)
     pure_tests()
+    preflight_matrix(app_dir, work)
     tray_matrix(app_dir, work)
     ports_closed = True
     for used in USED_PORTS:
