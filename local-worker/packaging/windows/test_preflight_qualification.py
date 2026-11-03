@@ -2,7 +2,7 @@
 
 Covers the allowlist gate, the exit/marker/traceback verdict, and the
 scrubbed preflight env, plus one in-process source-launcher delivery-check
-run proving the bundled modules import and behave without provisioning.
+run proving the source modules import and behave without provisioning.
 No frozen exe, daemon, tray, server, install, or network is touched; the
 frozen-exe matrix itself runs only inside qualify.py profiles on CI.
 """
