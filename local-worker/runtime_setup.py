@@ -30,6 +30,22 @@ SETUP_REQUIRED = "setup-required"
 READY = "ready"
 CONFIG_ERROR = "config-error"
 
+# A "ready" plan is setup/preflight readiness ONLY: engine path observed
+# (PATH lookup or a configured explicit path), GGUF magic bytes verified,
+# config references valid, placement evidence compatible. It is NOT tested
+# executable usability (discovered binaries are never executed), model
+# residency, model identity attestation, or inference qualification —
+# those remain unqualified/not-run and are marked as such on every plan.
+READINESS_SCOPE = (
+    "setup/preflight readiness only: engine observed (PATH or configured "
+    "path), GGUF magic bytes verified, config references valid, placement "
+    "evidence compatible")
+NOT_VERIFIED = (
+    "tested executable usability (binaries are never executed)",
+    "model residency",
+    "model identity attestation",
+    "inference qualification")
+
 FALLBACK_GUIDANCE = (
     "Supported configurations: native ik_llama managed runtime with a "
     "real GGUF model file (set the [[models]] path yourself), or "
@@ -232,7 +248,10 @@ def plan_setup(config_path, *, consent=False, which=None,
         return {
             "status": CONFIG_ERROR,
             "config_source": source,
+            "classifier": "none (config unreadable)",
             "reason": loaded,
+            "readiness_scope": READINESS_SCOPE,
+            "not_verified": list(NOT_VERIFIED),
             "actions": [
                 f"Fix {config_path} ({loaded}), then re-run this planner.",
                 "Nothing was installed, configured, or started.",
@@ -325,7 +344,11 @@ def plan_setup(config_path, *, consent=False, which=None,
 
     actions = []
     if status == READY:
-        actions.append("Configuration is ready: start the worker yourself when you choose.")
+        actions.append(
+            "Configuration is ready for setup/preflight purposes only "
+            "(see readiness scope below; executable usability, residency, "
+            "identity attestation and inference qualification were NOT run): "
+            "start the worker yourself when you choose.")
     else:
         actions.extend(unqualified or [reason])
         if mock_only:
@@ -350,6 +373,8 @@ def plan_setup(config_path, *, consent=False, which=None,
         "classifier": classifier,
         "mock_only": mock_only,
         "reason": reason,
+        "readiness_scope": READINESS_SCOPE,
+        "not_verified": list(NOT_VERIFIED),
         "guidance": verdict.get("guidance", FALLBACK_GUIDANCE),
         "engines_observed": observed_names,
         "hardware_observed": hw is not None,
@@ -364,10 +389,13 @@ def plan_setup(config_path, *, consent=False, which=None,
 
 def format_human(plan, config_path):
     lines = [
-        f"config: {config_path} (source: {plan['config_source']}, "
-        f"classifier: {plan['classifier']})",
-        f"status: {plan['status']}",
-        f"reason: {plan['reason']}",
+        f"config: {config_path} (source: {plan.get('config_source', 'unknown')}, "
+        f"classifier: {plan.get('classifier', 'none')})",
+        f"status: {plan.get('status', CONFIG_ERROR)}",
+        f"reason: {plan.get('reason', 'unavailable')}",
+        f"readiness scope: {plan.get('readiness_scope', READINESS_SCOPE)}",
+        "not verified (not run): "
+        + "; ".join(plan.get("not_verified", list(NOT_VERIFIED))),
     ]
     if plan.get("evidence"):
         lines.append("verified evidence:")
@@ -397,9 +425,10 @@ def main(argv=None):
         print(json.dumps(plan, indent=2))
     else:
         print(format_human(plan, args.config))
-    if plan["status"] == READY:
+    status = plan.get("status", CONFIG_ERROR)
+    if status == READY:
         return 0
-    return 1 if plan["status"] == CONFIG_ERROR else 2
+    return 1 if status == CONFIG_ERROR else 2
 
 
 if __name__ == "__main__":

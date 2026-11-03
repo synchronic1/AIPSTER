@@ -300,6 +300,88 @@ class CliTests(unittest.TestCase):
                 plan = json.loads(buf.getvalue())
                 self.assertEqual(plan["status"], "config-error")
 
+    def _run_main(self, args):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = runtime_setup.main(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_missing_config_human_no_traceback(self):
+        # REVIEW-RUNTIME-1 HOLD: default human output crashed with
+        # KeyError: 'classifier' on config-error plans.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "nope.toml")
+            with patch.object(runtime_setup, "_vendored_config_loader",
+                              return_value=None):
+                code, out, err = self._run_main(["--config", missing])
+        self.assertEqual(code, 1)
+        self.assertIn("config-error", out)
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn("KeyError", out + err)
+
+    def test_malformed_config_human_no_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = write_config(tmp, "[[runtimes\nbroken = = =")
+            with patch.object(runtime_setup, "_vendored_config_loader",
+                              return_value=None):
+                code, out, err = self._run_main(["--config", cfg_path])
+        self.assertEqual(code, 1)
+        self.assertIn("config-error", out)
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn("KeyError", out + err)
+
+    def test_missing_config_json_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "nope.toml")
+            with patch.object(runtime_setup, "_vendored_config_loader",
+                              return_value=None):
+                import io
+                from contextlib import redirect_stdout
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    code = runtime_setup.main(["--config", missing, "--json"])
+                self.assertEqual(code, 1)
+                plan = json.loads(buf.getvalue())
+                self.assertEqual(plan["status"], "config-error")
+                self.assertIn("classifier", plan)
+
+    def test_ready_plan_states_preflight_scope(self):
+        # "ready" is setup/preflight readiness only; the unqualified
+        # remainder (usability, residency, identity, inference) stays marked.
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "m.gguf").write_bytes(b"GGUFxx")
+            cfg_path = write_config(tmp, CPU_TOML.format(model="m.gguf"))
+            with patch.object(runtime_setup, "_vendored_config_loader",
+                              return_value=None), \
+                 patch.object(runtime_setup.shutil, "which",
+                              return_value="/bin/llama-server"):
+                code, out, err = self._run_main(["--config", cfg_path])
+                json_buf = io.StringIO()
+                with redirect_stdout(json_buf):
+                    json_code = runtime_setup.main(
+                        ["--config", cfg_path, "--json"])
+                plan = plan_setup(cfg_path,
+                                  which=lambda n: "/bin/llama-server",
+                                  hardware=fake_hardware())
+        self.assertEqual(code, 0)
+        self.assertEqual(json_code, 0)
+        self.assertEqual(plan["status"], "ready")
+        self.assertIn("preflight", plan["readiness_scope"])
+        for marker in ("executable usability", "residency",
+                       "identity attestation", "inference qualification"):
+            self.assertTrue(any(marker in item for item in plan["not_verified"]),
+                            marker)
+        self.assertIn("preflight", out)
+        self.assertIn("not verified (not run)", out)
+        self.assertEqual(json.loads(json_buf.getvalue())["status"], "ready")
+
 
 if __name__ == "__main__":
     unittest.main()
