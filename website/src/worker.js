@@ -25,6 +25,7 @@ import { grantPartiesSameSide, grantUsage, canUseResource } from './lib/access.j
 import { createDispatchCoordinator } from './inference/dispatch-coordinator.mjs';
 import { createWorkerTransport, validateWorkerResultReport, WORKER_RESULT_MAX_BYTES } from './inference/worker-transport.mjs';
 import { getDispatchStore } from './inference/dispatch-wiring.mjs';
+import { selectAdmissionTarget } from './inference/admission-select.mjs';
 import { matchGrant } from './fabric/policy.mjs';
 
 const VERSION = '0.5.0';
@@ -2894,10 +2895,24 @@ async function handleApi(request, env, url) {
     const d = needAuthz('inference'); if (d) return deny(d);
     if (actor.kind === 'session') { const c = needCsrf(); if (c) return deny(c); }
     const body = await readJson(request, ADMISSION_BODY_MAX);
-    if (Object.keys(body).some((k) => !['resource_id', 'model_id', 'max_tokens', 'runtime_id'].includes(k))) {
-      return json(400, { error: 'Only resource_id, model_id, max_tokens and runtime_id are accepted.', code: 'UNSUPPORTED_FIELD' });
+    if (Object.keys(body).some((k) => !['resource_id', 'model_id', 'max_tokens', 'runtime_id', 'select'].includes(k))) {
+      return json(400, { error: 'Only resource_id, model_id, max_tokens, runtime_id and select are accepted.', code: 'UNSUPPORTED_FIELD' });
     }
-    if (!isId(body.resource_id)) return json(400, { error: 'resource_id is required.', code: 'BAD_RESOURCE' });
+    // Opt-in server selection: omitting resource_id is only legal with a
+    // select object. Explicit resource binding stays the default path, and
+    // every check below runs unchanged on the resolved id.
+    let selection = null;
+    if (body.resource_id === undefined) {
+      const select = body.select;
+      if (select === null || typeof select !== 'object' || Array.isArray(select)) {
+        return json(400, { error: 'resource_id is required.', code: 'BAD_RESOURCE' });
+      }
+      if (Object.keys(select).some((k) => k !== 'device')) {
+        return json(400, { error: 'Only select.device is accepted.', code: 'UNSUPPORTED_FIELD' });
+      }
+    } else if (!isId(body.resource_id)) {
+      return json(400, { error: 'resource_id is required.', code: 'BAD_RESOURCE' });
+    }
     if (typeof body.model_id !== 'string' || !body.model_id || body.model_id.length > MODEL_ID_MAX) {
       return json(400, { error: 'model_id is required.', code: 'BAD_MODEL' });
     }
@@ -2911,7 +2926,23 @@ async function handleApi(request, env, url) {
     if (typeof runtime_id !== 'string' || !INFERENCE_RUNTIME_IDS.has(runtime_id)) {
       return json(400, { error: 'runtime_id must be one of: ganglion, llama-server.', code: 'BAD_RUNTIME' });
     }
-    const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', body.resource_id);
+    // Resolve an opted-in selection through the reviewed placement/binding
+    // logic. The winner re-enters the unchanged authority below (access,
+    // liveness, grant pin, store issuance); a refusal mints nothing.
+    let resourceId = body.resource_id;
+    if (resourceId === undefined) {
+      const picked = await selectAdmissionTarget({ db, tenantId: actor.user.id,
+        model: body.model_id, maxTokens: body.max_tokens,
+        device: body.select.device === undefined ? 'cpu' : body.select.device, runtimeId: runtime_id });
+      if (!picked.ok) {
+        if (picked.http === 400) return json(400, { error: picked.reason, code: picked.code });
+        if (picked.http === 409) return json(409, { error: picked.reason, code: picked.code });
+        return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
+      }
+      selection = picked.selection;
+      resourceId = picked.resourceId;
+    }
+    const resource = await first(db, 'SELECT * FROM resources WHERE id = ?', resourceId);
     // Owner or live same-side grant with remaining quota; foreign and unknown
     // resources answer the same 404 so existence is not disclosed.
     const access = resource ? await canUseResource(db, actor.user.id, resource) : { ok: false };
@@ -2963,6 +2994,7 @@ async function handleApi(request, env, url) {
     return json(201, {
       admission_ref: admission.admission_ref, expires_at: admission.expires_at,
       model_id: admission.model_id, max_tokens: admission.max_tokens,
+      ...(selection ? { selection } : {}),
     });
   }
 
