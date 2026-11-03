@@ -24,6 +24,41 @@
 //   listEligible. They are not caller assertions.
 import { listEligible } from '../routing/eligibility.mjs';
 import { selectPlacement, validatePlacementBinding } from './placement-binding.mjs';
+import { STALE_AFTER_MS } from '../lib/status.mjs';
+
+const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+
+// Qualification gate: a bounded disabled prerequisite, not a new authority.
+// Automatic selection may feed admission issuance only when the winning
+// descriptor carries explicit, server-shaped runtime/model qualification
+// evidence — a resident exact-instance attestation with named authority.
+// No such evidence exists in the current descriptor contract
+// (routing `buildDescriptor` carries no qualification field), so every row
+// is unqualified today and the select path refuses with advisory evidence
+// instead of minting. This gates ONLY the new automatic path: explicit
+// issuance names the caller's own resource and is unchanged.
+// Exact data prerequisite (forward-looking; nothing in-repo produces it):
+//   descriptor.qualification = { qualified: true,
+//     runtimeDigest: <non-empty string>, modelDigest: <non-empty string>,
+//     authority: <non-empty string>, attestedAt: <safe-int epoch ms> }
+// where attestedAt must be within STALE_AFTER_MS (freshness), never future.
+function qualificationOf(descriptor, nowMs) {
+  const missing = 'No runtime/model qualification evidence is recorded for this resource: no resident exact-instance attestation exists. Automatic selection cannot qualify execution; explicit issuance is unchanged.';
+  const q = isObj(descriptor) ? descriptor.qualification : undefined;
+  if (q === undefined || q === null) return { qualified: false, reason: missing };
+  const malformed = !isObj(q) || q.qualified !== true
+    || typeof q.runtimeDigest !== 'string' || q.runtimeDigest.length === 0
+    || typeof q.modelDigest !== 'string' || q.modelDigest.length === 0
+    || typeof q.authority !== 'string' || q.authority.length === 0
+    || !Number.isSafeInteger(q.attestedAt) || q.attestedAt > nowMs;
+  if (malformed) {
+    return { qualified: false, reason: 'Runtime/model qualification evidence is malformed or future-dated and cannot qualify automatic execution; explicit issuance is unchanged.' };
+  }
+  if (nowMs - q.attestedAt > STALE_AFTER_MS) {
+    return { qualified: false, reason: 'Runtime/model qualification evidence is stale (attestation older than the freshness window); explicit issuance is unchanged.' };
+  }
+  return { qualified: true };
+}
 
 /**
  * Server-side opt-in target selection for one principal.
@@ -58,17 +93,24 @@ export async function selectAdmissionTarget({ db, tenantId, model, maxTokens, de
       examined: decided.examined, excluded: decided.excluded.length,
     };
   }
-  return {
-    ok: true,
-    resourceId: winner.resourceId,
-    selection: {
-      resource_id: winner.resourceId,
-      device: winner.binding.device,
-      runtime_id: winner.binding.runtimeId,
-      score: winner.score,
-      evidence: winner.evidence,
-      examined: decided.examined,
-      excluded: decided.excluded.length,
-    },
+  const selection = {
+    resource_id: winner.resourceId,
+    device: winner.binding.device,
+    runtime_id: winner.binding.runtimeId,
+    score: winner.score,
+    evidence: winner.evidence,
+    examined: decided.examined,
+    excluded: decided.excluded.length,
   };
+  // The gate: without qualification evidence the wired selection is advisory
+  // only. The refusal carries the same advisory selection so the caller sees
+  // exactly what would have been picked and why it cannot execute yet.
+  const qual = qualificationOf(winner.candidate, now);
+  if (!qual.qualified) {
+    return {
+      ok: false, code: 'SELECTION_UNQUALIFIED', reason: qual.reason, http: 409,
+      selection, examined: decided.examined, excluded: decided.excluded.length,
+    };
+  }
+  return { ok: true, resourceId: winner.resourceId, selection };
 }

@@ -2936,7 +2936,12 @@ async function handleApi(request, env, url) {
         device: body.select.device === undefined ? 'cpu' : body.select.device, runtimeId: runtime_id });
       if (!picked.ok) {
         if (picked.http === 400) return json(400, { error: picked.reason, code: picked.code });
-        if (picked.http === 409) return json(409, { error: picked.reason, code: picked.code });
+        // Availability refusals (no eligible node; unqualified selection) carry
+        // the advisory selection when one was computed, and mint nothing.
+        if (picked.http === 409) {
+          return json(409, { error: picked.reason, code: picked.code,
+            ...(picked.selection ? { selection: picked.selection } : {}) });
+        }
         return json(503, { error: 'Inference dispatch is not available on this deployment.', code: 'DISPATCH_UNAVAILABLE' });
       }
       selection = picked.selection;

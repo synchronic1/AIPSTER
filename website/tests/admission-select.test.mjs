@@ -10,16 +10,17 @@ import { __setDispatchStoreFactoryForTest } from '../src/inference/dispatch-wiri
 
 const ENABLED = { INFERENCE_ENABLED: '1', INFERENCE_OWNER_DAILY_TOKENS: '8192' };
 const MODEL = 'deepseek-v4.1-flash:1017-cloud';
-const PROMPT = 'Reply with exactly: hello';
 
 const S = (t, user, extra = {}) => ({ ...t.as(user), ...t.csrf, ...extra });
 const K = (t, secret, extra = {}) => ({ Authorization: `Bearer ${secret}`, ...extra });
 
 afterEach(() => __setDispatchStoreFactoryForTest(null));
 
-async function register(t, user, name) {
+async function register(t, user, name, capabilities) {
+  const body = { name, kind: 'local', origin: 'lab', cpu: 'x', gpu: 'y' };
+  if (capabilities !== undefined) body.capabilities = capabilities;
   const out = await readJson(await t.call('/api/inventory', {
-    method: 'POST', headers: S(t, user), body: { name, kind: 'local', origin: 'lab', cpu: 'x', gpu: 'y' },
+    method: 'POST', headers: S(t, user), body,
   }));
   assert.equal(out.status, 201, out.text);
   return out.json;
@@ -37,8 +38,8 @@ const beat = (t, secret, id) => t.call(`/api/resources/${id}/heartbeat`, {
   method: 'POST', headers: K(t, secret), body: JSON.stringify({ usable: true }),
 });
 
-async function ready(t, user, name) {
-  const resource = await register(t, user, name);
+async function ready(t, user, name, capabilities) {
+  const resource = await register(t, user, name, capabilities);
   const hb = await mintKey(t, user, 'heartbeat', resource.id);
   const hbRes = await beat(t, hb.secret, resource.id);
   assert.equal(hbRes.status, 200, await hbRes.text());
@@ -56,36 +57,19 @@ const admitSelect = async (t, user, body) => readJson(await t.call('/api/inferen
   method: 'POST', headers: S(t, user), body,
 }));
 
-const submitBody = (admission_ref, over = {}) => ({
-  contract_version: 'v1.0.0', admission_ref, idempotency_key: 'alice-op-00000001',
-  model_id: MODEL, prompt: PROMPT, max_tokens: 128, deadline_at: Date.now() + 60000, ...over,
-});
-
-function resultFor(lease) {
-  const env = lease.envelope;
-  const p = env.task.placement;
-  const b = env.binding;
-  return {
-    lease_id: lease.lease_id,
-    status: 'succeeded',
-    result: {
-      request_id: lease.job_id, node_id: p.node_id, runtime_id: p.runtime_id, model_id: env.task.model_id,
-      runtime_instance: b.runtime_instance, model_fingerprint: b.model_fingerprint,
-      simulated: false, content: 'hello', elapsed_ms: 12, usage: { output_tokens: 1 }, cache: {},
-    },
-  };
-}
-
 // --------------------------------------------------------------- select path
 
-test('select: fresh owned resource is server-picked and runs the full authority lifecycle', async () => {
+test('select with unattested fresh/usable resource refuses with advisory evidence and mints nothing', async () => {
   const t = await createTestEnv(ENABLED);
   const store = useStore(t);
-  const r = await ready(t, t.alice, 'abox');
-  const out = await admitSelect(t, t.alice, { model_id: MODEL, max_tokens: 64, select: {} });
-  assert.equal(out.status, 201, out.text);
-  assert.deepEqual(Object.keys(out.json).sort(),
-    ['admission_ref', 'expires_at', 'max_tokens', 'model_id', 'selection']);
+  const before = JSON.stringify(store.state);
+  // Matching soft model token, authorized/online/usable — but no resident or
+  // exact-instance qualification evidence exists for any row.
+  const r = await ready(t, t.alice, 'abox', ['test-model-uno']);
+  const out = await admitSelect(t, t.alice, { model_id: 'test-model-uno', max_tokens: 64, select: {} });
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'SELECTION_UNQUALIFIED');
+  assert.ok(!('admission_ref' in out.json), 'refusal must not mint an admission');
   const sel = out.json.selection;
   assert.equal(sel.resource_id, r.resource.id);
   assert.equal(sel.device, 'cpu');
@@ -93,25 +77,30 @@ test('select: fresh owned resource is server-picked and runs the full authority 
   assert.equal(sel.evidence.liveness, 'online');
   assert.equal(sel.evidence.modelCompat, 'unverified');
   assert.ok(Number.isFinite(sel.score));
-  assert.equal(Object.keys(store.state.admissions).length, 1);
-
-  // The minted admission is ordinary authority: submit -> lease -> result -> settle.
-  const submitted = await readJson(await t.call('/api/jobs', {
+  assert.ok(Number.isSafeInteger(sel.examined) && Number.isSafeInteger(sel.excluded));
+  assert.equal(JSON.stringify(store.state), before, 'refusal must not mutate store state');
+  // No implicit fallback: the same unattested model still admits explicitly (legacy unchanged).
+  const explicit = await readJson(await t.call('/api/inference/admissions', {
     method: 'POST', headers: S(t, t.alice),
-    body: submitBody(out.json.admission_ref, { max_tokens: 64 }),
+    body: { resource_id: r.resource.id, model_id: 'test-model-uno', max_tokens: 64 },
   }));
-  assert.equal(submitted.status, 202, submitted.text);
-  const lease = await (await t.call('/api/worker/jobs/next', { headers: K(t, r.hb.secret) })).json();
-  assert.deepEqual(lease.envelope.task.placement,
-    { device: 'cpu', node_id: r.resource.id, runtime_id: 'ganglion' });
-  const accepted = await readJson(await t.call(`/api/worker/jobs/${lease.job_id}/result`, {
-    method: 'POST', headers: K(t, r.hb.secret), body: resultFor(lease),
-  }));
-  assert.equal(accepted.status, 200, accepted.text);
-  const done = await readJson(await t.call('/api/jobs/alice-op-00000001', { headers: S(t, t.alice) }));
-  assert.equal(done.status, 200, done.text);
-  assert.equal(done.json.status, 'settled');
-  assert.equal(done.json.outcome.content, 'hello');
+  assert.equal(explicit.status, 201, explicit.text);
+  assert.ok(!('selection' in explicit.json));
+});
+
+test('select with an unknown model string refuses despite zero token match', async () => {
+  const t = await createTestEnv(ENABLED);
+  const store = useStore(t);
+  const before = JSON.stringify(store.state);
+  const r = await ready(t, t.alice, 'abox');
+  const out = await admitSelect(t, t.alice,
+    { model_id: 'zzz-no-such-model-anywhere', max_tokens: 64, select: {} });
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'SELECTION_UNQUALIFIED');
+  assert.ok(!('admission_ref' in out.json));
+  assert.equal(out.json.selection.resource_id, r.resource.id);
+  assert.equal(out.json.selection.evidence.modelCompat, 'unverified');
+  assert.equal(JSON.stringify(store.state), before);
 });
 
 test('omitting both resource_id and select keeps the legacy refusal', async () => {
@@ -177,12 +166,13 @@ test('selection never crosses tenants and discloses no foreign ids', async () =>
   const a = await ready(t, t.alice, 'abox');
   const b = await ready(t, t.bob, 'bbox');
   const out = await admitSelect(t, t.alice, { model_id: MODEL, max_tokens: 64, select: {} });
-  assert.equal(out.status, 201, out.text);
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'SELECTION_UNQUALIFIED');
   assert.equal(out.json.selection.resource_id, a.resource.id);
   assert.ok(!JSON.stringify(out.json).includes(b.resource.id),
     'foreign resource id must not appear in the selection response');
   const bout = await admitSelect(t, t.bob, { model_id: MODEL, max_tokens: 64, select: {} });
-  assert.equal(bout.status, 201, bout.text);
+  assert.equal(bout.status, 409, bout.text);
   assert.equal(bout.json.selection.resource_id, b.resource.id);
 });
 
@@ -195,27 +185,24 @@ test('select honors a live same-side grant for a resourceless grantee', async ()
     VALUES ('g_shared01', ?, ?, ?, 5, 1000, 0, 0, 1, ?, NULL)`)
     .bind(r.resource.id, t.alice.id, t.bob.id, now).run();
   const out = await admitSelect(t, t.bob, { model_id: MODEL, max_tokens: 100, select: {} });
-  assert.equal(out.status, 201, out.text);
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'SELECTION_UNQUALIFIED');
+  assert.ok(!('admission_ref' in out.json));
   assert.equal(out.json.selection.resource_id, r.resource.id);
-  assert.equal(store.state.admissions[out.json.admission_ref].grant_id, 'g_shared01');
+  assert.deepEqual(store.state.admissions, {});
 });
 
-test('select with llama-server runtime pins placement end to end', async () => {
+test('select with llama-server runtime refuses with truthful advisory evidence', async () => {
   const t = await createTestEnv(ENABLED);
-  useStore(t);
-  const r = await ready(t, t.alice, 'abox');
+  const store = useStore(t);
+  await ready(t, t.alice, 'abox');
   const out = await admitSelect(t, t.alice,
     { model_id: MODEL, max_tokens: 64, runtime_id: 'llama-server', select: {} });
-  assert.equal(out.status, 201, out.text);
+  assert.equal(out.status, 409, out.text);
+  assert.equal(out.json.code, 'SELECTION_UNQUALIFIED');
+  assert.ok(!('admission_ref' in out.json));
   assert.equal(out.json.selection.runtime_id, 'llama-server');
-  const submitted = await readJson(await t.call('/api/jobs', {
-    method: 'POST', headers: S(t, t.alice),
-    body: submitBody(out.json.admission_ref, { max_tokens: 64 }),
-  }));
-  assert.equal(submitted.status, 202, submitted.text);
-  const lease = await (await t.call('/api/worker/jobs/next', { headers: K(t, r.hb.secret) })).json();
-  assert.deepEqual(lease.envelope.task.placement,
-    { device: 'cpu', node_id: r.resource.id, runtime_id: 'llama-server' });
+  assert.deepEqual(store.state.admissions, {});
 });
 
 test('flag off: the select path stays dark', async () => {
