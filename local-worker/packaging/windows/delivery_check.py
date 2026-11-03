@@ -20,6 +20,7 @@ only (presence, size, mtime); their contents are never read or hashed.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 EXIT_READY = 0
@@ -156,13 +157,24 @@ def _sender_state(data_dir):
     """Tri-state heartbeat-sender probe that never creates state.
 
     Returns True when another live process holds the sender lock, False
-    when absence of the lock file proves no holder can exist or a
-    read-only probe of the existing file succeeds, and None when the
-    sender state is unknown (pairing helper unavailable, or the probe
-    of an existing lock file failed). The protected pairing helper is
-    only ever called when the lock file already exists, because that
-    helper creates the file when absent. pairing.py itself is not
-    modified; it is only read through its existing probe entry point.
+    when a no-create probe proves no holder can exist, and None when
+    the sender state is unknown. pairing.py itself is not modified; its
+    existing probe entry point decides held-vs-free only on files this
+    function has already proven accessible without creating anything:
+
+    - pairing unavailable (or entry point missing) -> None (unverified).
+    - no-create ``os.open(O_RDONLY)`` fails with file-not-found -> False.
+      The open omits ``O_CREAT``, so an absent lock can never be
+      created here, and the protected helper (whose own open creates)
+      is never reached on that path — no exists-check-then-create
+      shape remains, raced or otherwise.
+    - no-create open fails any other way (EACCES and friends) -> None.
+      The protected helper swallows such open failures into ``False``,
+      so its verdict is untrustworthy here; access errors are unknown,
+      never free.
+    - no-create open succeeds -> the lock file exists and is readable;
+      only then is the helper consulted (True/False), and a raising
+      helper -> None.
     """
     try:
         import pairing
@@ -172,10 +184,19 @@ def _sender_state(data_dir):
     if probe is None:
         return None
     lock = Path(data_dir) / "sender.lock"
-    if not lock.exists():
-        # No file, no holder: calling the helper here would create the
-        # file, so the absence itself is the answer.
+    try:
+        fd = os.open(os.fspath(lock), os.O_RDONLY)
+    except FileNotFoundError:
+        # Absent with no creation: no holder can exist.
         return False
+    except OSError:
+        # Present-but-unreadable (or unreadable data path): the helper
+        # would swallow this into "free", so trust nothing.
+        return None
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     try:
         return True if probe(Path(data_dir)) else False
     except Exception:

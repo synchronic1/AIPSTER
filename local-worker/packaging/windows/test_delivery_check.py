@@ -1,6 +1,7 @@
 """Focused delivery validation tests. Synthetic fixtures only; read-only checks."""
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -205,6 +206,55 @@ class DeliveryCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["exit_code"], 2)
         self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
+
+    def test_swallowed_open_error_blocks_unknown(self):
+        # P5 residual: the protected helper swallows os.open failures
+        # into "free". The lane-local no-create open must see the same
+        # failure first and report unknown, never ready.
+        app, data = self.ready_pair()
+        (data / "sender.lock").write_bytes(b"synthetic-lock")
+        before = listing(data)
+        before_pair = (data / "pairing.json").read_bytes()
+        before_token = (data / "api-token.txt").read_bytes()
+        real_open = os.open
+
+        def fail_sender_open(path, *args, **kwargs):
+            if str(path).endswith("sender.lock"):
+                raise OSError("synthetic EACCES on sender.lock")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=fail_sender_open):
+            result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
+        self.assertEqual((data / "pairing.json").read_bytes(), before_pair)
+        self.assertEqual((data / "api-token.txt").read_bytes(), before_token)
+
+    def test_raced_exists_check_creates_nothing(self):
+        # P6 residual: no exists-check-then-create shape remains. Even
+        # if the existence answer is raced True for an absent lock, the
+        # no-create open answers ENOENT and the helper is never reached.
+        app, data = self.ready_pair()
+        before = listing(data)
+        self.assertNotIn("sender.lock", before)
+        real_exists = Path.exists
+
+        def raced_exists(self):
+            if self.name == "sender.lock":
+                return True
+            return real_exists(self)
+
+        with patch.object(Path, "exists", autospec=True,
+                          side_effect=raced_exists):
+            result = delivery_check.check_delivery(app, data)
+            created = os.path.exists(
+                os.fspath(data / "sender.lock"))
+        self.assertFalse(created, "checker must never create sender.lock")
+        self.assertEqual(result["status"], "ready", result)
+        self.assertEqual(result["exit_code"], 0)
         self.assertEqual(listing(data), before)
 
     def test_probe_error_blocks_instead_of_ready(self):
