@@ -132,7 +132,7 @@ def sender_forward(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="AIPSTER local worker launcher")
     parser.add_argument("command", nargs="?", choices=["run", "inspect", "tray", "pair", "sender",
-                                                       "delivery-check"],
+                                                       "delivery-check", "runtime-plan"],
                         default="run")
     parser.add_argument("tray_command", nargs="?",
                         help="with 'tray': status | start | stop | restart | quit")
@@ -147,7 +147,13 @@ def main(argv=None):
                         help="with 'delivery-check': installed app dir holding the frozen bundle "
                              "(default: the bundle beside the launcher)")
     parser.add_argument("--config", default=None,
-                        help="with 'pair'/'sender': worker config (sender default: installed config)")
+                        help="with 'pair'/'sender': worker config (sender default: installed config); "
+                             "with 'runtime-plan': config to evaluate (required)")
+    parser.add_argument("--json", action="store_true",
+                        help="with 'runtime-plan': emit the structured plan as JSON")
+    parser.add_argument("--consent", choices=("yes", "no"), default="no",
+                        help="with 'runtime-plan': record explicit install/configuration consent "
+                             "(default: no; recorded only, never acted on)")
     parser.add_argument("--name", default=None,
                         help="with 'pair': display-name hint (default: hostname)")
     parser.add_argument("--code", default=None,
@@ -169,6 +175,16 @@ def main(argv=None):
         result = check_delivery(app_dir, data)
         print(format_result(result))
         return result["exit_code"]
+    if args.command == "runtime-plan":
+        # Preflight planning only, BEFORE any setup/token/provisioning path:
+        # no data dir creation, no token, no config write, no engine run.
+        if not args.config:
+            parser.error("--config is required with 'runtime-plan'")
+        from runtime_setup import main as runtime_plan_main
+        plan_argv = ["--config", args.config, "--consent", args.consent]
+        if args.json:
+            plan_argv.append("--json")
+        return runtime_plan_main(plan_argv)
     if args.command == "tray":
         from aipster_tray.controller import main as tray_main
         return tray_main([args.tray_command or "status"])
