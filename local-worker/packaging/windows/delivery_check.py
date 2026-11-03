@@ -19,6 +19,7 @@ only (presence, size, mtime); their contents are never read or hashed.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -153,54 +154,109 @@ def _scan_config_status(config_text, config_path):
                        "config.toml")}
 
 
-def _sender_state(data_dir):
-    """Tri-state heartbeat-sender probe that never creates state.
+# errnos that denote genuine lock contention (held by another live
+# process) across the CRT/flock conventions used below. Verified on
+# Windows: msvcrt.locking LK_NBLCK against a held byte-0 region fails
+# with EACCES. Anything else from the lock call is mechanics, not
+# contention, and fails closed to unknown.
+_LOCK_CONFLICT_ERRNOS = frozenset({
+    errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLOCK,
+})
 
-    Returns True when another live process holds the sender lock, False
-    when a no-create probe proves no holder can exist, and None when
-    the sender state is unknown. pairing.py itself is not modified; its
-    existing probe entry point decides held-vs-free only on files this
-    function has already proven accessible without creating anything:
 
-    - pairing unavailable (or entry point missing) -> None (unverified).
-    - no-create ``os.open(O_RDONLY)`` fails with file-not-found -> False.
-      The open omits ``O_CREAT``, so an absent lock can never be
-      created here, and the protected helper (whose own open creates)
-      is never reached on that path — no exists-check-then-create
-      shape remains, raced or otherwise.
-    - no-create open fails any other way (EACCES and friends) -> None.
-      The protected helper swallows such open failures into ``False``,
-      so its verdict is untrustworthy here; access errors are unknown,
-      never free.
-    - no-create open succeeds -> the lock file exists and is readable;
-      only then is the helper consulted (True/False), and a raising
-      helper -> None.
+def _probe_windows_lock(fd):
+    """Non-blocking exclusive probe of one already-open descriptor.
+
+    Returns True (held) only on contention errnos, False after a clean
+    acquire+release, None on any mechanics error or missing API.
+    The descriptor stays open; the caller owns cleanup.
     """
     try:
-        import pairing
+        import msvcrt
     except ImportError:
         return None
-    probe = getattr(pairing, "sender_lock_held", None)
-    if probe is None:
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        return True if exc.errno in _LOCK_CONFLICT_ERRNOS else None
+    except Exception:
+        return None
+    try:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass  # Acquire already proved freedom; close releases regardless.
+    return False
+
+
+def _probe_posix_lock(fd):
+    """Non-blocking exclusive probe of one already-open descriptor.
+
+    Same tri-state contract as the Windows probe. Untested on this
+    Windows-only box; implemented against documented flock semantics.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        return True if exc.errno in _LOCK_CONFLICT_ERRNOS else None
+    except Exception:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass  # Acquire already proved freedom; close releases regardless.
+    return False
+
+
+def _sender_state(data_dir):
+    """Tri-state heartbeat-sender probe on ONE descriptor, never creating.
+
+    pairing.sender_lock_held is never called: any second open would
+    reintroduce the swallowed-access-failure and O_CREAT-recreation
+    modes. Instead this function opens the lock path exactly once with
+    ``os.open(O_RDWR)`` and *without* ``O_CREAT`` — O_RDWR is an
+    access-mode requirement of the exclusive-lock APIs (verified: the
+    lock call itself performs no file-data write), never a creation:
+
+    - pairing subsystem unavailable -> None (unverified; fail closed).
+    - open fails with file-not-found -> False (missing is proven; no
+      holder can exist; nothing was or can be created here).
+    - open fails any other way (EACCES/read-only file and friends) ->
+      None (access errors are unknown, never free).
+    - open succeeds -> one non-blocking exclusive attempt on that same
+      descriptor: acquired+released -> False (positively verified
+      free); contention errnos -> True (held); any mechanics error or
+      missing platform API -> None.
+    - non-Windows/non-POSIX platforms -> None (fail closed, untested).
+
+    The descriptor is closed on every path. pairing.py is not modified
+    and none of its entry points are invoked.
+    """
+    try:
+        import pairing  # noqa: F401 -- availability gate only; never called
+    except ImportError:
         return None
     lock = Path(data_dir) / "sender.lock"
     try:
-        fd = os.open(os.fspath(lock), os.O_RDONLY)
+        fd = os.open(os.fspath(lock), os.O_RDWR)
     except FileNotFoundError:
-        # Absent with no creation: no holder can exist.
         return False
     except OSError:
-        # Present-but-unreadable (or unreadable data path): the helper
-        # would swallow this into "free", so trust nothing.
         return None
     try:
-        os.close(fd)
-    except OSError:
-        pass
-    try:
-        return True if probe(Path(data_dir)) else False
-    except Exception:
+        if os.name == "nt":
+            return _probe_windows_lock(fd)
+        if os.name == "posix":
+            return _probe_posix_lock(fd)
         return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def check_delivery(app_dir, data_dir, loaded=None):
@@ -308,16 +364,18 @@ def check_delivery(app_dir, data_dir, loaded=None):
         return result
     if sender is None:
         note("single sender", False,
-             "sender lock cannot be probed read-only; state unverified")
+             "sender lock not verifiable read-only (unavailable subsystem, "
+             "access denial, or lock-mechanics error)")
         return _blocked(
             "upgrade blocked: heartbeat sender state is unknown/unverified "
-            "(the sender lock cannot be probed without creating state); "
+            "(the sender lock cannot be verified read-only: unavailable "
+            "subsystem, access denial, or lock-mechanics error); "
             "stop the worker and re-run this check before upgrading",
             checks, build_info=build_info, runtime=runtime,
             enrollment=enrollment)
     note("single sender", True,
-         "no live sender holds the lock (absent lock file, or read-only "
-         "probe of the existing lock)")
+         "no live sender holds the lock (absent lock file, or exclusive "
+         "lock acquired and released on one no-create descriptor)")
 
     return {
         "status": "ready",

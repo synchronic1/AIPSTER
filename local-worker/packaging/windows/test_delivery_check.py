@@ -1,7 +1,9 @@
 """Focused delivery validation tests. Synthetic fixtures only; read-only checks."""
 import importlib.util
+import errno
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -257,12 +259,134 @@ class DeliveryCheckTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(listing(data), before)
 
-    def test_probe_error_blocks_instead_of_ready(self):
+    def test_lock_mechanics_error_blocks_unknown(self):
+        # Replaces the obsolete helper-raise test: the checker never
+        # calls pairing.sender_lock_held, so a failure inside the
+        # lane-local lock call itself must fail closed to unknown.
         app, data = self.ready_pair()
         (data / "sender.lock").write_bytes(b"synthetic-lock")
         before = listing(data)
-        with patch.object(pairing, "sender_lock_held",
-                          side_effect=OSError("synthetic probe failure")):
+        if os.name == "nt":
+            import msvcrt as mech
+            patcher = patch.object(mech, "locking", side_effect=ValueError(
+                "synthetic mechanics bug (not a lock conflict)"))
+        else:
+            import fcntl as mech
+            patcher = patch.object(mech, "flock", side_effect=ValueError(
+                "synthetic mechanics bug (not a lock conflict)"))
+        with patcher:
+            result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
+
+    def test_flag_split_denial_blocks_unknown(self):
+        # Qa1 shape: O_RDONLY allowed but O_RDWR denied. The old
+        # preflight-then-helper shape reported ready here because the
+        # helper swallowed the reopen failure; the single-descriptor
+        # probe must see the same denial first and block.
+        app, data = self.ready_pair()
+        (data / "sender.lock").write_bytes(b"synthetic-lock")
+        before = listing(data)
+        real_open = os.open
+
+        def rdonly_ok_rdwr_denied(path, flags, *args, **kwargs):
+            if str(path).endswith("sender.lock") and (flags & (os.O_RDWR | os.O_CREAT)):
+                raise OSError(errno.EACCES, "synthetic EACCES on reopen")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=rdonly_ok_rdwr_denied):
+            result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
+
+    def test_real_readonly_lock_file_blocks_unknown(self):
+        # Qa2 shape, no mocks: a genuinely read-only lock file cannot
+        # be opened O_RDWR, so no exclusive probe is possible and the
+        # state is unknown -- never "verified free".
+        app, data = self.ready_pair()
+        lock = data / "sender.lock"
+        lock.write_bytes(b"synthetic-lock")
+        os.chmod(lock, stat.S_IREAD)
+        self.addCleanup(os.chmod, lock, stat.S_IWRITE)
+        try:
+            probe = os.open(os.fspath(lock), os.O_RDWR)
+        except OSError:
+            pass
+        else:
+            os.close(probe)
+            self.skipTest("platform allows O_RDWR on read-only files")
+        before = listing(data)
+        result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
+
+    def test_midprobe_delete_cannot_recreate_lock(self):
+        # Deletion raced into the probe window must fail safe and must
+        # never recreate sender.lock: single descriptor, no O_CREAT,
+        # no reopen. On Windows the open descriptor additionally
+        # refuses the delete (no delete sharing), pinning the file for
+        # the probe; where the delete goes through, nothing recreates
+        # the file afterwards.
+        app, data = self.ready_pair()
+        (data / "sender.lock").write_bytes(b"synthetic-lock")
+        before_pair = (data / "pairing.json").read_bytes()
+        before_token = (data / "api-token.txt").read_bytes()
+        outcomes = {}
+        if os.name == "nt":
+            import msvcrt as mech
+            real_call = mech.locking
+
+            def delete_then_call(fd, *args):
+                try:
+                    (data / "sender.lock").unlink()
+                    outcomes["deleted"] = True
+                except OSError as exc:
+                    outcomes["deleted"] = False
+                    outcomes["errno"] = exc.errno
+                return real_call(fd, *args)
+
+            patcher = patch.object(mech, "locking", side_effect=delete_then_call)
+        else:
+            import fcntl as mech
+            real_call = mech.flock
+
+            def delete_then_call(fd, *args):
+                try:
+                    (data / "sender.lock").unlink()
+                    outcomes["deleted"] = True
+                except OSError as exc:
+                    outcomes["deleted"] = False
+                    outcomes["errno"] = exc.errno
+                return real_call(fd, *args)
+
+            patcher = patch.object(mech, "flock", side_effect=delete_then_call)
+        with patcher:
+            result = delivery_check.check_delivery(app, data)
+        # Freedom was positively verified on a real descriptor, so the
+        # verdict is ready either way; the file state differs by platform.
+        self.assertEqual(result["status"], "ready", result)
+        self.assertEqual((data / "pairing.json").read_bytes(), before_pair)
+        self.assertEqual((data / "api-token.txt").read_bytes(), before_token)
+        if outcomes.get("deleted"):
+            self.assertFalse(os.path.exists(os.fspath(data / "sender.lock")),
+                             "checker must never recreate sender.lock")
+        else:
+            self.assertTrue((data / "sender.lock").is_file())
+            self.assertIn("errno", outcomes)
+
+    def test_missing_lock_implementation_fails_closed(self):
+        # A platform without the lock API cannot verify anything.
+        app, data = self.ready_pair()
+        (data / "sender.lock").write_bytes(b"synthetic-lock")
+        before = listing(data)
+        module = "msvcrt" if os.name == "nt" else "fcntl"
+        with patch.dict(sys.modules, {module: None}):
             result = delivery_check.check_delivery(app, data)
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["exit_code"], 2)
