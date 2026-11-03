@@ -1327,8 +1327,14 @@ def full_profile(setup):
     env["LOCALAPPDATA"] = str(home)
     created = []
     procs = []
+    state = {"halted": False}
 
     def _cleanup():
+        if state["halted"]:
+            # Authoritative in-memory halt: an unknown detached uninstall
+            # may still be live. Preserve the scratch root and diagnostics;
+            # never launch or clean up against it, marker or no marker.
+            return
         for proc in list(procs):
             try:
                 proc.terminate()
@@ -1585,6 +1591,9 @@ def full_profile(setup):
     halted = not completed
     halt_why = ("detached completion unknown; stopping all further "
                 "destructive work (shared HKCU singletons)")
+    # In-memory halt authority, set before any diagnostic write: cleanup
+    # consults this even if the marker write below fails.
+    state["halted"] = halted
     if completed:
         check("uninstall removes payload but preserves unrelated user files",
               not launcher.exists() and unrelated.exists()
@@ -1623,12 +1632,17 @@ def full_profile(setup):
             released = f"released {install} from atexit cleanup; "
         else:
             released = "nothing registered for atexit cleanup; "
-        # An on-disk marker preserves the scratch root through every
-        # cleanup path (including atexit) and records the stop reason.
-        (work / HALTED_MARKER_NAME).write_text(
-            "detached uninstall outcome unknown; target may still be live; "
-            + released +
-            "no second launch or cleanup against it", encoding="utf-8")
+        # An on-disk marker records the stop reason for diagnosis. It is
+        # not the cleanup authority (see state["halted"]): a failed write
+        # still halts with the scratch preserved and a nonzero return.
+        try:
+            (work / HALTED_MARKER_NAME).write_text(
+                "detached uninstall outcome unknown; target may still be live; "
+                + released +
+                "no second launch or cleanup against it", encoding="utf-8")
+        except OSError as exc:
+            print(f"WARNING halt marker not written ({exc}); "
+                  "in-memory halt holds", flush=True)
 
     if halted:
         # An unknown detached uninstall may still be live: stop ALL

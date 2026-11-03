@@ -688,7 +688,6 @@ class DetachedUninstallCycleTests(unittest.TestCase):
             self.assertIn("aipster-tray.exe", log)
             self.assertEqual(len(runner.detached_calls), 1)
             self.assertEqual(runner.uninstall_calls, [])
-
 class FullProfileHaltTests(unittest.TestCase):
     """F-A: real full_profile halts ALL destructive work on detached-unknown.
 
@@ -705,7 +704,8 @@ class FullProfileHaltTests(unittest.TestCase):
         p.mkdir(parents=True, exist_ok=True)
         (p / "api-token.txt").write_text("C" * 43, encoding="utf-8")
 
-    def test_unknown_detached_halts_destructive_work(self):
+    def _drive_halted_profile(self, extra=()):
+        """Run the real full_profile to a detached-unknown halt; return evidence."""
         from contextlib import ExitStack
         tmp = Path(tempfile.mkdtemp(prefix="aipster-fullhalt-"))
         real_rmtree = shutil.rmtree
@@ -864,6 +864,8 @@ class FullProfileHaltTests(unittest.TestCase):
                 stack.enter_context(patch.object(
                     qualify, "lnk_target",
                     return_value="C:\\fake\\aipster-tray.exe"))
+                for context in extra:
+                    stack.enter_context(context)
                 rc = qualify.full_profile(str(tmp / "Setup.exe"))
             observed = list(qualify.FAILURES)
         finally:
@@ -872,53 +874,116 @@ class FullProfileHaltTests(unittest.TestCase):
             qualify.USED_PORTS.update(saved_ports)
 
         install = work / "app"
+        return SimpleNamespace(
+            rc=rc, observed=observed, work=work, install=install,
+            marker=work / qualify.HALTED_MARKER_NAME,
+            run_calls=run_calls, launcher_runs=launcher_runs,
+            popen_calls=popen_calls, cycle_calls=cycle_calls,
+            uninstall_cycle_calls=uninstall_cycle_calls,
+            sync_owned_calls=sync_owned_calls, matrix_calls=matrix_calls,
+            preflight_calls=preflight_calls, tray_calls=tray_calls,
+            pure_calls=pure_calls, rmtree_calls=rmtree_calls,
+            atexit_funcs=atexit_funcs)
+
+    def invoke_cleanup(self, r):
+        with patch("shutil.rmtree",
+                   side_effect=lambda p, *a, **k: r.rmtree_calls.append(
+                       str(p))):
+            r.atexit_funcs[0]()
+
+    def test_unknown_detached_halts_destructive_work(self):
+        r = self._drive_halted_profile()
         # First FAIL preserved; halt path returns nonzero.
-        self.assertEqual(rc, 1)
-        self.assertIn("uninstall completes (async self-copy)", observed)
-        self.assertNotIn("silent uninstall exits 0", observed)
+        self.assertEqual(r.rc, 1)
+        self.assertIn("uninstall completes (async self-copy)", r.observed)
+        self.assertNotIn("silent uninstall exits 0", r.observed)
         # Exactly one ordinary detached attempt; no sync substitute.
-        self.assertEqual(len(cycle_calls), 1)
-        self.assertEqual(cycle_calls[0], (str(install), "silent uninstall"))
+        self.assertEqual(len(r.cycle_calls), 1)
+        self.assertEqual(r.cycle_calls[0], (str(r.install),
+                                            "silent uninstall"))
         # Tripwire: no later install/uninstall/retry/matrix anywhere.
-        self.assertEqual(uninstall_cycle_calls, [])
-        self.assertEqual(sync_owned_calls, [])
-        self.assertEqual(matrix_calls, [])
-        setup_runs = [c for c in run_calls
+        self.assertEqual(r.uninstall_cycle_calls, [])
+        self.assertEqual(r.sync_owned_calls, [])
+        self.assertEqual(r.matrix_calls, [])
+        setup_runs = [c for c in r.run_calls
                       if isinstance(c, list)
                       and str(c[0]).lower().endswith("setup.exe")]
-        self.assertEqual(len(run_calls), 5)
+        self.assertEqual(len(r.run_calls), 5)
         self.assertEqual(len(setup_runs), 3)
-        self.assertEqual(len(launcher_runs), 2)
-        for cmd in run_calls:
+        self.assertEqual(len(r.launcher_runs), 2)
+        for cmd in r.run_calls:
             text = cmd if isinstance(cmd, str) else " ".join(cmd)
             for banned in ("app2", "app3", "app4", "AUTOSTART", "REMOVEDATA",
                            "uninstall-observe", "uninstall.exe"):
                 self.assertNotIn(banned, text)
-        for argv in popen_calls:
+        for argv in r.popen_calls:
             self.assertNotIn("uninstall",
                              " ".join(str(x) for x in argv).lower())
         # Pre-uninstall matrices ran (stubbed); failure matrix never did.
-        self.assertEqual(len(preflight_calls), 1)
-        self.assertEqual(len(tray_calls), 1)
-        self.assertEqual(len(pure_calls), 1)
+        self.assertEqual(len(r.preflight_calls), 1)
+        self.assertEqual(len(r.tray_calls), 1)
+        self.assertEqual(len(r.pure_calls), 1)
         # Target dropped from atexit cleanup; marker records the release.
-        marker = work / qualify.HALTED_MARKER_NAME
-        self.assertTrue(marker.is_file())
-        text = marker.read_text(encoding="utf-8")
+        self.assertTrue(r.marker.is_file())
+        text = r.marker.read_text(encoding="utf-8")
         self.assertIn("detached uninstall outcome unknown", text)
         self.assertIn("released", text)
         self.assertIn("no second launch", text)
-        self.assertIn(str(install), text)
+        self.assertIn(str(r.install), text)
         # Tail + atexit preservation: no destructive cleanup of unknown work.
-        self.assertTrue(work.exists())
-        self.assertTrue(install.exists())
-        self.assertEqual(rmtree_calls, [])
-        self.assertEqual(len(atexit_funcs), 1)
-        atexit_funcs[0]()
-        self.assertEqual(rmtree_calls, [])
-        self.assertTrue(work.exists())
-        self.assertTrue(install.exists())
-        self.assertTrue(marker.is_file())
+        self.assertTrue(r.work.exists())
+        self.assertTrue(r.install.exists())
+        self.assertEqual(r.rmtree_calls, [])
+        self.assertEqual(len(r.atexit_funcs), 1)
+        self.invoke_cleanup(r)
+        self.assertEqual(r.rmtree_calls, [])
+        self.assertTrue(r.work.exists())
+        self.assertTrue(r.install.exists())
+        self.assertTrue(r.marker.is_file())
+
+    def test_marker_write_failure_returns_nonzero_halt(self):
+        """Disk-full marker write: OSError must not escape; halt holds."""
+        real_write_text = Path.write_text
+
+        def fail_marker(self, *args, **kwargs):
+            if self.name == qualify.HALTED_MARKER_NAME:
+                raise OSError("synthetic disk full")
+            return real_write_text(self, *args, **kwargs)
+
+        r = self._drive_halted_profile(
+            extra=[patch.object(Path, "write_text", fail_marker)])
+        self.assertEqual(r.rc, 1)
+        self.assertIn("uninstall completes (async self-copy)", r.observed)
+        self.assertFalse(r.marker.exists())
+
+    def test_marker_write_failure_cleanup_preserves_scratch(self):
+        """With the marker never on disk, atexit cleanup still refuses."""
+        real_write_text = Path.write_text
+
+        def fail_marker(self, *args, **kwargs):
+            if self.name == qualify.HALTED_MARKER_NAME:
+                raise OSError("synthetic disk full")
+            return real_write_text(self, *args, **kwargs)
+
+        r = self._drive_halted_profile(
+            extra=[patch.object(Path, "write_text", fail_marker)])
+        self.assertFalse(r.marker.exists())
+        self.assertEqual(len(r.atexit_funcs), 1)
+        self.invoke_cleanup(r)
+        self.assertEqual(r.rmtree_calls, [])
+        self.assertTrue(r.work.exists())
+        self.assertTrue(r.install.exists())
+
+    def test_marker_absent_but_unknown_still_refuses_cleanup(self):
+        """Marker written then deleted: in-memory halt still refuses cleanup."""
+        r = self._drive_halted_profile()
+        self.assertTrue(r.marker.is_file())
+        r.marker.unlink()
+        self.assertEqual(len(r.atexit_funcs), 1)
+        self.invoke_cleanup(r)
+        self.assertEqual(r.rmtree_calls, [])
+        self.assertTrue(r.work.exists())
+        self.assertTrue(r.install.exists())
 
 
 class OwnedCopyStagingTests(unittest.TestCase):
