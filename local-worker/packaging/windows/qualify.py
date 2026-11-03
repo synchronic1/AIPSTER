@@ -18,6 +18,7 @@ desktop); see screenshots.py + BUILD-REPORT.md.
 Usage:
   python packaging/windows/qualify.py [--app-dir packaging/windows/build/freeze/app]
 """
+import hashlib
 import json
 import os
 import secrets
@@ -90,6 +91,160 @@ def wait_gone(path, timeout=180):
     while Path(path).exists() and time.monotonic() < deadline:
         time.sleep(0.5)
     return not Path(path).exists()
+
+
+UNINSTALL_SYNC_TIMEOUT = 120
+UNINSTALL_COPY_NAME = "uninstall-observe.exe"
+_WORKER_IMAGE_NAMES = ("aipster-tray.exe", "aipster-worker.exe", "dendrite.exe")
+
+
+def uninstall_cmdline(exe_path, target_dir, extra=()):
+    """Verbatim synchronous uninstall command line (single string).
+
+    Official NSIS 3.2.2 semantics: `_?=<dir>` sets $INSTDIR and disables
+    the temp-copy detachment (so the caller's wait observes the real exit
+    code). It MUST be the last parameter and MUST NOT contain quotes,
+    even when the path contains spaces (the rest of the line is the dir).
+    Python's argv-list form would quote a spaced value and mis-target, so
+    the command line is assembled verbatim and passed as one string
+    (shell=False passes strings through untouched). Raises instead of
+    mis-targeting on relative or quote-containing paths.
+    """
+    extra = list(extra or ())
+    target = os.fspath(target_dir)
+    if not os.path.isabs(target):
+        raise SystemExit(f"refusing non-absolute uninstall target: {target!r}")
+    exe = os.fspath(exe_path)
+    if '"' in target or '"' in exe or any('"' in p for p in extra):
+        raise SystemExit("refusing uninstall command containing quotes")
+    switches = " ".join([f'"{exe}"', "/S"] + [
+        f'"{p}"' if (" " in p or p == "") else p for p in extra])
+    return f"{switches} _?={target}"
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sync_uninstall_owned(target, work, env, label="uninstall",
+                         extra=(), timeout=UNINSTALL_SYNC_TIMEOUT):
+    """Owned-copy synchronous uninstall with an observed exit code.
+
+    Copies target/uninstall.exe to a scratch dir OUTSIDE the removal
+    target (verified byte-identical by sha256), runs
+    `<copy> /S [extra] _?=<target>`, then removes the copy by exact path.
+    The running image lives outside the target, so nothing inside is
+    locked by the check itself: the real exit code is observed (no
+    detachment), and the target's own uninstall.exe is deleted by the run
+    (true self-delete). Raises SystemExit without launching anything on
+    setup errors (missing exe, unverifiable copy). Returns (proc, detail);
+    proc is None only on timeout (the stdlib run() reaps the child before
+    raising) or launch failure (recorded, never raised). Never retries and
+    never kills by name: only the owned copy path is cleaned up.
+    """
+    target = Path(target)
+    src = target / "uninstall.exe"
+    if not src.is_file():
+        raise SystemExit(f"{label}: {src} is missing")
+    probe_dir = work / "uninstall-owned-copy"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    copy = probe_dir / UNINSTALL_COPY_NAME
+    if copy.exists():
+        copy.unlink()
+    try:
+        shutil.copy2(src, copy)
+        verified = (copy.is_file()
+                    and copy.stat().st_size == src.stat().st_size
+                    and _file_sha256(copy) == _file_sha256(src))
+    except OSError as exc:
+        raise SystemExit(f"{label}: owned copy failed: {exc}")
+    if not verified:
+        try:
+            copy.unlink()
+        except OSError:
+            pass
+        raise SystemExit(f"{label}: owned copy failed verification")
+    try:
+        proc = subprocess.run(uninstall_cmdline(copy, target, extra),
+                              capture_output=True, text=True, env=env,
+                              timeout=timeout, cwd=str(probe_dir))
+    except subprocess.TimeoutExpired:
+        drop = _drop_owned_copy(copy)
+        return None, (f"{label}: timed out after {timeout}s "
+                      f"(stdlib reaps the child); copy cleanup: {drop}")
+    except OSError as exc:
+        drop = _drop_owned_copy(copy)
+        return None, f"{label}: launch failed: {exc}; copy cleanup: {drop}"
+    drop = _drop_owned_copy(copy)
+    return proc, f"{label}: observed exit {proc.returncode}; copy cleanup: {drop}"
+
+
+def _drop_owned_copy(copy):
+    """Remove exactly the owned copy path; report, never raise."""
+    try:
+        copy.unlink()
+        return "removed"
+    except FileNotFoundError:
+        return "already gone"
+    except OSError as exc:
+        return f"NOT removed: {exc}"
+
+
+def worker_images_running():
+    """Read-only tasklist snapshot of worker image names.
+
+    Returns (running, unknown). No kills, no changes; a query failure is
+    reported as unknown, never as clean.
+    """
+    running, unknown = [], []
+    for image in _WORKER_IMAGE_NAMES:
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH", "/FI", f"IMAGENAME eq {image}"],
+                capture_output=True, text=True, timeout=30)
+        except Exception as exc:
+            unknown.append(f"{image}: {exc}")
+            continue
+        if proc.returncode != 0:
+            unknown.append(f"{image}: tasklist rc={proc.returncode}")
+            continue
+        if any(line.strip().lower().startswith(f'"{image}"')
+               for line in proc.stdout.splitlines()):
+            running.append(image)
+    return running, unknown
+
+
+def uninstall_cycle(target, work, env, label, extra=()):
+    """One ordinary uninstall with deterministic completion evidence.
+
+    Synchronous owned-copy run with an observed exit. On an observed
+    exit 2 with no live worker image and no unknown query, retries ONCE:
+    the first child is verified terminated (observed exit, stdlib-reaped)
+    and the uninstaller documents an idempotent retry path (the failure
+    matrix proves retry-after-partial exits 0). A live or unknown worker
+    state, a timeout, or a launch failure returns after the first attempt
+    with diagnostics — never starts a second uninstall over an unknown
+    state. Returns (proc, log); callers apply the unchanged assertions to
+    the final state. Both attempts are logged.
+    """
+    first, detail = sync_uninstall_owned(target, work, env, label=label, extra=extra)
+    log = [f"attempt1: {detail}"]
+    if first is None:
+        return None, "; ".join(log)
+    if first.returncode != 2:
+        return first, "; ".join(log)
+    running, unknown = worker_images_running()
+    if running or unknown:
+        log.append(f"no retry: worker images running={running} unknown={unknown}")
+        return first, "; ".join(log)
+    second, detail2 = sync_uninstall_owned(target, work, env,
+                                           label=label + " retry", extra=extra)
+    log.append(f"attempt2: {detail2}")
+    return second, "; ".join(log)
 
 
 def reg_value(root, path, name):
@@ -1342,9 +1497,13 @@ def full_profile(setup):
           and (home / "AIPSTER-Worker/qual-marker.txt").read_text(encoding="utf-8") == "preserve-me")
     unrelated = install / "unrelated-user-file.txt"
     unrelated.write_text("synthetic preserve-me")
-    proc = run_silent([str(install / "uninstall.exe"), "/S"], env)
-    check("silent uninstall exits 0", proc.returncode == 0, proc.stderr[-500:])
-    check("uninstall completes (async self-copy)", wait_gone(install / "uninstall.exe"))
+    proc, how = uninstall_cycle(install, work, env, "silent uninstall")
+    check("silent uninstall exits 0",
+          proc is not None and proc.returncode == 0,
+          (proc.stderr[-500:] if proc is not None else how) + " | " + how)
+    check("uninstall completes (observed sync exit)",
+          proc is not None and proc.returncode == 0
+          and not (install / "uninstall.exe").exists(), how)
     check("uninstall removes payload but preserves unrelated user files",
           not launcher.exists() and unrelated.exists()
           and unrelated.read_text() == "synthetic preserve-me")
@@ -1352,7 +1511,7 @@ def full_profile(setup):
     try:
         install.rmdir()  # Empty test directory only; never recursive.
     except FileNotFoundError:
-        pass  # Async uninstaller may have just removed the now-empty directory.
+        pass  # Sync uninstaller already removed the now-empty directory.
     check("empty install directory can be removed", not install.exists())
     check("Start Menu entry removed", not start_menu.exists())
     check("desktop shortcut removed", not desktop_lnk.exists())
@@ -1372,9 +1531,13 @@ def full_profile(setup):
     run_value = reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") or ""
     check("Run key points at the installed tray",
           str(install2) in run_value and run_value.endswith('aipster-tray.exe"'), run_value)
-    proc = run_silent([str(install2 / "uninstall.exe"), "/S"], env)
-    check("second uninstall exits 0", proc.returncode == 0, proc.stderr[-500:])
-    check("second uninstall completes (async self-copy)", wait_gone(install2))
+    proc, how = uninstall_cycle(install2, work, env, "second uninstall")
+    check("second uninstall exits 0",
+          proc is not None and proc.returncode == 0,
+          (proc.stderr[-500:] if proc is not None else how) + " | " + how)
+    check("second uninstall completes (observed sync exit)",
+          proc is not None and proc.returncode == 0
+          and not (install2 / "uninstall.exe").exists(), how)
     check("Run key cleared by uninstall",
           reg_value(winreg.HKEY_CURRENT_USER, RUN_KEY, "AIPSTER-Worker") is None)
     check("second install dir removed", not install2.exists())
@@ -1389,16 +1552,25 @@ def full_profile(setup):
     created.append(install3)
     if preexisting:
         skip("/REMOVEDATA removes data", "real profile already holds data; refusing to touch it")
-        proc = run_silent([str(install3 / "uninstall.exe"), "/S"], env)
-        check("third uninstall exits 0", proc.returncode == 0, proc.stderr[-500:])
-        check("third uninstall completes", wait_gone(install3))
+        proc, how = uninstall_cycle(install3, work, env, "third uninstall")
+        check("third uninstall exits 0",
+              proc is not None and proc.returncode == 0,
+              (proc.stderr[-500:] if proc is not None else how) + " | " + how)
+        check("third uninstall completes (observed sync exit)",
+              proc is not None and proc.returncode == 0
+              and not (install3 / "uninstall.exe").exists(), how)
     else:
         removal_marker = real_data / "qual-removal-marker.txt"
         real_data.mkdir(parents=True, exist_ok=True)
         removal_marker.write_text("remove-me", encoding="utf-8")
-        proc = run_silent([str(install3 / "uninstall.exe"), "/S", "/REMOVEDATA=1"], env)
-        check("uninstall with /REMOVEDATA=1 exits 0", proc.returncode == 0, proc.stderr[-500:])
-        check("removal uninstall completes", wait_gone(install3))
+        proc, how = uninstall_cycle(install3, work, env, "removal uninstall",
+                                    extra=("/REMOVEDATA=1",))
+        check("uninstall with /REMOVEDATA=1 exits 0",
+              proc is not None and proc.returncode == 0,
+              (proc.stderr[-500:] if proc is not None else how) + " | " + how)
+        check("removal uninstall completes (observed sync exit)",
+              proc is not None and proc.returncode == 0
+              and not (install3 / "uninstall.exe").exists(), how)
         # Data removal runs after the app dir goes; poll the marker too.
         check("data removal completes", wait_gone(removal_marker))
         check("default data dir removed by /REMOVEDATA=1", not removal_marker.exists())
@@ -1429,7 +1601,9 @@ def uninstall_failure_matrix(setup, env, work, created, procs):
     created are touched.
     """
     def sync_uninstall(target):
-        return run_silent([str(target / "uninstall.exe"), "/S", f"_?={target}"], env)
+        # Verbatim single-string form: an argv list would quote a spaced
+        # _?= target and mis-target (official NSIS 3.2.2: no quotes).
+        return run_silent(uninstall_cmdline(target / "uninstall.exe", target), env)
 
     def payload_left(target):
         return sorted(str(p.relative_to(target)) for p in target.rglob("*")
