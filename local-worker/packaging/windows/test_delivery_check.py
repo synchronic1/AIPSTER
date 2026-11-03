@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 WINDOWS = Path(__file__).resolve().parent
 ROOT = WINDOWS.parent.parent
@@ -80,16 +81,27 @@ def make_data(path, *, config=None, pairing_json=True, token=True):
     return path
 
 
+def listing(path):
+    return sorted(p.name for p in Path(path).iterdir())
+
+
 class DeliveryCheckTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="aipster-delivery-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
 
+    def ready_pair(self, name="app", data="data"):
+        app = make_app(self.base / name)
+        model = self.base / "model.gguf"
+        model.write_bytes(b"GGUF-synthetic")
+        data_path = make_data(self.base / data,
+                              config=REAL_CONFIG.replace("MODELFILE", model.as_posix()))
+        return app, data_path
+
     def test_missing_tray_executable_blocks(self):
         app = make_app(self.base / "app", with_tray=False)
         data = make_data(self.base / "data", config=REAL_CONFIG)
-        (data / "model.gguf").write_bytes(b"GGUF-synthetic")
         result = delivery_check.check_delivery(app, data)
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["exit_code"], 2)
@@ -101,7 +113,7 @@ class DeliveryCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertIn("absent", result["reason"])
 
-    def test_missing_runtime_blocks(self):
+    def test_missing_runtime_config_blocks(self):
         app = make_app(self.base / "app")
         data = make_data(self.base / "data", config=None)
         result = delivery_check.check_delivery(app, data)
@@ -117,61 +129,118 @@ class DeliveryCheckTests(unittest.TestCase):
         self.assertTrue(result["runtime"].get("mock_only"))
         self.assertIn("mock", result["reason"])
 
-    def test_ready_runtime_passes(self):
+    def test_malformed_config_is_unknown_not_ready(self):
         app = make_app(self.base / "app")
-        model = self.base / "model.gguf"
-        model.write_bytes(b"GGUF-synthetic")
-        data = make_data(self.base / "data",
-                         config=REAL_CONFIG.replace("MODELFILE", model.as_posix()))
+        data = make_data(self.base / "data", config="[[[not toml\n")
+        before = listing(data)
+        result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertEqual(result["runtime"].get("status"), "unknown")
+        self.assertIn("parseable", result["reason"])
+        self.assertEqual(listing(data), before)
+
+    def test_ready_is_bundle_config_validation_only(self):
+        app, data = self.ready_pair()
         result = delivery_check.check_delivery(app, data)
         self.assertEqual(result["status"], "ready", result)
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["build"]["worker_version"], "9.9.9-test")
+        scope = result["reason"] + result.get("guidance", "")
+        self.assertIn("live-runtime", scope)
+        self.assertIn("qualified-artifact", scope)
         self.assertIn("roll back", result["rollback"].lower())
 
-    def test_store_and_identity_preserved(self):
-        app = make_app(self.base / "app")
-        model = self.base / "model.gguf"
-        model.write_bytes(b"GGUF-synthetic")
-        data = make_data(self.base / "data",
-                         config=REAL_CONFIG.replace("MODELFILE", model.as_posix()))
-        before_pair = (data / "pairing.json").read_bytes()
-        before_token = (data / "api-token.txt").read_bytes()
+    def test_store_and_identity_preserved_by_metadata(self):
+        app, data = self.ready_pair()
+        before_files = listing(data)
+        before_meta = {n: delivery_check._describe_enrollment(data / n)
+                       for n in ("pairing.json", "api-token.txt")}
         result = delivery_check.check_delivery(app, data)
         self.assertEqual(result["status"], "ready", result)
-        self.assertEqual((data / "pairing.json").read_bytes(), before_pair)
-        self.assertEqual((data / "api-token.txt").read_bytes(), before_token)
-        self.assertTrue(result["enrollment"]["pairing.json"]["present"])
-        self.assertTrue(result["enrollment"]["api-token.txt"]["present"])
+        self.assertEqual(listing(data), before_files)
+        for name, meta in before_meta.items():
+            self.assertTrue(meta["present"])
+            self.assertNotIn("sha", "".join(
+                k for k in result["enrollment"][name]))
+            self.assertEqual(result["enrollment"][name], meta)
+
+    def test_checker_reads_no_file_contents(self):
+        app, data = self.ready_pair()
+        with patch.object(Path, "read_bytes",
+                          side_effect=AssertionError("secret content read")):
+            result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "ready", result)
+
+    def test_absent_lock_creates_nothing_with_helper(self):
+        app, data = self.ready_pair()
+        before = listing(data)
+        self.assertNotIn("sender.lock", before)
+        result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "ready", result)
+        after = listing(data)
+        self.assertEqual(after, before)
+        self.assertNotIn("sender.lock", after)
+
+    def test_absent_lock_creates_nothing_when_pairing_unavailable(self):
+        app, data = self.ready_pair()
+        before = listing(data)
+        with patch.dict(sys.modules, {"pairing": None}):
+            result = delivery_check.check_delivery(app, data)
+        # Unverifiable sender state must block, never report ready ...
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        # ... and the probe must not have created any state.
+        after = listing(data)
+        self.assertEqual(after, before)
+        self.assertNotIn("sender.lock", after)
+
+    def test_present_lock_with_unavailable_pairing_blocks(self):
+        app, data = self.ready_pair()
+        (data / "sender.lock").write_bytes(b"synthetic-lock")
+        before = listing(data)
+        with patch.dict(sys.modules, {"pairing": None}):
+            result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
+
+    def test_probe_error_blocks_instead_of_ready(self):
+        app, data = self.ready_pair()
+        (data / "sender.lock").write_bytes(b"synthetic-lock")
+        before = listing(data)
+        with patch.object(pairing, "sender_lock_held",
+                          side_effect=OSError("synthetic probe failure")):
+            result = delivery_check.check_delivery(app, data)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("unknown", result["reason"])
+        self.assertEqual(listing(data), before)
 
     def test_duplicate_sender_rejects_upgrade(self):
-        app = make_app(self.base / "app")
-        model = self.base / "model.gguf"
-        model.write_bytes(b"GGUF-synthetic")
-        data = make_data(self.base / "data",
-                         config=REAL_CONFIG.replace("MODELFILE", model.as_posix()))
+        app, data = self.ready_pair()
         guard = pairing._hold_sender_lock(data)
         self.assertIsNotNone(guard)
         self.addCleanup(guard.release)
         self.assertTrue(pairing.sender_lock_held(data))
-        before_pair = (data / "pairing.json").read_bytes()
+        before = listing(data)
         result = delivery_check.check_delivery(app, data)
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["exit_code"], 6)
         self.assertIn("sender", result["reason"])
-        self.assertEqual((data / "pairing.json").read_bytes(), before_pair)
+        self.assertEqual(listing(data), before)
 
     def test_failed_check_changes_nothing(self):
         app = make_app(self.base / "app", with_tray=False)
         data = make_data(self.base / "data", config=MOCK_CONFIG)
-        before = sorted(p.name for p in data.iterdir())
-        before_bytes = {p.name: p.read_bytes() for p in data.iterdir() if p.is_file()}
+        before = listing(data)
         result = delivery_check.check_delivery(app, data)
         self.assertEqual(result["status"], "blocked")
         self.assertIn("changed nothing", result["rollback"])
-        self.assertEqual(sorted(p.name for p in data.iterdir()), before)
-        for name, content in before_bytes.items():
-            self.assertEqual((data / name).read_bytes(), content)
+        self.assertEqual(listing(data), before)
+        self.assertNotIn("sender.lock", listing(data))
 
     def test_launcher_delivery_check_reports_missing_tray(self):
         app = make_app(self.base / "app", with_tray=False)

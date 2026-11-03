@@ -1,20 +1,25 @@
 """Delivery validation for the installed AIPSTER Worker bundle.
 
-Read-only preflight for upgrades/qualification: requires the visible tray
-executable plus the frozen console bundle, correct source/runtime
-capability evidence (BUILD.json/default.toml plus a real configured
-runtime), and enrollment-preserving single-sender upgrade semantics.
+Read-only upgrade preflight: requires the visible tray executable plus
+the frozen console bundle, bundle metadata (BUILD.json/default.toml),
+and a data-dir config selecting a real runtime. Single-sender upgrade
+semantics are enforced through a strictly no-create sender-lock probe:
+the probe never creates, modifies, or deletes any file, and an
+unavailable or failing probe blocks the upgrade as unverified instead
+of reporting safe-to-upgrade.
+
+Scope is bundle/config validation only. Nothing here proves a live
+runtime, model capability, or a qualified artifact, and no statement
+below claims otherwise.
 
 Never writes, installs, downloads, starts, or stops anything. Enrollment
-files (pairing.json, api-token.txt) are only read for presence/fingerprint;
-a live heartbeat sender blocks the upgrade instead of being disturbed.
+files (pairing.json, api-token.txt) are described by filesystem metadata
+only (presence, size, mtime); their contents are never read or hashed.
 """
 
 from __future__ import annotations
 
 import json
-import re
-from hashlib import sha256
 from pathlib import Path
 
 EXIT_READY = 0
@@ -31,92 +36,163 @@ REQUIRED_APP_FILES = (
 
 TRAY_EXE = "aipster-tray.exe"
 
+SUPPORTED_MANAGED_KINDS = ("ik_llama", "llama_cpp")
+PLACEHOLDER_MODEL_MARKER = "replace-with-your-model"
 
-def _fingerprint(path):
-    """Short stable fingerprint of an enrollment file (never logs values)."""
+NOT_QUALIFIED = ("bundle/config validation only; not a live-runtime "
+                 "or qualified-artifact proof")
+
+
+def _describe_enrollment(path):
+    """Filesystem metadata for an enrollment file; contents never read."""
     try:
-        digest = sha256(Path(path).read_bytes()).hexdigest()[:16]
-        return {"present": True, "sha16": digest,
-                "size": Path(path).stat().st_size}
+        stat = Path(path).stat()
     except OSError:
         return {"present": False}
+    return {"present": True, "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns}
 
 
 def _read_build_evidence(app_dir):
-    """Parse BUILD.json capability evidence; return (info, error)."""
+    """Parse BUILD.json bundle metadata; return (info, error).
+
+    Presence and shape only: worker_name/version metadata is reported,
+    never presented as qualification of the source or runtime.
+    """
     try:
         info = json.loads((app_dir / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return None, f"unreadable BUILD.json capability evidence: {exc}"
+        return None, f"unreadable BUILD.json bundle metadata: {exc}"
     if not isinstance(info, dict):
-        return None, "BUILD.json capability evidence is not an object"
+        return None, "BUILD.json bundle metadata is not an object"
     missing = [k for k in ("worker_name", "worker_version") if not info.get(k)]
     if missing:
-        return None, ("BUILD.json capability evidence is missing: "
+        return None, ("BUILD.json bundle metadata is missing: "
                        + ", ".join(missing))
     return info, ""
 
 
-def _minimal_runtime_status(config_text, config_path):
-    """Classify config text without importing the worker (read-only scan).
+def _scan_config_status(config_text, config_path):
+    """Classify config text with a strict TOML parse (no worker import).
 
-    Mirrors firstrun.classify_runtime_selection for the delivery gate:
-    mock-only selections stay setup-required; a managed real runtime
-    needs an existing model path; attach needs an upstream_model.
+    Returns {"status", ...} where status is "ready" (config names a real
+    runtime with a usable model reference), "setup-required", or "unknown"
+    (config present but not parseable, so the selection is unverified).
+    "ready" describes the config text only: it is not a live-runtime,
+    model-capability, or artifact-qualification claim.
     """
-    kinds = re.findall(r'^\s*kind\s*=\s*"([^"]+)"', config_text,
-                       flags=re.MULTILINE)
-    if "[[runtimes]]" not in config_text or "[[models]]" not in config_text:
+    try:
+        import tomllib
+    except ImportError:
+        return {"status": "unknown", "mock_only": False,
+                "reason": ("config cannot be verified: "
+                           "TOML parser unavailable")}
+    try:
+        doc = tomllib.loads(config_text)
+    except Exception:
+        return {"status": "unknown", "mock_only": False,
+                "reason": ("config.toml is not parseable; "
+                           "runtime selection is unverified")}
+    if not isinstance(doc, dict):
+        return {"status": "unknown", "mock_only": False,
+                "reason": ("config.toml is not a TOML document; "
+                           "runtime selection is unverified")}
+    runtimes = doc.get("runtimes")
+    models = doc.get("models")
+    if (not isinstance(runtimes, list) or not runtimes
+            or not isinstance(models, list) or not models):
         return {"status": "setup-required", "mock_only": False,
                 "reason": "no runtimes/models are configured"}
+    table_runtimes = [r for r in runtimes if isinstance(r, dict)]
+    table_models = [m for m in models if isinstance(m, dict)]
+    if not table_runtimes or not table_models:
+        return {"status": "setup-required", "mock_only": False,
+                "reason": "no runtimes/models are configured"}
+    by_id = {r.get("id"): r for r in table_runtimes}
+    kinds = [r.get("kind") for r in table_runtimes]
     if kinds and all(k == "mock" for k in kinds):
         return {"status": "setup-required", "mock_only": True,
                 "reason": ("mock runtime is a test/demo option only; "
                            "select a real configured runtime to operate")}
-    if any(k in ("ik_llama", "llama_cpp") for k in kinds):
-        paths = re.findall(r'^\s*path\s*=\s*"([^"]+)"', config_text,
-                           flags=re.MULTILINE)
-        has_placeholder = any("replace-with-your-model" in p for p in paths)
-        real_paths = [p for p in paths if "replace-with-your-model" not in p]
-        if re.search(r'^\s*upstream_model\s*=', config_text,
-                     flags=re.MULTILINE):
-            return {"status": "ready", "mock_only": False,
-                    "reason": "attached runtime serves a loopback model"}
-        base = config_path.parent
-        for candidate in real_paths:
-            if (base / candidate).exists() or Path(candidate).exists():
-                return {"status": "ready", "mock_only": False,
-                        "reason": "managed runtime serves a configured model"}
-        if has_placeholder or not real_paths:
-            return {"status": "setup-required", "mock_only": False,
-                    "reason": ("no real model is configured; install a GGUF "
-                               "model file yourself (never downloaded "
-                               "automatically) and point a real runtime at "
-                               "it in config.toml")}
+    if not any(k in SUPPORTED_MANAGED_KINDS for k in kinds):
         return {"status": "setup-required", "mock_only": False,
-                "reason": "configured model path does not exist"}
+                "reason": "no supported real runtime is configured"}
+    for model in table_models:
+        runtime = by_id.get(model.get("runtime"))
+        if not isinstance(runtime, dict):
+            continue
+        kind = runtime.get("kind")
+        if kind == "mock" or kind not in SUPPORTED_MANAGED_KINDS:
+            continue
+        if runtime.get("mode", "managed") == "attach":
+            if model.get("upstream_model"):
+                return {"status": "ready", "mock_only": False,
+                        "reason": (
+                            "config validation passed: attached runtime "
+                            f"{runtime.get('id')!r} names an upstream model "
+                            f"for model {model.get('id')!r} "
+                            f"({NOT_QUALIFIED})")}
+            continue
+        path = model.get("path")
+        if not path or not isinstance(path, str):
+            continue
+        if PLACEHOLDER_MODEL_MARKER in path:
+            continue
+        if Path(path).exists() or (config_path.parent / path).exists():
+            return {"status": "ready", "mock_only": False,
+                    "reason": (
+                        "config validation passed: managed runtime "
+                        f"{runtime.get('id')!r} names an existing model path "
+                        f"for model {model.get('id')!r} "
+                        f"({NOT_QUALIFIED})")}
     return {"status": "setup-required", "mock_only": False,
-            "reason": "no supported real runtime is configured"}
+            "reason": ("no configured model with an existing path; install "
+                       "a GGUF model file yourself (never downloaded "
+                       "automatically) and point a real runtime at it in "
+                       "config.toml")}
 
 
-def _sender_running(data_dir):
-    """True when another live process holds the heartbeat sender lock."""
+def _sender_state(data_dir):
+    """Tri-state heartbeat-sender probe that never creates state.
+
+    Returns True when another live process holds the sender lock, False
+    when absence of the lock file proves no holder can exist or a
+    read-only probe of the existing file succeeds, and None when the
+    sender state is unknown (pairing helper unavailable, or the probe
+    of an existing lock file failed). The protected pairing helper is
+    only ever called when the lock file already exists, because that
+    helper creates the file when absent. pairing.py itself is not
+    modified; it is only read through its existing probe entry point.
+    """
     try:
         import pairing
     except ImportError:
+        return None
+    probe = getattr(pairing, "sender_lock_held", None)
+    if probe is None:
+        return None
+    lock = Path(data_dir) / "sender.lock"
+    if not lock.exists():
+        # No file, no holder: calling the helper here would create the
+        # file, so the absence itself is the answer.
         return False
     try:
-        return bool(pairing.sender_lock_held(Path(data_dir)))
+        return True if probe(Path(data_dir)) else False
     except Exception:
-        return False
+        return None
 
 
 def check_delivery(app_dir, data_dir, loaded=None):
     """Validate an installed bundle + data dir without changing either.
 
     Returns a dict with status ("ready"/"blocked"), exit_code (0/2/6),
-    reason, guidance, checks, enrollment fingerprints, and a safe
-    failure/rollback plan. Never creates, modifies, or deletes files.
+    reason, guidance, checks, enrollment metadata, and a safe
+    failure/rollback plan. Creates, modifies, reads secret contents of,
+    or deletes nothing. An unknown sender state or an unparseable
+    config blocks the upgrade; only a positively verified free sender
+    and a positively validated config report ready. "ready" is an
+    upgrade-preflight verdict on bundle/config evidence, not a
+    live-runtime or qualified-artifact claim.
     """
     app_dir, data_dir = Path(app_dir), Path(data_dir)
     checks = []
@@ -144,22 +220,22 @@ def check_delivery(app_dir, data_dir, loaded=None):
             + "; reinstall the qualified package before upgrading",
             checks)
     build_info, build_error = _read_build_evidence(app_dir)
-    note("capability evidence", build_info is not None, build_error)
+    note("bundle metadata (BUILD.json)", build_info is not None, build_error)
     if build_info is None:
         return _blocked(build_error, checks)
 
     config_path = data_dir / "config.toml"
     if not config_path.is_file():
-        note("runtime configured", False, "config.toml is absent")
+        note("runtime config present", False, "config.toml is absent")
         return _blocked(
-            "runtime absent: no config.toml in the data dir; first run "
-            "has not completed and there is nothing to upgrade",
+            "runtime config absent: no config.toml in the data dir; first "
+            "run has not completed and there is nothing to upgrade",
             checks, build_info=build_info)
     try:
         config_text = config_path.read_text(encoding="utf-8")
     except OSError as exc:
-        note("runtime configured", False, str(exc))
-        return _blocked(f"runtime unreadable: {exc}", checks,
+        note("runtime config present", False, str(exc))
+        return _blocked(f"runtime config unreadable: {exc}", checks,
                         build_info=build_info)
     if loaded is not None:
         try:
@@ -169,10 +245,19 @@ def check_delivery(app_dir, data_dir, loaded=None):
             runtime = {"status": "setup-required", "mock_only": False,
                        "reason": f"runtime classification failed: {exc}"}
     else:
-        runtime = _minimal_runtime_status(config_text, config_path)
+        runtime = _scan_config_status(config_text, config_path)
     runtime_ok = runtime.get("status") == "ready"
-    note("runtime configured", runtime_ok, runtime.get("reason", ""))
+    note("runtime config selects a real runtime", runtime_ok,
+         runtime.get("reason", ""))
     if not runtime_ok:
+        if runtime.get("status") == "unknown":
+            return _blocked(
+                "verification unknown: " + runtime.get("reason", ""),
+                checks, build_info=build_info,
+                guidance=("The config cannot be verified; fix or replace "
+                          "config.toml and re-run this check before "
+                          "upgrading."),
+                runtime=runtime)
         guidance = ("Supported configurations: native ik_llama managed "
                     "runtime with a real GGUF model file (set the "
                     "[[models]] path yourself), or llama_cpp managed with "
@@ -185,12 +270,13 @@ def check_delivery(app_dir, data_dir, loaded=None):
                         runtime=runtime)
 
     enrollment = {
-        "pairing.json": _fingerprint(data_dir / "pairing.json"),
-        "api-token.txt": _fingerprint(data_dir / "api-token.txt"),
+        "pairing.json": _describe_enrollment(data_dir / "pairing.json"),
+        "api-token.txt": _describe_enrollment(data_dir / "api-token.txt"),
     }
-    note("enrollment preserved (read-only)",
-         True, "validator never writes enrollment files")
-    if _sender_running(data_dir):
+    note("enrollment untouched (metadata-only)",
+         True, "validator never reads enrollment contents or writes files")
+    sender = _sender_state(data_dir)
+    if sender is True:
         note("single sender", False, "heartbeat sender lock is held")
         result = _blocked(
             "upgrade blocked: heartbeat sender is running "
@@ -199,16 +285,31 @@ def check_delivery(app_dir, data_dir, loaded=None):
             enrollment=enrollment)
         result["exit_code"] = EXIT_SENDER_RUNNING
         return result
-    note("single sender", True, "no live sender holds the lock")
+    if sender is None:
+        note("single sender", False,
+             "sender lock cannot be probed read-only; state unverified")
+        return _blocked(
+            "upgrade blocked: heartbeat sender state is unknown/unverified "
+            "(the sender lock cannot be probed without creating state); "
+            "stop the worker and re-run this check before upgrading",
+            checks, build_info=build_info, runtime=runtime,
+            enrollment=enrollment)
+    note("single sender", True,
+         "no live sender holds the lock (absent lock file, or read-only "
+         "probe of the existing lock)")
 
     return {
         "status": "ready",
         "exit_code": EXIT_READY,
-        "reason": ("delivery ready: tray bundle "
+        "reason": ("delivery preflight passed: tray bundle "
                    f"{build_info.get('worker_name')} "
-                   f"{build_info.get('worker_version')} with "
-                   f"{runtime.get('reason', 'a real configured runtime')}"),
-        "guidance": "",
+                   f"{build_info.get('worker_version')} names a real "
+                   "runtime in config "
+                   f"({runtime.get('reason', 'config validation passed')}; "
+                   f"{NOT_QUALIFIED})"),
+        "guidance": ("Scope: bundle and config validation only. BUILD.json "
+                     "metadata and config checks do not prove a live "
+                     "runtime, model capability, or a qualified artifact."),
         "checks": checks,
         "build": {"worker_name": build_info.get("worker_name"),
                   "worker_version": build_info.get("worker_version"),
