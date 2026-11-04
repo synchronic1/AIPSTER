@@ -8,6 +8,9 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
+import {mkdtempSync, writeFileSync, chmodSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 
 const deployUrl = new URL('../../.github/workflows/public-site-production-deploy.yml', import.meta.url);
 const workerUrl = new URL('../../.github/workflows/local-worker-checks.yml', import.meta.url);
@@ -202,7 +205,7 @@ test('worker check keeps the gate-bound mock-install job identity', () => {
 });
 
 test('the Cloudflare credential reaches no step before main-revision preflight and the release gate', () => {
-  const all = steps(deploy.split('\n  schema-diagnostic:\n')[0]);
+  const all = steps(deploy.split('\n  schema-diagnostic-validate:\n')[0]);
   const at = (pred, label) => { const i = all.findIndex(pred); assert(i >= 0, label); return i; };
   const preflight = at(b => b.header.includes('Require the verified current main revision'), 'preflight step');
   const gate = at(b => b.header.includes('Enforce release gate over included PRs'), 'release gate step');
@@ -215,40 +218,46 @@ test('the Cloudflare credential reaches no step before main-revision preflight a
   assert(report.body.includes("steps.schema.outputs.hold == 'true'"), 'a schema hold is reported and fails the job');
 });
 
-// Read-only schema diagnostic job: deploy exclusion and SHA binding.
-const [deployJob, diagJob] = deploy.split('\n  schema-diagnostic:\n');
+// Read-only schema diagnostic: deploy exclusion and SHA binding.
+const [deployJob, diagRest] = deploy.split('\n  schema-diagnostic-validate:\n');
+const [validateJob, diagJob] = diagRest.split('\n  schema-diagnostic:\n');
 const runBlock = (step) => step.body.split('run: |\n')[1].split(/\n {8}env:/)[0]
   .split('\n').map(l => l.replace(/^ {10}/, '')).join('\n');
+const jobIf = (job) => job.match(/(?:^|\n) {4}if: (.+)\n/)[1];
+const DIAG_IF = "github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER' && github.ref == 'refs/heads/claude/migration-state-preflight' && github.triggering_actor == 'synchronic1'";
 
 test('diagnostic mode can never reach the deploy job on main or any branch', () => {
-  assert(diagJob, 'schema-diagnostic job exists');
-  const deployIf = deployJob.match(/\n {4}if: (.+)\n/)[1];
+  const deployIf = jobIf(deployJob);
   assert(deployIf.startsWith("github.ref == 'refs/heads/main' && "), 'main-only deploy guard preserved');
   assert(deployIf.includes("(github.event_name != 'workflow_dispatch' || inputs.mode == 'deploy')"),
     'a dispatch deploys only in explicit deploy mode, on every ref');
-  const diagIf = diagJob.match(/(?:^|\n) {4}if: (.+)\n/)[1];
-  assert.equal(diagIf, "github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER'");
-  assert(!/needs:/.test(diagJob), 'diagnostic is independent of the deploy job');
-  assert(deploy.includes("group: ${{ inputs.mode == 'schema-diagnostic' && 'public-site-schema-diagnostic' || 'public-site-production' }}"),
-    'diagnostic never shares the production concurrency group');
-  assert(deploy.includes('options: [deploy, schema-diagnostic]') && deploy.includes('default: deploy'));
+  assert.match(deploy, /mode:\n.*\n {8}required: true\n {8}type: choice\n {8}options: \[deploy, schema-diagnostic\]/,
+    'mode is required with no default: a missing mode never falls into deploy');
+  assert(!/mode:[\s\S]{0,200}default:/.test(deploy.split('jobs:')[0]), 'no default mode');
+  assert.equal(jobIf(validateJob), DIAG_IF);
+  assert.equal(jobIf(diagJob), DIAG_IF);
+  assert(diagJob.startsWith('    needs: schema-diagnostic-validate\n'), 'read job requires the secret-free validation');
+  assert(!/needs:/.test(deployJob) && !/needs:\s*\[?\s*deploy/.test(diagRest), 'no dependency path between deploy and diagnostic');
+  assert(!/continue-on-error|always\(\)/.test(diagRest), 'no failure bypass');
+  assert(deploy.includes("group: ${{ inputs.mode == 'schema-diagnostic' && 'public-site-schema-diagnostic' || 'public-site-production' }}"));
 });
 
-test('diagnostic job is read-only, credential-minimal and fixed-query', () => {
-  const body = diagJob.replace(/^\s*#.*$/gm, '');
+test('diagnostic jobs are read-only, credential-minimal and fixed-query', () => {
+  const body = diagRest.replace(/^\s*#.*$/gm, '');
   for (const bad of [/wrangler deploy/, /migrations apply/, /d1 migrations/, /environment:/, /upload-artifact/,
-    /secret put/, /\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b/, /verify:live/, /npm test/, /npm run build/])
+    /secret put/, /\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b/, /verify:live/, /npm test/, /npm run build/, /set -x/, /\benv\b\s*$/m])
     assert(!bad.test(body), `diagnostic must not contain ${bad}`);
+  assert(!/secrets\./.test(validateJob), 'validation job holds no secret');
   assert.deepEqual(body.match(/secrets\.[A-Z_]+/g), ['secrets.CLOUDFLARE_API_TOKEN'], 'exactly one secret reference');
-  assert.match(body, /permissions:\n {6}contents: read\n {4}defaults/, 'contents: read only');
+  for (const job of [validateJob, diagJob]) assert.match(job, /permissions:\n {6}contents: read\n/, 'contents: read only');
   const st = steps(diagJob);
-  const reqRev = st.findIndex(b => b.header.includes('Require the exact reviewed workflow revision'));
   const checkout = st.findIndex(b => b.header.includes('actions/checkout'));
-  const verify = st.findIndex(b => b.header.includes('Verify checkout matches the reviewed SHA'));
+  const verify = st.findIndex(b => b.header.includes('Verify checkout matches the reviewed diagnostic SHA'));
+  const install = st.findIndex(b => b.header.includes('npm ci --ignore-scripts'));
   const query = st.findIndex(b => b.body.includes('secrets.CLOUDFLARE_API_TOKEN'));
-  assert(reqRev === 0 && reqRev < checkout && checkout < verify && verify < query && query === st.length - 1,
-    'both SHA proofs precede the only credentialed step, which is last');
-  assert(st[checkout].body.includes('persist-credentials: false') && st[checkout].body.includes('ref: ${{ inputs.reviewed_sha }}'));
+  assert(checkout === 0 && checkout < verify && verify < install && install < query && query === st.length - 1,
+    'checkout proof and script-free install precede the only credentialed step, which is last');
+  assert(st[checkout].body.includes('persist-credentials: false') && st[checkout].body.includes('ref: ${{ inputs.diagnostic_sha }}'));
   const q = st[query].body;
   assert.equal((q.match(/--command/g) || []).length, 2, 'exactly two fixed queries');
   assert(q.includes(`SELECT name FROM d1_migrations WHERE name = '0029_fabric_dispatch_spend.sql'`));
@@ -257,16 +266,25 @@ test('diagnostic job is read-only, credential-minimal and fixed-query', () => {
   assert(q.includes('migration-state.mjs diagnose'), 'only the sanitized verdict is printed');
 });
 
-test('diagnostic refuses a wrong, short or mismatched reviewed SHA before any secret', () => {
-  const step = steps(diagJob).find(b => b.header.includes('Require the exact reviewed workflow revision'));
-  const script = runBlock(step);
-  const run = (env) => spawnSync('bash', ['-e', '-c', script], {encoding: 'utf8', env: {PATH: process.env.PATH, ...env}}).status;
-  const A = 'a'.repeat(40), B = 'b'.repeat(40);
-  assert.equal(run({REVIEWED_SHA: A, RUN_SHA: A}), 0);
-  assert.notEqual(run({REVIEWED_SHA: A, RUN_SHA: B}), 0, 'dispatched revision differs');
-  assert.notEqual(run({REVIEWED_SHA: 'a'.repeat(7), RUN_SHA: 'a'.repeat(7)}), 0, 'short SHA');
-  assert.notEqual(run({REVIEWED_SHA: A.toUpperCase(), RUN_SHA: A.toUpperCase()}), 0, 'non-canonical SHA');
-  assert.notEqual(run({REVIEWED_SHA: '', RUN_SHA: ''}), 0, 'missing SHA');
-  const verify = runBlock(steps(diagJob).find(b => b.header.includes('Verify checkout matches the reviewed SHA')));
-  assert(verify.includes('test "$BUILT_SHA" = "$REVIEWED_SHA"'), 'checkout is re-proven');
+test('diagnostic validation refuses every binding mismatch before any secret', () => {
+  const script = runBlock(steps(validateJob)[0]);
+  const dir = mkdtempSync(join(tmpdir(), 'diag-bind-'));
+  const gh = join(dir, 'gh');
+  writeFileSync(gh, '#!/bin/sh\nprintf "%s\\n" "$FAKE_MAIN"\n'); chmodSync(gh, 0o755);
+  const D = 'd'.repeat(40), T = 'e'.repeat(40), X = 'f'.repeat(40);
+  const run = (over) => spawnSync('bash', ['-e', '-c', script], {encoding: 'utf8', env: {PATH: `${dir}:${process.env.PATH}`,
+    GITHUB_STEP_SUMMARY: join(dir, 'summary'), DIAGNOSTIC_SHA: D, REVIEWED_SHA: T, RUN_SHA: D, WORKFLOW_SHA: D, FAKE_MAIN: T, ...over}}).status;
+  assert.equal(run({}), 0, 'exact binding passes');
+  for (const [label, over] of [
+    ['branch moved after approval (event SHA)', {RUN_SHA: X}],
+    ['workflow file differs', {WORKFLOW_SHA: X}],
+    ['main is not the reviewed target', {FAKE_MAIN: X}],
+    ['diagnostic SHA equals deploy target', {DIAGNOSTIC_SHA: T, RUN_SHA: T, WORKFLOW_SHA: T}],
+    ['short diagnostic SHA', {DIAGNOSTIC_SHA: 'd'.repeat(7)}],
+    ['missing diagnostic SHA', {DIAGNOSTIC_SHA: ''}],
+    ['uppercase SHA', {DIAGNOSTIC_SHA: D.toUpperCase(), RUN_SHA: D.toUpperCase(), WORKFLOW_SHA: D.toUpperCase()}],
+    ['main lookup failed', {FAKE_MAIN: ''}],
+  ]) assert.notEqual(run(over), 0, label);
+  const verify = runBlock(steps(diagJob).find(b => b.header.includes('Verify checkout matches the reviewed diagnostic SHA')));
+  assert(verify.includes('test "$BUILT_SHA" = "$DIAGNOSTIC_SHA"') && verify.includes('"$WORKFLOW_SHA" = "$DIAGNOSTIC_SHA"'));
 });

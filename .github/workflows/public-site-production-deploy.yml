@@ -34,15 +34,18 @@ on:
   workflow_dispatch:
     inputs:
       reviewed_sha:
-        description: Full merged main commit approved for this release (schema-diagnostic, the exact reviewed head of the dispatched ref)
+        description: Full merged main commit approved for this release (in schema-diagnostic mode, the production target that main must equal)
         required: true
         type: string
       mode:
-        description: deploy (main only) or schema-diagnostic (read-only production schema metadata; never deploys)
-        required: false
-        default: deploy
+        description: deploy (main only) or schema-diagnostic (read-only production schema metadata; never deploys). No default.
+        required: true
         type: choice
         options: [deploy, schema-diagnostic]
+      diagnostic_sha:
+        description: schema-diagnostic only - the exact independently reviewed commit of the dispatched branch
+        required: false
+        type: string
   workflow_run:
     workflows: ['Public site checks', 'Public local worker installation']
     types: [completed]
@@ -251,16 +254,47 @@ jobs:
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
           RELEASE_MODE: ${{ steps.release.outputs.mode }}
           HOLD_REASON: ${{ steps.migration.outputs.reason || steps.schema.outputs.reason }}
-  # Read-only production schema diagnostic (manual, canonical repo only).
-  # Never deploys, applies, writes or changes flags; no environment, so no
-  # deployment record. The secret reaches only the fixed read-only query
-  # step, after the dispatched workflow revision AND the checkout are proven
-  # to be the exact reviewed SHA. Raw D1 output stays in RUNNER_TEMP; only a
+  # Read-only production schema diagnostic. Never deploys, applies, writes
+  # or changes flags; no environment (no deployment record); no dependency
+  # path to `deploy`. A secret-free validation job must succeed first: it
+  # binds the event SHA, the workflow-file SHA and (in the read job) the
+  # checkout to the independently reviewed diagnostic_sha, requires that
+  # SHA to differ from the deploy target, and requires production main to
+  # equal reviewed_sha. Only then does the read job inject the existing
+  # secret into one step running two fixed read-only queries; only a
   # sanitized verdict is printed. Limitation: GitHub runs the workflow file
-  # at the dispatched ref head, so the dispatcher must also confirm the
-  # created run's head_sha equals the reviewed SHA.
+  # at the dispatched branch head, so these guards bind a REVIEWED snapshot
+  # but are not a sandbox against an unreviewed rewrite: freeze the branch,
+  # resolve its SHA immediately before dispatch, and confirm the run's
+  # head/workflow SHA afterwards (both are written to the run summary).
+  schema-diagnostic-validate:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER' && github.ref == 'refs/heads/claude/migration-state-preflight' && github.triggering_actor == 'synchronic1'
+    name: Validate schema diagnostic binding (no secrets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Bind event, workflow file and production main to the reviewed SHAs
+        run: |
+          hex() { printf '%s' "$1" | grep -Eqx '[0-9a-f]{40}'; }
+          hex "$DIAGNOSTIC_SHA" || { echo 'diagnostic_sha must be a full 40-hex SHA'; exit 1; }
+          hex "$REVIEWED_SHA" || { echo 'reviewed_sha must be a full 40-hex SHA'; exit 1; }
+          test "$DIAGNOSTIC_SHA" != "$REVIEWED_SHA" || { echo 'diagnostic_sha must differ from the deploy target'; exit 1; }
+          test "$RUN_SHA" = "$DIAGNOSTIC_SHA" || { echo "Dispatched revision $RUN_SHA is not the reviewed diagnostic $DIAGNOSTIC_SHA"; exit 1; }
+          test "$WORKFLOW_SHA" = "$DIAGNOSTIC_SHA" || { echo "Workflow file revision $WORKFLOW_SHA is not the reviewed diagnostic $DIAGNOSTIC_SHA"; exit 1; }
+          MAIN_SHA="$(gh api repos/synchronic1/AIPSTER/commits/main --jq .sha)"
+          test "$MAIN_SHA" = "$REVIEWED_SHA" || { echo "Production main $MAIN_SHA is not the reviewed target $REVIEWED_SHA"; exit 1; }
+          printf '## Schema diagnostic binding\n\n- run head: %s\n- workflow file: %s\n- main: %s\n' "$RUN_SHA" "$WORKFLOW_SHA" "$MAIN_SHA" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          DIAGNOSTIC_SHA: ${{ inputs.diagnostic_sha }}
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          RUN_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
   schema-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER'
+    needs: schema-diagnostic-validate
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER' && github.ref == 'refs/heads/claude/migration-state-preflight' && github.triggering_actor == 'synchronic1'
     name: Read-only production schema diagnostic (no deploy)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -270,25 +304,20 @@ jobs:
       run:
         working-directory: website
     steps:
-      - name: Require the exact reviewed workflow revision
-        working-directory: ${{ github.workspace }}
-        run: |
-          printf '%s' "$REVIEWED_SHA" | grep -Eqx '[0-9a-f]{40}' || { echo 'reviewed_sha must be a full 40-hex SHA'; exit 1; }
-          test "$RUN_SHA" = "$REVIEWED_SHA" || { echo "Dispatched revision $RUN_SHA is not the reviewed $REVIEWED_SHA"; exit 1; }
-        env:
-          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
-          RUN_SHA: ${{ github.sha }}
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6 verified 2026-10-26
         with:
           persist-credentials: false
-          ref: ${{ inputs.reviewed_sha }}
-      - name: Verify checkout matches the reviewed SHA
+          ref: ${{ inputs.diagnostic_sha }}
+      - name: Verify checkout matches the reviewed diagnostic SHA
         working-directory: ${{ github.workspace }}
         run: |
           BUILT_SHA="$(git rev-parse HEAD)"
-          test "$BUILT_SHA" = "$REVIEWED_SHA" || { echo "Checked-out $BUILT_SHA differs from reviewed $REVIEWED_SHA"; exit 1; }
+          test "$BUILT_SHA" = "$DIAGNOSTIC_SHA" || { echo "Checked-out $BUILT_SHA differs from reviewed $DIAGNOSTIC_SHA"; exit 1; }
+          test "$RUN_SHA" = "$DIAGNOSTIC_SHA" && test "$WORKFLOW_SHA" = "$DIAGNOSTIC_SHA" || { echo 'run/workflow revision moved'; exit 1; }
         env:
-          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          DIAGNOSTIC_SHA: ${{ inputs.diagnostic_sha }}
+          RUN_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6 verified 2026-10-26
         with:
           node-version: '24'
