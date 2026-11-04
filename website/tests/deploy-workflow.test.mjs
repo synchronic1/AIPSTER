@@ -93,9 +93,17 @@ test('checkout is pinned and HEAD is verified before build', () => {
 });
 
 test('migration hold and worker applicability are fail-closed and visible', () => {
-  assert(deploy.includes('export ANCESTOR DIFF_OK MIGRATIONS'), 'hold inputs must reach the decision');
+  const hold = steps(deploy).find(b => b.body.includes('id: migration'));
+  assert(hold, 'schema hold step exists');
+  assert(!/^\s+if:/m.test(hold.body.split('run: |')[0]), 'schema hold runs in BOTH auto and manual mode');
+  assert(hold.body.includes('export ANCESTOR DIFF_OK'), 'auto baseline inputs must reach the decision');
+  assert(hold.body.includes('changedMigrationPaths: []'), 'a git diff alone no longer decides; baseline guards stay');
+  assert(hold.body.includes('SELECT name FROM d1_migrations ORDER BY id'), 'reads the authoritative journal');
+  assert(hold.body.includes('scripts/migration-state.mjs decide'), 'state-aware decision is evaluated');
+  assert(hold.body.includes('--journal-exit') && hold.body.includes('--columns-exit'), 'failed reads reach the decision');
+  assert(!/migrations apply|d1 migrations|INSERT|UPDATE|DELETE|ALTER/i.test(hold.body.replace(/^\s*#.*$/gm, '')), 'hold step never writes or applies');
   assert(deploy.includes('export W_OK CHANGED'), 'applicability inputs must reach the decision');
-  const report = steps(deploy).find(b => b.header.includes('Report automatic hold'));
+  const report = steps(deploy).find(b => b.header.includes('Report schema hold'));
   assert(report && report.body.includes("steps.migration.outputs.hold == 'true'"), 'hold report runs on hold');
   assert(report.body.includes('exit 1'), 'a hold must not report success');
   assert(report.body.includes('$GITHUB_STEP_SUMMARY'), 'a hold must be explicit in the summary');

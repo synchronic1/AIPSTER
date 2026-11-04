@@ -124,21 +124,44 @@ jobs:
           node --input-type=module -e "import {isAlreadyLive} from './scripts/release-preflight.mjs'; const target = process.env.TARGET_SHA; let liveCommit = ''; try { const res = await fetch('https://aipster.net/deployment.json', {signal: AbortSignal.timeout(15000)}); if (res.ok) liveCommit = (await res.json()).git_commit || ''; } catch {} if (!/^[a-f0-9]{40}$/.test(liveCommit)) liveCommit = ''; const already = isAlreadyLive({liveCommit, targetSha: target}); const fs = await import('node:fs/promises'); await fs.appendFile(process.env.GITHUB_OUTPUT, 'live_sha=' + liveCommit + '\n' + 'already=' + (already ? 'true' : 'false') + '\n'); console.log(already ? 'Live revision already matches; redeploy will be skipped.' : 'Live baseline: ' + (liveCommit || '(unknown)') + '.');"
         env:
           TARGET_SHA: ${{ steps.release.outputs.sha }}
-      - name: Hold automatic release on unknown or migrated schema
+      # State-aware schema hold, both modes. Auto mode keeps the baseline
+      # guards (unknown/non-ancestor live, uncomputable delta). Instead of
+      # holding on any migration diff, both modes read the AUTHORITATIVE
+      # production journal and altered-table columns (read-only SELECTs) and
+      # proceed only when every reviewed migration is proven applied. Any
+      # failed/unobservable read, pending, unknown, duplicate or drifted state
+      # holds. Nothing here applies or repairs a migration.
+      - name: Hold release on unknown, unapplied or drifted production schema
         id: migration
-        if: steps.release.outputs.mode == 'auto'
-        working-directory: ${{ github.workspace }}
         run: |
-          ANCESTOR=false; DIFF_OK=false; MIGRATIONS='';
-          if git cat-file -e "$LIVE_SHA^{commit}" 2>/dev/null && git cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null; then
-            git merge-base --is-ancestor "$LIVE_SHA" "$TARGET_SHA" 2>/dev/null && ANCESTOR=true;
-            if MIGRATIONS="$(git diff --name-only "$LIVE_SHA" "$TARGET_SHA" -- website/migrations 2>/dev/null)"; then DIFF_OK=true; else MIGRATIONS=''; fi
+          BASELINE_HOLD=false; BASELINE_REASON='';
+          if [ "$RELEASE_MODE" = auto ]; then
+            ANCESTOR=false; DIFF_OK=false; MIGRATIONS='';
+            if git cat-file -e "$LIVE_SHA^{commit}" 2>/dev/null && git cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null; then
+              git merge-base --is-ancestor "$LIVE_SHA" "$TARGET_SHA" 2>/dev/null && ANCESTOR=true;
+              if MIGRATIONS="$(git diff --name-only "$LIVE_SHA" "$TARGET_SHA" -- migrations 2>/dev/null)"; then DIFF_OK=true; else MIGRATIONS=''; fi
+            fi
+            echo "Migration files changed since live baseline (informational): ${MIGRATIONS:-(none)}"
+            export ANCESTOR DIFF_OK
+            BASELINE="$(node --input-type=module -e "import {migrationHoldDecision} from './scripts/release-preflight.mjs'; const d = migrationHoldDecision({liveSha: process.env.LIVE_SHA, targetSha: process.env.TARGET_SHA, ancestor: process.env.ANCESTOR === 'true', diffOk: process.env.DIFF_OK === 'true', changedMigrationPaths: []}); console.log(JSON.stringify(d));")"
+            BASELINE_HOLD="$(printf '%s' "$BASELINE" | node -e "process.stdin.on('data', b => process.stdout.write(String(JSON.parse(b).hold)))")"
+            BASELINE_REASON="$(printf '%s' "$BASELINE" | node -e "process.stdin.on('data', b => process.stdout.write(JSON.parse(b).reason))")"
           fi
-          export ANCESTOR DIFF_OK MIGRATIONS
-          node --input-type=module -e "import {migrationHoldDecision} from './website/scripts/release-preflight.mjs'; import fs from 'node:fs/promises'; const d = migrationHoldDecision({liveSha: process.env.LIVE_SHA, targetSha: process.env.TARGET_SHA, ancestor: process.env.ANCESTOR === 'true', diffOk: process.env.DIFF_OK === 'true', changedMigrationPaths: (process.env.MIGRATIONS || '').split('\n').map(s => s.trim()).filter(Boolean)}); await fs.appendFile(process.env.GITHUB_OUTPUT, 'hold=' + (d.hold ? 'true' : 'false') + '\nreason=' + d.reason.replace(/\n/g, ' ') + '\n'); console.log((d.hold ? 'HOLD: ' : 'PROCEED: ') + d.reason);"
+          J="$RUNNER_TEMP/d1-journal.json"; C="$RUNNER_TEMP/d1-columns.json"
+          JE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
+            --command "SELECT name FROM d1_migrations ORDER BY id" > "$J" || JE=$?
+          PROBE="$(node scripts/migration-state.mjs probe-sql)"
+          CE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
+            --command "$PROBE" > "$C" || CE=$?
+          node scripts/migration-state.mjs decide --journal "$J" --columns "$C" \
+            --journal-exit "$JE" --columns-exit "$CE" \
+            --baseline-hold "$BASELINE_HOLD" --baseline-reason "${BASELINE_REASON:-none}"
         env:
+          RELEASE_MODE: ${{ steps.release.outputs.mode }}
           LIVE_SHA: ${{ steps.live.outputs.live_sha }}
           TARGET_SHA: ${{ steps.release.outputs.sha }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WRANGLER_SEND_METRICS: 'false'
       - name: Determine worker-suite applicability
         id: worker
         if: steps.release.outputs.mode == 'auto' && steps.migration.outputs.hold != 'true'
@@ -198,19 +221,20 @@ jobs:
           # run's own stamp, so the verifier validates the receipt instead of
           # byte-comparing deployment.json. New deploys stay byte-strict.
           AIPSTER_ALREADY_LIVE: ${{ steps.live.outputs.already }}
-      - name: Report automatic hold
+      - name: Report schema hold
         if: steps.migration.outputs.hold == 'true'
         run: |
           {
-            echo '## AUTODEPLOY HOLD — no deployment performed'
+            echo "## DEPLOY HOLD ($RELEASE_MODE) — no deployment performed"
             echo ''
             echo "- release SHA: $RELEASE_SHA"
             echo "- reason: $HOLD_REASON"
             echo ''
-            echo 'Ship via manual workflow_dispatch after review.'
+            echo 'Production schema is not proven applied. Apply or reconcile migrations through the reviewed operator process, then re-run. This workflow never applies migrations.'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error::AUTODEPLOY HOLD: $HOLD_REASON"
+          echo "::error::DEPLOY HOLD: $HOLD_REASON"
           exit 1
         env:
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_MODE: ${{ steps.release.outputs.mode }}
           HOLD_REASON: ${{ steps.migration.outputs.reason }}
