@@ -210,3 +210,42 @@ test('diagnose CLI: failed reads are UNOBSERVABLE with a safe classification, ne
   assert.doesNotMatch(r.stdout, /Cloudflare API|Authentication error/);
   assert.equal(run(['--journal', j]).status, 2);
 });
+
+test('journal and columns are reported independently; verdict still needs both', () => {
+  // Run 41935825294 shape: journal read failed, column read may have succeeded.
+  const d = diag({ journalRows: null });
+  assert.equal(d.verdict, 'UNOBSERVABLE');
+  assert.equal(d.journal_0029, 'unobservable');
+  assert.deepEqual(d.columns, { used_tokens: 'INTEGER NOT NULL DEFAULT 0', used_jobs: 'INTEGER NOT NULL DEFAULT 0' },
+    'a valid column read is still reported');
+  assert.equal(d.reason, 'journal read failed or malformed');
+  const c = diag({ columnRows: null });
+  assert.equal(c.verdict, 'UNOBSERVABLE'); assert.equal(c.journal_0029, 'present'); assert.equal(c.columns, null);
+  assert.equal(c.reason, 'fabric_grants column read failed, empty or malformed');
+  const both = diag({ journalRows: null, columnRows: [...fg(), fg()[1]] });
+  assert.equal(both.reason, 'journal read failed or malformed; duplicate column rows');
+  assert.equal(both.columns, null);
+});
+
+test('describeRead keeps only an integer from wrangler plain-text stderr codes', () => {
+  const r = describeRead('', '✘ [ERROR] A request to the Cloudflare API (/accounts/5bdd4f74/d1) failed.\n  Authentication error [code: 10000]', 1);
+  assert.deepEqual(r, { exit: 1, shape: 'empty', error_code: 10000, error_class: 'authentication' });
+  assert.doesNotMatch(JSON.stringify(r), /5bdd4f74|accounts|Cloudflare/);
+  assert.equal(describeRead(fixtureD1([]), '[code: 1]', 0).error_code, null, 'a successful read never carries a code');
+  assert.equal(describeRead('', '[code: 12345678]', 1).error_code, null, 'oversized codes are dropped');
+});
+
+test('diagnose CLI reports both reads when the journal fails and columns succeed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'diag2-'));
+  const je = join(dir, 'je'), c = join(dir, 'c');
+  writeFileSync(je, wErr({ name: 'APIError', text: 'A request to the Cloudflare API failed.', code: 7500 }));
+  writeFileSync(c, fixtureD1(fg()));
+  const r = spawnSync(process.execPath, [SCRIPT, 'diagnose', '--journal', je, '--columns', c, '--journal-exit', '1'],
+    { encoding: 'utf8', env: { ...process.env, GITHUB_STEP_SUMMARY: '' } });
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.verdict, 'UNOBSERVABLE');
+  assert.deepEqual(out.journal_read, { exit: 1, shape: 'wrangler-error', error_code: 7500, error_class: 'unclassified' });
+  assert.deepEqual(out.columns_read, { exit: 0, shape: 'd1-result', error_code: null, error_class: null });
+  assert.equal(out.columns.used_jobs, 'INTEGER NOT NULL DEFAULT 0');
+  assert.doesNotMatch(r.stdout, /Cloudflare API/);
+});

@@ -183,6 +183,11 @@ export function describeRead(stdout, stderr, exitCode) {
     out.error_class = classify(data.error.text, ...notes) || 'unclassified';
   }
   if (out.shape !== 'd1-result' && !out.error_class) out.error_class = classify(stderr) || (out.exit ? 'unclassified' : null);
+  // Wrangler's plain-text fatal format carries `[code: N]`; only the integer is kept.
+  if (out.error_code === null && out.shape !== 'd1-result' && typeof stderr === 'string') {
+    const m = /\[code: (\d{1,6})\]/.exec(stderr);
+    if (m) out.error_code = Number(m[1]);
+  }
   return out;
 }
 
@@ -196,26 +201,33 @@ export function diagnose0029({ expected, journalRows, columnRows, journalRead = 
   const out = { schema: 'aipster.schema-diagnostic/v2', migration: M0029, verdict: 'UNOBSERVABLE',
     journal_0029: 'unobservable', columns: null, journal_read: journalRead, columns_read: columnsRead };
   if (want.length !== 2) { out.reason = 'expected 0029 definition not derivable'; return out; }
+  // Journal and columns are evaluated and reported independently; the
+  // verdict needs BOTH to be valid, otherwise it stays UNOBSERVABLE.
+  const reasons = [];
   if (!journalRows || !journalRows.every(r => r && r.name === M0029) || journalRows.length > 1) {
-    out.reason = 'journal read failed or malformed'; return out;
+    reasons.push('journal read failed or malformed');
+  } else {
+    out.journal_0029 = journalRows.length ? 'present' : 'absent';
   }
-  out.journal_0029 = journalRows.length ? 'present' : 'absent';
+  let present = 0, exact = 0;
+  const by = new Map();
   if (!columnRows || !columnRows.length || !columnRows.every(r => r && r.t === 'fabric_grants' && typeof r.name === 'string'
     && typeof r.type === 'string' && (r.nn === 0 || r.nn === 1) && (r.dflt === null || typeof r.dflt === 'string'))) {
-    out.reason = 'fabric_grants column read failed, empty or malformed'; return out;
+    reasons.push('fabric_grants column read failed, empty or malformed');
+  } else if (columnRows.some(r => (by.has(r.name) ? true : (by.set(r.name, r), false)))) {
+    reasons.push('duplicate column rows');
+  } else {
+    out.columns = {};
+    for (const c of want) {
+      const r = by.get(c.column);
+      if (!r) { out.columns[c.column] = 'absent'; continue; }
+      present++;
+      const got = `${r.type.toUpperCase()} ${r.nn ? 'NOT NULL' : 'NULL'} DEFAULT ${r.dflt ?? 'none'}`;
+      if (got === `${c.type} ${c.notNull ? 'NOT NULL' : 'NULL'} DEFAULT ${c.dflt ?? 'none'}`) exact++;
+      out.columns[c.column] = got;
+    }
   }
-  const by = new Map();
-  for (const r of columnRows) { if (by.has(r.name)) { out.reason = 'duplicate column rows'; return out; } by.set(r.name, r); }
-  out.columns = {};
-  let present = 0, exact = 0;
-  for (const c of want) {
-    const r = by.get(c.column);
-    if (!r) { out.columns[c.column] = 'absent'; continue; }
-    present++;
-    const got = `${r.type.toUpperCase()} ${r.nn ? 'NOT NULL' : 'NULL'} DEFAULT ${r.dflt ?? 'none'}`;
-    if (got === `${c.type} ${c.notNull ? 'NOT NULL' : 'NULL'} DEFAULT ${c.dflt ?? 'none'}`) exact++;
-    out.columns[c.column] = got;
-  }
+  if (reasons.length) { out.reason = reasons.join('; '); return out; }
   if (out.journal_0029 === 'present') out.verdict = exact === want.length ? 'APPLIED' : 'DRIFT';
   else out.verdict = present === 0 ? 'NOT_APPLIED' : 'AMBIGUOUS';
   return out;
