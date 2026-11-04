@@ -144,16 +144,57 @@ export function schemaStateDecision({ repoMigrations, expected, journalRows, col
   return { hold: false, reason: `production schema matches all ${repoMigrations.length} reviewed migrations`, pending: [], applied: names.length };
 }
 
+// Allowlisted failure labels. Only the label is ever emitted, never text.
+const ERROR_CLASSES = [
+  ['missing-api-token', /CLOUDFLARE_API_TOKEN|non-interactive environment|wrangler login/i],
+  ['account-selection', /more than one account|account_id|select an account/i],
+  ['authentication', /authenticat|unauthori[sz]ed|not authori[sz]ed|forbidden|permission/i],
+  ['database-not-found', /couldn'?t find a D1|database .*not found|could not be found/i],
+  ['no-such-table', /no such table/i],
+  ['sql-error', /SQLITE_|syntax error|no such column/i],
+  ['network', /ECONN|ETIMEDOUT|ENOTFOUND|fetch failed|socket/i],
+];
+const classify = (...texts) => {
+  const t = texts.filter(x => typeof x === 'string').join('\n');
+  if (!t.trim()) return null;
+  for (const [label, re] of ERROR_CLASSES) if (re.test(t)) return label;
+  return 'unclassified';
+};
+
+/**
+ * Safe description of one `wrangler d1 execute --json` read. Wrangler 4.x
+ * prints a --json failure as `{"error": {...}}` on STDOUT (JsonFriendlyFatalError
+ * via logger.log) and exits non-zero; APIError carries a numeric `code`.
+ * Emits only exit code, response shape, an integer code and an allowlisted
+ * label; never raw stdout/stderr text.
+ */
+export function describeRead(stdout, stderr, exitCode) {
+  const out = { exit: Number.isSafeInteger(exitCode) ? exitCode : null, shape: 'empty', error_code: null, error_class: null };
+  let data;
+  if (typeof stdout === 'string' && stdout.trim()) {
+    try { data = JSON.parse(stdout); out.shape = 'unexpected-json'; } catch { out.shape = 'not-json'; }
+  }
+  if (Array.isArray(data) && data.length === 1 && data[0] && data[0].success === true && Array.isArray(data[0].results)) {
+    out.shape = 'd1-result';
+  } else if (data && typeof data === 'object' && !Array.isArray(data) && data.error && typeof data.error === 'object') {
+    out.shape = 'wrangler-error';
+    if (Number.isSafeInteger(data.error.code) && data.error.code > 0) out.error_code = data.error.code;
+    const notes = Array.isArray(data.error.notes) ? data.error.notes.map(n => n && n.text) : [];
+    out.error_class = classify(data.error.text, ...notes) || 'unclassified';
+  }
+  if (out.shape !== 'd1-result' && !out.error_class) out.error_class = classify(stderr) || (out.exit ? 'unclassified' : null);
+  return out;
+}
+
 /**
  * Sanitized 0029 diagnostic over the two fixed diagnostic reads. Emits only
- * the verdict, the 0029 journal presence and the two column definitions;
- * never other column names, raw output or error text (numeric codes only).
+ * the verdict, the 0029 journal presence, the two column definitions and a
+ * safe description of each read; never other column names or raw text.
  */
-export function diagnose0029({ expected, journalRows, columnRows, journalErr, columnsErr }) {
+export function diagnose0029({ expected, journalRows, columnRows, journalRead = null, columnsRead = null }) {
   const want = (expected && expected[M0029]) || [];
-  const codes = t => [...new Set(String(t || '').match(/\b\d{4,5}\b/g) || [])].slice(0, 3);
-  const out = { schema: 'aipster.schema-diagnostic/v1', migration: M0029, verdict: 'UNOBSERVABLE',
-    journal_0029: 'unobservable', columns: null, error_codes: [...codes(journalErr), ...codes(columnsErr)] };
+  const out = { schema: 'aipster.schema-diagnostic/v2', migration: M0029, verdict: 'UNOBSERVABLE',
+    journal_0029: 'unobservable', columns: null, journal_read: journalRead, columns_read: columnsRead };
   if (want.length !== 2) { out.reason = 'expected 0029 definition not derivable'; return out; }
   if (!journalRows || !journalRows.every(r => r && r.name === M0029) || journalRows.length > 1) {
     out.reason = 'journal read failed or malformed'; return out;
@@ -172,8 +213,7 @@ export function diagnose0029({ expected, journalRows, columnRows, journalErr, co
     if (!r) { out.columns[c.column] = 'absent'; continue; }
     present++;
     const got = `${r.type.toUpperCase()} ${r.nn ? 'NOT NULL' : 'NULL'} DEFAULT ${r.dflt ?? 'none'}`;
-    const ok = got === `${c.type} ${c.notNull ? 'NOT NULL' : 'NULL'} DEFAULT ${c.dflt ?? 'none'}`;
-    if (ok) exact++;
+    if (got === `${c.type} ${c.notNull ? 'NOT NULL' : 'NULL'} DEFAULT ${c.dflt ?? 'none'}`) exact++;
     out.columns[c.column] = got;
   }
   if (out.journal_0029 === 'present') out.verdict = exact === want.length ? 'APPLIED' : 'DRIFT';
@@ -221,11 +261,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     } else if (cmd === 'diagnose') {
       const a = argMap(rest);
       if (!a.journal || !a.columns) throw new Error('diagnose requires --journal and --columns');
+      const jOut = readOrNull(a.journal), cOut = readOrNull(a.columns);
+      const jExit = Number(a['journal-exit'] ?? 0), cExit = Number(a['columns-exit'] ?? 0);
       const d = diagnose0029({ expected,
-        journalRows: parseD1Rows(readOrNull(a.journal), Number(a['journal-exit'] ?? 0)),
-        columnRows: parseD1Rows(readOrNull(a.columns), Number(a['columns-exit'] ?? 0)),
-        journalErr: a['journal-stderr'] ? readOrNull(a['journal-stderr']) : '',
-        columnsErr: a['columns-stderr'] ? readOrNull(a['columns-stderr']) : '' });
+        journalRows: parseD1Rows(jOut, jExit), columnRows: parseD1Rows(cOut, cExit),
+        journalRead: describeRead(jOut, a['journal-stderr'] ? readOrNull(a['journal-stderr']) : '', jExit),
+        columnsRead: describeRead(cOut, a['columns-stderr'] ? readOrNull(a['columns-stderr']) : '', cExit) });
       console.log(JSON.stringify(d));
       if (process.env.GITHUB_STEP_SUMMARY)
         appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Schema diagnostic (read-only, no deploy)\n\n\`${JSON.stringify(d)}\`\n`);

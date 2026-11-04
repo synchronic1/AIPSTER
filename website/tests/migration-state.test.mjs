@@ -8,7 +8,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { diagnose0029, addedColumns, expectedColumns, listRepoMigrations, parseD1Rows, probeSql,
+import { describeRead, diagnose0029, addedColumns, expectedColumns, listRepoMigrations, parseD1Rows, probeSql,
   schemaStateDecision, combinedDecision } from '../scripts/migration-state.mjs';
 
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '../scripts/migration-state.mjs');
@@ -162,24 +162,51 @@ test('diagnostic fails closed on bad responses and emits only sanitized metadata
     { columnRows: [{ t: 'fabric_grants', name: 'used_jobs', type: 'INTEGER', nn: true, dflt: '0' }] },
     { columnRows: [...fg(), fg()[1]] }])
     assert.equal(diag(over).verdict, 'UNOBSERVABLE', JSON.stringify(over));
-  const d = diag({ journalRows: null, journalErr: '{"error":{"text":"Authentication error [code: 7403] acct 5bdd4f746ccac889f54e026435565e70"}}' });
-  assert.deepEqual(d.error_codes, ['7403']);
-  assert.doesNotMatch(JSON.stringify(d), /5bdd4f74|Authentication/, 'no raw error text or identifiers');
   const ok = diag({});
-  assert.deepEqual(Object.keys(ok).sort(), ['columns', 'error_codes', 'journal_0029', 'migration', 'schema', 'verdict']);
+  assert.deepEqual(Object.keys(ok).sort(), ['columns', 'columns_read', 'journal_0029', 'journal_read', 'migration', 'schema', 'verdict']);
   assert.deepEqual(Object.keys(ok.columns).sort(), ['used_jobs', 'used_tokens'], 'no other column names leak');
 });
 
-test('diagnose CLI: failed reads are UNOBSERVABLE, never a crash or PASS', () => {
+// Shapes from wrangler 4.153.0 --json: success prints the D1 result array;
+// failure prints {"error": {...}} on STDOUT and exits non-zero (FIXTURES).
+const wErr = (error) => JSON.stringify({ error }, null, 2);
+test('describeRead classifies the run 41935825294 failure path instead of losing it', () => {
+  const ACCT = '5bdd4f746ccac889f54e026435565e70';
+  const api = describeRead(wErr({ name: 'APIError', text: `A request to the Cloudflare API (/accounts/${ACCT}/d1/database/x/query) failed.`,
+    notes: [{ text: 'Authentication error [code: 10000]' }], kind: 'error', code: 10000 }), '', 1);
+  assert.deepEqual(api, { exit: 1, shape: 'wrangler-error', error_code: 10000, error_class: 'authentication' });
+  assert.deepEqual(describeRead(wErr({ text: 'In a non-interactive environment, it\'s necessary to set a CLOUDFLARE_API_TOKEN' }), '', 1),
+    { exit: 1, shape: 'wrangler-error', error_code: null, error_class: 'missing-api-token' });
+  assert.equal(describeRead(wErr({ text: 'More than one account available but unable to select one in non-interactive mode.' }), '', 1).error_class, 'account-selection');
+  assert.equal(describeRead(wErr({ text: 'no such table: d1_migrations: SQLITE_ERROR', code: 7500 }), '', 1).error_class, 'no-such-table');
+  assert.equal(describeRead(wErr({ text: 'something new' }), '', 1).error_class, 'unclassified');
+  assert.deepEqual(describeRead('', 'npm error could not determine executable to run', 1),
+    { exit: 1, shape: 'empty', error_code: null, error_class: 'unclassified' });
+  assert.deepEqual(describeRead('', 'Error: fetch failed ECONNRESET', 1).error_class, 'network');
+  assert.equal(describeRead('not json', '', 0).shape, 'not-json');
+  assert.equal(describeRead(fixtureD1([{ name: M29 }]), '', 0).shape, 'd1-result');
+  assert.deepEqual(describeRead(fixtureD1([]), '', 0), { exit: 0, shape: 'd1-result', error_code: null, error_class: null });
+  assert.equal(describeRead(wErr({ text: 'x', code: '7403' }), '', 1).error_code, null, 'only integer codes are emitted');
+  const all = JSON.stringify([api, describeRead(wErr({ text: `acct ${ACCT} token abc123` }), `token=abc123 ${ACCT}`, 1)]);
+  assert.doesNotMatch(all, /5bdd4f74|abc123|Cloudflare API|accounts/, 'no raw text, ids or tokens are emitted');
+});
+
+test('diagnose CLI: failed reads are UNOBSERVABLE with a safe classification, never a crash or PASS', () => {
   const dir = mkdtempSync(join(tmpdir(), 'diag-'));
-  const j = join(dir, 'j'), c = join(dir, 'c'), e = join(dir, 'e');
+  const j = join(dir, 'j'), c = join(dir, 'c'), e = join(dir, 'e'), je = join(dir, 'je');
   writeFileSync(j, fixtureD1([{ name: M29 }])); writeFileSync(c, fixtureD1(fg()));
-  writeFileSync(e, '✘ [ERROR] A request to the Cloudflare API failed. Authentication error [code: 10000]');
+  writeFileSync(e, ''); writeFileSync(je, wErr({ name: 'APIError', text: 'A request to the Cloudflare API failed.',
+    notes: [{ text: 'Authentication error [code: 10000]' }], code: 10000 }));
   const run = args => spawnSync(process.execPath, [SCRIPT, 'diagnose', ...args], { encoding: 'utf8', env: { ...process.env, GITHUB_STEP_SUMMARY: '' } });
   let r = run(['--journal', j, '--columns', c]);
   assert.equal(r.status, 0); assert.equal(JSON.parse(r.stdout).verdict, 'APPLIED');
-  r = run(['--journal', j, '--columns', c, '--columns-exit', '1', '--columns-stderr', e]);
+  // Exactly the run 41935825294 outcome: error JSON on the journal STDOUT, exit 1.
+  r = run(['--journal', je, '--columns', c, '--journal-exit', '1', '--journal-stderr', e]);
   const out = JSON.parse(r.stdout);
-  assert.equal(out.verdict, 'UNOBSERVABLE'); assert.deepEqual(out.error_codes, ['10000']);
+  assert.equal(out.verdict, 'UNOBSERVABLE');
+  assert.equal(out.reason, 'journal read failed or malformed');
+  assert.deepEqual(out.journal_read, { exit: 1, shape: 'wrangler-error', error_code: 10000, error_class: 'authentication' });
+  assert.equal(out.columns_read.shape, 'd1-result');
+  assert.doesNotMatch(r.stdout, /Cloudflare API|Authentication error/);
   assert.equal(run(['--journal', j]).status, 2);
 });
