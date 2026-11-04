@@ -486,3 +486,22 @@ test('replacement allowance needs the exact prior-toucher list; default stays ex
   await assert.rejects(run(h2(), activeR(undefined, {priorAllowanceMerges: [h('1')]})), /touchers must be the target PR plus exactly/);
   assert.throws(() => replacement(named83(), {priorAllowanceMerges: []}), /non-empty/);
 });
+
+test('repository replacement allowance file is the exact proposed RELEASE158R entry', async () => {
+  const {readFile} = await import('node:fs/promises');
+  const raw = await readFile(new URL('../../.github/release-historical-allowances.json', import.meta.url), 'utf8');
+  const parsed = parseAllowancesFile(JSON.parse(raw));
+  assert.deepEqual(Object.keys(parsed), ['RELEASE158R-8bcd4c7'], 'exactly one entry: the replacement (never two on one live SHA)');
+  const e = parsed['RELEASE158R-8bcd4c7'];
+  assert.equal(e.liveSha, '8bcd4c7a054e8fa6dda8e4d087be490d15b8f923');
+  assert.equal(e.mainBase, '2dd1f79c1c1aea1acf86ae6e8f3a549b57018b36');
+  assert.deepEqual(e.priorAllowanceMerges, ['2dd1f79c1c1aea1acf86ae6e8f3a549b57018b36']);
+  assert.deepEqual(e.registryTouches, ['00c7d848cf3329d32e4d4d286b0a042a37fb4f5d',
+    'ff82c051c45a51521f8c5b6e7053bda7df97c15a', '3bad6d97dee628986a052a5edffa718b3784a0a5']);
+  const [s83, s88] = e.supersededHeads;
+  assert.deepEqual([s83.pr, s83.head, s83.merge], [83, '01fce781f6926db9023964acddfb2ddc1b570293', '851f9e46d95686cb54fcc2d53fabbd89f7de9229']);
+  assert.deepEqual(s83.blockingReviews, [{id: 5755949055, by: 'synchronic1'}]);
+  assert.deepEqual(s83.repairedBy.map((r) => r.pr), [97, 99, 104]);
+  assert.equal(s88.pr, 88); assert(!('blockingReviews' in s88), 'PR 88 keeps its full blocking-review requirement');
+  assert.match(e.decision, /^PROPOSED, NOT YET APPROVED/);
+});

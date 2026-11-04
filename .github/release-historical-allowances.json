@@ -1,9 +1,9 @@
 {
   "version": 1,
   "allowances": {
-    "RELEASE158-8bcd4c7": {
+    "RELEASE158R-8bcd4c7": {
       "liveSha": "8bcd4c7a054e8fa6dda8e4d087be490d15b8f923",
-      "mainBase": "0e6b60890c736207664d122c62e39d8c4affd2fa",
+      "mainBase": "2dd1f79c1c1aea1acf86ae6e8f3a549b57018b36",
       "notAfter": "2026-11-11T23:59:59Z",
       "registryTouches": [
         "00c7d848cf3329d32e4d4d286b0a042a37fb4f5d",
@@ -16,23 +16,44 @@
           "head": "01fce781f6926db9023964acddfb2ddc1b570293",
           "merge": "851f9e46d95686cb54fcc2d53fabbd89f7de9229",
           "repairedBy": [
-            {"pr": 97, "head": "d494f1173993a6bc4a0973915140d3ce5c3c3798"},
-            {"pr": 99, "head": "f39736b1c97036070167934cd910c85b75ba36df"},
-            {"pr": 104, "head": "55e567510f0bb7dd08c8f4301b7893644d48f0b7"}
+            {
+              "pr": 97,
+              "head": "d494f1173993a6bc4a0973915140d3ce5c3c3798"
+            },
+            {
+              "pr": 99,
+              "head": "f39736b1c97036070167934cd910c85b75ba36df"
+            },
+            {
+              "pr": 104,
+              "head": "55e567510f0bb7dd08c8f4301b7893644d48f0b7"
+            }
           ],
-          "reason": "PR 83 head 01fce781 is NOT a PASS: its only exact-head independent review (0bb9) was HOLD with two fail-open catalog defects (compat cache collision on unresolved selectors; fp16 filename), and the owner's review 5755949055 required the dashboard file picker. Both defects were repaired in-range by PR 97 (d494f117) and PR 99 (f39736b1); the picker landed in PR 104 (55e56751, commit 28c2a77). Each repair head must carry its own bound evidence in the same range."
+          "reason": "PR 83 head 01fce781 is NOT a PASS: its only exact-head independent review (0bb9) was HOLD with two fail-open catalog defects (compat cache collision on unresolved selectors; fp16 filename), and the owner's review 5755949055 required the dashboard file picker. Both defects were repaired in-range by PR 97 (d494f117) and PR 99 (f39736b1); the picker landed in PR 104 (55e56751, commit 28c2a77). Each repair head must carry its own bound evidence in the same range. GitHub returned HTTP 200 for both dismissal requests of owner review 5755949055 on the merged PR (including event DISMISS, API 2026-03-10, 2026-11-04T23:27:33Z) but the review stayed CHANGES_REQUESTED with no review_dismissed event; this entry names that one review for deferral instead of claiming it dismissed.",
+          "blockingReviews": [
+            {
+              "id": 5755949055,
+              "by": "synchronic1"
+            }
+          ]
         },
         {
           "pr": 88,
           "head": "734242a61241c867ae7718b6153ab1d5b0f21ed0",
           "merge": "ba1c72e8c36e677fe073e62d2880761f12091dd9",
           "repairedBy": [
-            {"pr": 98, "head": "42178f1845402fd63335b210befeb566cbf08243"}
+            {
+              "pr": 98,
+              "head": "42178f1845402fd63335b210befeb566cbf08243"
+            }
           ],
           "reason": "PR 88 head 734242a is NOT a PASS: its exact-head independent review (1c60b372, REVIEW160) was HOLD with real defects introduced at that head (dark-mode custom-property self-cycles --accent-soft and --warn-line; topology five-column overflow ~960-1140px; landing header badge/nav collision ~761-800px; prior A5-A7). All were repaired in-range by PR 98 (42178f1; website/public byte-identical to independently PASSed 875efd3, CSS-REPAIR-001 4/4 with 0/4 on base plus native dark render). The repair head must carry its own bound evidence in the same range."
         }
       ],
-      "decision": "PROPOSED, NOT YET APPROVED: one-time historical release from live 8bcd4c7 only. Allows exactly the three listed hold-registry commits (PR 94 seed 00c7d84 and FIX-010 ff82c05; PR 101 owner clearance 3bad6d9) and substitutes the missing exact-head evidence of PR 83 (repair chain PR 97/99/104) and PR 88 (repair chain PR 98) with the named in-range repair chains. Neither old head is a PASS. Bound to exactly one target: the merge commit of the introducing PR onto mainBase 0e6b6089 (first parent mainBase, second parent that PR head); any later tip or other base refuses. Inert once live moves past 8bcd4c7 and after notAfter (proposed 2026-11-11T23:59:59Z; owner may shorten). Becomes effective only after markerAuthor synchronic1 posts the RELEASE-HISTORICAL-ALLOWANCE marker review at the introducing PR's head.",
+      "priorAllowanceMerges": [
+        "2dd1f79c1c1aea1acf86ae6e8f3a549b57018b36"
+      ],
+      "decision": "PROPOSED, NOT YET APPROVED: replaces RELEASE158-8bcd4c7 (introduced by PR 112, merge 2dd1f79, marker review 5777275029 over digest 94a030cd...; that marker can never match this id or digest). Same one-time historical release from live 8bcd4c7 only, same three hold-registry commits, same PR 83 and PR 88 repair chains, plus exactly one deferred blocking review: PR 83 owner review 5755949055 at head 01fce781, which GitHub would not dismiss. Neither old head is a PASS. Bound to exactly one target: the merge of the PR introducing this file onto mainBase 2dd1f79 (first parent mainBase, second parent that PR head); PR 112 merge 2dd1f79 is the only other allowed toucher. Any later tip or other base refuses. Inert once live moves past 8bcd4c7 and after notAfter. Becomes effective only after markerAuthor synchronic1 posts the RELEASE-HISTORICAL-ALLOWANCE marker naming this id and this file's sha256 at the introducing PR's head.",
       "markerAuthor": "synchronic1"
     }
   }
