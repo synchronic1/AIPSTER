@@ -168,6 +168,13 @@ const classify = (...texts) => {
  * Emits only exit code, response shape, an integer code and an allowlisted
  * label; never raw stdout/stderr text.
  */
+/** Byte/row counts only (never content), reported beside describeRead. */
+export function readSizes(stdout, stderr) {
+  const bytes = t => (typeof t === 'string' ? Buffer.byteLength(t) : null);
+  const rows = parseD1Rows(stdout, 0);
+  return { stdout_bytes: bytes(stdout), stderr_bytes: bytes(stderr), rows: rows ? rows.length : null };
+}
+
 export function describeRead(stdout, stderr, exitCode) {
   const out = { exit: Number.isSafeInteger(exitCode) ? exitCode : null, shape: 'empty', error_code: null, error_class: null };
   let data;
@@ -183,11 +190,6 @@ export function describeRead(stdout, stderr, exitCode) {
     out.error_class = classify(data.error.text, ...notes) || 'unclassified';
   }
   if (out.shape !== 'd1-result' && !out.error_class) out.error_class = classify(stderr) || (out.exit ? 'unclassified' : null);
-  // Wrangler's plain-text fatal format carries `[code: N]`; only the integer is kept.
-  if (out.error_code === null && out.shape !== 'd1-result' && typeof stderr === 'string') {
-    const m = /\[code: (\d{1,6})\]/.exec(stderr);
-    if (m) out.error_code = Number(m[1]);
-  }
   return out;
 }
 
@@ -248,6 +250,13 @@ function argMap(argv) {
   return out;
 }
 function readOrNull(p) { try { return readFileSync(p, 'utf8'); } catch { return null; } }
+/** Installed wrangler package version (a version string only), or null. */
+export function installedWranglerVersion(dir = resolve(HERE, '..')) {
+  try {
+    const v = JSON.parse(readFileSync(resolve(dir, 'node_modules/wrangler/package.json'), 'utf8')).version;
+    return typeof v === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v) ? v : null;
+  } catch { return null; }
+}
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -274,14 +283,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       const a = argMap(rest);
       if (!a.journal || !a.columns) throw new Error('diagnose requires --journal and --columns');
       const jOut = readOrNull(a.journal), cOut = readOrNull(a.columns);
+      const jErr = a['journal-stderr'] ? readOrNull(a['journal-stderr']) : '';
+      const cErr = a['columns-stderr'] ? readOrNull(a['columns-stderr']) : '';
       const jExit = Number(a['journal-exit'] ?? 0), cExit = Number(a['columns-exit'] ?? 0);
       const d = diagnose0029({ expected,
         journalRows: parseD1Rows(jOut, jExit), columnRows: parseD1Rows(cOut, cExit),
-        journalRead: describeRead(jOut, a['journal-stderr'] ? readOrNull(a['journal-stderr']) : '', jExit),
-        columnsRead: describeRead(cOut, a['columns-stderr'] ? readOrNull(a['columns-stderr']) : '', cExit) });
+        journalRead: { ...describeRead(jOut, jErr, jExit), ...readSizes(jOut, jErr) },
+        columnsRead: { ...describeRead(cOut, cErr, cExit), ...readSizes(cOut, cErr) } });
+      d.wrangler_version = installedWranglerVersion();
       console.log(JSON.stringify(d));
       if (process.env.GITHUB_STEP_SUMMARY)
         appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Schema diagnostic (read-only, no deploy)\n\n\`${JSON.stringify(d)}\`\n`);
+      // The sanitized report is printed first; an unobservable state then
+      // fails the job so a green run can never be read as schema evidence.
+      if (d.verdict === 'UNOBSERVABLE') process.exit(3);
     } else {
       throw new Error('usage: migration-state.mjs probe-sql | decide ... | diagnose --journal <f> --columns <f> [...]');
     }

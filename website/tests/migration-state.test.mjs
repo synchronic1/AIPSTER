@@ -8,7 +8,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describeRead, diagnose0029, addedColumns, expectedColumns, listRepoMigrations, parseD1Rows, probeSql,
+import { readSizes, describeRead, diagnose0029, addedColumns, expectedColumns, listRepoMigrations, parseD1Rows, probeSql,
   schemaStateDecision, combinedDecision } from '../scripts/migration-state.mjs';
 
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '../scripts/migration-state.mjs');
@@ -169,6 +169,7 @@ test('diagnostic fails closed on bad responses and emits only sanitized metadata
 
 // Shapes from wrangler 4.153.0 --json: success prints the D1 result array;
 // failure prints {"error": {...}} on STDOUT and exits non-zero (FIXTURES).
+const core = (r) => ({ exit: r.exit, shape: r.shape, error_code: r.error_code, error_class: r.error_class });
 const wErr = (error) => JSON.stringify({ error }, null, 2);
 test('describeRead classifies the run 41935825294 failure path instead of losing it', () => {
   const ACCT = '5bdd4f746ccac889f54e026435565e70';
@@ -202,10 +203,11 @@ test('diagnose CLI: failed reads are UNOBSERVABLE with a safe classification, ne
   assert.equal(r.status, 0); assert.equal(JSON.parse(r.stdout).verdict, 'APPLIED');
   // Exactly the run 41935825294 outcome: error JSON on the journal STDOUT, exit 1.
   r = run(['--journal', je, '--columns', c, '--journal-exit', '1', '--journal-stderr', e]);
+  assert.equal(r.status, 3, 'UNOBSERVABLE fails the step after the report');
   const out = JSON.parse(r.stdout);
   assert.equal(out.verdict, 'UNOBSERVABLE');
   assert.equal(out.reason, 'journal read failed or malformed');
-  assert.deepEqual(out.journal_read, { exit: 1, shape: 'wrangler-error', error_code: 10000, error_class: 'authentication' });
+  assert.deepEqual(core(out.journal_read), { exit: 1, shape: 'wrangler-error', error_code: 10000, error_class: 'authentication' });
   assert.equal(out.columns_read.shape, 'd1-result');
   assert.doesNotMatch(r.stdout, /Cloudflare API|Authentication error/);
   assert.equal(run(['--journal', j]).status, 2);
@@ -227,14 +229,6 @@ test('journal and columns are reported independently; verdict still needs both',
   assert.equal(both.columns, null);
 });
 
-test('describeRead keeps only an integer from wrangler plain-text stderr codes', () => {
-  const r = describeRead('', '✘ [ERROR] A request to the Cloudflare API (/accounts/5bdd4f74/d1) failed.\n  Authentication error [code: 10000]', 1);
-  assert.deepEqual(r, { exit: 1, shape: 'empty', error_code: 10000, error_class: 'authentication' });
-  assert.doesNotMatch(JSON.stringify(r), /5bdd4f74|accounts|Cloudflare/);
-  assert.equal(describeRead(fixtureD1([]), '[code: 1]', 0).error_code, null, 'a successful read never carries a code');
-  assert.equal(describeRead('', '[code: 12345678]', 1).error_code, null, 'oversized codes are dropped');
-});
-
 test('diagnose CLI reports both reads when the journal fails and columns succeed', () => {
   const dir = mkdtempSync(join(tmpdir(), 'diag2-'));
   const je = join(dir, 'je'), c = join(dir, 'c');
@@ -244,8 +238,39 @@ test('diagnose CLI reports both reads when the journal fails and columns succeed
     { encoding: 'utf8', env: { ...process.env, GITHUB_STEP_SUMMARY: '' } });
   const out = JSON.parse(r.stdout);
   assert.equal(out.verdict, 'UNOBSERVABLE');
-  assert.deepEqual(out.journal_read, { exit: 1, shape: 'wrangler-error', error_code: 7500, error_class: 'unclassified' });
-  assert.deepEqual(out.columns_read, { exit: 0, shape: 'd1-result', error_code: null, error_class: null });
+  assert.deepEqual(core(out.journal_read), { exit: 1, shape: 'wrangler-error', error_code: 7500, error_class: 'unclassified' });
+  assert.deepEqual(core(out.columns_read), { exit: 0, shape: 'd1-result', error_code: null, error_class: null });
   assert.equal(out.columns.used_jobs, 'INTEGER NOT NULL DEFAULT 0');
   assert.doesNotMatch(r.stdout, /Cloudflare API/);
+});
+
+test('per-read sizes are counts only; version is a bare version string', async () => {
+  assert.deepEqual(readSizes(fixtureD1([{ name: M29 }]), ''), { stdout_bytes: Buffer.byteLength(fixtureD1([{ name: M29 }])), stderr_bytes: 0, rows: 1 });
+  assert.deepEqual(readSizes(fixtureD1([]), 'warn'), { stdout_bytes: Buffer.byteLength(fixtureD1([])), stderr_bytes: 4, rows: 0 });
+  assert.deepEqual(readSizes(wErr({ text: 'x', code: 7500 }), null), { stdout_bytes: Buffer.byteLength(wErr({ text: 'x', code: 7500 })), stderr_bytes: null, rows: null });
+  const { installedWranglerVersion } = await import('../scripts/migration-state.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'wv-'));
+  const { mkdirSync } = await import('node:fs');
+  mkdirSync(join(dir, 'node_modules/wrangler'), { recursive: true });
+  writeFileSync(join(dir, 'node_modules/wrangler/package.json'), JSON.stringify({ version: '4.153.0' }));
+  assert.equal(installedWranglerVersion(dir), '4.153.0');
+  writeFileSync(join(dir, 'node_modules/wrangler/package.json'), JSON.stringify({ version: '4.153.0 token=abc' }));
+  assert.equal(installedWranglerVersion(dir), null);
+  assert.equal(installedWranglerVersion(join(dir, 'missing')), null);
+});
+
+test('diagnose CLI exit: 0 for a decided verdict, 3 for UNOBSERVABLE, never raw text', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'diag3-'));
+  const j0 = join(dir, 'j0'), c = join(dir, 'c'), bad = join(dir, 'bad');
+  writeFileSync(j0, fixtureD1([])); writeFileSync(c, fixtureD1(fg({ drop: ['used_tokens', 'used_jobs'] }))); writeFileSync(bad, 'Error: something\n[{"results":[]}]');
+  const run = args => spawnSync(process.execPath, [SCRIPT, 'diagnose', ...args], { encoding: 'utf8', env: { ...process.env, GITHUB_STEP_SUMMARY: '' } });
+  let r = run(['--journal', j0, '--columns', c]);
+  assert.equal(r.status, 0); const ok = JSON.parse(r.stdout);
+  assert.equal(ok.verdict, 'NOT_APPLIED', 'a successful empty journal result is decided, not unobservable');
+  assert.equal(ok.journal_read.rows, 0);
+  r = run(['--journal', bad, '--columns', c]);
+  assert.equal(r.status, 3);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.journal_read.shape, 'not-json', 'log-contaminated output is never scraped for an embedded array');
+  assert.doesNotMatch(r.stdout, /something/);
 });
