@@ -102,6 +102,22 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      # Trusted bootstrap (workflow logic only, before ANY selected-checkout
+      # code runs): the release SHA must be a full SHA in the canonical repo
+      # and equal authenticated current main. Same rule preflight enforces
+      # later (validateRelease/validateAutoRelease), moved ahead so a
+      # selected revision can never decide its own eligibility.
+      - name: Require the release SHA to be authenticated current main
+        working-directory: ${{ github.workspace }}
+        run: |
+          printf '%s' "$RELEASE_SHA" | grep -Eqx '[0-9a-f]{40}' || { echo 'Release SHA must be a full 40-hex SHA'; exit 1; }
+          test "$REPO" = 'synchronic1/AIPSTER' || { echo 'Release requires the canonical repository'; exit 1; }
+          MAIN_SHA="$(gh api repos/synchronic1/AIPSTER/commits/main --jq .sha)"
+          test "$MAIN_SHA" = "$RELEASE_SHA" || { echo "Release $RELEASE_SHA is not current main $MAIN_SHA"; exit 1; }
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6 verified 2026-10-26
         with:
           persist-credentials: false

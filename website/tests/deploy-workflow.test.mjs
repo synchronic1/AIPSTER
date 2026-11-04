@@ -288,3 +288,22 @@ test('diagnostic validation refuses every binding mismatch before any secret', (
   const verify = runBlock(steps(diagJob).find(b => b.header.includes('Verify checkout matches the reviewed diagnostic SHA')));
   assert(verify.includes('test "$BUILT_SHA" = "$DIAGNOSTIC_SHA"') && verify.includes('"$WORKFLOW_SHA" = "$DIAGNOSTIC_SHA"'));
 });
+
+test('trusted bootstrap proves release == authenticated current main before any checkout code', () => {
+  const all = steps(deployJob);
+  const boot = all.findIndex(b => b.header.includes('Require the release SHA to be authenticated current main'));
+  const checkout = all.findIndex(b => b.header.includes('actions/checkout'));
+  const firstNpm = all.findIndex(b => /npm ci/.test(b.header));
+  assert(boot >= 0 && boot < checkout && checkout < firstNpm, 'bootstrap precedes checkout and every selected-code step');
+  assert(!all[boot].body.includes('secrets.'), 'bootstrap holds no secret');
+  const script = runBlock(all[boot]);
+  const dir = mkdtempSync(join(tmpdir(), 'boot-'));
+  writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf "%s\\n" "$FAKE_MAIN"\n'); chmodSync(join(dir, 'gh'), 0o755);
+  const M = 'a'.repeat(40), X = 'b'.repeat(40);
+  const run = (over) => spawnSync('bash', ['-e', '-c', script], {encoding: 'utf8',
+    env: {PATH: `${dir}:${process.env.PATH}`, RELEASE_SHA: M, REPO: 'synchronic1/AIPSTER', FAKE_MAIN: M, ...over}}).status;
+  assert.equal(run({}), 0);
+  for (const [label, over] of [['main moved', {FAKE_MAIN: X}], ['fork', {REPO: 'someone/AIPSTER'}],
+    ['short SHA', {RELEASE_SHA: 'a'.repeat(7), FAKE_MAIN: 'a'.repeat(7)}], ['main lookup failed', {FAKE_MAIN: ''}]])
+    assert.notEqual(run(over), 0, label);
+});
