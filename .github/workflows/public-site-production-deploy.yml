@@ -34,9 +34,15 @@ on:
   workflow_dispatch:
     inputs:
       reviewed_sha:
-        description: Full merged main commit approved for this release
+        description: Full merged main commit approved for this release (schema-diagnostic, the exact reviewed head of the dispatched ref)
         required: true
         type: string
+      mode:
+        description: deploy (main only) or schema-diagnostic (read-only production schema metadata; never deploys)
+        required: false
+        default: deploy
+        type: choice
+        options: [deploy, schema-diagnostic]
   workflow_run:
     workflows: ['Public site checks', 'Public local worker installation']
     types: [completed]
@@ -46,11 +52,13 @@ permissions:
   checks: read
   pull-requests: read
 concurrency:
-  group: public-site-production
+  # The diagnostic never shares the production group, so it can neither
+  # queue behind nor displace a pending production deploy.
+  group: ${{ inputs.mode == 'schema-diagnostic' && 'public-site-schema-diagnostic' || 'public-site-production' }}
   cancel-in-progress: false
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'workflow_dispatch' || inputs.mode == 'deploy')
     name: Build and deploy dist to production
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -124,44 +132,27 @@ jobs:
           node --input-type=module -e "import {isAlreadyLive} from './scripts/release-preflight.mjs'; const target = process.env.TARGET_SHA; let liveCommit = ''; try { const res = await fetch('https://aipster.net/deployment.json', {signal: AbortSignal.timeout(15000)}); if (res.ok) liveCommit = (await res.json()).git_commit || ''; } catch {} if (!/^[a-f0-9]{40}$/.test(liveCommit)) liveCommit = ''; const already = isAlreadyLive({liveCommit, targetSha: target}); const fs = await import('node:fs/promises'); await fs.appendFile(process.env.GITHUB_OUTPUT, 'live_sha=' + liveCommit + '\n' + 'already=' + (already ? 'true' : 'false') + '\n'); console.log(already ? 'Live revision already matches; redeploy will be skipped.' : 'Live baseline: ' + (liveCommit || '(unknown)') + '.');"
         env:
           TARGET_SHA: ${{ steps.release.outputs.sha }}
-      # State-aware schema hold, both modes. Auto mode keeps the baseline
-      # guards (unknown/non-ancestor live, uncomputable delta). Instead of
-      # holding on any migration diff, both modes read the AUTHORITATIVE
-      # production journal and altered-table columns (read-only SELECTs) and
-      # proceed only when every reviewed migration is proven applied. Any
-      # failed/unobservable read, pending, unknown, duplicate or drifted state
-      # holds. Nothing here applies or repairs a migration.
-      - name: Hold release on unknown, unapplied or drifted production schema
+      # Baseline guard (auto only, no credentials): unknown/non-ancestor live
+      # or an uncomputable delta holds before anything else runs. A migration
+      # diff alone no longer holds here; production schema state is decided
+      # by the credentialed `schema` step, which runs only AFTER the
+      # main-revision preflight and the release gate have passed.
+      - name: Hold automatic release on unknown live baseline
         id: migration
+        if: steps.release.outputs.mode == 'auto'
+        working-directory: ${{ github.workspace }}
         run: |
-          BASELINE_HOLD=false; BASELINE_REASON='';
-          if [ "$RELEASE_MODE" = auto ]; then
-            ANCESTOR=false; DIFF_OK=false; MIGRATIONS='';
-            if git cat-file -e "$LIVE_SHA^{commit}" 2>/dev/null && git cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null; then
-              git merge-base --is-ancestor "$LIVE_SHA" "$TARGET_SHA" 2>/dev/null && ANCESTOR=true;
-              if MIGRATIONS="$(git diff --name-only "$LIVE_SHA" "$TARGET_SHA" -- migrations 2>/dev/null)"; then DIFF_OK=true; else MIGRATIONS=''; fi
-            fi
-            echo "Migration files changed since live baseline (informational): ${MIGRATIONS:-(none)}"
-            export ANCESTOR DIFF_OK
-            BASELINE="$(node --input-type=module -e "import {migrationHoldDecision} from './scripts/release-preflight.mjs'; const d = migrationHoldDecision({liveSha: process.env.LIVE_SHA, targetSha: process.env.TARGET_SHA, ancestor: process.env.ANCESTOR === 'true', diffOk: process.env.DIFF_OK === 'true', changedMigrationPaths: []}); console.log(JSON.stringify(d));")"
-            BASELINE_HOLD="$(printf '%s' "$BASELINE" | node -e "process.stdin.on('data', b => process.stdout.write(String(JSON.parse(b).hold)))")"
-            BASELINE_REASON="$(printf '%s' "$BASELINE" | node -e "process.stdin.on('data', b => process.stdout.write(JSON.parse(b).reason))")"
+          ANCESTOR=false; DIFF_OK=false; MIGRATIONS='';
+          if git cat-file -e "$LIVE_SHA^{commit}" 2>/dev/null && git cat-file -e "$TARGET_SHA^{commit}" 2>/dev/null; then
+            git merge-base --is-ancestor "$LIVE_SHA" "$TARGET_SHA" 2>/dev/null && ANCESTOR=true;
+            if MIGRATIONS="$(git diff --name-only "$LIVE_SHA" "$TARGET_SHA" -- website/migrations 2>/dev/null)"; then DIFF_OK=true; else MIGRATIONS=''; fi
           fi
-          J="$RUNNER_TEMP/d1-journal.json"; C="$RUNNER_TEMP/d1-columns.json"
-          JE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
-            --command "SELECT name FROM d1_migrations ORDER BY id" > "$J" || JE=$?
-          PROBE="$(node scripts/migration-state.mjs probe-sql)"
-          CE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
-            --command "$PROBE" > "$C" || CE=$?
-          node scripts/migration-state.mjs decide --journal "$J" --columns "$C" \
-            --journal-exit "$JE" --columns-exit "$CE" \
-            --baseline-hold "$BASELINE_HOLD" --baseline-reason "${BASELINE_REASON:-none}"
+          echo "Migration files changed since live baseline (informational): ${MIGRATIONS:-(none)}"
+          export ANCESTOR DIFF_OK
+          node --input-type=module -e "import {migrationHoldDecision} from './website/scripts/release-preflight.mjs'; import fs from 'node:fs/promises'; const d = migrationHoldDecision({liveSha: process.env.LIVE_SHA, targetSha: process.env.TARGET_SHA, ancestor: process.env.ANCESTOR === 'true', diffOk: process.env.DIFF_OK === 'true', changedMigrationPaths: []}); await fs.appendFile(process.env.GITHUB_OUTPUT, 'hold=' + (d.hold ? 'true' : 'false') + '\nreason=' + d.reason.replace(/\n/g, ' ') + '\n'); console.log((d.hold ? 'HOLD: ' : 'PROCEED: ') + d.reason);"
         env:
-          RELEASE_MODE: ${{ steps.release.outputs.mode }}
           LIVE_SHA: ${{ steps.live.outputs.live_sha }}
           TARGET_SHA: ${{ steps.release.outputs.sha }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          WRANGLER_SEND_METRICS: 'false'
       - name: Determine worker-suite applicability
         id: worker
         if: steps.release.outputs.mode == 'auto' && steps.migration.outputs.hold != 'true'
@@ -207,13 +198,35 @@ jobs:
           RELEASE_MODE: ${{ steps.release.outputs.mode }}
           DISPATCH_ACTOR: ${{ github.triggering_actor }}
           GH_TOKEN: ${{ github.token }}
+      # Credentialed, read-only production schema check, both modes. Runs
+      # ONLY after main-revision preflight and the release gate succeeded
+      # (a failed step stops the job), so the token never reaches target
+      # code before eligibility is proven. Proceeds only when every reviewed
+      # migration is journaled and its added columns exist; any failed or
+      # unobservable read, pending, unknown, duplicate or drifted state holds.
+      # Nothing here applies or repairs a migration.
+      - name: Hold release on unknown, unapplied or drifted production schema
+        id: schema
+        if: steps.migration.outputs.hold != 'true'
+        run: |
+          J="$RUNNER_TEMP/d1-journal.json"; C="$RUNNER_TEMP/d1-columns.json"
+          JE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
+            --command "SELECT name FROM d1_migrations ORDER BY id" > "$J" || JE=$?
+          PROBE="$(node scripts/migration-state.mjs probe-sql)"
+          CE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
+            --command "$PROBE" > "$C" || CE=$?
+          node scripts/migration-state.mjs decide --journal "$J" --columns "$C" \
+            --journal-exit "$JE" --columns-exit "$CE" --baseline-hold false --baseline-reason none
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WRANGLER_SEND_METRICS: 'false'
       - run: npx wrangler deploy --config wrangler.jsonc
-        if: steps.migration.outputs.hold != 'true' && steps.live.outputs.already != 'true'
+        if: steps.migration.outputs.hold != 'true' && steps.schema.outputs.hold == 'false' && steps.live.outputs.already != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           WRANGLER_SEND_METRICS: 'false'
       - name: Verify live assets, release revision and anonymous access protection
-        if: steps.migration.outputs.hold != 'true'
+        if: steps.migration.outputs.hold != 'true' && steps.schema.outputs.hold == 'false'
         run: npm run verify:live
         env:
           GITHUB_SHA: ${{ steps.release.outputs.sha }}
@@ -222,7 +235,7 @@ jobs:
           # byte-comparing deployment.json. New deploys stay byte-strict.
           AIPSTER_ALREADY_LIVE: ${{ steps.live.outputs.already }}
       - name: Report schema hold
-        if: steps.migration.outputs.hold == 'true'
+        if: steps.migration.outputs.hold == 'true' || steps.schema.outputs.hold == 'true'
         run: |
           {
             echo "## DEPLOY HOLD ($RELEASE_MODE) — no deployment performed"
@@ -237,4 +250,59 @@ jobs:
         env:
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
           RELEASE_MODE: ${{ steps.release.outputs.mode }}
-          HOLD_REASON: ${{ steps.migration.outputs.reason }}
+          HOLD_REASON: ${{ steps.migration.outputs.reason || steps.schema.outputs.reason }}
+  # Read-only production schema diagnostic (manual, canonical repo only).
+  # Never deploys, applies, writes or changes flags; no environment, so no
+  # deployment record. The secret reaches only the fixed read-only query
+  # step, after the dispatched workflow revision AND the checkout are proven
+  # to be the exact reviewed SHA. Raw D1 output stays in RUNNER_TEMP; only a
+  # sanitized verdict is printed. Limitation: GitHub runs the workflow file
+  # at the dispatched ref head, so the dispatcher must also confirm the
+  # created run's head_sha equals the reviewed SHA.
+  schema-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER'
+    name: Read-only production schema diagnostic (no deploy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Require the exact reviewed workflow revision
+        working-directory: ${{ github.workspace }}
+        run: |
+          printf '%s' "$REVIEWED_SHA" | grep -Eqx '[0-9a-f]{40}' || { echo 'reviewed_sha must be a full 40-hex SHA'; exit 1; }
+          test "$RUN_SHA" = "$REVIEWED_SHA" || { echo "Dispatched revision $RUN_SHA is not the reviewed $REVIEWED_SHA"; exit 1; }
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          RUN_SHA: ${{ github.sha }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6 verified 2026-10-26
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.reviewed_sha }}
+      - name: Verify checkout matches the reviewed SHA
+        working-directory: ${{ github.workspace }}
+        run: |
+          BUILT_SHA="$(git rev-parse HEAD)"
+          test "$BUILT_SHA" = "$REVIEWED_SHA" || { echo "Checked-out $BUILT_SHA differs from reviewed $REVIEWED_SHA"; exit 1; }
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6 verified 2026-10-26
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Fixed read-only 0029 journal and fabric_grants column metadata
+        run: |
+          J="$RUNNER_TEMP/diag-journal.json"; C="$RUNNER_TEMP/diag-columns.json"
+          JE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
+            --command "SELECT name FROM d1_migrations WHERE name = '0029_fabric_dispatch_spend.sql'" > "$J" 2> "$J.err" || JE=$?
+          CE=0; npx wrangler d1 execute aipster-app --remote --json --config wrangler.jsonc \
+            --command "SELECT 'fabric_grants' AS t, name, type, \"notnull\" AS nn, dflt_value AS dflt FROM pragma_table_info('fabric_grants')" > "$C" 2> "$C.err" || CE=$?
+          node scripts/migration-state.mjs diagnose --journal "$J" --columns "$C" \
+            --journal-exit "$JE" --columns-exit "$CE" --journal-stderr "$J.err" --columns-stderr "$C.err"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WRANGLER_SEND_METRICS: 'false'

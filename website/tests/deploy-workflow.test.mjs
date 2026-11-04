@@ -7,6 +7,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {spawnSync} from 'node:child_process';
 
 const deployUrl = new URL('../../.github/workflows/public-site-production-deploy.yml', import.meta.url);
 const workerUrl = new URL('../../.github/workflows/local-worker-checks.yml', import.meta.url);
@@ -34,7 +35,7 @@ function steps(text) {
 test('deploy workflow has no tabs and the expected top-level shape', () => {
   assert(!deploy.includes('\t'), 'workflow must not contain tabs');
   for (const key of ['name: Public site production deploy', 'on:', 'permissions:',
-    'concurrency:', 'jobs:', 'group: public-site-production', 'environment: production']) {
+    'concurrency:', 'jobs:', "|| 'public-site-production' }}", 'environment: production']) {
     assert(deploy.includes(key), `workflow must declare ${key}`);
   }
 });
@@ -94,14 +95,18 @@ test('checkout is pinned and HEAD is verified before build', () => {
 
 test('migration hold and worker applicability are fail-closed and visible', () => {
   const hold = steps(deploy).find(b => b.body.includes('id: migration'));
-  assert(hold, 'schema hold step exists');
-  assert(!/^\s+if:/m.test(hold.body.split('run: |')[0]), 'schema hold runs in BOTH auto and manual mode');
+  assert(hold, 'baseline guard step exists');
+  assert(hold.body.includes("if: steps.release.outputs.mode == 'auto'"), 'baseline guard stays auto-only');
   assert(hold.body.includes('export ANCESTOR DIFF_OK'), 'auto baseline inputs must reach the decision');
   assert(hold.body.includes('changedMigrationPaths: []'), 'a git diff alone no longer decides; baseline guards stay');
-  assert(hold.body.includes('SELECT name FROM d1_migrations ORDER BY id'), 'reads the authoritative journal');
-  assert(hold.body.includes('scripts/migration-state.mjs decide'), 'state-aware decision is evaluated');
-  assert(hold.body.includes('--journal-exit') && hold.body.includes('--columns-exit'), 'failed reads reach the decision');
-  assert(!/migrations apply|d1 migrations|INSERT|UPDATE|DELETE|ALTER/i.test(hold.body.replace(/^\s*#.*$/gm, '')), 'hold step never writes or applies');
+  assert(!hold.body.includes('CLOUDFLARE_API_TOKEN'), 'baseline guard never receives the credential');
+  const schema = steps(deploy).find(b => b.body.includes('id: schema'));
+  assert(schema, 'credentialed schema step exists');
+  assert(!schema.body.includes('mode =='), 'schema check runs in BOTH auto and manual mode');
+  assert(schema.body.includes('SELECT name FROM d1_migrations ORDER BY id'), 'reads the authoritative journal');
+  assert(schema.body.includes('scripts/migration-state.mjs decide'), 'state-aware decision is evaluated');
+  assert(schema.body.includes('--journal-exit') && schema.body.includes('--columns-exit'), 'failed reads reach the decision');
+  assert(!/migrations apply|d1 migrations|INSERT|UPDATE|DELETE|ALTER/i.test(schema.body.replace(/^\s*#.*$/gm, '')), 'schema step never writes or applies');
   assert(deploy.includes('export W_OK CHANGED'), 'applicability inputs must reach the decision');
   const report = steps(deploy).find(b => b.header.includes('Report schema hold'));
   assert(report && report.body.includes("steps.migration.outputs.hold == 'true'"), 'hold report runs on hold');
@@ -110,7 +115,8 @@ test('migration hold and worker applicability are fail-closed and visible', () =
 });
 
 test('deploy and verify steps are skipped on hold or already-live', () => {
-  assert(deploy.includes("steps.migration.outputs.hold != 'true' && steps.live.outputs.already != 'true'"));
+  assert(deploy.includes("steps.migration.outputs.hold != 'true' && steps.schema.outputs.hold == 'false' && steps.live.outputs.already != 'true'"),
+    'deploy requires an explicit schema PROCEED (a skipped/failed schema step never deploys)');
 });
 
 test('no plain-scalar run step contains YAML-breaking colons', () => {
@@ -193,4 +199,74 @@ test('worker check keeps the gate-bound mock-install job identity', () => {
   const job = worker.slice(worker.indexOf('\n', at)).split(/^  \w[\w-]*:/m)[0];
   assert(job.includes('runs-on: windows-2025'), 'mock-install keeps its qualified runner');
   assert(!/^\s*name:/m.test(job), 'mock-install keeps its job-id check name (the gate binds on it)');
+});
+
+test('the Cloudflare credential reaches no step before main-revision preflight and the release gate', () => {
+  const all = steps(deploy.split('\n  schema-diagnostic:\n')[0]);
+  const at = (pred, label) => { const i = all.findIndex(pred); assert(i >= 0, label); return i; };
+  const preflight = at(b => b.header.includes('Require the verified current main revision'), 'preflight step');
+  const gate = at(b => b.header.includes('Enforce release gate over included PRs'), 'release gate step');
+  const schema = at(b => b.body.includes('id: schema'), 'schema step');
+  const wrangler = at(b => b.header.includes('npx wrangler deploy'), 'deploy step');
+  const credentialed = all.map((b, i) => (b.body.includes('secrets.CLOUDFLARE_API_TOKEN') ? i : -1)).filter(i => i >= 0);
+  assert.deepEqual(credentialed, [schema, wrangler], 'only the schema check and deploy hold the credential');
+  assert(preflight < gate && gate < schema && schema < wrangler, 'preflight < gate < schema check < deploy');
+  const report = all.find(b => b.header.includes('Report schema hold'));
+  assert(report.body.includes("steps.schema.outputs.hold == 'true'"), 'a schema hold is reported and fails the job');
+});
+
+// Read-only schema diagnostic job: deploy exclusion and SHA binding.
+const [deployJob, diagJob] = deploy.split('\n  schema-diagnostic:\n');
+const runBlock = (step) => step.body.split('run: |\n')[1].split(/\n {8}env:/)[0]
+  .split('\n').map(l => l.replace(/^ {10}/, '')).join('\n');
+
+test('diagnostic mode can never reach the deploy job on main or any branch', () => {
+  assert(diagJob, 'schema-diagnostic job exists');
+  const deployIf = deployJob.match(/\n {4}if: (.+)\n/)[1];
+  assert(deployIf.startsWith("github.ref == 'refs/heads/main' && "), 'main-only deploy guard preserved');
+  assert(deployIf.includes("(github.event_name != 'workflow_dispatch' || inputs.mode == 'deploy')"),
+    'a dispatch deploys only in explicit deploy mode, on every ref');
+  const diagIf = diagJob.match(/(?:^|\n) {4}if: (.+)\n/)[1];
+  assert.equal(diagIf, "github.event_name == 'workflow_dispatch' && inputs.mode == 'schema-diagnostic' && github.repository == 'synchronic1/AIPSTER'");
+  assert(!/needs:/.test(diagJob), 'diagnostic is independent of the deploy job');
+  assert(deploy.includes("group: ${{ inputs.mode == 'schema-diagnostic' && 'public-site-schema-diagnostic' || 'public-site-production' }}"),
+    'diagnostic never shares the production concurrency group');
+  assert(deploy.includes('options: [deploy, schema-diagnostic]') && deploy.includes('default: deploy'));
+});
+
+test('diagnostic job is read-only, credential-minimal and fixed-query', () => {
+  const body = diagJob.replace(/^\s*#.*$/gm, '');
+  for (const bad of [/wrangler deploy/, /migrations apply/, /d1 migrations/, /environment:/, /upload-artifact/,
+    /secret put/, /\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b/, /verify:live/, /npm test/, /npm run build/])
+    assert(!bad.test(body), `diagnostic must not contain ${bad}`);
+  assert.deepEqual(body.match(/secrets\.[A-Z_]+/g), ['secrets.CLOUDFLARE_API_TOKEN'], 'exactly one secret reference');
+  assert.match(body, /permissions:\n {6}contents: read\n {4}defaults/, 'contents: read only');
+  const st = steps(diagJob);
+  const reqRev = st.findIndex(b => b.header.includes('Require the exact reviewed workflow revision'));
+  const checkout = st.findIndex(b => b.header.includes('actions/checkout'));
+  const verify = st.findIndex(b => b.header.includes('Verify checkout matches the reviewed SHA'));
+  const query = st.findIndex(b => b.body.includes('secrets.CLOUDFLARE_API_TOKEN'));
+  assert(reqRev === 0 && reqRev < checkout && checkout < verify && verify < query && query === st.length - 1,
+    'both SHA proofs precede the only credentialed step, which is last');
+  assert(st[checkout].body.includes('persist-credentials: false') && st[checkout].body.includes('ref: ${{ inputs.reviewed_sha }}'));
+  const q = st[query].body;
+  assert.equal((q.match(/--command/g) || []).length, 2, 'exactly two fixed queries');
+  assert(q.includes(`SELECT name FROM d1_migrations WHERE name = '0029_fabric_dispatch_spend.sql'`));
+  assert(q.includes(`FROM pragma_table_info('fabric_grants')`));
+  assert(!/\$\{\{\s*inputs/.test(q), 'no input reaches the query text');
+  assert(q.includes('migration-state.mjs diagnose'), 'only the sanitized verdict is printed');
+});
+
+test('diagnostic refuses a wrong, short or mismatched reviewed SHA before any secret', () => {
+  const step = steps(diagJob).find(b => b.header.includes('Require the exact reviewed workflow revision'));
+  const script = runBlock(step);
+  const run = (env) => spawnSync('bash', ['-e', '-c', script], {encoding: 'utf8', env: {PATH: process.env.PATH, ...env}}).status;
+  const A = 'a'.repeat(40), B = 'b'.repeat(40);
+  assert.equal(run({REVIEWED_SHA: A, RUN_SHA: A}), 0);
+  assert.notEqual(run({REVIEWED_SHA: A, RUN_SHA: B}), 0, 'dispatched revision differs');
+  assert.notEqual(run({REVIEWED_SHA: 'a'.repeat(7), RUN_SHA: 'a'.repeat(7)}), 0, 'short SHA');
+  assert.notEqual(run({REVIEWED_SHA: A.toUpperCase(), RUN_SHA: A.toUpperCase()}), 0, 'non-canonical SHA');
+  assert.notEqual(run({REVIEWED_SHA: '', RUN_SHA: ''}), 0, 'missing SHA');
+  const verify = runBlock(steps(diagJob).find(b => b.header.includes('Verify checkout matches the reviewed SHA')));
+  assert(verify.includes('test "$BUILT_SHA" = "$REVIEWED_SHA"'), 'checkout is re-proven');
 });

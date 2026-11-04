@@ -30,17 +30,30 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const MIGRATIONS_DIR = resolve(HERE, '../migrations');
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const M0029 = '0029_fabric_dispatch_spend.sql';
 
 export function listRepoMigrations(dir = MIGRATIONS_DIR) {
   return readdirSync(dir).filter(f => /^\d{4}_.+\.sql$/.test(f)).sort();
 }
 
+// One ADD COLUMN definition: `name TYPE [NOT NULL] [DEFAULT literal]
+// [REFERENCES t(c)]`. Anything else is not derivable and throws (fail
+// closed): the expected definition must be exact, never guessed.
+const DEF = /^(\w+)\s+(\w+)(\s+NOT\s+NULL)?(?:\s+DEFAULT\s+(-?\d+(?:\.\d+)?|'(?:[^']|'')*'))?(?:\s+REFERENCES\s+\w+\s*\(\s*\w+\s*\))?$/i;
+
 /** ADD COLUMN statements in one migration's SQL (comments stripped). */
 export function addedColumns(sql) {
   const text = sql.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
   const out = [];
-  const re = /ALTER\s+TABLE\s+["`]?(\w+)["`]?\s+ADD\s+(?:COLUMN\s+)?["`]?(\w+)["`]?/gi;
-  for (let m; (m = re.exec(text));) out.push({ table: m[1], column: m[2] });
+  const re = /ALTER\s+TABLE\s+["`]?(\w+)["`]?\s+ADD\s+(?:COLUMN\s+)?([^;]+);/gi;
+  for (let m; (m = re.exec(text));) {
+    const def = m[2].trim().replace(/\s+/g, ' ').replace(/^["`](\w+)["`]/, '$1');
+    const d = DEF.exec(def);
+    if (!d) throw new Error(`cannot derive expected definition for ALTER TABLE ${m[1]} ADD COLUMN ${def}`);
+    out.push({ table: m[1], column: d[1], type: d[2].toUpperCase(), notNull: !!d[3], dflt: d[4] ?? null });
+  }
+  if (/ALTER\s+TABLE/i.test(text) && out.length !== (text.match(/ALTER\s+TABLE/gi) || []).length)
+    throw new Error('unparsed ALTER TABLE statement (fail closed)');
   return out;
 }
 
@@ -56,7 +69,7 @@ export function probeSql(expected) {
   const tables = [...new Set(Object.values(expected).flat().map(c => c.table))].sort();
   if (!tables.length) return null;
   for (const t of tables) if (!IDENT.test(t)) throw new Error(`unsafe table name ${t}`);
-  return tables.map(t => `SELECT '${t}' AS t, name FROM pragma_table_info('${t}')`).join(' UNION ALL ') + ';';
+  return tables.map(t => `SELECT '${t}' AS t, name, type, "notnull" AS nn, dflt_value AS dflt FROM pragma_table_info('${t}')`).join(' UNION ALL ') + ';';
 }
 
 /**
@@ -91,14 +104,27 @@ export function schemaStateDecision({ repoMigrations, expected, journalRows, col
   if (unknown.length) return H(`production journal has migrations unknown to the target: ${unknown.join(', ')}`);
 
   const needsColumns = Object.values(expected || {}).some(c => c.length);
-  const cols = new Set();
+  const cols = new Map();
   if (needsColumns) {
     if (!columnRows) return H('production column state unobservable');
-    if (!columnRows.every(r => r && typeof r.t === 'string' && typeof r.name === 'string'))
+    if (!columnRows.every(r => r && typeof r.t === 'string' && typeof r.name === 'string'
+      && typeof r.type === 'string' && (r.nn === 0 || r.nn === 1)
+      && (r.dflt === null || typeof r.dflt === 'string')))
       return H('production column state malformed');
-    for (const r of columnRows) cols.add(`${r.t}.${r.name}`);
+    for (const r of columnRows) {
+      const k = `${r.t}.${r.name}`;
+      if (cols.has(k)) return H(`ambiguous column state: duplicate ${k}`);
+      cols.set(k, r);
+    }
   }
   const has = c => cols.has(`${c.table}.${c.column}`);
+  // Exact definition: declared type, NOT NULL and default as written.
+  const mismatch = c => {
+    const r = cols.get(`${c.table}.${c.column}`);
+    const want = `${c.type} ${c.notNull ? 'NOT NULL' : 'NULL'} DEFAULT ${c.dflt ?? 'none'}`;
+    const got = `${r.type.toUpperCase()} ${r.nn ? 'NOT NULL' : 'NULL'} DEFAULT ${r.dflt ?? 'none'}`;
+    return want === got ? null : `${c.table}.${c.column} is ${got}, expected ${want}`;
+  };
 
   const pending = repoMigrations.filter(m => !seen.has(m));
   for (const m of repoMigrations) {
@@ -107,6 +133,8 @@ export function schemaStateDecision({ repoMigrations, expected, journalRows, col
       const missing = c.filter(x => !has(x));
       if (missing.length)
         return H(`schema drift: ${m} journaled but columns missing: ${missing.map(x => `${x.table}.${x.column}`).join(', ')}`);
+      const wrong = c.map(mismatch).filter(Boolean);
+      if (wrong.length) return H(`schema drift: ${m} column definition mismatch: ${wrong.join('; ')}`);
     } else if (c.some(has)) {
       return H(`ambiguous schema: ${m} not journaled but its columns exist (out-of-band or partial apply; operator reconciliation required, do not re-run)`);
     }
@@ -114,6 +142,43 @@ export function schemaStateDecision({ repoMigrations, expected, journalRows, col
   if (pending.length)
     return { hold: true, reason: `unapplied migrations (operator must apply before deploy): ${pending.join(', ')}`, pending, applied: names.length };
   return { hold: false, reason: `production schema matches all ${repoMigrations.length} reviewed migrations`, pending: [], applied: names.length };
+}
+
+/**
+ * Sanitized 0029 diagnostic over the two fixed diagnostic reads. Emits only
+ * the verdict, the 0029 journal presence and the two column definitions;
+ * never other column names, raw output or error text (numeric codes only).
+ */
+export function diagnose0029({ expected, journalRows, columnRows, journalErr, columnsErr }) {
+  const want = (expected && expected[M0029]) || [];
+  const codes = t => [...new Set(String(t || '').match(/\b\d{4,5}\b/g) || [])].slice(0, 3);
+  const out = { schema: 'aipster.schema-diagnostic/v1', migration: M0029, verdict: 'UNOBSERVABLE',
+    journal_0029: 'unobservable', columns: null, error_codes: [...codes(journalErr), ...codes(columnsErr)] };
+  if (want.length !== 2) { out.reason = 'expected 0029 definition not derivable'; return out; }
+  if (!journalRows || !journalRows.every(r => r && r.name === M0029) || journalRows.length > 1) {
+    out.reason = 'journal read failed or malformed'; return out;
+  }
+  out.journal_0029 = journalRows.length ? 'present' : 'absent';
+  if (!columnRows || !columnRows.length || !columnRows.every(r => r && r.t === 'fabric_grants' && typeof r.name === 'string'
+    && typeof r.type === 'string' && (r.nn === 0 || r.nn === 1) && (r.dflt === null || typeof r.dflt === 'string'))) {
+    out.reason = 'fabric_grants column read failed, empty or malformed'; return out;
+  }
+  const by = new Map();
+  for (const r of columnRows) { if (by.has(r.name)) { out.reason = 'duplicate column rows'; return out; } by.set(r.name, r); }
+  out.columns = {};
+  let present = 0, exact = 0;
+  for (const c of want) {
+    const r = by.get(c.column);
+    if (!r) { out.columns[c.column] = 'absent'; continue; }
+    present++;
+    const got = `${r.type.toUpperCase()} ${r.nn ? 'NOT NULL' : 'NULL'} DEFAULT ${r.dflt ?? 'none'}`;
+    const ok = got === `${c.type} ${c.notNull ? 'NOT NULL' : 'NULL'} DEFAULT ${c.dflt ?? 'none'}`;
+    if (ok) exact++;
+    out.columns[c.column] = got;
+  }
+  if (out.journal_0029 === 'present') out.verdict = exact === want.length ? 'APPLIED' : 'DRIFT';
+  else out.verdict = present === 0 ? 'NOT_APPLIED' : 'AMBIGUOUS';
+  return out;
 }
 
 /** Baseline hold (auto mode) is preserved and checked before production state. */
@@ -153,8 +218,19 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `hold=${d.hold}\nreason=${reason}\n`);
       console.log((d.hold ? 'HOLD: ' : 'PROCEED: ') + reason);
       console.log(JSON.stringify({ ...d, pending: state.pending || null, applied: state.applied ?? null }));
+    } else if (cmd === 'diagnose') {
+      const a = argMap(rest);
+      if (!a.journal || !a.columns) throw new Error('diagnose requires --journal and --columns');
+      const d = diagnose0029({ expected,
+        journalRows: parseD1Rows(readOrNull(a.journal), Number(a['journal-exit'] ?? 0)),
+        columnRows: parseD1Rows(readOrNull(a.columns), Number(a['columns-exit'] ?? 0)),
+        journalErr: a['journal-stderr'] ? readOrNull(a['journal-stderr']) : '',
+        columnsErr: a['columns-stderr'] ? readOrNull(a['columns-stderr']) : '' });
+      console.log(JSON.stringify(d));
+      if (process.env.GITHUB_STEP_SUMMARY)
+        appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Schema diagnostic (read-only, no deploy)\n\n\`${JSON.stringify(d)}\`\n`);
     } else {
-      throw new Error('usage: migration-state.mjs probe-sql | decide --journal <f> --columns <f> [...]');
+      throw new Error('usage: migration-state.mjs probe-sql | decide ... | diagnose --journal <f> --columns <f> [...]');
     }
   } catch (err) {
     console.error(`ERROR: ${err.message}`);
