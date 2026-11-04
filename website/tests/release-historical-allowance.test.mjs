@@ -384,3 +384,49 @@ test('the allowance PR merge itself must not change the hold registry', async ()
   await assert.rejects(run(harness({registryBlobs: {[BASE]: null}}), A()),
     /differs from mainBase/);
 });
+
+// PR83 owner review 5755949055 (CHANGES_REQUESTED at the superseded head).
+// Diagnosis regression: the allowance defers only evidence binding, never a
+// same-head blocking review. Fixtures mirror the real review's shape; the
+// DISMISSED case models what a working dismissal would return (GitHub
+// replaces the object's state) and is NOT a claim about production.
+const PR83_OWNER_CR = 5755949055;
+const ownerCr = (over = {}) => review(OLD83, 'Blocking: dashboard file picker.',
+  {id: PR83_OWNER_CR, state: 'CHANGES_REQUESTED', submitted_at: '2026-11-03T16:34:12Z', ...over});
+const with83 = (reviews) => prTable({83: {...prTable()[83], reviews}});
+const active = {allowances: allowances(), allowanceDigest: DIGEST};
+
+test('PR83 owner CR 5755949055 refuses even with the allowance active, naming the review', async () => {
+  await assert.rejects(run(harness({table: with83([ownerCr()])}), active),
+    new RegExp(`PR 83 has unresolved changes-requested by synchronic1 at head ${OLD83} \\(review ${PR83_OWNER_CR}\\)`));
+});
+
+test('PR83: only a dismissal of that exact object or a later same-author same-head APPROVED clears it', async () => {
+  const dismissed = await run(harness({table: with83([ownerCr({state: 'DISMISSED'})])}), active);
+  assert.equal(dismissed.ok, true);
+  const approved = await run(harness({table: with83([ownerCr(),
+    review(OLD83, 'Clears my picker request only (landed in PR 104); this head is not a PASS.',
+      {state: 'APPROVED', submitted_at: '2026-11-05T00:00:00Z'})])}), active);
+  assert.equal(approved.ok, true);
+  assert.equal(approved.prs.find((p) => p.number === 83).evidence, 0, 'clearing the CR never makes the old head a PASS');
+  assert(approved.historicalAllowances.some((u) => u.supersededHead?.pr === 83), 'repair chain still applied');
+});
+
+test('PR83: nothing else clears the owner CR', async () => {
+  const later = {submitted_at: '2026-11-05T00:00:00Z'};
+  for (const [label, extra] of [
+    ['comment by the same author', review(OLD83, 'Picker landed in PR 104.', later)],
+    ['approval at a different head', review(R104, 'ok', {state: 'APPROVED', ...later})],
+    ['dismissal of a different object', review(OLD83, 'x', {id: 1, state: 'DISMISSED', ...later})],
+  ]) {
+    await assert.rejects(run(harness({table: with83([ownerCr(), extra])}), active),
+      /PR 83 has unresolved changes-requested/, label);
+  }
+});
+
+test('PR83: clearing the CR does not waive the repair chain evidence', async () => {
+  const t = with83([ownerCr(), review(OLD83, 'Clears picker request.',
+    {state: 'APPROVED', submitted_at: '2026-11-05T00:00:00Z'})]);
+  t[104] = {...t[104], reviews: []};
+  await assert.rejects(run(harness({table: t}), active), /PR 104|repair PR 104/);
+});
