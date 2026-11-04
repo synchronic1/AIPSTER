@@ -46,6 +46,13 @@ function exactKeys(obj, keys, label) {
   assert.deepEqual(got, [...keys].sort(), `${label} has missing or unknown keys`);
 }
 
+// Exact keys with an explicit optional set: absent optional keys keep the
+// original shape byte-for-byte; unknown keys still refuse.
+function exactKeysOpt(obj, keys, optional, label) {
+  assert(obj && typeof obj === 'object' && !Array.isArray(obj), `${label} must be an object`);
+  exactKeys(Object.fromEntries(Object.entries(obj).filter(([k]) => !optional.includes(k))), keys, label);
+}
+
 function shaList(list, label) {
   assert(Array.isArray(list) && list.length > 0, `${label} must be a non-empty list`);
   for (const s of list) assert(SHA_RE.test(s || ''), `${label} entries must be full 40-hex SHAs`);
@@ -60,8 +67,8 @@ export function parseAllowancesFile(json) {
   const out = {};
   for (const [id, e] of Object.entries(json.allowances || {})) {
     assert(ID_RE.test(id), `Allowance id ${id} is malformed`);
-    exactKeys(e, ['liveSha', 'mainBase', 'notAfter', 'registryTouches', 'supersededHeads',
-      'decision', 'markerAuthor'], `Allowance ${id}`);
+    exactKeysOpt(e, ['liveSha', 'mainBase', 'notAfter', 'registryTouches', 'supersededHeads',
+      'decision', 'markerAuthor'], ['priorAllowanceMerges'], `Allowance ${id}`);
     assert(SHA_RE.test(e.liveSha || ''), `Allowance ${id} liveSha must be a full SHA`);
     // mainBase pins the exact main tip the allowance PR merges onto, so the
     // released range can never float to a later tip.
@@ -76,9 +83,30 @@ export function parseAllowancesFile(json) {
       `Allowance ${id} needs a written decision`);
     assert(Array.isArray(e.registryTouches), `Allowance ${id} registryTouches must be a list`);
     if (e.registryTouches.length) shaList(e.registryTouches, `Allowance ${id} registryTouches`);
+    // Optional, exact: merges of EARLIER PRs in range that touched the
+    // allowance file (a superseded allowance). Absent = exactly one toucher.
+    if ('priorAllowanceMerges' in e) shaList(e.priorAllowanceMerges, `Allowance ${id} priorAllowanceMerges`);
     assert(Array.isArray(e.supersededHeads), `Allowance ${id} supersededHeads must be a list`);
     for (const s of e.supersededHeads) {
-      exactKeys(s, ['pr', 'head', 'merge', 'repairedBy', 'reason'], `Allowance ${id} superseded head`);
+      exactKeysOpt(s, ['pr', 'head', 'merge', 'repairedBy', 'reason'], ['blockingReviews'],
+        `Allowance ${id} superseded head`);
+      // Optional, exact: native CHANGES_REQUESTED review objects at this
+      // superseded head that the marker author (the same owner) records as
+      // repaired by the chain because GitHub would not dismiss them. Only
+      // the marker author's own reviews may be named.
+      if ('blockingReviews' in s) {
+        assert(Array.isArray(s.blockingReviews) && s.blockingReviews.length > 0,
+          `Allowance ${id} PR ${s.pr} blockingReviews must be a non-empty list`);
+        for (const b of s.blockingReviews) {
+          exactKeys(b, ['id', 'by'], `Allowance ${id} PR ${s.pr} blocking review`);
+          assert(Number.isSafeInteger(b.id) && b.id > 0, `Allowance ${id} PR ${s.pr} blocking review id invalid`);
+          assert.equal(b.by, e.markerAuthor, `Allowance ${id} PR ${s.pr} may only name the marker author's own reviews`);
+        }
+        assert.equal(new Set(s.blockingReviews.map((b) => b.id)).size, s.blockingReviews.length,
+          `Allowance ${id} PR ${s.pr} blockingReviews has duplicates`);
+        assert(s.blockingReviews.every((b) => s.reason.includes(String(b.id))),
+          `Allowance ${id} PR ${s.pr} reason must name every blocking review id`);
+      }
       assert(Number.isSafeInteger(s.pr) && s.pr > 0, `Allowance ${id} superseded pr must be a number`);
       shaList([s.head, s.merge], `Allowance ${id} superseded head/merge`);
       assert(Array.isArray(s.repairedBy) && s.repairedBy.length > 0,
@@ -111,10 +139,21 @@ export function activeAllowance({allowances, allowanceDigest, mode, dispatchActo
   if (mode !== 'manual') return why('allowances apply to manual dispatch only');
   if (dispatchActor !== PINNED_OWNER) return why('dispatch actor is not the pinned owner');
   if (!/^[a-f0-9]{64}$/.test(allowanceDigest || '')) return why('allowance file digest unavailable');
-  if (allowanceTouchers.length !== 1) {
-    return why(`exactly one PR in range must introduce ${ALLOWANCE_PATH} (found ${allowanceTouchers.length})`);
+  let t;
+  if (!entry.priorAllowanceMerges) {
+    if (allowanceTouchers.length !== 1) {
+      return why(`exactly one PR in range must introduce ${ALLOWANCE_PATH} (found ${allowanceTouchers.length})`);
+    }
+    [t] = allowanceTouchers;
+  } else {
+    // Replacement allowance: the activating PR is the target's own merge;
+    // every other toucher must be exactly the named prior merges.
+    t = allowanceTouchers.find((x) => x.merge === targetSha);
+    const others = allowanceTouchers.filter((x) => x !== t).map((x) => x.merge).sort();
+    if (!t || others.join() !== [...entry.priorAllowanceMerges].sort().join()) {
+      return why(`${ALLOWANCE_PATH} touchers must be the target PR plus exactly ${entry.priorAllowanceMerges.join(', ')} (found ${allowanceTouchers.map((x) => x.merge).join(', ') || 'none'})`);
+    }
   }
-  const [t] = allowanceTouchers;
   if (!(Number.isFinite(now) && now <= Date.parse(entry.notAfter))) {
     return why(`allowance ${id} expired at ${entry.notAfter} (or clock unavailable)`);
   }
@@ -233,8 +272,32 @@ export async function evaluateDeployGate({git, request, fetchChecks,
         `No maintainer acceptance for PR ${pr.number} head ${pr.headSha}`);
       // Acceptance does not erase blocking: an unresolved same-head
       // CHANGES_REQUESTED or structured HOLD refuses this PR too.
-      const state = resolveReviewState({reviews, headSha: pr.headSha,
+      let state = resolveReviewState({reviews, headSha: pr.headSha,
         permissions});
+      // Exact-review deferral: only a native changes-requested object that
+      // a superseded-head entry names (id AND author = marker author). The
+      // state is recomputed without that one object, so any other block
+      // still refuses; the deferral resolves only if the allowance is
+      // proven active and the repair chain carries its own evidence.
+      const blockedHit = state.blocked && state.blocked.via === 'changes-requested'
+        ? supersededEntry(pr, sha) : null;
+      const named = blockedHit && (blockedHit.s.blockingReviews || []).find((b) =>
+        b.id === state.blocked.reviewId && b.by === state.blocked.by
+        && b.by === allowances[blockedHit.id].markerAuthor);
+      if (named) {
+        const rest = resolveReviewState({reviews: reviews.filter((r) => r.id !== named.id),
+          headSha: pr.headSha, permissions});
+        if (!rest.blocked) {
+          let d = deferred.find((x) => x.number === pr.number && x.merge === sha);
+          if (!d) {
+            d = {number: pr.number, head: pr.headSha, merge: sha, ...blockedHit,
+              evidenceError: `unresolved changes-requested by ${named.by} (review ${named.id})`};
+            deferred.push(d);
+          }
+          d.deferredReview = {id: named.id, by: named.by};
+          state = rest;
+        }
+      }
       assert(!state.blocked,
         `PR ${pr.number} has unresolved ${state.blocked?.via} by ${state.blocked?.by} at head ${pr.headSha} (review ${state.blocked?.reviewId})`);
       // Per-PR head CI: the installer workflow is PR-only, so installer
@@ -320,7 +383,8 @@ export async function evaluateDeployGate({git, request, fetchChecks,
         `PR ${d.number} repair PR ${r.pr} head ${r.head} is not merged in this range with its own bound evidence`);
     }
     used.push({allowance: d.id, supersededHead: {pr: d.number, head: d.head,
-      repairedBy: d.s.repairedBy}});
+      repairedBy: d.s.repairedBy,
+      ...(d.deferredReview ? {deferredBlockingReview: d.deferredReview} : {})}});
   }
   // Fresh trusted hold governs before any production step: any active
   // GLOBAL hold, or any active hold on an ancestor-or-self of the target

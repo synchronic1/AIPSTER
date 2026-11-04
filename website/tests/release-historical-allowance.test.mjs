@@ -430,3 +430,59 @@ test('PR83: clearing the CR does not waive the repair chain evidence', async () 
   t[104] = {...t[104], reviews: []};
   await assert.rejects(run(harness({table: t}), active), /PR 104|repair PR 104/);
 });
+
+// Replacement-allowance remedy (fixtures only): exact named review deferral
+// plus an exact prior-allowance-toucher list. Both optional fields are off
+// by default; every test above runs without them unchanged.
+const PRIOR_H = '7e'.repeat(20);
+const PRIOR_M = '7f'.repeat(20);
+const named83 = (over = {}) => ({...entry().supersededHeads[0],
+  reason: `Owner review ${PR83_OWNER_CR} required the picker; repaired in-range by PR 104.`,
+  blockingReviews: [{id: PR83_OWNER_CR, by: 'synchronic1'}], ...over});
+const replacement = (s83 = named83(), over = {}) => allowances({
+  supersededHeads: [s83, entry().supersededHeads[1]], ...over});
+const activeR = (s83, over) => ({allowances: replacement(s83, over), allowanceDigest: DIGEST});
+
+test('named owner CR at the superseded head defers only with the allowance active and records it', async () => {
+  const out = await run(harness({table: with83([ownerCr()])}), activeR());
+  assert.equal(out.ok, true);
+  const u = out.historicalAllowances.find((x) => x.supersededHead?.pr === 83);
+  assert.deepEqual(u.supersededHead.deferredBlockingReview, {id: PR83_OWNER_CR, by: 'synchronic1'});
+  assert.equal(out.prs.find((p) => p.number === 83).evidence, 0, 'old head is never called PASS');
+  await assert.rejects(run(harness({table: with83([ownerCr()])}), {...activeR(), now: Date.parse('2026-12-01T00:00:00Z')}),
+    /allowance inactive: allowance RELEASE158-8bcd4c7 expired/);
+  const auto = harness({table: with83([ownerCr()])}); auto.mode = 'auto';
+  await assert.rejects(run(auto, activeR()), /allowance inactive: allowances apply to manual dispatch only/);
+});
+
+test('named deferral is exact: other ids, other blockers and missing repair evidence still refuse', async () => {
+  await assert.rejects(run(harness({table: with83([ownerCr({id: 42})])}), activeR()), /PR 83 has unresolved changes-requested/);
+  // A later, unnamed CR object by the same owner is the live block: it refuses.
+  const second = review(OLD83, 'Also blocking.', {id: 77, state: 'CHANGES_REQUESTED',
+    submitted_at: '2026-11-03T17:00:00Z'});
+  await assert.rejects(run(harness({table: with83([ownerCr(), second])}), activeR()), /PR 83 has unresolved/);
+  const t = with83([ownerCr()]); t[104] = {...t[104], reviews: []};
+  await assert.rejects(run(harness({table: t}), activeR()), /104/);
+  const t88 = prTable({88: {...prTable()[88], reviews: [review(OLD88, 'x', {id: PR83_OWNER_CR + 1, state: 'CHANGES_REQUESTED'})]}});
+  await assert.rejects(run(harness({table: t88}), activeR()), /PR 88 has unresolved/, 'naming is per superseded head');
+});
+
+test('blockingReviews parsing is strict', () => {
+  assert.throws(() => replacement(named83({blockingReviews: [{id: PR83_OWNER_CR, by: 'someone'}]})), /marker author's own reviews/);
+  assert.throws(() => replacement(named83({reason: 'Repaired in-range by PR 104 and others, long enough.'})), /must name every blocking review id/);
+  assert.throws(() => replacement(named83({blockingReviews: []})), /non-empty/);
+  assert.throws(() => replacement(named83({blockingReviews: [{id: PR83_OWNER_CR, by: 'synchronic1', note: 'x'}]})), /unknown keys/);
+  assert.throws(() => replacement(named83({waive: true})), /unknown keys/);
+});
+
+test('replacement allowance needs the exact prior-toucher list; default stays exactly-one', async () => {
+  const prior = {112: {head: PRIOR_H, merge: PRIOR_M, reviews: [review(PRIOR_H, evidenceBody(PRIOR_H))],
+    files: [ALLOWANCE_PATH, 'website/scripts/release-deploy-gate.mjs']}};
+  const order = [MALLOW, PRIOR_M, M104, M99, M98, M97, M88, M83];
+  const h2 = () => harness({table: {...with83([ownerCr()]), ...prior}, order});
+  await assert.rejects(run(h2(), activeR()), /exactly one PR in range must introduce .*found 2/);
+  const ok = await run(h2(), activeR(undefined, {priorAllowanceMerges: [PRIOR_M]}));
+  assert.equal(ok.ok, true);
+  await assert.rejects(run(h2(), activeR(undefined, {priorAllowanceMerges: [h('1')]})), /touchers must be the target PR plus exactly/);
+  assert.throws(() => replacement(named83(), {priorAllowanceMerges: []}), /non-empty/);
+});
