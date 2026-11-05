@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { evaluateReadiness, loadRepoExpectations, parseJsonc } from '../scripts/verify-production-readiness.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -135,7 +135,7 @@ test('CLI exit codes: READY 0, HOLD 1, usage 2; no network', () => {
   // Any network attempt would throw via the preloaded guard.
   const guard = join(dir, 'guard.mjs');
   writeFileSync(guard, "globalThis.fetch = () => { throw new Error('network forbidden'); };");
-  const exec = args => spawnSync(process.execPath, ['--import', guard, SCRIPT, ...args], { encoding: 'utf8' });
+  const exec = args => spawnSync(process.execPath, ['--import', pathToFileURL(guard).href, SCRIPT, ...args], { encoding: 'utf8' });
   const a = exec(['--evidence', ok, '--candidate', CAND]);
   assert.equal(a.status, 0, a.stdout + a.stderr); assert.equal(JSON.parse(a.stdout).verdict, 'READY');
   const b = exec(['--evidence', hold, '--candidate', CAND]);

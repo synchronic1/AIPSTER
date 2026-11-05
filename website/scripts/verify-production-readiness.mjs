@@ -59,8 +59,8 @@ export function loadRepoExpectations(websiteDir = resolve(HERE, '..')) {
   };
 }
 
-// Effective value as the runtime code parses it (muse-provider.mjs,
-// dgm/router.mjs, worker.js): flags are on only when exactly '1'; the spend
+// Effective value as the runtime code parses it (src/dgm/muse-provider.mjs,
+// src/dgm/router.mjs, src/worker.js): flags are on only when exactly '1'; the spend
 // cap is a finite non-negative number, otherwise 0.
 function flagOn(v) { return v === '1'; }
 function capUsd(v) {
