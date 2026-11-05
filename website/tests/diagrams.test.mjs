@@ -180,3 +180,19 @@ test('README embeds each diagram, with Fig. 1 beside the research diagram', asyn
   assert.ok(!readme.includes('website/public/assets/IRB-DGM'), 'Fig. 1 comes from the repository copy');
   await readFile(resolve(import.meta.dirname, '..', '..', 'assets', 'IRB-DGM-JEV-component-flow.png'));
 });
+
+test('every README image points at a file in the repository', async () => {
+  const root = resolve(import.meta.dirname, '..', '..');
+  const readme = await readFile(resolve(root, 'README.md'), 'utf8');
+  const paths = [...readme.matchAll(/!\[[^\]]*\]\(([^)\s]+)\)/g), ...readme.matchAll(/<img\b[^>]*\bsrc="([^"]+)"/g)]
+    .map(m => m[1]).filter(path => !/^https?:/.test(path));
+  for (const path of ['assets/screenshots/landing-1440-light.png', 'assets/screenshots/landing-1440-dark.png', 'assets/screenshots/landing-390-light.png'])
+    assert.ok(paths.includes(path), `README shows ${path}`);
+  assert.ok(readme.indexOf('## The site') < readme.indexOf('## Live demo'), 'the current screenshots come first');
+  for (const path of paths) {
+    assert.ok(!path.startsWith('/') && !path.includes('..'), `${path} is repository-relative`);
+    const bytes = await readFile(resolve(root, path));
+    assert.ok(bytes.length > 0, `${path} is not empty`);
+  }
+  assert.ok(paths.length >= 10, `found ${paths.length} images`);
+});

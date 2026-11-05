@@ -1,5 +1,20 @@
 # AIPSTER
 
+## The site
+
+What the landing page at [aipster.net](https://aipster.net/) looks like with the
+current design: the intro video, the hero with a static slice of the control
+panel, and the "How it would work" diagram. Captured 2026-11-05 from a local build
+of commit `5a09cf4` with motion settled; the landing page files are unchanged
+through `f5b4572`, the build live at aipster.net on 2026-11-05. The Overview slice
+is the seeded demo account, not live data.
+
+![The AIPSTER landing page at 1440 px, light theme: sponsor strip and navigation, the v0.2 intro video beside its description, the hero "Now you're the ISP" with the Open the control panel button, a static Overview slice of the seeded demo account (1 resource, 0 reachable, 12 requests, rate not measured), and the How it would work diagram of four owner-controlled steps.](assets/screenshots/landing-1440-light.png)
+
+![The same landing page at 1440 px in the dark theme: dark green surfaces with copper accents, the intro video, the hero and demo Overview slice, and the How it would work diagram.](assets/screenshots/landing-1440-dark.png)
+
+<img src="assets/screenshots/landing-390-light.png" width="320" alt="The landing page on a 390 px phone screen, light theme: the sponsor strip, the wordmark with a Sign in button, the intro video and its description, then the hero headline, summary and full-width Open the control panel and Explore the direction buttons.">
+
 ## Live demo (verified 2026-10-31)
 
 **Working build:** [https://aipster.net/](https://aipster.net/). Per the release
