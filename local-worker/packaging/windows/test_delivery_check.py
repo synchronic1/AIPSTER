@@ -370,9 +370,11 @@ BAD_PORT_ZERO = BAD_PORT_HI.replace("port = 99999", "port = 0")
 
 def make_app(path, *, with_tray=True, build=True):
     path.mkdir(parents=True, exist_ok=True)
-    names = ["aipster-worker.exe", "dendrite.exe", "BUILD.json", "default.toml"]
+    # The checker's own platform-specific payload names (.exe on Windows,
+    # extensionless aipster-* on Linux), so this fixture never drifts from it.
+    names = [n for n in delivery_check.REQUIRED_APP_FILES if n != delivery_check.TRAY_EXE]
     if with_tray:
-        names = ["aipster-tray.exe"] + names
+        names = [delivery_check.TRAY_EXE] + names
     for name in names:
         (path / name).write_bytes(b"synthetic-" + name.encode())
     if build:
