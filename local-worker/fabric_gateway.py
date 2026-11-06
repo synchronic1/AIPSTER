@@ -33,6 +33,7 @@ Standard library only.
 import argparse
 import errno
 import json
+import math
 import os
 import signal
 import socket
@@ -79,6 +80,9 @@ class GatewayConfig(object):
         object.__setattr__(self, "enabled", enabled is True)
         object.__setattr__(self, "fabric_origin", fabric_origin if isinstance(fabric_origin, str) else "")
         object.__setattr__(self, "port", port)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+                or not math.isfinite(timeout):
+            raise GatewayStartError("bad_timeout")
         object.__setattr__(self, "timeout", min(max(float(timeout), 1.0), 60.0))
 
     def __setattr__(self, name, value):
@@ -164,6 +168,9 @@ class FabricGateway(object):
         with self._lock:
             server, thread = self._server, self._thread
             self._server = self._thread = None
+            # An explicit stop is a fresh baseline: a previous failed start
+            # must not keep reporting "failed" once the caller has stopped.
+            self._last_error = None
             if server is not None:
                 server.shutdown()
                 server.server_close()

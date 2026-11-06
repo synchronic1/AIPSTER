@@ -188,6 +188,23 @@ class LifecycleTests(GatewayBase):
         self.assertEqual(g.stop()["state"], "stopped")  # idempotent
         self.assertTrue(g.start()["listening"])  # restartable on the same port
 
+    def test_stop_clears_failed_start_error(self):
+        g = self.gateway(fabric_origin="http://fabric.example")
+        with self.assertRaises(gw.GatewayStartError):
+            g.start()
+        self.assertEqual(g.status()["state"], "failed")
+        st = g.stop()
+        self.assertEqual((st["state"], st["last_error"], st["listening"]), ("stopped", None, False))
+
+    def test_bad_timeout_is_a_typed_refusal(self):
+        for bad in ("30", None, True, float("nan"), float("inf"), [], object()):
+            with self.assertRaises(gw.GatewayStartError) as ctx:
+                gw.GatewayConfig(timeout=bad)
+            self.assertEqual(ctx.exception.code, "bad_timeout", bad)
+        self.assertEqual(gw.GatewayConfig(timeout=0).timeout, 1.0)
+        self.assertEqual(gw.GatewayConfig(timeout=600).timeout, 60.0)
+        self.assertEqual(gw.GatewayConfig(timeout=5).timeout, 5.0)
+
     def test_status_never_carries_credentials(self):
         g = self.gateway()
         port = g.start()["port"]
