@@ -232,9 +232,15 @@ async function classifyRefusal(db, tenant, win, tokWin, totalTokens, spendMicro,
  * settled-replay; throws 402/409/429 otherwise. Never double-charges, never
  * refunds, never fails open.
  */
+export async function assertQualKeyNotRetired(db, tenant, opKey) {
+  const row = await first(db, "SELECT record_key FROM qualification_retired_records WHERE owner_id=? AND kind='recommendation' AND record_key=?", tenant, opKey);
+  if (row) throw httpError(409, 'This qualification operation belongs to a retired worker.', 'QUAL_OPERATION_RETIRED');
+}
+
 export async function claimQualOp(db, tenant, nodeId, profileDigest, opKey, digest, { inputTokens = 0, outputTokens = QUAL_OUTPUT_MAX_TOKENS, spendMicro = 0, mode = 'fixture', env = null, clock = null } = {}) {
   const found = await existingOp(db, tenant, opKey);
   if (found) return fromRow(found, digest);
+  await assertQualKeyNotRetired(db, tenant, opKey);
   const live = mode === 'live';
   const at = typeof clock === 'function' ? clock() : new Date();
   const win = live ? qualWindow(at) : qualFixtureWindow(at);
@@ -249,7 +255,9 @@ export async function claimQualOp(db, tenant, nodeId, profileDigest, opKey, dige
       + 'SELECT ?, ?, ?, ?, ?, ?, ?, ?, \'reserved\', NULL, ?, ? '
       // SUM (not a bare column) so an empty bucket yields one NULL row that
       // COALESCE turns into 0 instead of an empty set that voids the gate.
-      + 'WHERE NOT EXISTS (SELECT 1 FROM qualification_recommendations WHERE owner_id = ? AND op_key = ?) '
+      + 'WHERE EXISTS (SELECT 1 FROM resources r JOIN "user" u ON u.id=r.owner_id WHERE r.id=? AND r.owner_id=? AND u.disabled=0) '
+      + "AND NOT EXISTS (SELECT 1 FROM qualification_retired_records WHERE owner_id=? AND kind='recommendation' AND record_key=?) "
+      + 'AND NOT EXISTS (SELECT 1 FROM qualification_recommendations WHERE owner_id = ? AND op_key = ?) '
       // Same identity already inflight under another key: wait, never duplicate.
       + 'AND NOT EXISTS (SELECT 1 FROM qualification_recommendations WHERE owner_id = ? AND node_id = ? AND profile_digest = ? AND catalog_version = ? AND prompt_version = ? AND mode = ? AND state IN (\'reserved\',\'fetching\')) '
       // Same identity already settled under another key: a delivery or an
@@ -264,7 +272,7 @@ export async function claimQualOp(db, tenant, nodeId, profileDigest, opKey, dige
       + 'AND (? = 0 OR (SELECT COALESCE(SUM(usd_micro), 0) FROM qualification_spend WHERE owner_id = ?) + ? <= ?) '
       + 'AND (? = 0 OR (SELECT COALESCE(SUM(usd_micro), 0) FROM qualification_spend WHERE owner_id = ?) + ? <= ?)',
     ).bind(tenant, nodeId, profileDigest, QUAL_CATALOG_VERSION, QUAL_PROMPT_VERSION, mode, opKey, digest, created, created,
-      tenant, opKey,
+      nodeId, tenant, tenant, opKey, tenant, opKey,
       tenant, nodeId, profileDigest, QUAL_CATALOG_VERSION, QUAL_PROMPT_VERSION, mode,
       tenant, nodeId, profileDigest, QUAL_CATALOG_VERSION, QUAL_PROMPT_VERSION, mode,
       tenant, nodeId, profileDigest, QUAL_CATALOG_VERSION, QUAL_PROMPT_VERSION, mode,
@@ -297,6 +305,9 @@ export async function claimQualOp(db, tenant, nodeId, profileDigest, opKey, dige
   }
   const again = await existingOp(db, tenant, opKey);
   if (again) return fromRow(again, digest);
+  await assertQualKeyNotRetired(db, tenant, opKey);
+  const resource = await first(db, 'SELECT r.id FROM resources r JOIN "user" u ON u.id=r.owner_id WHERE r.id=? AND r.owner_id=? AND u.disabled=0', nodeId, tenant);
+  if (!resource) throw httpError(404, 'Resource not found or not yours.', 'RESOURCE_NOT_FOUND');
   const identity = { nodeId, profileDigest, mode };
   const inflight = await findInflight(db, tenant, identity);
   if (inflight) return { outcome: 'in-progress' };

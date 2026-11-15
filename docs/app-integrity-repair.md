@@ -1,0 +1,15 @@
+# App integrity repair and qualification retirement
+
+## Upgrade and API contract
+
+Migration 0032 enforces at most one active direct grant per resource and grantee. It reconciles only duplicate active groups. The oldest matching-owner, same-sandbox active grant survives when any is valid; all remaining duplicate rows become revoked. Existing individually revoked rows are not reopened. The survivor's effective remaining jobs and tokens are bounded by the most restrictive old remaining allowance including net refunds; historical gross usage, refund receipts, grant IDs and existing foreign references stay intact. If no valid survivor exists, retire the whole duplicate group. Each duplicate row receives an internal migration audit record. Reconciliation can reduce available quota and prevents stacking concurrent active grants, not create more authority. Owner-controlled revoke and a subsequent explicitly new grant retain their existing meanings.
+
+Direct grants and keys use one guarded transactional D1 batch each: audit intent marker, state change, and the creation-only write debit. A duplicate or concurrency loser commits none, and revocation remains idempotent and possible when the hourly budget is exhausted. A failed audit, write, debit or constraint is not a successful mutation. Untouched provisioning/pairing endpoints are not redefined by this migration.
+
+Owned inventory responses are unchanged. Direct inventory detail for a currently granted non-owner exposes only resource ID, public-to-that-grantee label, and kind. Operating details, capability and liveness telemetry, private limits, provenance and credits stay in the owner response. This does not add inventory visibility to federated dispatch grants or change the separate shared grant and routing contracts.
+
+## Worker retirement and accounting
+
+Owner-authorized teardown archives private owner-bound recommendation, cache, and benchmark rows before removing their resource foreign-key references. The scoped deletion and archive/audit operations are in the same transaction. A prior queued assignment is marked closed; a previously reserved/fetching recommendation or leased/uncertain run is retained as outcome uncertain, not considered a success, refunded, or sent again. Completed historical rows retain their original sanitized receipts. The archive has no normal product API and does not reappear in the active qualification panel. The qualification spend ledger and counters are unchanged. Retired recommendation keys are retained as nonreplayable tombstones even if the same owner creates another worker.
+
+An already admitted in-flight provider operation cannot be recalled by deleting its worker. The surviving accounting remains authoritative. No stale active lease, assignment, or cache can be replayed once the resource is gone. Archive access, retention horizon and destruction policies are not asserted by this change: do not expose archived payloads or prune them automatically without the corresponding policy. Apply migrations and run the exact candidate's real-D1 checks before release; no remote database operations are covered by the local test record.

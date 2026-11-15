@@ -81,6 +81,13 @@ export function cardFor(r, ownerName, nowMs = Date.now()) {
   };
 }
 
+// A shared resource ID is discoverable under a live grant, not an owner
+// inventory card. Explicit allowlist; operations, provider metadata and
+// private telemetry must stay out even if the owner card expands.
+export function sharedCardFor(r) {
+  return { id: r.id, name: r.name, kind: r.kind };
+}
+
 export function mapGrant(g) {
   return {
     id: g.id, resourceId: g.resource_id, ownerId: g.owner_id, granteeId: g.grantee_id,
