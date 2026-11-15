@@ -5,10 +5,12 @@
 // /app* and /admin* -> panel assets, everything else -> ASSETS (landing page
 // preserved byte-for-byte).
 import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
-import { all, first, run, pageQuery, cardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, rid16, nowIso } from './lib/store.js';
+import { all, first, run, pageQuery, cardFor, sharedCardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, rid16, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET, MAX_BODY_BYTES } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_GRANTS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, MAX_ASSET_FILES_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, MAX_ASSET_FILES_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { createAppGrant, createAppKey, revokeAppEntry } from './lib/app-mutations.js';
+import { qualificationRetirementStatements } from './qualification/retirement.mjs';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
 import { handleAdmin } from './admin/router.mjs';
 import { dgmPreviewEnabled } from './dgm/router.mjs';
@@ -887,7 +889,8 @@ async function handleApi(request, env, url) {
       if (!r) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
       if (r.owner_id !== me()) {
         const g = await first(db, 'SELECT * FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', r.id, me());
-        if (!g || !(await grantPartiesSameSide(db, g))) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+        if (!g || g.owner_id !== r.owner_id || !(await grantPartiesSameSide(db, g))) return json(404, { error: 'Resource not found or not shared with you.', code: 'NOT_FOUND' });
+        return json(200, sharedCardFor(r));
       }
       return json(200, cardFor(r, await ownerName(db, r.owner_id)));
     }
@@ -914,6 +917,9 @@ async function handleApi(request, env, url) {
       const now = nowIso();
       const owned = `EXISTS(SELECT 1 FROM resources r JOIN "user" u ON u.id = r.owner_id WHERE r.id = ? AND r.owner_id = ? AND u.disabled = 0)`;
       const deleted = await db.batch([
+        db.prepare(`INSERT INTO audit(id,at,actor_id,action,target,detail)
+          SELECT ?,?,?,'resource.delete',?,'' WHERE ${owned}`).bind(rid16('a_'), now, me(), r.id, r.id, me()),
+        ...qualificationRetirementStatements(db, r.id, me(), now),
         db.prepare(`DELETE FROM node_capabilities WHERE node_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM catalog_reservations WHERE node_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM jobs WHERE (resource_id = ? OR grant_id IN (SELECT id FROM grants WHERE resource_id = ?)) AND ${owned}`).bind(r.id, r.id, r.id, me()),
@@ -928,9 +934,8 @@ async function handleApi(request, env, url) {
           WHERE resource_id = ? AND status IN ('queued', 'leased') AND ${owned}`).bind(now, r.id, r.id, me()),
         db.prepare(`DELETE FROM dispatch_admissions WHERE resource_id = ? AND ${owned}`).bind(r.id, r.id, me()),
         db.prepare(`DELETE FROM resources WHERE id = ? AND owner_id = ? AND EXISTS(SELECT 1 FROM "user" WHERE id = ? AND disabled = 0)`).bind(r.id, me(), me()),
-        db.prepare(`INSERT INTO audit (id, at, actor_id, action, target, detail) SELECT ?, ?, ?, 'resource.delete', ?, '' WHERE changes() = 1`).bind(rid('a_'), now, me(), r.id)
       ]);
-      if (Number(deleted[9].meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
+      if (Number(deleted.at(-1).meta.changes) !== 1) return json(404, { error: 'Resource not found or not yours.', code: 'NOT_FOUND' });
       return json(200, { ok: true });
     }
   }
@@ -1283,16 +1288,8 @@ async function handleApi(request, env, url) {
     const maxTokens = Math.floor(Number(body.maxTokens));
     if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 10000) return json(400, { error: 'maxJobs must be 1..10000.', code: 'BAD_QUOTA' });
     if (!Number.isSafeInteger(maxTokens) || maxTokens < 100 || maxTokens > 10000000) return json(400, { error: 'maxTokens must be 100..10000000.', code: 'BAD_QUOTA' });
-    const existing = await first(db, 'SELECT id FROM grants WHERE resource_id = ? AND grantee_id = ? AND revoked_at IS NULL', resource.id, grantee.id);
-    if (existing) return json(409, { error: 'An active grant already exists for this user and resource.', code: 'GRANT_EXISTS' });
-    await checkWriteBudget(db, me());
-    const id = rid('g_');
-    const gc = await run(db, `INSERT INTO grants (id, resource_id, owner_id, grantee_id, max_jobs, max_tokens, used_jobs, used_tokens, inference_only, created_at, revoked_at)
-      SELECT ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, NULL WHERE (SELECT COUNT(*) FROM grants WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_GRANTS_PER_USER}`,
-      id, resource.id, me(), grantee.id, maxJobs, maxTokens, nowIso(), me());
-    assertClaimed(gc, 'grant');
-    await audit(db, me(), 'grant.create', id, `${resource.id} -> ${grantee.email}`);
-    return json(201, mapGrantLite(await first(db, 'SELECT * FROM grants WHERE id = ?', id)));
+    const created = await createAppGrant(db, { owner: me(), resource: resource.id, grantee, maxJobs, maxTokens });
+    return json(201, mapGrantLite(created));
   }
   // Fabric adviser (flag-gated). Authorization precedes routing: anonymous
   // callers get 401 even when the flag is off, so the flag is not an oracle.
@@ -1329,11 +1326,9 @@ async function handleApi(request, env, url) {
     const m = /^\/api\/grants\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (m && method === 'DELETE') {
       const d = needSession() || needCsrf(); if (d) return deny(d);
-      const g = await first(db, 'SELECT * FROM grants WHERE id = ? AND owner_id = ?', m[1], me());
-      if (!g) return json(404, { error: 'Grant not found or not yours.', code: 'NOT_FOUND' });
-      if (g.revoked_at) return json(200, { ok: true });
-      await run(db, 'UPDATE grants SET revoked_at = ? WHERE id = ?', nowIso(), g.id);
-      await audit(db, me(), 'grant.revoke', g.id);
+      if (!await revokeAppEntry(db, 'grant', me(), m[1])) {
+        return json(404, { error: 'Grant not found or not yours.', code: 'NOT_FOUND' });
+      }
       return json(200, { ok: true });
     }
   }
@@ -2951,27 +2946,23 @@ async function handleApi(request, env, url) {
     }
     const metadata = isDemo() ? 'sandbox: demo-only credential' : (body.metadata !== undefined ? String(body.metadata).slice(0, 500) : '');
     const keyPrefix = isDemo() ? DEMO_KEY_PREFIX : KEY_PREFIX;
-    await checkWriteBudget(db, me());
     const { id, secret, short } = mintKey(keyPrefix);
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const salt = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    const kc = await run(db, `INSERT INTO key_verifiers (id, owner_id, name, scope, resource_id, salt, verifier, prefix, expires_at, metadata, created_at, last_used_at, revoked_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL WHERE (SELECT COUNT(*) FROM key_verifiers WHERE owner_id = ? AND revoked_at IS NULL) < ${MAX_KEYS_PER_USER}`,
-      id, me(), body.name.trim(), body.scope, heartbeatResourceId, salt, await verifierFor(secret, salt), keyPrefix + id + '_' + short, expiresAt, metadata, nowIso(), me());
-    assertClaimed(kc, 'key');
-    await audit(db, me(), 'key.create', id, body.scope === 'heartbeat' ? `heartbeat:${heartbeatResourceId}` : body.scope);
-    const row = await first(db, 'SELECT * FROM key_verifiers WHERE id = ?', id);
+    const row = await createAppKey(db, {
+      id, owner: me(), demo: isDemo() ? 1 : 0, name: body.name.trim(), scope: body.scope,
+      resource: heartbeatResourceId, salt, verifier: await verifierFor(secret, salt),
+      prefix: keyPrefix + id + '_' + short, expiresAt, metadata,
+    });
     return json(201, { ...publicKey(mapKeyRow(row)), secret, oneTime: 'This secret is shown once. It cannot be recovered.' });
   }
   {
     const m = /^\/api\/keys\/([A-Za-z0-9_-]{1,64})$/.exec(path);
     if (m && method === 'DELETE') {
       const d = needSession() || needCsrf(); if (d) return deny(d);
-      const k = await first(db, 'SELECT id, revoked_at FROM key_verifiers WHERE id = ? AND owner_id = ?', m[1], me());
-      if (!k) return json(404, { error: 'Key not found or not yours.', code: 'NOT_FOUND' });
-      if (k.revoked_at) return json(200, { ok: true });
-      await run(db, 'UPDATE key_verifiers SET revoked_at = ? WHERE id = ?', nowIso(), m[1]);
-      await audit(db, me(), 'key.revoke', m[1]);
+      if (!await revokeAppEntry(db, 'key', me(), m[1])) {
+        return json(404, { error: 'Key not found or not yours.', code: 'NOT_FOUND' });
+      }
       return json(200, { ok: true });
     }
   }

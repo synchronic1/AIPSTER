@@ -27,6 +27,7 @@ const appSchema = {
   pairing_codes: 'id owner_id salt verifier created_at expires_at used_at attempts node_id resource_id',
   idempotency_keys: 'owner_id key resource_id created_at',
   routing_refunds: 'reservation_id grant_id jobs tokens created_at',
+  qualification_retired_records: 'owner_id node_id kind record_key prior_state disposition record_json retired_at',
 };
 
 const federationSchema = {

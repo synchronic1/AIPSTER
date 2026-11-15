@@ -24,7 +24,8 @@ test('real local D1: federation upgrade preserves main signup budget and identit
     '0028_dgm_muse_spend.sql',
     '0029_fabric_dispatch_spend.sql',
     '0030_qualification.sql',
-    '0031_dgm_self_test.sql'
+    '0031_dgm_self_test.sql',
+    '0032_grants_qualification_teardown.sql'
   ]);
   const mf = new Miniflare(convertV4MiniflareOptions({ modules: true,
     script: 'export default {fetch(){return new Response("synthetic upgrade")}}',

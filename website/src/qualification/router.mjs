@@ -12,7 +12,7 @@ import { qualificationLiveEnabled } from './constants.mjs';
 import { canonicalProfileDigest, eligibleCatalog, normalizeProfile } from './profile.mjs';
 import { checkQualificationBody, validateProviderAdvice, validateWorkerResultReport } from './validate.mjs';
 import {
-  claimQualOp, findCache, findUncertain, markQualOp, qualSpendCapUsd,
+  assertQualKeyNotRetired, claimQualOp, findCache, findUncertain, markQualOp, qualSpendCapUsd,
   saveCache, sweepQualStale,
 } from './admission.mjs';
 import { preflightLiveRequest, runFixture, runLive } from './provider.mjs';
@@ -56,6 +56,7 @@ export async function handleQualificationPost({ db, env, ownerId, resourceId, bo
   const key = opKey || rid('qop_');
   const resource = await first(db, 'SELECT * FROM resources WHERE id = ? AND owner_id = ?', resourceId, ownerId);
   if (!resource) throw httpError(404, 'Resource not found or not yours.', 'RESOURCE_NOT_FOUND');
+  await assertQualKeyNotRetired(db, ownerId, key);
   const caps = await first(db, 'SELECT * FROM node_capabilities WHERE node_id = ?', resourceId);
   if (!caps) throw httpError(409, 'No capability snapshot for this node yet; the worker must report first.', 'QUAL_NO_SNAPSHOT');
   const profile = normalizeProfile(caps);
@@ -139,7 +140,10 @@ export async function handleQualificationPost({ db, env, ownerId, resourceId, bo
     throw httpError(409, 'This operation is already running. Retry shortly with the same key.', 'OP_IN_PROGRESS');
   }
   const t0 = Date.now();
-  await markQualOp(db, ownerId, key, ['reserved'], 'fetching');
+  if (!await markQualOp(db, ownerId, key, ['reserved'], 'fetching')) {
+    await assertQualKeyNotRetired(db, ownerId, key);
+    throw httpError(409, 'Qualification admission is no longer active.', 'OP_IN_PROGRESS');
+  }
   try {
     let advice;
     let out = {};
@@ -153,9 +157,13 @@ export async function handleQualificationPost({ db, env, ownerId, resourceId, bo
     }
     const elapsedMs = Date.now() - t0;
     const receipt = receiptFor({ key, live, out, elapsedMs, replay: false, env });
-    await db.prepare(
-      'UPDATE qualification_recommendations SET state = ?, advice_json = ?, receipt_json = ?, updated_at = ? WHERE owner_id = ? AND op_key = ?',
+    const delivered = await db.prepare(
+      "UPDATE qualification_recommendations SET state = ?, advice_json = ?, receipt_json = ?, updated_at = ? WHERE owner_id = ? AND op_key = ? AND state = 'fetching'",
     ).bind('delivered', JSON.stringify(advice), JSON.stringify(receipt), new Date().toISOString(), ownerId, key).run();
+    if (Number(delivered.meta.changes) !== 1) {
+      await assertQualKeyNotRetired(db, ownerId, key);
+      throw httpError(409, 'Qualification admission is no longer active.', 'OP_IN_PROGRESS');
+    }
     await saveCache(db, ownerId, { ...identity, adviceJson: JSON.stringify(advice), receiptJson: JSON.stringify(receipt) });
     const assignment = await ensureAssignment(db, { ownerId, resourceId, digest, advice, mode });
     return { status: 200, body: { advice, assignment, receipt, replay: false } };
