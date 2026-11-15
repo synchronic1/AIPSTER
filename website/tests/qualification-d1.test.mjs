@@ -35,6 +35,11 @@ async function freshDb(name) {
   return { inst, db: handle };
 }
 
+async function seedResource(ownerId, resourceId, now) {
+  await db.prepare('INSERT INTO resources (id, owner_id, name, kind, origin, cpu, gpu, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .bind(resourceId, ownerId, 'n', 'local', 'local', 'cpu', 'gpu', now).run();
+}
+
 before(async () => {
   ({ inst: mf, db } = await freshDb('qual-d1-test'));
   const now = new Date().toISOString();
@@ -83,11 +88,12 @@ test('real D1: concurrent same-key claims admit exactly once', async () => {
 
 test('real D1: concurrent distinct keys share one request budget', async () => {
   const env = { QUAL_OWNER_PER_HOUR: '1', QUAL_GLOBAL_PER_HOUR: '100' };
+  await seedResource('u3', 'r3', new Date().toISOString());
   const { qualWindow } = await import('../src/qualification/admission.mjs');
   const win = qualWindow(new Date());
   const reqCount = async () => (await db.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind('u3', win).first())?.count ?? 0;
   const before = await reqCount();
-  const mk = (k) => claimQualOp(db, 'u3', 'r1', `d-cap-${k}`, k, `d-cap-${k}`, { env, mode: 'live' }).then((r) => r.outcome, (e) => e.code);
+  const mk = (k) => claimQualOp(db, 'u3', 'r3', `d-cap-${k}`, k, `d-cap-${k}`, { env, mode: 'live' }).then((r) => r.outcome, (e) => e.code);
   const out = await Promise.all([mk('k-cap-a'), mk('k-cap-b')]);
   assert.ok(out.includes('claimed'), `one winner, got ${out}`);
   assert.ok(out.includes('QUAL_OWNER_QUOTA'), `loser quota-refused, got ${out}`);
@@ -99,6 +105,7 @@ test('real D1: concurrent distinct keys share one request budget', async () => {
 test('real D1: fixture claims use a separate owner bucket, never live/global', async () => {
   const now = new Date().toISOString();
   await db.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, createdAt, updatedAt) VALUES (?,?,?,?,?,?,?)').bind('u4', 'N4', 'n4@x.invalid', 0, null, now, now).run();
+  await seedResource('u4', 'r4', now);
   const env = { QUAL_OWNER_PER_HOUR: '1', QUAL_GLOBAL_PER_HOUR: '100' };
   const { qualWindow, qualFixtureWindow } = await import('../src/qualification/admission.mjs');
   const at = new Date();
@@ -107,7 +114,7 @@ test('real D1: fixture claims use a separate owner bucket, never live/global', a
   const countIn = async (u, w) => (await db.prepare('SELECT count FROM write_budget WHERE user_id = ? AND window = ?').bind(u, w).first())?.count ?? 0;
   const liveBefore = await countIn('u4', liveWin);
   const globBefore = await countIn('deployment', liveWin);
-  const mk = (k) => claimQualOp(db, 'u4', 'r1', `d-fix-${k}`, k, `d-fix-${k}`, { env, mode: 'fixture' }).then((r) => r.outcome, (e) => e.code);
+  const mk = (k) => claimQualOp(db, 'u4', 'r4', `d-fix-${k}`, k, `d-fix-${k}`, { env, mode: 'fixture' }).then((r) => r.outcome, (e) => e.code);
   const out = await Promise.all([mk('k-fix-a'), mk('k-fix-b')]);
   assert.ok(out.includes('claimed'), `one winner, got ${out}`);
   assert.ok(out.includes('QUAL_FIXTURE_QUOTA'), `loser fixture-refused, got ${out}`);
@@ -119,12 +126,13 @@ test('real D1: fixture claims use a separate owner bucket, never live/global', a
 test('real D1: same identity under a different key waits, never duplicates', async () => {
   const now = new Date().toISOString();
   await db.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, createdAt, updatedAt) VALUES (?,?,?,?,?,?,?)').bind('u5', 'N5', 'n5@x.invalid', 0, null, now, now).run();
+  await seedResource('u5', 'r5', now);
   const env = { QUAL_OWNER_PER_HOUR: '100', QUAL_GLOBAL_PER_HOUR: '100' };
-  const first = await claimQualOp(db, 'u5', 'r1', 'd-dupe', 'k-dupe-a', 'd-dupe', { env, mode: 'fixture' });
+  const first = await claimQualOp(db, 'u5', 'r5', 'd-dupe', 'k-dupe-a', 'd-dupe', { env, mode: 'fixture' });
   assert.equal(first.outcome, 'claimed');
-  const second = await claimQualOp(db, 'u5', 'r1', 'd-dupe', 'k-dupe-b', 'd-dupe', { env, mode: 'fixture' });
+  const second = await claimQualOp(db, 'u5', 'r5', 'd-dupe', 'k-dupe-b', 'd-dupe', { env, mode: 'fixture' });
   assert.equal(second.outcome, 'in-progress', `second key must wait, got ${JSON.stringify(second)}`);
-  const rows = (await db.prepare("SELECT op_key FROM qualification_recommendations WHERE owner_id = ? AND node_id = ? AND profile_digest = ? AND state IN ('reserved','fetching')").bind('u5', 'r1', 'd-dupe').all()).results;
+  const rows = (await db.prepare("SELECT op_key FROM qualification_recommendations WHERE owner_id = ? AND node_id = ? AND profile_digest = ? AND state IN ('reserved','fetching')").bind('u5', 'r5', 'd-dupe').all()).results;
   assert.equal(rows.length, 1, 'exactly one inflight op for the identity');
   assert.equal(rows[0].op_key, 'k-dupe-a', 'the first key holds the reservation');
 });
@@ -143,14 +151,15 @@ test('real D1: aggregate spend cap binds concurrent live reservations', async ()
 test('real D1: completion between pre-checks and reservation replays, never a second call', async () => {
   const now = new Date().toISOString();
   await db.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, createdAt, updatedAt) VALUES (?,?,?,?,?,?,?)').bind('u6', 'N6', 'n6@x.invalid', 0, null, now, now).run();
+  await seedResource('u6', 'r6', now);
   const env = { QUAL_OWNER_PER_HOUR: '100', QUAL_GLOBAL_PER_HOUR: '100' };
-  const identity = { nodeId: 'r1', profileDigest: 'd-race', mode: 'fixture' };
+  const identity = { nodeId: 'r6', profileDigest: 'd-race', mode: 'fixture' };
   const charges = async () => Number((await db.prepare('SELECT COALESCE(SUM(count), 0) AS n FROM write_budget WHERE user_id = ?').bind('u6').first())?.n ?? 0);
   // Second key's pre-claim reads: cache empty, nothing uncertain, nothing inflight.
   assert.ok(!(await findCache(db, 'u6', identity)), 'second key reads cache empty');
   assert.ok(!(await findUncertain(db, 'u6', identity)), 'second key reads no uncertain terminal');
   // First key completes (deliver + stable cache) before the second reserves.
-  const a = await claimQualOp(db, 'u6', 'r1', 'd-race', 'k-race-a', 'd-race', { env, mode: 'fixture' });
+  const a = await claimQualOp(db, 'u6', 'r6', 'd-race', 'k-race-a', 'd-race', { env, mode: 'fixture' });
   assert.equal(a.outcome, 'claimed');
   await markQualOp(db, 'u6', 'k-race-a', ['reserved'], 'fetching');
   const advice = JSON.stringify({ summary: 's', suggestions: [], rationale: '', unknowns: [], benchmarkCatalogId: 'unsupported' });
@@ -161,14 +170,14 @@ test('real D1: completion between pre-checks and reservation replays, never a se
   const spentByFirst = await charges();
   // The late reservation declines atomically and replays the first call:
   // no second dispatch, no second spend, no op row for the refused key.
-  const b = await claimQualOp(db, 'u6', 'r1', 'd-race', 'k-race-b', 'd-race', { env, mode: 'fixture' });
+  const b = await claimQualOp(db, 'u6', 'r6', 'd-race', 'k-race-b', 'd-race', { env, mode: 'fixture' });
   assert.equal(b.outcome, 'settled-replay');
   assert.equal(b.from, 'cached');
   assert.equal(JSON.parse(b.adviceJson).summary, 's', 'first advice replays');
   assert.equal(await charges(), spentByFirst, 'the declined reservation spent nothing');
   const brows = (await db.prepare('SELECT op_key FROM qualification_recommendations WHERE owner_id = ? AND op_key = ?').bind('u6', 'k-race-b').all()).results;
   assert.equal(brows.length, 0, 'the refused key wrote no op row');
-  const aroows = (await db.prepare("SELECT op_key FROM qualification_recommendations WHERE owner_id = ? AND node_id = ? AND profile_digest = ? AND state = 'delivered'").bind('u6', 'r1', 'd-race').all()).results;
+  const aroows = (await db.prepare("SELECT op_key FROM qualification_recommendations WHERE owner_id = ? AND node_id = ? AND profile_digest = ? AND state = 'delivered'").bind('u6', 'r6', 'd-race').all()).results;
   assert.equal(aroows.length, 1, 'exactly one delivery for the identity');
 });
 
@@ -176,25 +185,26 @@ test('real D1: delivered-without-cache replays from the row; uncertain wins over
   const now = new Date().toISOString();
   for (const u of ['u7', 'u8']) {
     await db.prepare('INSERT INTO "user" (id, name, email, emailVerified, image, createdAt, updatedAt) VALUES (?,?,?,?,?,?,?)').bind(u, 'N', `${u}@x.invalid`, 0, null, now, now).run();
+    await seedResource(u, 'r' + u.slice(1), now);
   }
   const env = { QUAL_OWNER_PER_HOUR: '100', QUAL_GLOBAL_PER_HOUR: '100' };
   const advice = JSON.stringify({ summary: 's7', suggestions: [], rationale: '', unknowns: [], benchmarkCatalogId: 'unsupported' });
   const receipt = JSON.stringify({ opKey: 'k-race7-a', mode: 'fixture' });
   // Crash window: delivered but the cache row never landed.
-  assert.equal((await claimQualOp(db, 'u7', 'r1', 'd-race7', 'k-race7-a', 'd-race7', { env, mode: 'fixture' })).outcome, 'claimed');
+  assert.equal((await claimQualOp(db, 'u7', 'r7', 'd-race7', 'k-race7-a', 'd-race7', { env, mode: 'fixture' })).outcome, 'claimed');
   await markQualOp(db, 'u7', 'k-race7-a', ['reserved'], 'fetching');
   await db.prepare("UPDATE qualification_recommendations SET state = 'delivered', advice_json = ?, receipt_json = ?, updated_at = ? WHERE owner_id = ? AND op_key = ?")
     .bind(advice, receipt, new Date().toISOString(), 'u7', 'k-race7-a').run();
-  const b7 = await claimQualOp(db, 'u7', 'r1', 'd-race7', 'k-race7-b', 'd-race7', { env, mode: 'fixture' });
+  const b7 = await claimQualOp(db, 'u7', 'r7', 'd-race7', 'k-race7-b', 'd-race7', { env, mode: 'fixture' });
   assert.equal(b7.outcome, 'settled-replay');
   assert.equal(b7.from, 'delivered', 'replay comes from the delivered row when the cache is missing');
   // Uncertain wins: a later uncertain terminal for the same identity blocks
   // replay-as-clean, even with an older delivery present.
   await db.prepare("INSERT INTO qualification_recommendations (owner_id, node_id, profile_digest, catalog_version, prompt_version, mode, op_key, input_digest, state, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-    .bind('u8', 'r1', 'd-race8', 'qual-catalog-v1', 'qual-prompt-v1', 'fixture', 'k-race8-a', 'd-race8', 'delivered', now, now).run();
+    .bind('u8', 'r8', 'd-race8', 'qual-catalog-v1', 'qual-prompt-v1', 'fixture', 'k-race8-a', 'd-race8', 'delivered', now, now).run();
   await db.prepare("INSERT INTO qualification_recommendations (owner_id, node_id, profile_digest, catalog_version, prompt_version, mode, op_key, input_digest, state, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-    .bind('u8', 'r1', 'd-race8', 'qual-catalog-v1', 'qual-prompt-v1', 'fixture', 'k-race8-b', 'd-race8', 'uncertain', now, now).run();
-  const c8 = await claimQualOp(db, 'u8', 'r1', 'd-race8', 'k-race8-c', 'd-race8', { env, mode: 'fixture' });
+    .bind('u8', 'r8', 'd-race8', 'qual-catalog-v1', 'qual-prompt-v1', 'fixture', 'k-race8-b', 'd-race8', 'uncertain', now, now).run();
+  const c8 = await claimQualOp(db, 'u8', 'r8', 'd-race8', 'k-race8-c', 'd-race8', { env, mode: 'fixture' });
   assert.equal(c8.outcome, 'uncertain', 'uncertain terminal reconciles, never replays-as-clean');
   const spent8 = Number((await db.prepare('SELECT COALESCE(SUM(count), 0) AS n FROM write_budget WHERE user_id = ?').bind('u8').first())?.n ?? 0);
   assert.equal(spent8, 0, 'blocked keys spend nothing');
