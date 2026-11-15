@@ -8,7 +8,7 @@ import { createAuth, oauthConfigured, sessionUser } from './lib/auth.js';
 import { all, first, run, pageQuery, cardFor, sharedCardFor, mapGrant, mapKey, mapJob, mapUsage, audit, rid, rid16, nowIso } from './lib/store.js';
 import { mintKey, verifierFor, publicKey, splitPresented, timingSafeEqualStr, KEY_PREFIX, DEMO_KEY_PREFIX } from './lib/keys.js';
 import { readJson, readBodyBytes, isId, isName, isScope, isEmail, pagination, httpError, normalizePairCode, PAIR_CODE_ALPHABET, MAX_BODY_BYTES } from './lib/validate.js';
-import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, MAX_ASSET_FILES_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
+import { checkWriteBudget, assertClaimed, capError, budgetWindow, WRITE_BUDGET_PER_HOUR, MAX_RESOURCES_PER_USER, MAX_KEYS_PER_USER, MAX_ACTIVE_UPLOADS_PER_USER, MAX_ASSET_FILES_PER_USER, heartbeatBudgets, heartbeatWindow, HEARTBEAT_CAPS_SQL, heartbeatCounterStatements, pruneHeartbeatBuckets, heartbeatBucketCount, secondsUntilNextHour, HEARTBEAT_GLOBAL_ID } from './lib/quotas.js';
 import { createAppGrant, createAppKey, revokeAppEntry } from './lib/app-mutations.js';
 import { qualificationRetirementStatements } from './qualification/retirement.mjs';
 import { handleFabric, federationEnabled } from './fabric/router.mjs';
